@@ -1,0 +1,88 @@
+{
+	"eufy_ws": "ws://eufy-security-ws:3000",
+	"go2rtc_api": "http://frigate:1984",
+	"rtsp_publish": "rtsp://GO2RTC_RTSP_USER:GO2RTC_RTSP_PASSWORD@frigate:8554/{name}",
+	"frigate_api": "http://frigate:5000",
+	"ha_webhook": "http://homeassistant:8123/api/webhook/eufy_frigate_bridge",
+	"hold_secs": 60,
+	"max_secs": 900,
+	"view_linger_secs": 20,
+	"view_max_secs": 300,
+	"min_dwell_secs": 15,
+	"viewer_cooldown_secs": 5,
+	"event_secs": 30,
+	"snapshot_delay_secs": 3,
+	"ring_label": "person",
+	"forward_face_names": true,
+	"trigger_events": [
+		"motion detected",
+		"person detected",
+		"pet detected",
+		"vehicle detected",
+		"dog detected",
+		"stranger person detected",
+		"identity person detected",
+		"sound detected",
+		"rings"
+	],
+	"early_sleep_secs": 20,
+	"low_battery_threshold": 20,
+	"low_battery_hold_secs": 20,
+	"low_battery_wake_on_view": false,
+	"enforce_streaming_quality": true,
+	"card_theme": "default",
+	"card_position": "center",
+	"card_background": "snapshot",
+	"cache_dir": "/config/cache",
+	"startup_snapshot": true,
+	"font_file": "/usr/share/fonts/Inter.ttf",
+	"telemetry_poll_secs": 300,
+	"telemetry": {
+		"enabled": true,
+		"battery": true,
+		"power_source": true,
+		"wifi": true,
+		"rssi": true,
+		"temperature": true,
+		"last_seen": true
+	},
+	"audio": true,
+	"preserve_aspect_ratio": true,
+	"hwaccel": false,
+	"hwaccel_device": "/dev/dri/renderD128",
+	"width": 1280,
+	"height": 720,
+	"live_fps": 10,
+	"idle_fps": 4,
+	"cameras": [
+		{
+			"name": "shed",
+			"title": "Shed",
+			"serial": "T8162T0000000000"
+		},
+		{
+			"name": "backyard",
+			"title": "Backyard",
+			"serial": "T8162T1111111111"
+		},
+		{
+			"name": "front_doorbell",
+			"title": "Front Doorbell",
+			"serial": "T8214T2222222222",
+			"preserve_aspect_ratio": false,
+			"card_theme": "icons",
+			"card_position": "bottom-left",
+			"card_background": "snapshot",
+			"startup_snapshot": true,
+			"telemetry": {
+				"enabled": true,
+				"battery": true,
+				"power_source": true,
+				"wifi": true,
+				"rssi": true,
+				"temperature": false,
+				"last_seen": true
+			}
+		}
+	]
+}

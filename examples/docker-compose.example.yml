@@ -1,0 +1,26 @@
+services:
+  eufy-frigate-battery-bridge:
+    build: .
+    image: eufy-frigate-battery-bridge:latest
+    container_name: eufy-frigate-battery-bridge
+    restart: unless-stopped
+    environment:
+      # log and "Last live" overlay timestamps
+      TZ: America/New_York
+    volumes:
+      - ./config.json:/config/config.json:ro
+      # persists last camera frames across container restarts
+      - ./cache:/config/cache
+    # Optional: uncomment below to enable hardware-accelerated encoding ("hwaccel": "vaapi" or "qsv")
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "video"
+    #   - "render"
+    # Must reach Frigate's go2rtc (API :1984, RTSP :8554) and Frigate's API (:5000) by name.
+    networks:
+      - frigate
+
+networks:
+  frigate:
+    external: true

@@ -1,0 +1,15 @@
+.git/
+.gitignore
+.idea/
+.opencode/
+*.iml
+*.jsonc
+*.md
+*.yml
+Makefile
+Dockerfile
+LICENSE
+conversations/
+examples/
+config.json
+cache/
