@@ -77,7 +77,7 @@ Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP /
 | `eufy_ws` | yes | — | `eufy-security-ws` `WebSocket` URL (e.g., `ws://eufy-security-ws:3000`) |
 | `go2rtc_api` | yes | — | Frigate's `go2rtc` HTTP API URL, normally `http://frigate:1984` |
 | `rtsp_publish` | yes | — | Where to publish each camera. `{name}` is replaced by the camera name. If Frigate's `go2rtc` has `rtsp.username/password` set, put them in the URL. |
-| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card; `priority` sets the camera's base arbitration weight (default `0`). |
+| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "card_show_on_live", "auto_frigate_mask", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card; `priority` sets the camera's base arbitration weight (default `0`). |
 | `frigate_api` | no | — | Frigate's internal HTTP API (`http://frigate:5000`). Without it, no `Frigate` events are filed and early-sleep object checks are skipped. |
 | `ha_webhook` | no | — | `Home Assistant` webhook URL (see [Home Assistant Notifications](#home-assistant-notifications)) |
 | `log_level` | no | `"info"` | Minimum log severity (`"debug"`, `"info"`, `"warn"`, `"error"`). Can also be set via the `LOG_LEVEL` environment variable. |
@@ -106,7 +106,8 @@ Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP /
 |---|---|---|
 | `trigger_events` | `motion`, `person`, `pet`, `vehicle`, `dog`, `stranger`, `identity person`, `sound`, `rings` | Eufy event names (or shorthand aliases) that wake the camera and trigger a `Frigate` event |
 | `event_secs` | `30` | Duration of the `Frigate` event in seconds |
-| `snapshot_delay_secs` | `3` | Seconds of continuous decoded video required before the event is filed, so its snapshot isn't the `"Waking Up..."` card |
+| `snapshot_delay_secs` | `3` | Seconds of continuous decoded video required before the event is filed (`1.2 s` on `RTSP`), so its snapshot isn't the `"Waking Up..."` card |
+| `instant_event_snapshot` | `true` | Immediately files `Frigate` events if a short clip finishes early and injects the clean un-overlayed `lastFrame` if a wake times out so `Frigate` never captures the `"Waking Up..."` card as the event thumbnail |
 | `forward_face_names` | `true` | Forwards `HomeBase 3` recognized face names (`identity person detected`) as Frigate's `sub_label` and `Home Assistant` webhook `person` |
 | `ring_label` | `"person"` | `Frigate` event label filed when a doorbell `rings` event occurs |
 
@@ -128,6 +129,8 @@ Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP /
 | `card_position` | `"center"` | Overlay placement for any theme: `"center"`, `"bottom-left"`, `"bottom-right"`, `"top-left"`, or `"top-right"`. Can be overridden per camera. |
 | `card_background` | `"snapshot"` | Background behind the status card: `"snapshot"` (last live frame), `"slate"` (solid dark gray), or `"black"` (pitch-black). Can be overridden per camera. |
 | `card_dim_background` | `false` | Dim the `"snapshot"` backdrop behind the status card (`true` / `false`). Disabled by default so unmasked background pixels outside the card do not trigger `Frigate` motion detection on sleep/wake transitions. Can be overridden per camera. |
+| `card_show_on_live` | `true` | Keep corner status cards (`card_position !== "center"`) visible on the live video stream with a live status indicator (`Blue` dot/play icon) and real-time telemetry while keeping saved snapshots clean. Can be overridden per camera. |
+| `auto_frigate_mask` | `true` | Automatically calculate the normalized polygon for each camera's corner status card and apply both `motion.mask` and `objects.mask` (`eufy_bridge_card`) to `Frigate` via `PUT /api/config/set` (`requires_restart: 0`) on startup and automatically whenever `Frigate` restarts. Can be overridden per camera. |
 | `telemetry` | `true` | `true`, `false`, or an object controlling which telemetry items are shown on the sleeping card (see [Live Camera Telemetry & Battery Swap Detection](#live-camera-telemetry--battery-swap-detection)). Can be overridden per camera. |
 | `telemetry_poll_secs` | `300` | Background telemetry poll interval in seconds to detect battery swaps and charging updates while sleeping (`0` to disable) |
 | `cache_dir` | `"/config/cache"` | Directory for persisting last live snapshots (`last_<name>_<serial>.jpg`) across container restarts (falls back to `"/tmp"`) |
@@ -217,7 +220,7 @@ Note: All samples are AI-generated.
 | Color | Dot 1 / Status Icon | Dot 2 / Battery Icon | Dot 3 / Wi-Fi & `RSSI` Arcs | Thermometer Icon (`icons` theme) |
 |---|---|---|---|---|
 | **Green** (`#4ade80`) | **Asleep** (Online & ready) | **Good** (`>= 50%`) | **Strong** (`4/4` bars or `>= -65 dBm`) | **Normal** (`6°C – 35°C`) |
-| **Blue** (`#38bdf8`) | **Waking Up** (`P2P` connecting) | **Charging / Solar / Plugged** | **Good / Average** (`3/4` bars or `-66..-72 dBm`) | **Cold** (`<= 5°C`) |
+| **Blue** (`#38bdf8`) | **Waking Up / Live** (Connecting or streaming) | **Charging / Solar / Plugged** | **Good / Average** (`3/4` bars or `-66..-72 dBm`) | **Cold** (`<= 5°C`) |
 | **Yellow** (`#facc15`) | **Waiting** (`HomeBase` busy) | **Medium** (`21% – 49%`) | **Fair / Weak** (`2/4` bars or `-73..-80 dBm`) | **Warm** (`36°C – 44°C`) |
 | **Red** (`#f87171`) | **Low-Battery Economy Mode** | **Low / Critical** (`<= 20%` or `n/a`) | **Poor** (`0–1/4` bars, `< -80 dBm`, or `n/a`) | **Hot** (`>= 45°C`) |
 

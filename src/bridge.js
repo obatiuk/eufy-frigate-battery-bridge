@@ -159,6 +159,9 @@ const LET_EUFY_DECIDE_END = cfg.let_eufy_decide_event_end !== false;
 const GLOBAL_USE_RTSP = cfg.use_rtsp !== false;
 const BACKFILL_DOWNLOADS = cfg.backfill_downloads !== false;
 const BACKFILL_DELAY_MS = clampNum(cfg.backfill_delay_secs, 2, 120, 5) * 1000;
+const GLOBAL_AUTO_FRIGATE_MASK = cfg.auto_frigate_mask !== false;
+const GLOBAL_CARD_SHOW_ON_LIVE = cfg.card_show_on_live !== false;
+const INSTANT_EVENT_SNAPSHOT = cfg.instant_event_snapshot !== false;
 
 // Smart battery conservation, periodic telemetry refresh, and startup snapshot probe options.
 const EARLY_SLEEP_MS = clampNum(cfg.early_sleep_secs, 0, 3600, 0) * 1000;
@@ -711,7 +714,7 @@ function drawStatusGlyph(canvas, cx, cy, scale, st) {
         st.statusRgb[2],
         0.95
     );
-  } else if (st.statusKind === 'waking') {
+  } else if (st.statusKind === 'waking' || st.statusKind === 'live') {
     const xLeft = cx - 2.2 * scale;
     const xRight = cx + 3.6 * scale;
     const yHalf = 3.6 * scale;
@@ -947,16 +950,18 @@ function evaluateTelemetryState(titleText, status) {
   const charging = Boolean(status && status.charging);
   const economyMode = Boolean(status && status.economyMode);
 
-  // 1. Camera Status Color: Green = Asleep, Blue = Waking Up, Yellow = Waiting, Red = Low-Bat Eco.
-  const statusKind = /Waking/i.test(titleText)
-      ? 'waking'
-      : /Waiting/i.test(titleText)
-          ? 'waiting'
-          : economyMode || /Low Battery/i.test(titleText)
-              ? 'low'
-              : 'asleep';
+  // 1. Camera Status Color: Green = Asleep, Blue = Waking Up / Live, Yellow = Waiting, Red = Low-Bat Eco.
+  const statusKind = /^Live\b/i.test(titleText)
+      ? 'live'
+      : /Waking/i.test(titleText)
+          ? 'waking'
+          : /Waiting/i.test(titleText)
+              ? 'waiting'
+              : economyMode || /Low Battery/i.test(titleText)
+                  ? 'low'
+                  : 'asleep';
   const statusRgb =
-      statusKind === 'waking'
+      statusKind === 'waking' || statusKind === 'live'
           ? COLOR_BLUE
           : statusKind === 'waiting'
               ? COLOR_YELLOW
@@ -1719,6 +1724,12 @@ function renderCameraCards(cam) {
       baseCanvas,
       hasBackground
   );
+  cam.liveTelState = evaluateTelemetryState('Live', status);
+  if (cam.showCardOnLive && cam.cardCfg.theme === 'default' && cam.cardCfg.position !== 'center') {
+    cam.liveCard = card('Live', '', '', status, baseCanvas, hasBackground);
+  } else {
+    cam.liveCard = null;
+  }
   cam.burstUntil = Date.now() + 1200;
 }
 
@@ -1755,6 +1766,15 @@ const cams = cfg.cameras.map((c) => {
     preserveAspect,
     cardCfg,
     telCfg: resolveTelemetryConfig(c),
+    autoFrigateMask:
+        c.auto_frigate_mask !== undefined ? Boolean(c.auto_frigate_mask) : GLOBAL_AUTO_FRIGATE_MASK,
+    showCardOnLive:
+        c.card_show_on_live !== undefined ? Boolean(c.card_show_on_live) : GLOBAL_CARD_SHOW_ON_LIVE,
+    lastSyncedMaskPoly: '',
+    liveTelState: null,
+    liveCard: null,
+    liveOverlayBuf: Buffer.allocUnsafe(FRAME),
+    suppressLiveCard: false,
     needsStartupSnapshot,
     isStartupProbe: false,
     useHwaccel: Boolean(ACTIVE_HWACCEL),
@@ -1900,6 +1920,374 @@ function clearViewerQueue(cam, clearReason = '') {
 }
 
 /**
+ * Computes the bounding box { boxX, boxY, boxW, boxH } of a camera's corner status card
+ * across all states so Frigate motion/object masks and live overlays cover the exact card footprint.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @returns {{ boxX: number, boxY: number, boxW: number, boxH: number }|null}
+ */
+function getCameraCardBounds(cam) {
+  const {theme, position} = cam.cardCfg;
+  if (theme === 'none' || position === 'center') return null;
+
+  let boxW = 92;
+  let boxH = 36;
+  if (theme === 'icons') {
+    const tc = cam.telCfg;
+    let contentW = 20;
+    if (tc.enabled && tc.battery) contentW += 16 + 37;
+    if (tc.enabled && tc.wifi) contentW += 16 + 28;
+    if (tc.enabled && tc.temperature) contentW += 16 + 16;
+    if (tc.enabled && tc.lastSeen) contentW += 16 + 20;
+    boxW = contentW + 32;
+    boxH = 44;
+  } else if (theme === 'default') {
+    const title = cam.title || cam.name;
+    const maxHeader = 'Asleep (Low Battery)  -  ' + title;
+    const headerW = 42 + maxHeader.length * 11 + 24;
+    const st = cam.liveTelState || evaluateTelemetryState('Asleep', {
+      telCfg: cam.telCfg,
+      battery: cam.battery ?? 100,
+      charging: cam.charging,
+      powerLabel: cam.powerLabel || 'Charging',
+      wifi: cam.wifi ?? 4,
+      rssi: cam.rssi ?? -60,
+      temp: cam.temp ?? 25,
+      lastSeen: cam.lastSeen || '00:00',
+    });
+    const segments = buildTelemetrySegments(st);
+    const hasTelemetry = cam.telCfg.enabled && segments.length > 0;
+    const gap = 18;
+    const telW = hasTelemetry
+        ? segments.reduce((sum, seg) => sum + seg.width, 0) + gap * Math.max(0, segments.length - 1) + 44
+        : 0;
+    boxW = Math.min(W - 48, Math.max(hasTelemetry ? 540 : 400, telW, headerW));
+    boxH = hasTelemetry ? 88 : 48;
+  }
+
+  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
+  return {boxX, boxY, boxW, boxH};
+}
+
+/**
+ * Copies the rectangular sub-region (boxX, boxY, boxW, boxH) from srcYuv to dstYuv.
+ *
+ * @param {Uint8Array} srcYuv - Source YUV420p frame buffer.
+ * @param {Uint8Array} dstYuv - Destination YUV420p frame buffer.
+ * @param {number} boxX - Left X coordinate.
+ * @param {number} boxY - Top Y coordinate.
+ * @param {number} boxW - Width in pixels.
+ * @param {number} boxH - Height in pixels.
+ */
+function copyYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH) {
+  const x0 = Math.max(0, boxX & ~1);
+  const y0 = Math.max(0, boxY & ~1);
+  const x1 = Math.min(W, (boxX + boxW + 1) & ~1);
+  const y1 = Math.min(H, (boxY + boxH + 1) & ~1);
+  const rw = x1 - x0;
+  if (rw <= 0 || y1 <= y0) return;
+
+  for (let y = y0; y < y1; y++) {
+    const off = y * W + x0;
+    srcYuv.copy(dstYuv, off, off, off + rw);
+  }
+  const cw = W >> 1;
+  const cSize = cw * (H >> 1);
+  const cx0 = x0 >> 1;
+  const cy0 = y0 >> 1;
+  const cy1 = y1 >> 1;
+  const crw = rw >> 1;
+  for (let cy = cy0; cy < cy1; cy++) {
+    const uOff = W * H + cy * cw + cx0;
+    const vOff = uOff + cSize;
+    srcYuv.copy(dstYuv, uOff, uOff, uOff + crw);
+    srcYuv.copy(dstYuv, vOff, vOff, vOff + crw);
+  }
+}
+
+/**
+ * Composites the camera's corner status card onto a copy of a live video frame when
+ * card_show_on_live is enabled, leaving the original raw frame (and cam.lastFrame) untouched.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {Uint8Array} rawFrame - Clean decoded YUV420p video frame.
+ * @returns {Uint8Array} YUV420p frame buffer with corner overlay applied (or rawFrame if disabled).
+ */
+function renderLiveFrameWithCard(cam, rawFrame) {
+  if (
+      !cam.showCardOnLive ||
+      cam.suppressLiveCard ||
+      cam.cardCfg.theme === 'none' ||
+      cam.cardCfg.position === 'center'
+  ) {
+    return rawFrame;
+  }
+  const out = cam.liveOverlayBuf;
+  rawFrame.copy(out);
+  const st = cam.liveTelState || evaluateTelemetryState('Live', {
+    telCfg: cam.telCfg,
+    battery: cam.battery,
+    charging: cam.charging,
+    powerLabel: cam.powerLabel,
+    economyMode: isLowBattery(cam),
+    wifi: cam.wifi,
+    rssi: cam.rssi,
+    temp: cam.temp,
+    lastSeen: cam.lastSeen,
+  });
+
+  if (cam.cardCfg.theme === 'minimal') {
+    drawMinimalDotsCard(out, cam.cardCfg.position, st, true);
+    return out;
+  }
+  if (cam.cardCfg.theme === 'icons') {
+    drawIconsOnlyCard(out, cam.cardCfg.position, st, true);
+    return out;
+  }
+  if (cam.cardCfg.theme === 'default' && Buffer.isBuffer(cam.liveCard)) {
+    const bounds = getCameraCardBounds(cam);
+    if (bounds) {
+      copyYuvRegion(cam.liveCard, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
+    }
+    return out;
+  }
+  return rawFrame;
+}
+
+/**
+ * Computes the normalized Frigate mask polygon string ('x0,y0,x0,y1,x1,y1,x1,y0')
+ * for a camera's status card with a 6px chroma/anti-aliasing safety margin.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @returns {string} Normalized polygon coordinates, or '' if no corner card is active.
+ */
+function computeFrigateMaskPolygon(cam) {
+  const bounds = getCameraCardBounds(cam);
+  if (!bounds) return '';
+  const pad = 6;
+  const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
+  const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
+  const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
+  const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(3);
+  return x0 + ',' + y0 + ',' + x0 + ',' + y1 + ',' + x1 + ',' + y1 + ',' + x1 + ',' + y0;
+}
+
+/**
+ * Synchronizes a single mask section ('motion' or 'objects') for a camera in Frigate via
+ * PUT /api/config/set (requires_restart: 0).
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {Record<string, *>} camCfg - Camera configuration object from Frigate /api/config.
+ * @param {'motion'|'objects'} section - Frigate mask section ('motion' or 'objects').
+ * @param {string} poly - Normalized polygon string, or '' to disable.
+ * @returns {Promise<'verified'|'applied'|'disabled'|'none'|'failed'>}
+ */
+async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
+  const sectionObj = camCfg && camCfg[section] ? camCfg[section] : null;
+  const existingMasks = sectionObj ? sectionObj.mask : undefined;
+  const isNamedDict =
+      existingMasks !== null && typeof existingMasks === 'object' && !Array.isArray(existingMasks);
+
+  if (!poly) {
+    if (isNamedDict && existingMasks.eufy_bridge_card && existingMasks.eufy_bridge_card.enabled) {
+      try {
+        const res = await fetch(cfg.frigate_api + '/api/config/set', {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          signal: AbortSignal.timeout(8000),
+          body: JSON.stringify({
+            requires_restart: 0,
+            update_topic: 'config/cameras/' + cam.name + '/' + section,
+            config_data: {
+              cameras: {
+                [cam.name]: {
+                  [section]: {
+                    mask: {
+                      eufy_bridge_card: {
+                        friendly_name: 'Eufy Bridge Status Card',
+                        enabled: false,
+                        coordinates: existingMasks.eufy_bridge_card.coordinates,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }),
+        });
+        return res.ok ? 'disabled' : 'failed';
+      } catch (err) {
+        log.warn(cam, 'failed to disable Frigate ' + section + '.mask: ' + err.message);
+        return 'failed';
+      }
+    }
+    return 'none';
+  }
+
+  if (
+      isNamedDict &&
+      existingMasks.eufy_bridge_card &&
+      existingMasks.eufy_bridge_card.enabled !== false &&
+      existingMasks.eufy_bridge_card.coordinates === poly
+  ) {
+    return 'verified';
+  }
+
+  try {
+    const putRes = await fetch(cfg.frigate_api + '/api/config/set', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({
+        requires_restart: 0,
+        update_topic: 'config/cameras/' + cam.name + '/' + section,
+        config_data: {
+          cameras: {
+            [cam.name]: {
+              [section]: {
+                mask: {
+                  eufy_bridge_card: {
+                    friendly_name: 'Eufy Bridge Status Card',
+                    enabled: true,
+                    coordinates: poly,
+                  },
+                },
+              },
+            },
+          },
+        },
+      }),
+    });
+
+    if (putRes.ok) {
+      return 'applied';
+    }
+
+    // Fallback for Frigate 0.14-0.16 query parameter format.
+    const legacyUrl =
+        cfg.frigate_api +
+        '/api/config/set?cameras.' +
+        encodeURIComponent(cam.name) +
+        '.' +
+        section +
+        '.mask=' +
+        encodeURIComponent(poly);
+    const legRes = await fetch(legacyUrl, {
+      method: 'PUT',
+      signal: AbortSignal.timeout(8000),
+    });
+    if (legRes.ok) {
+      return 'applied';
+    }
+
+    const errText = (await putRes.text()).slice(0, 160);
+    log.warn(
+        cam,
+        'could not auto-apply Frigate ' +
+        section +
+        '.mask (HTTP ' +
+        putRes.status +
+        '): ' +
+        errText +
+        ' (calculated mask=' +
+        poly +
+        ')'
+    );
+    return 'failed';
+  } catch (err) {
+    log.warn(cam, 'error syncing Frigate ' + section + '.mask (' + poly + '): ' + err.message);
+    return 'failed';
+  }
+}
+
+/**
+ * Automatically synchronizes each camera's calculated corner status card motion.mask and
+ * objects.mask into Frigate via Frigate's HTTP API (GET /api/config + PUT /api/config/set).
+ */
+let isSyncingMasks = false;
+let frigateApiDown = false;
+let lastMaskCheckAt = 0;
+
+async function syncFrigateMotionMasks(forceResync = false) {
+  if (isSyncingMasks || shuttingDown || !cfg.frigate_api || !cams.some((c) => c.autoFrigateMask)) return;
+  isSyncingMasks = true;
+  try {
+    if (forceResync) {
+      for (const c of cams) c.lastSyncedMaskPoly = '';
+    }
+    let frigateCfg = null;
+    try {
+      const r = await fetch(cfg.frigate_api + '/api/config', {signal: AbortSignal.timeout(5000)});
+      if (!r.ok) {
+        frigateApiDown = true;
+        return;
+      }
+      frigateCfg = await r.json();
+    } catch (err) {
+      frigateApiDown = true;
+      log.debug('bridge', 'could not fetch Frigate /api/config for auto_frigate_mask: ' + err.message);
+      return;
+    }
+
+    lastMaskCheckAt = Date.now();
+    for (const cam of cams) {
+      if (!cam.autoFrigateMask) continue;
+      const poly = computeFrigateMaskPolygon(cam);
+      const camCfg = frigateCfg && frigateCfg.cameras ? frigateCfg.cameras[cam.name] : null;
+      if (!camCfg) continue;
+
+      const motMask = camCfg.motion && camCfg.motion.mask ? camCfg.motion.mask.eufy_bridge_card : null;
+      const objMask = camCfg.objects && camCfg.objects.mask ? camCfg.objects.mask.eufy_bridge_card : null;
+      const masksIntact =
+          motMask &&
+          motMask.enabled !== false &&
+          motMask.coordinates === poly &&
+          objMask &&
+          objMask.enabled !== false &&
+          objMask.coordinates === poly;
+
+      if (poly && cam.lastSyncedMaskPoly === poly && masksIntact) continue;
+
+      const motionStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'motion', poly);
+      const objectStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'objects', poly);
+
+      if (!poly) {
+        if (motionStatus === 'disabled' || objectStatus === 'disabled') {
+          log.info(
+              cam,
+              'disabled Frigate motion & object masks eufy_bridge_card (card is ' +
+              cam.cardCfg.theme +
+              '/' +
+              cam.cardCfg.position +
+              ')'
+          );
+        }
+        continue;
+      }
+
+      if (motionStatus !== 'failed' && objectStatus !== 'failed') {
+        cam.lastSyncedMaskPoly = poly;
+        const actionVerb =
+            motionStatus === 'applied' || objectStatus === 'applied' ? 'auto-applied' : 'verified';
+        log.info(
+            cam,
+            actionVerb +
+            ' Frigate motion & object masks eufy_bridge_card (' +
+            cam.cardCfg.theme +
+            '@' +
+            cam.cardCfg.position +
+            ' -> ' +
+            poly +
+            ')'
+        );
+      }
+    }
+  } finally {
+    isSyncingMasks = false;
+  }
+}
+
+/**
  * Pushes the appropriate video frame (live decoded video, waking card, busy card, or asleep card)
  * to a camera's persistent FFmpeg encoder stdin immediately when a state change or new decoded
  * frame arrives, or on the periodic frame tick.
@@ -1942,8 +2330,18 @@ function pushFrameToEncoder(cam, now = Date.now()) {
 
   const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < 2000);
   const live = cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame)));
-  const liveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
-  const frame = live ? liveFrame : cam.active ? cam.waking : now < want(cam) ? cam.busy : cam.asleep;
+  const rawLiveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
+  const liveFrame =
+      live && rawLiveFrame ? renderLiveFrameWithCard(cam, rawLiveFrame) : rawLiveFrame;
+  const frame = live
+      ? liveFrame
+      : cam.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)
+          ? cam.lastFrame
+          : cam.active
+              ? cam.waking
+              : now < want(cam)
+                  ? cam.busy
+                  : cam.asleep;
   const stateChanged = frame !== cam.lastSent;
   if (stateChanged) {
     cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
@@ -2250,7 +2648,10 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
       log.warn(cam, 'device.get_properties failed: ' + (res.errorCode || 'unknown'));
     }
   }
-  initialTelemetryLoaded = true;
+  if (!initialTelemetryLoaded) {
+    initialTelemetryLoaded = true;
+    void syncFrigateMotionMasks();
+  }
 }
 
 /**
@@ -2682,11 +3083,18 @@ function frigateEvent(cam, ev, personName = '') {
     cam.evTimer = null;
     notifyHA(cam, {});
 
+    const requiredDelayMs =
+        cam.activeMode === 'download'
+            ? 0
+            : cam.activeMode === 'rtsp' && INSTANT_EVENT_SNAPSHOT
+                ? Math.min(SNAP_DELAY_MS, 1200)
+                : SNAP_DELAY_MS;
     const showing = () =>
-        cam.active &&
-        cam.frame &&
-        Date.now() - cam.frameAt < 1500 &&
-        (cam.activeMode === 'download' || Date.now() - cam.firstFrameAt >= SNAP_DELAY_MS);
+        (cam.active &&
+            cam.frame &&
+            Date.now() - cam.frameAt < 1500 &&
+            Date.now() - cam.firstFrameAt >= requiredDelayMs) ||
+        (INSTANT_EVENT_SNAPSHOT && !cam.active && cam.gotVideo && Date.now() - cam.lastVideoAt < 5000);
 
     const maxWaitLoops = Math.max(125, Math.ceil((SNAP_DELAY_MS + 15000) / 200));
     for (let i = 0; i < maxWaitLoops && cam.evLabel !== 'test' && !showing(); i++) {
@@ -2694,6 +3102,12 @@ function frigateEvent(cam, ev, personName = '') {
     }
 
     const noVideo = cam.evLabel !== 'test' && !showing();
+    if (noVideo && INSTANT_EVENT_SNAPSHOT && Buffer.isBuffer(cam.lastFrame)) {
+      cam.suppressLiveCard = true;
+      cam.burstUntil = Date.now() + 1500;
+      pushFrameToEncoder(cam, Date.now());
+      await sleep(450);
+    }
     const finalLabel = cam.evLabel;
     const finalPerson = cam.evPerson;
     const subLabel = finalPerson || 'eufy';
@@ -2752,6 +3166,11 @@ function frigateEvent(cam, ev, personName = '') {
       notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
       log.error(cam, 'Frigate event failed: ' + err.message);
+    } finally {
+      if (cam.suppressLiveCard) {
+        cam.suppressLiveCard = false;
+        pushFrameToEncoder(cam, Date.now());
+      }
     }
   }, 600);
 }
@@ -3778,6 +4197,12 @@ function startEncoder(cam) {
     }
 
     log.error(cam, 'encoder exited (code=' + code + ') ' + errSummary + ' - restarting in 3 s');
+    if (Date.now() - spawnAt > 10000) {
+      frigateApiDown = true;
+      setTimeout(() => {
+        if (!shuttingDown) void syncFrigateMotionMasks(true);
+      }, 6000);
+    }
     setTimeout(() => {
       if (!cam.enc && !shuttingDown) startEncoder(cam);
     }, 3000);
@@ -4309,12 +4734,16 @@ async function pollViewers() {
     const findStationMotionCam = (cam) => cams.find((c) => inMotion(c) && !isRtspCapable(c) && getStationKey(c) === getStationKey(cam));
     const newConnections = [];
 
+    let anyPollOk = false;
+    let allPollsFailed = true;
     for (const cam of cams) {
       try {
         const r = await fetch(cfg.go2rtc_api + '/api/streams?src=' + cam.name, {
           signal: AbortSignal.timeout(2500),
         });
         if (!r.ok) continue;
+        allPollsFailed = false;
+        anyPollOk = true;
         const d = await r.json();
         const viewers = (d.consumers || []).filter(
             (c) => !/FFmpeg Frigate|^go2rtc/i.test(c.user_agent || '')
@@ -4352,6 +4781,15 @@ async function pollViewers() {
       } catch (err) {
         // Ignore transient errors while go2rtc/Frigate is restarting.
       }
+    }
+    if (allPollsFailed) {
+      frigateApiDown = true;
+    } else if (anyPollOk && frigateApiDown) {
+      frigateApiDown = false;
+      log.info('bridge', 'Frigate API recovered after restart/outage, re-verifying motion & object masks');
+      setTimeout(() => {
+        if (!shuttingDown) void syncFrigateMotionMasks(true);
+      }, 3000);
     }
 
     // Only classify as a multi-camera dashboard grid if 2+ sleeping cameras got new viewers AND 2+ cameras have active viewers.
@@ -4442,6 +4880,10 @@ setInterval(() => {
   const now = Date.now();
   arbitrate();
   void processBackfillQueue(now);
+  if (wsReady && now - lastMaskCheckAt >= 60000) {
+    lastMaskCheckAt = now;
+    void syncFrigateMotionMasks(false);
+  }
 
   if (wsReady && initialTelemetryLoaded && now - wsReadyAt > 6000) {
     const nextProbeCam = cams.find(
@@ -4624,6 +5066,10 @@ const startMsg =
     GLOBAL_USE_RTSP +
     ', backfill=' +
     BACKFILL_DOWNLOADS +
+    ', autoMask=' +
+    GLOBAL_AUTO_FRIGATE_MASK +
+    ', cardOnLive=' +
+    GLOBAL_CARD_SHOW_ON_LIVE +
     ', letEufyDecideEnd=' +
     LET_EUFY_DECIDE_END +
     ', dimBg=' +
@@ -4641,3 +5087,4 @@ log.info('bridge', startMsg);
 
 for (const c of cams) startEncoder(c);
 connectWs();
+setTimeout(() => void syncFrigateMotionMasks(), 2500);

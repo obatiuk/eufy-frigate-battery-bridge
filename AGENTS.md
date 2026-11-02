@@ -77,7 +77,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `eufy_ws`: `WebSocket` URL for `eufy-security-ws` (e.g., `ws://eufy-security-ws:3000`)
 - `go2rtc_api`: Frigate's `go2rtc` HTTP API URL (e.g., `http://frigate:1984`)
 - `rtsp_publish`: `RTSP` publish URL template containing `{name}` (e.g., `rtsp://frigate:8554/{name}`)
-- `cameras`: Array of camera objects `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`
+- `cameras`: Array of camera objects `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "card_show_on_live", "auto_frigate_mask", "preserve_aspect_ratio", "startup_snapshot" }]`
 
 ### Optional Core Keys
 
@@ -115,6 +115,9 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `card_position` (alias `card_corner`): `"center"` (default), `"bottom-left"`, `"bottom-right"`, `"top-left"`, or `"top-right"` (also accepts `"left-bottom"`, `"right-top"`, etc.). Applies to `"default"`, `"icons"`, and `"minimal"` themes. Can be overridden per camera.
 - `card_background`: `"snapshot"` (default last live frame), `"slate"` (solid dark slate `0x22`), or `"black"`/`"none"` (pitch-black `0x10` background). Can be overridden per camera.
 - `card_dim_background`: `false` (default) or `true`. Controls whether `"snapshot"` backgrounds are dimmed across the entire frame behind status cards. Disabled by default so unmasked background pixels do not trigger Frigate motion detection on sleep/wake transitions. Can be overridden per camera.
+- `card_show_on_live`: `true` (default) or `true`/`false` per camera. Keeps corner status cards (`card_position !== "center"`) visible on the live video stream (using a `Blue` live dot/play glyph) via a zero-allocation scratch buffer while keeping `cam.lastFrame` and `/config/cache` snapshots clean.
+- `auto_frigate_mask`: `true` (default) or `true`/`false` per camera. Computes the exact normalized bounding-box polygon for each camera's corner status card (with a `6px` chroma/anti-aliasing safety margin) and syncs both `motion.mask.eufy_bridge_card` and `objects.mask.eufy_bridge_card` into Frigate via `GET /api/config` and `PUT /api/config/set` (`requires_restart: 0`) on startup, every 60s, and automatically whenever Frigate restarts.
+- `instant_event_snapshot`: `true` (default). Uses a fast `1.2s` snapshot delay on RTSP wakes, files events immediately if a clip ends early after receiving video, and temporarily pushes the clean un-overlayed `cam.lastFrame` on `noVideo` timeouts so Frigate never saves the `"Waking Up..."` card as an event thumbnail.
 - `telemetry`: `true` (default), `false`, or object `{ "enabled": true, "battery": true, "power_source": true, "wifi": true, "rssi": true, "temperature": true, "last_seen": true }`. Can also be overridden per camera in `cameras[]`.
 - `telemetry_poll_secs`: Interval in seconds to poll `device.get_properties` (and `driver.poll_refresh` when in Low-Battery Economy Mode) so battery swaps and charging updates are detected while sleeping (default: `300`, `0` to disable).
 - `cache_dir`: Directory for storing persistent camera snapshots `last_<name>_<serial>.jpg` across container restarts (default: `/config/cache`, falls back to `/tmp`).
@@ -250,6 +253,7 @@ All log output in `bridge.js` must use `log.debug()`, `log.info()`, `log.warn()`
 - [x] Block 6 (Step 1) - Configurable Camera Priority (`priority`), Built-In Event Priority Boosts (`EVENT_PRIORITIES`), Zero-Dwell Instant Event Switching, and `15 fps` / `5 fps` Drain-Aware Encoder Pipeline
 - [x] Block 6 (Step 2) - HomeBase Native RTSP Ingestion (`use_rtsp`, `rtsp_url`, `startRtspDecoder` with `750ms` wake retries & `arbitrate()` P2P fallback) & HomeBase 3 Post-Event Clip Download Backfill (`backfill_downloads`, `station.database_query_latest_info`/`by_date`, `device.start_download` with `15 fps` real-time playback & `SIGUSR1` test hook)
 - [x] Block 6 (Step 3) - Standalone Camera / Multi-Station Concurrent Streaming (`stationSerial` P2P Arbitration & Per-Station Transition Locks)
+- [x] Block 6 (Step 4) - Auto-Applied Frigate Motion & Object Masks (`auto_frigate_mask` with Frigate restart recovery), Live-Stream Corner Status Cards (`card_show_on_live`), and Instant Clean Event Snapshot Fallback (`instant_event_snapshot`)
 
 ### Pending (Next Up)
 - [ ] Block 3 (Part 2) - Built-In Prometheus `/metrics` & `/healthz` HTTP Server (`metrics_port`):
