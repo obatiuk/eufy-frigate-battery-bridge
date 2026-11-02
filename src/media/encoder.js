@@ -47,16 +47,88 @@ function configureEncoderHooks(hooks = {}) {
 }
 
 /**
- * Pushes the appropriate video frame (live decoded video, waking card, busy card, or asleep card)
- * to a camera's persistent FFmpeg encoder stdin immediately when a state change or new decoded
- * frame arrives, or on the periodic frame tick.
+ * Advances the buffered download frame queue by one frame at LIVE_FPS pacing when a camera
+ * is replaying a post-event HomeBase clip download.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ */
+function advanceDownloadPlaybackFrame(cam, now) {
+  const frameIntervalMs = Math.floor(1000 / LIVE_FPS) - 4;
+  if (
+      cam.active &&
+      cam.activeMode === 'download' &&
+      cam.downloadFrames.length > 0 &&
+      now - cam.lastWrite >= frameIntervalMs
+  ) {
+    const nextBuf = cam.downloadFrames.shift();
+    cam.frame = nextBuf;
+    cam.frameAt = now;
+    cam.lastVideoAt = now;
+    cam.frameNew = true;
+    cam.lastFrame = nextBuf;
+    cam.lastSeen = formatLocalHm(new Date(now));
+  }
+}
+
+/**
+ * Selects the YUV420p frame buffer to feed to the camera's encoder (live video with optional
+ * corner card, clean snapshot fallback, waking card, busy card, or asleep card).
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {{ frame: Uint8Array, isLive: boolean }}
+ */
+function selectEncoderFrame(cam, now) {
+  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < 2000);
+  const isLive = Boolean(cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame))));
+
+  if (isLive) {
+    const rawLiveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
+    const liveFrame = rawLiveFrame ? renderLiveFrameWithCard(cam, rawLiveFrame) : rawLiveFrame;
+    return {frame: liveFrame, isLive: true};
+  }
+  if (cam.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)) {
+    return {frame: cam.lastFrame, isLive: false};
+  }
+  if (cam.active) {
+    return {frame: cam.waking, isLive: false};
+  }
+  if (now < want(cam)) {
+    return {frame: cam.busy, isLive: false};
+  }
+  return {frame: cam.asleep, isLive: false};
+}
+
+/**
+ * Determines whether a frame should be written to the FFmpeg encoder stdin on the current tick.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {boolean} isLive - Whether the camera is currently streaming live video.
+ * @param {boolean} stateChanged - Whether the selected frame buffer changed since last write.
+ * @param {boolean} inBurst - Whether the camera is in a keyframe burst window.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {boolean}
+ */
+function shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now) {
+  const elapsedMs = now - cam.lastWrite;
+  if (isLive) {
+    return Boolean(cam.frameNew || elapsedMs >= 500);
+  }
+  return Boolean(stateChanged || inBurst || elapsedMs >= 1000 / IDLE_FPS);
+}
+
+/**
+ * Pushes the appropriate video frame to a camera's persistent FFmpeg encoder stdin.
  *
  * @param {Record<string, *>} cam - Camera state object.
  * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  */
 function pushFrameToEncoder(cam, now = Date.now()) {
   const enc = cam.enc;
-  if (!enc || !enc.stdin || !enc.stdin.writable) return;
+  if (!enc || !enc.stdin || !enc.stdin.writable) {
+    return;
+  }
   if (enc.stdin.writableNeedDrain) {
     if (now - cam.lastWrite > 10000) {
       log.error(
@@ -72,46 +144,15 @@ function pushFrameToEncoder(cam, now = Date.now()) {
     return;
   }
 
-  if (
-      cam.active &&
-      cam.activeMode === 'download' &&
-      cam.downloadFrames.length > 0 &&
-      now - cam.lastWrite >= Math.floor(1000 / LIVE_FPS) - 4
-  ) {
-    const nextBuf = cam.downloadFrames.shift();
-    cam.frame = nextBuf;
-    cam.frameAt = now;
-    cam.lastVideoAt = now;
-    cam.frameNew = true;
-    cam.lastFrame = nextBuf;
-    cam.lastSeen = formatLocalHm(new Date(now));
-  }
-
-  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < 2000);
-  const live = cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame)));
-  const rawLiveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
-  const liveFrame =
-      live && rawLiveFrame ? renderLiveFrameWithCard(cam, rawLiveFrame) : rawLiveFrame;
-  const frame = live
-      ? liveFrame
-      : cam.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)
-          ? cam.lastFrame
-          : cam.active
-              ? cam.waking
-              : now < want(cam)
-                  ? cam.busy
-                  : cam.asleep;
+  advanceDownloadPlaybackFrame(cam, now);
+  const {frame, isLive} = selectEncoderFrame(cam, now);
   const stateChanged = frame !== cam.lastSent;
   if (stateChanged) {
     cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
   }
   const inBurst = now < (cam.burstUntil || 0);
 
-  if (
-      live
-          ? cam.frameNew || now - cam.lastWrite >= 500
-          : stateChanged || inBurst || now - cam.lastWrite >= 1000 / IDLE_FPS
-  ) {
+  if (shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now)) {
     enc.stdin.write(frame);
     cam.lastWrite = now;
     cam.lastSent = frame;
@@ -120,16 +161,93 @@ function pushFrameToEncoder(cam, now = Date.now()) {
 }
 
 /**
- * Spawns the persistent FFmpeg encoder process for a camera.
- * Reads raw YUV420p video frames from stdin (pipe:0) and s16le PCM audio from fd 3 (pipe:3),
- * publishing a continuous H.264 + AAC RTSP stream to go2rtc.
+ * Builds the video encoder codec arguments for the requested hardware acceleration mode.
+ *
+ * @param {string} hwMode - Hardware acceleration mode ('vaapi', 'qsv', 'nvenc', 'v4l2m2m', or '').
+ * @param {string} gop - Keyframe interval (GOP size) string.
+ * @returns {string[]}
+ */
+function buildVideoCodecArgs(hwMode, gop) {
+  switch (hwMode) {
+    case 'vaapi':
+      return [
+        '-vf',
+        'format=nv12,hwupload',
+        '-c:v',
+        'h264_vaapi',
+        '-bf',
+        '0',
+        '-qp',
+        '18',
+        '-g',
+        gop,
+      ];
+    case 'qsv':
+      return [
+        '-vf',
+        'format=nv12,hwupload=extra_hw_frames=64',
+        '-c:v',
+        'h264_qsv',
+        '-global_quality',
+        '19',
+        '-maxrate',
+        '3500k',
+        '-bufsize',
+        '5000k',
+        '-g',
+        gop,
+      ];
+    case 'nvenc':
+      return [
+        '-c:v',
+        'h264_nvenc',
+        '-preset',
+        'p3',
+        '-tune',
+        'ull',
+        '-pix_fmt',
+        'yuv420p',
+        '-cq',
+        '19',
+        '-maxrate',
+        '3500k',
+        '-bufsize',
+        '5000k',
+        '-g',
+        gop,
+      ];
+    case 'v4l2m2m':
+      return ['-c:v', 'h264_v4l2m2m', '-pix_fmt', 'yuv420p', '-b:v', '3000k', '-g', gop];
+    default:
+      return [
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-tune',
+        'zerolatency',
+        '-pix_fmt',
+        'yuv420p',
+        '-crf',
+        '19',
+        '-maxrate',
+        '3500k',
+        '-bufsize',
+        '5000k',
+        '-g',
+        gop,
+      ];
+  }
+}
+
+/**
+ * Builds the full FFmpeg CLI argument list for a camera's persistent RTSP encoder.
  *
  * @param {Record<string, *>} cam - Camera state object.
+ * @param {string} hwMode - Hardware acceleration mode ('vaapi', 'qsv', 'nvenc', 'v4l2m2m', or '').
+ * @returns {string[]}
  */
-function startEncoder(cam) {
-  if (isShuttingDownFn() || cam.enc) return;
-
-  const hwMode = cam.useHwaccel ? ACTIVE_HWACCEL : '';
+function buildEncoderArgs(cam, hwMode) {
   const gop = String(Math.max(4, LIVE_FPS));
   const args = ['-hide_banner', '-loglevel', 'warning'];
 
@@ -171,108 +289,60 @@ function startEncoder(cam) {
     );
   }
 
-  args.push('-fps_mode', 'passthrough');
-
-  if (hwMode === 'vaapi') {
-    args.push(
-        '-vf',
-        'format=nv12,hwupload',
-        '-c:v',
-        'h264_vaapi',
-        '-bf',
-        '0',
-        '-qp',
-        '18',
-        '-g',
-        gop
-    );
-  } else if (hwMode === 'qsv') {
-    args.push(
-        '-vf',
-        'format=nv12,hwupload=extra_hw_frames=64',
-        '-c:v',
-        'h264_qsv',
-        '-global_quality',
-        '19',
-        '-maxrate',
-        '3500k',
-        '-bufsize',
-        '5000k',
-        '-g',
-        gop
-    );
-  } else if (hwMode === 'nvenc') {
-    args.push(
-        '-c:v',
-        'h264_nvenc',
-        '-preset',
-        'p3',
-        '-tune',
-        'ull',
-        '-pix_fmt',
-        'yuv420p',
-        '-cq',
-        '19',
-        '-maxrate',
-        '3500k',
-        '-bufsize',
-        '5000k',
-        '-g',
-        gop
-    );
-  } else if (hwMode === 'v4l2m2m') {
-    args.push('-c:v', 'h264_v4l2m2m', '-pix_fmt', 'yuv420p', '-b:v', '3000k', '-g', gop);
-  } else {
-    args.push(
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-tune',
-        'zerolatency',
-        '-pix_fmt',
-        'yuv420p',
-        '-crf',
-        '19',
-        '-maxrate',
-        '3500k',
-        '-bufsize',
-        '5000k',
-        '-g',
-        gop
-    );
-  }
+  args.push('-fps_mode', 'passthrough', ...buildVideoCodecArgs(hwMode, gop));
 
   if (AUDIO) {
     args.push('-af', 'aresample=async=1', '-c:a', 'aac', '-b:a', '32k');
   }
   args.push('-f', 'rtsp', '-rtsp_transport', 'tcp', cfg.rtsp_publish.replace('{name}', cam.name));
+  return args;
+}
 
+/**
+ * Spawns the persistent FFmpeg encoder process for a camera.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ */
+function startEncoder(cam) {
+  if (isShuttingDownFn() || cam.enc) {
+    return;
+  }
+
+  const hwMode = cam.useHwaccel ? ACTIVE_HWACCEL : '';
+  const args = buildEncoderArgs(cam, hwMode);
   const spawnAt = Date.now();
   const enc = spawn('ffmpeg', args, {
     stdio: ['pipe', 'ignore', 'pipe', AUDIO ? 'pipe' : 'ignore'],
   });
+
   cam.enc = enc;
   cam.lastSent = null;
   cam.lastWrite = Date.now();
   cam.burstUntil = Date.now() + 1500;
 
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
-  enc.stdin.on('error', () => {
-  });
+  enc.stdin.on('error', () => {});
   enc.stdin.on('drain', () => {
-    if (cam.frameNew) pushFrameToEncoder(cam);
+    if (cam.frameNew) {
+      pushFrameToEncoder(cam);
+    }
   });
-  if (AUDIO && enc.stdio[3]) enc.stdio[3].on('error', () => {
-  });
+  if (AUDIO && enc.stdio[3]) {
+    enc.stdio[3].on('error', () => {});
+  }
 
   let tail = '';
   enc.stderr.on('data', (d) => {
     tail = (tail + d).slice(-500);
   });
+
   enc.on('exit', (code) => {
-    if (cam.enc === enc) cam.enc = null;
-    if (isShuttingDownFn()) return;
+    if (cam.enc === enc) {
+      cam.enc = null;
+    }
+    if (isShuttingDownFn()) {
+      return;
+    }
     const errSummary = tail.trim().split('\n').join(' | ');
 
     if (
@@ -290,7 +360,9 @@ function startEncoder(cam) {
           '), falling back to software libx264'
       );
       setTimeout(() => {
-        if (!cam.enc && !isShuttingDownFn()) startEncoder(cam);
+        if (!cam.enc && !isShuttingDownFn()) {
+          startEncoder(cam);
+        }
       }, 1000);
       return;
     }
@@ -300,7 +372,9 @@ function startEncoder(cam) {
       onEncoderDropCallback();
     }
     setTimeout(() => {
-      if (!cam.enc && !isShuttingDownFn()) startEncoder(cam);
+      if (!cam.enc && !isShuttingDownFn()) {
+        startEncoder(cam);
+      }
     }, 3000);
   });
 
@@ -326,7 +400,9 @@ function startMediaTickers(cams) {
     setInterval(() => {
       for (const cam of cams) {
         const enc = cam.enc;
-        if (!enc || !enc.stdio[3] || !enc.stdio[3].writable || enc.stdio[3].writableNeedDrain) continue;
+        if (!enc || !enc.stdio[3] || !enc.stdio[3].writable || enc.stdio[3].writableNeedDrain) {
+          continue;
+        }
         let out = SILENCE;
         if (cam.pcmLen >= AUDIO_CHUNK) {
           const all = cam.pcm.length === 1 ? cam.pcm[0] : Buffer.concat(cam.pcm);
@@ -343,7 +419,12 @@ function startMediaTickers(cams) {
 
 module.exports = {
   configureEncoderHooks,
+  advanceDownloadPlaybackFrame,
+  selectEncoderFrame,
+  shouldWriteEncoderFrame,
   pushFrameToEncoder,
+  buildVideoCodecArgs,
+  buildEncoderArgs,
   startEncoder,
   startMediaTickers,
 };

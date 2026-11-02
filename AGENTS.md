@@ -18,7 +18,10 @@
     ├── config.js                      # Config loader, validation, numeric clamping & constants
     ├── logger.js                      # Structured Alloy/Loki logger & ICU-free local ISO timestamps
     ├── domain/
-    │   └── camera.js                  # Camera domain entity, session state & priority rules
+    │   ├── camera.js                  # Camera entity composing StatusCard, Telemetry & stream rules
+    │   ├── status-card.js             # StatusCard model (theme/position, bounds & Frigate mask polygon)
+    │   ├── telemetry.js               # Telemetry model (sensor state, Eufy parsing & 6-color rules)
+    │   └── backfill-job.js            # BackfillJob model (.zxvideo record parser & time-window matcher)
     ├── overlay/
     │   ├── yuv-canvas.js              # Low-level YUV420p drawing, anti-aliasing & box blur
     │   ├── card-renderer.js           # Theme engines (default, icons, minimal, none) & mask bounds
@@ -182,7 +185,7 @@ podman exec eufy-frigate-battery-bridge node -e '
   entire frame behind status cards. Disabled by default so unmasked background pixels do not trigger Frigate motion
   detection on sleep/wake transitions. Can be overridden per camera.
 - `card_show_on_live`: `true` (default) or `true`/`false` per camera. Keeps corner status cards
-  (`card_position !== "center"`) visible on the live video stream (using a `Blue` live dot/play glyph) via a
+  (`card_position !== "center"`) visible on the live video stream (using a `Red` on-air live dot/play glyph) via a
   zero-allocation scratch buffer while keeping `cam.lastFrame` and `/config/cache` snapshots clean.
 - `auto_frigate_mask`: `true` (default) or `true`/`false` per camera. Computes the exact normalized bounding-box polygon
   for each camera's corner status card (with a `6px` chroma/anti-aliasing safety margin) and syncs both
@@ -249,7 +252,8 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
              └─────────┬──────────┘
                        ▼
           ┌─────────────────────────┐
-          │ domain/camera.js        │  (Domain & Foundation Layer)
+          │ domain/* (camera, card, │  (Domain & Foundation Layer)
+          │ telemetry, backfill)    │
           │ config.js / logger.js   │
           └─────────────────────────┘
 ```
@@ -482,8 +486,9 @@ Alloy / Loki ingestion:
 - [x] Block 6 (Step 4) - Auto-Applied Frigate Motion & Object Masks (`auto_frigate_mask` with Frigate restart recovery),
   Live-Stream Corner Status Cards (`card_show_on_live`), and Instant Clean Event Snapshot Fallback
   (`instant_event_snapshot`)
-- [x] Block 7 - Enterprise Modular Refactoring (`src/config.js`, `src/logger.js`, `src/domain/camera.js`,
-  `src/overlay/*`, `src/media/*`, `src/services/*`)
+- [x] Block 7 - Enterprise Modular Refactoring (`src/config.js`, `src/logger.js`, `src/domain/*` [`camera.js`,
+  `status-card.js`, `telemetry.js`, `backfill-job.js`], `src/overlay/*`, `src/media/*`, `src/services/*`) & 6-Color
+  Semantic Palette (`Red`, `Grey`, `Green`, `Blue`, `Yellow`, `Purple`)
 
 ### Pending (Next Up)
 

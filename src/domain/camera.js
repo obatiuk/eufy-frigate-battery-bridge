@@ -4,8 +4,8 @@
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
- * Camera domain entity encapsulating per-camera configuration, session state,
- * telemetry, and stream arbitration priority rules.
+ * Camera domain entity composing StatusCard, Telemetry, and BackfillJob models
+ * alongside per-camera stream session state and arbitration priority rules.
  */
 'use strict';
 
@@ -14,15 +14,29 @@ const {
   GLOBAL_PRESERVE_ASPECT,
   GLOBAL_STARTUP_SNAPSHOT,
   GLOBAL_USE_RTSP,
-  GLOBAL_AUTO_FRIGATE_MASK,
-  GLOBAL_CARD_SHOW_ON_LIVE,
   ACTIVE_HWACCEL,
-  FRAME,
-  LOW_BAT_THRESHOLD,
-  resolveCardConfig,
-  resolveTelemetryConfig,
 } = require('../config');
 const {log} = require('../logger');
+const {Telemetry} = require('./telemetry');
+const {StatusCard} = require('./status-card');
+
+/**
+ * Determines whether a camera needs a brief startup snapshot probe on boot.
+ *
+ * @param {string} backgroundMode - Resolved card background ('snapshot', 'slate', 'black').
+ * @param {boolean|string} startupMode - Configured startup_snapshot setting.
+ * @param {Uint8Array|null} cachedFrame - Cached YUV420p frame loaded from disk, if any.
+ * @returns {boolean}
+ */
+function shouldProbeStartupSnapshot(backgroundMode, startupMode, cachedFrame) {
+  if (backgroundMode !== 'snapshot') {
+    return false;
+  }
+  if (startupMode === 'always') {
+    return true;
+  }
+  return Boolean(startupMode) && cachedFrame === null;
+}
 
 /**
  * Represents a configured Eufy camera and its runtime stream, overlay, and telemetry state.
@@ -36,31 +50,30 @@ class Camera {
   constructor(rawCamCfg, cachedSnapshot = {frame: null, lastSeen: ''}, renderCardsFn = null) {
     Object.assign(this, rawCamCfg);
 
-    const preserveAspect =
-        rawCamCfg.preserve_aspect_ratio !== undefined
-            ? Boolean(rawCamCfg.preserve_aspect_ratio)
-            : GLOBAL_PRESERVE_ASPECT;
-    const cardCfg = resolveCardConfig(rawCamCfg);
-    const startupMode =
-        rawCamCfg.startup_snapshot !== undefined ? rawCamCfg.startup_snapshot : GLOBAL_STARTUP_SNAPSHOT;
-    const usesSnapshot = cardCfg.background === 'snapshot';
-    const needsStartupSnapshot =
-        usesSnapshot &&
-        (startupMode === 'always' ? true : Boolean(startupMode) && cachedSnapshot.frame === null);
+    // 1. Composed Domain Models (StatusCard & Telemetry)
+    this.card = new StatusCard(rawCamCfg);
+    this.telemetry = new Telemetry(rawCamCfg, cachedSnapshot.lastSeen);
 
+    // 2. Identity, Priority & Routing Configuration
+    const startupMode = rawCamCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT;
     this.priority = clampNum(rawCamCfg.priority, -10000, 10000, 0);
     this.eventPriority = 0;
     this.stationSerial = rawCamCfg.station_serial || '';
-    this.useRtsp =
-        rawCamCfg.use_rtsp !== undefined
-            ? Boolean(rawCamCfg.use_rtsp)
-            : GLOBAL_USE_RTSP || Boolean(rawCamCfg.rtsp_url);
+    this.useRtsp = rawCamCfg.use_rtsp ?? (GLOBAL_USE_RTSP || Boolean(rawCamCfg.rtsp_url));
     this.rtspUrl = rawCamCfg.rtsp_url || '';
     this.rtspSupported = Boolean(rawCamCfg.rtsp_url || rawCamCfg.use_rtsp === true);
     this.rtspEnabledChecked = false;
     this.rtspFallbackUntil = 0;
-    this.lastStoppedAt = 0;
-    this.activeMode = '';
+    this.preserveAspect = rawCamCfg.preserve_aspect_ratio ?? GLOBAL_PRESERVE_ASPECT;
+    this.useHwaccel = Boolean(ACTIVE_HWACCEL);
+
+    // 3. Startup Snapshot & Backfill State
+    this.needsStartupSnapshot = shouldProbeStartupSnapshot(
+        this.card.background,
+        startupMode,
+        cachedSnapshot.frame
+    );
+    this.isStartupProbe = false;
     this.pendingBackfill = null;
     this.backfillClip = null;
     this.lastBackfillQueryAt = 0;
@@ -68,31 +81,16 @@ class Camera {
     this.downloadFrames = [];
     this.downloadFinished = false;
     this.isTestBackfill = false;
-    this.preserveAspect = preserveAspect;
-    this.cardCfg = cardCfg;
-    this.telCfg = resolveTelemetryConfig(rawCamCfg);
-    this.autoFrigateMask =
-        rawCamCfg.auto_frigate_mask !== undefined
-            ? Boolean(rawCamCfg.auto_frigate_mask)
-            : GLOBAL_AUTO_FRIGATE_MASK;
-    this.showCardOnLive =
-        rawCamCfg.card_show_on_live !== undefined
-            ? Boolean(rawCamCfg.card_show_on_live)
-            : GLOBAL_CARD_SHOW_ON_LIVE;
-    this.lastSyncedMaskPoly = '';
-    this.liveTelState = null;
-    this.liveCard = null;
-    this.liveOverlayBuf = Buffer.allocUnsafe(FRAME);
-    this.suppressLiveCard = false;
-    this.needsStartupSnapshot = needsStartupSnapshot;
-    this.isStartupProbe = false;
-    this.useHwaccel = Boolean(ACTIVE_HWACCEL);
+
+    // 4. Active Stream Session & Timers
     this.active = false;
+    this.activeMode = '';
     this.starting = false;
     this.startPromise = null;
     this.eventActive = false;
     this.sessionId = 0;
     this.p2pReady = false;
+    this.lastStoppedAt = 0;
     this.lastUnsolicitedStopAt = 0;
     this.videoWidth = 0;
     this.videoHeight = 0;
@@ -114,20 +112,15 @@ class Camera {
     this.lastVideoAt = 0;
     this.restarts = 0;
     this.gotVideo = false;
+
+    // 5. Frigate External Event State
     this.evTimer = null;
     this.evPending = false;
     this.evLabel = '';
     this.evPerson = '';
     this.evUntil = 0;
-    this.battery = null;
-    this.charging = false;
-    this.powerLabel = '';
-    this.wifi = null;
-    this.rssi = null;
-    this.temp = null;
-    this.lastLowBatRefreshAt = 0;
-    this.qualityChecked = false;
-    this.lastSeen = cachedSnapshot.lastSeen;
+
+    // 6. FFmpeg Process & Media Buffers
     this.enc = null;
     this.dec = null;
     this.frame = null;
@@ -140,14 +133,57 @@ class Camera {
     this.pcmLen = 0;
     this.viewers = 0;
     this.viewerIds = new Map();
-    this.asleep = null;
-    this.waking = null;
-    this.busy = null;
 
     if (typeof renderCardsFn === 'function') {
       renderCardsFn(this);
     }
   }
+
+  // Delegated StatusCard accessors
+  get cardCfg() { return this.card.config; }
+  set cardCfg(v) { this.card.config = v; }
+  get autoFrigateMask() { return this.card.autoFrigateMask; }
+  set autoFrigateMask(v) { this.card.autoFrigateMask = v; }
+  get showCardOnLive() { return this.card.showOnLive; }
+  set showCardOnLive(v) { this.card.showOnLive = v; }
+  get lastSyncedMaskPoly() { return this.card.lastSyncedMaskPoly; }
+  set lastSyncedMaskPoly(v) { this.card.lastSyncedMaskPoly = v; }
+  get liveTelState() { return this.card.liveTelState; }
+  set liveTelState(v) { this.card.liveTelState = v; }
+  get liveCard() { return this.card.liveCard; }
+  set liveCard(v) { this.card.liveCard = v; }
+  get liveOverlayBuf() { return this.card.liveOverlayBuf; }
+  set liveOverlayBuf(v) { this.card.liveOverlayBuf = v; }
+  get suppressLiveCard() { return this.card.suppressLiveCard; }
+  set suppressLiveCard(v) { this.card.suppressLiveCard = v; }
+  get asleep() { return this.card.asleep; }
+  set asleep(v) { this.card.asleep = v; }
+  get waking() { return this.card.waking; }
+  set waking(v) { this.card.waking = v; }
+  get busy() { return this.card.busy; }
+  set busy(v) { this.card.busy = v; }
+
+  // Delegated Telemetry accessors
+  get telCfg() { return this.telemetry.config; }
+  set telCfg(v) { this.telemetry.config = v; }
+  get battery() { return this.telemetry.battery; }
+  set battery(v) { this.telemetry.battery = v; }
+  get charging() { return this.telemetry.charging; }
+  set charging(v) { this.telemetry.charging = v; }
+  get powerLabel() { return this.telemetry.powerLabel; }
+  set powerLabel(v) { this.telemetry.powerLabel = v; }
+  get wifi() { return this.telemetry.wifi; }
+  set wifi(v) { this.telemetry.wifi = v; }
+  get rssi() { return this.telemetry.rssi; }
+  set rssi(v) { this.telemetry.rssi = v; }
+  get temp() { return this.telemetry.temp; }
+  set temp(v) { this.telemetry.temp = v; }
+  get lastSeen() { return this.telemetry.lastSeen; }
+  set lastSeen(v) { this.telemetry.lastSeen = v; }
+  get lastLowBatRefreshAt() { return this.telemetry.lastLowBatRefreshAt; }
+  set lastLowBatRefreshAt(v) { this.telemetry.lastLowBatRefreshAt = v; }
+  get qualityChecked() { return this.telemetry.qualityChecked; }
+  set qualityChecked(v) { this.telemetry.qualityChecked = v; }
 
   /**
    * Returns the timestamp until which the camera wants to remain awake.
@@ -175,7 +211,10 @@ class Camera {
    * @returns {number}
    */
   getEffectivePriority(now = Date.now()) {
-    return this.isInMotion(now) ? this.priority + (this.eventPriority || 0) : this.priority;
+    if (!this.isInMotion(now)) {
+      return this.priority;
+    }
+    return this.priority + (this.eventPriority || 0);
   }
 
   /**
@@ -194,13 +233,13 @@ class Camera {
    * @returns {boolean}
    */
   isRtspCapable(now = Date.now()) {
-    return Boolean(
-        this.useRtsp &&
-        this.rtspUrl &&
-        this.activeMode !== 'p2p' &&
-        this.activeMode !== 'download' &&
-        now >= (this.rtspFallbackUntil || 0)
-    );
+    if (!this.useRtsp || !this.rtspUrl) {
+      return false;
+    }
+    if (this.activeMode === 'p2p' || this.activeMode === 'download') {
+      return false;
+    }
+    return now >= (this.rtspFallbackUntil || 0);
   }
 
   /**
@@ -218,13 +257,21 @@ class Camera {
    * @returns {boolean}
    */
   isLowBattery() {
-    return (
-        LOW_BAT_THRESHOLD > 0 &&
-        this.battery !== null &&
-        !Number.isNaN(Number(this.battery)) &&
-        Number(this.battery) <= LOW_BAT_THRESHOLD &&
-        !this.charging
-    );
+    return this.telemetry.isLowBattery();
+  }
+
+  /**
+   * Returns true if at least one connected go2rtc consumer is an eligible waking human viewer.
+   *
+   * @returns {boolean}
+   */
+  hasWakingViewer() {
+    for (const isWaking of this.viewerIds.values()) {
+      if (isWaking) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -234,7 +281,7 @@ class Camera {
    * @param {string} [clearReason=''] - Optional diagnostic context for why the viewer queue was cleared.
    */
   clearViewerQueue(clearReason = '') {
-    const hadViewers = this.viewUntil > Date.now() || [...this.viewerIds.values()].some(Boolean);
+    const hadViewers = this.viewUntil > Date.now() || this.hasWakingViewer();
     this.viewUntil = 0;
     this.viewSince = 0;
     for (const id of this.viewerIds.keys()) {
@@ -257,6 +304,7 @@ const clearViewerQueue = (cam, clearReason = '') => cam.clearViewerQueue(clearRe
 
 module.exports = {
   Camera,
+  shouldProbeStartupSnapshot,
   want,
   inMotion,
   getEffectivePriority,

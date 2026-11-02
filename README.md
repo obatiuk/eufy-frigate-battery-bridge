@@ -140,7 +140,7 @@ fill it in. Settings are grouped by function below:
 | `card_position`       | `"center"`                     | Overlay placement for any theme: `"center"`, `"bottom-left"`, `"bottom-right"`, `"top-left"`, or `"top-right"`. Can be overridden per camera.                                                                                                                                                                   |
 | `card_background`     | `"snapshot"`                   | Background behind the status card: `"snapshot"` (last live frame), `"slate"` (solid dark gray), or `"black"` (pitch-black). Can be overridden per camera.                                                                                                                                                       |
 | `card_dim_background` | `false`                        | Dim the `"snapshot"` backdrop behind the status card (`true` / `false`). Disabled by default so unmasked background pixels outside the card do not trigger `Frigate` motion detection on sleep/wake transitions. Can be overridden per camera.                                                                  |
-| `card_show_on_live`   | `true`                         | Keep corner status cards (`card_position !== "center"`) visible on the live video stream with a live status indicator (`Blue` dot/play icon) and real-time telemetry while keeping saved snapshots clean. Can be overridden per camera.                                                                         |
+| `card_show_on_live`   | `true`                         | Keep corner status cards (`card_position !== "center"`) visible on the live video stream with a red on-air tally indicator (`Red` dot/play icon) and real-time telemetry while keeping saved snapshots clean. Can be overridden per camera.                                                                         |
 | `auto_frigate_mask`   | `true`                         | Automatically calculate the normalized polygon for each camera's corner status card and apply both `motion.mask` and `objects.mask` (`eufy_bridge_card`) to `Frigate` via `PUT /api/config/set` (`requires_restart: 0`) on startup and automatically whenever `Frigate` restarts. Can be overridden per camera. |
 | `telemetry`           | `true`                         | `true`, `false`, or an object controlling which telemetry items are shown on the sleeping card (see [Live Camera Telemetry & Battery Swap Detection](#live-camera-telemetry--battery-swap-detection)). Can be overridden per camera.                                                                            |
 | `telemetry_poll_secs` | `300`                          | Background telemetry poll interval in seconds to detect battery swaps and charging updates while sleeping (`0` to disable)                                                                                                                                                                                      |
@@ -234,14 +234,16 @@ Here is how the **Icons Theme** (`card_theme: "icons"`) looks:
 
 Note: All samples are AI-generated.
 
-#### 4-Color Semantic Scale (`Green`, `Blue`, `Yellow`, `Red`)
+#### 6-Color Semantic Scale (`Red`, `Grey`, `Green`, `Blue`, `Yellow`, `Purple`)
 
-| Color                  | Dot 1 / Status Icon                            | Dot 2 / Battery Icon                   | Dot 3 / Wi-Fi & `RSSI` Arcs                       | Thermometer Icon (`icons` theme) |
+| Color                  | Dot 1 / Status Glyph (`▶` / `●` / `⏸`)         | Dot 2 / Battery Icon                   | Dot 3 / Wi-Fi & `RSSI` Arcs                       | Thermometer Icon (`icons` theme) |
 |------------------------|------------------------------------------------|----------------------------------------|---------------------------------------------------|----------------------------------|
-| **Green** (`#4ade80`)  | **Asleep** (Online & ready)                    | **Good** (`>= 50%`)                    | **Strong** (`4/4` bars or `>= -65 dBm`)           | **Normal** (`6°C – 35°C`)        |
-| **Blue** (`#38bdf8`)   | **Waking Up / Live** (Connecting or streaming) | **Charging / Solar / Plugged**         | **Good / Average** (`3/4` bars or `-66..-72 dBm`) | **Cold** (`<= 5°C`)              |
-| **Yellow** (`#facc15`) | **Waiting** (`HomeBase` busy)                  | **Medium** (`21% – 49%`)               | **Fair / Weak** (`2/4` bars or `-73..-80 dBm`)    | **Warm** (`36°C – 44°C`)         |
-| **Red** (`#f87171`)    | **Low-Battery Economy Mode**                   | **Low / Critical** (`<= 20%` or `n/a`) | **Poor** (`0–1/4` bars, `< -80 dBm`, or `n/a`)    | **Hot** (`>= 45°C`)              |
+| **Red** (`#ef4444`)    | **Live** (`▶` On-air stream running)           | *Unused (reserved for Live)*           | *Unused (reserved for Live)*                      | *Unused (reserved for Live)*     |
+| **Grey** (`#b4b4be`)   | **Asleep** (`⏸` Standby & ready)               | *Unused*                               | *Unused*                                          | *Unused*                         |
+| **Green** (`#4ade80`)  | *Unused*                                       | **Good** (`>= 50%`)                    | **Strong** (`4/4` bars or `>= -65 dBm`)           | **Normal** (`6°C – 35°C`)        |
+| **Blue** (`#38bdf8`)   | **Waking Up** (`●` Connecting)                 | **Charging / Solar / Plugged**         | **Good / Average** (`3/4` bars or `-66..-72 dBm`) | **Cold** (`<= 5°C`)              |
+| **Yellow** (`#facc15`) | **Waiting** (`⏸` `HomeBase` busy)              | **Medium** (`21% – 49%`)               | **Fair / Weak** (`2/4` bars or `-73..-80 dBm`)    | **Warm** (`36°C – 44°C`)         |
+| **Purple** (`#e879f9`) | **Low-Battery Economy Mode** (`⏸`)             | **Low / Critical** (`<= 20%` or `n/a`) | **Poor** (`0–1/4` bars, `< -80 dBm`, or `n/a`)    | **Hot** (`>= 45°C`)              |
 
 #### Frigate `motion.mask` Coordinates for Corner Placement (`1280×720`)
 

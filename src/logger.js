@@ -8,62 +8,123 @@
  */
 'use strict';
 
-const LOG_LEVELS = {debug: 0, info: 1, warn: 2, warning: 2, error: 3};
+const LOG_LEVELS = Object.freeze({
+  debug: 0,
+  info: 1,
+  warn: 2,
+  warning: 2,
+  error: 3,
+});
+
 let currentLogLevel = LOG_LEVELS.info;
 let activeLogLevelName = 'info';
 
 /**
- * Formats a Date object as 'YYYY-MM-DD HH:MM:SS' in local time (via TZ) without ICU locale dependencies.
+ * Pads a number to 2 digits with a leading zero.
  *
- * @param {Date} [d=new Date()] - Date instance to format.
+ * @param {number} value - Number to pad.
  * @returns {string}
  */
-function formatLocalTimestamp(d = new Date()) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return (
-      d.getFullYear() +
-      '-' +
-      pad(d.getMonth() + 1) +
-      '-' +
-      pad(d.getDate()) +
-      ' ' +
-      pad(d.getHours()) +
-      ':' +
-      pad(d.getMinutes()) +
-      ':' +
-      pad(d.getSeconds())
-  );
+function padTwoDigits(value) {
+  return String(value).padStart(2, '0');
 }
 
 /**
- * Formats a Date object as 'HH:MM' in local time (via TZ) without ICU locale dependencies.
+ * Formats a Date object as 'YYYY-MM-DD HH:MM:SS' in local time without ICU locale dependencies.
  *
- * @param {Date} [d=new Date()] - Date instance to format.
+ * @param {Date} [date=new Date()] - Date instance to format.
  * @returns {string}
  */
-function formatLocalHm(d = new Date()) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return pad(d.getHours()) + ':' + pad(d.getMinutes());
+function formatLocalTimestamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = padTwoDigits(date.getMonth() + 1);
+  const day = padTwoDigits(date.getDate());
+  const hours = padTwoDigits(date.getHours());
+  const minutes = padTwoDigits(date.getMinutes());
+  const seconds = padTwoDigits(date.getSeconds());
+
+  return year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;
 }
 
 /**
- * Formats and writes a structured log line to stdout when `level` meets or exceeds currentLogLevel.
- * Every line uses the identical prefix layout for Grafana Alloy parsing:
+ * Formats a Date object as 'HH:MM' in local time without ICU locale dependencies.
+ *
+ * @param {Date} [date=new Date()] - Date instance to format.
+ * @returns {string}
+ */
+function formatLocalHm(date = new Date()) {
+  return padTwoDigits(date.getHours()) + ':' + padTwoDigits(date.getMinutes());
+}
+
+/**
+ * Normalizes a log level string ('warning' -> 'warn', unknown -> 'info').
+ *
+ * @param {string} rawLevel - Raw severity string.
+ * @returns {'debug'|'info'|'warn'|'error'}
+ */
+function normalizeLevelName(rawLevel) {
+  switch (String(rawLevel || '').toLowerCase().trim()) {
+    case 'debug':
+      return 'debug';
+    case 'info':
+      return 'info';
+    case 'warn':
+    case 'warning':
+      return 'warn';
+    case 'error':
+      return 'error';
+    default:
+      return 'info';
+  }
+}
+
+/**
+ * Resolves the log scope label from a camera object or scope string.
+ *
+ * @param {string|{name?: string}|null|undefined} scope - Camera instance or scope name.
+ * @returns {string}
+ */
+function resolveScopeName(scope) {
+  if (!scope) {
+    return 'bridge';
+  }
+  if (typeof scope === 'object') {
+    return scope.name || 'bridge';
+  }
+  return String(scope);
+}
+
+/**
+ * Formats a single structured log line for Grafana Alloy / Loki:
  *   YYYY-MM-DD HH:MM:SS [LEVEL] [camera_or_bridge] message
  *
  * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
- * @param {string|{name?: string}|null|undefined} scope - Camera state/config object, camera name, or 'bridge'.
+ * @param {string|{name?: string}|null|undefined} scope - Camera state/config object or scope string.
+ * @param {Array<*>} args - Message segments.
+ * @param {Date} [now=new Date()] - Timestamp to format.
+ * @returns {string}
+ */
+function formatLogLine(level, scope, args, now = new Date()) {
+  const normLevel = normalizeLevelName(level);
+  const timestamp = formatLocalTimestamp(now);
+  const scopeName = resolveScopeName(scope);
+  return timestamp + ' [' + normLevel.toUpperCase() + '] [' + scopeName + '] ' + args.join(' ');
+}
+
+/**
+ * Writes a structured log line to stdout when `level` meets or exceeds currentLogLevel.
+ *
+ * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
+ * @param {string|{name?: string}|null|undefined} scope - Camera state/config object or 'bridge'.
  * @param {...*} args - Message segments.
  */
 function writeLog(level, scope, ...args) {
-  const normLevel = level === 'warning' ? 'warn' : level;
-  const weight = LOG_LEVELS[normLevel] ?? LOG_LEVELS.info;
-  if (weight < currentLogLevel) return;
-  const ts = formatLocalTimestamp();
-  const lvlTag = normLevel.toUpperCase();
-  const scopeName =
-      scope && typeof scope === 'object' ? scope.name || 'bridge' : String(scope || 'bridge');
-  console.log(ts + ' [' + lvlTag + '] [' + scopeName + '] ' + args.join(' '));
+  const normLevel = normalizeLevelName(level);
+  const weight = LOG_LEVELS[normLevel];
+  if (weight < currentLogLevel) {
+    return;
+  }
+  console.log(formatLogLine(normLevel, scope, args));
 }
 
 const log = {
@@ -80,13 +141,13 @@ const log = {
  * @returns {string} Normalized active log level name.
  */
 function initLogger(rawLevel) {
-  const cleaned = String(rawLevel || 'info')
-      .toLowerCase()
-      .trim();
-  currentLogLevel = LOG_LEVELS[cleaned] ?? LOG_LEVELS.info;
-  activeLogLevelName =
-      Object.keys(LOG_LEVELS).find((k) => k !== 'warning' && LOG_LEVELS[k] === currentLogLevel) || 'info';
-  if (!(cleaned in LOG_LEVELS)) {
+  const cleaned = String(rawLevel || 'info').toLowerCase().trim();
+  const isKnown = cleaned in LOG_LEVELS;
+
+  activeLogLevelName = normalizeLevelName(cleaned);
+  currentLogLevel = LOG_LEVELS[activeLogLevelName];
+
+  if (!isKnown) {
     log.warn('bridge', 'unknown LOG_LEVEL "' + cleaned + '", defaulting to "info"');
   }
   return activeLogLevelName;
@@ -105,6 +166,9 @@ module.exports = {
   LOG_LEVELS,
   formatLocalTimestamp,
   formatLocalHm,
+  normalizeLevelName,
+  resolveScopeName,
+  formatLogLine,
   writeLog,
   log,
   initLogger,

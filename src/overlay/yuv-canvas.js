@@ -26,7 +26,9 @@ let blurScratch = Buffer.allocUnsafe(0);
  * @param {number} alpha - Opacity from 0.0 (transparent) to 1.0 (opaque).
  */
 function blendYuvPixel(yuvBuf, x, y, r, g, b, alpha) {
-  if (x < 0 || x >= W || y < 0 || y >= H || alpha <= 0) return;
+  if (x < 0 || x >= W || y < 0 || y >= H || alpha <= 0) {
+    return;
+  }
   const a = alpha > 1 ? 1 : alpha;
   const invA = 1 - a;
 
@@ -247,9 +249,38 @@ function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
 }
 
 /**
- * Draws a frosted-glass rounded rectangle or capsule onto a YUV420p frame buffer:
- * blurs only the background pixels inside the rounded boundary (when blurBackdrop is true),
- * then blends the dark translucent glass tint and subtle anti-aliased rim highlight on top.
+ * Blends a single blurred backdrop pixel into the target YUV420p canvas at (gx, gy).
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} gx - Global X coordinate.
+ * @param {number} gy - Global Y coordinate.
+ * @param {number} rx0 - Region left X offset.
+ * @param {number} ry0 - Region top Y offset.
+ * @param {number} rw - Region width.
+ * @param {{ buf: Uint8Array, lumaSize: number, chromaSize: number, cw: number }} blurred - Blurred region data.
+ * @param {number} cov - Coverage weight (0..1).
+ */
+function blendBlurredBackdropPixel(canvas, gx, gy, rx0, ry0, rw, blurred, cov) {
+  const lx = gx - rx0;
+  const ly = gy - ry0;
+  const yIdx = gy * W + gx;
+  const bY = blurred.buf[ly * rw + lx];
+  canvas[yIdx] = (canvas[yIdx] * (1 - cov) + bY * cov + 0.5) | 0;
+
+  if ((gx & 1) === 0 && (gy & 1) === 0) {
+    const cOff = (gy >> 1) * (W >> 1) + (gx >> 1);
+    const uIdx = W * H + cOff;
+    const vIdx = uIdx + (W >> 1) * (H >> 1);
+    const rOff = (ly >> 1) * blurred.cw + (lx >> 1);
+    const bU = blurred.buf[blurred.lumaSize + rOff];
+    const bV = blurred.buf[blurred.lumaSize + blurred.chromaSize + rOff];
+    canvas[uIdx] = (canvas[uIdx] * (1 - cov) + bU * cov + 0.5) | 0;
+    canvas[vIdx] = (canvas[vIdx] * (1 - cov) + bV * cov + 0.5) | 0;
+  }
+}
+
+/**
+ * Draws a frosted-glass rounded rectangle or capsule onto a YUV420p frame buffer.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer of length FRAME.
  * @param {number} boxX - Left X coordinate.
@@ -277,38 +308,27 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
     for (let px = 0; px < boxW; px++) {
       const gx = boxX + px;
       const gy = boxY + py;
-      if (gx < rx0 || gx >= rx1 || gy < ry0 || gy >= ry1) continue;
+      if (gx < rx0 || gx >= rx1 || gy < ry0 || gy >= ry1) {
+        continue;
+      }
 
       const dx = Math.max(rSafe - px, 0, px - (boxW - 1 - rSafe));
       const dy = Math.max(rSafe - py, 0, py - (boxH - 1 - rSafe));
       const dist = Math.hypot(dx, dy);
       const cov = Math.min(1, Math.max(0, rSafe + 0.5 - dist));
-      if (cov > 0) {
-        if (blurred) {
-          const lx = gx - rx0;
-          const ly = gy - ry0;
-          const yIdx = gy * W + gx;
-          const bY = blurred.buf[ly * rw + lx];
-          canvas[yIdx] = (canvas[yIdx] * (1 - cov) + bY * cov + 0.5) | 0;
+      if (cov <= 0) {
+        continue;
+      }
 
-          if ((gx & 1) === 0 && (gy & 1) === 0) {
-            const cOff = (gy >> 1) * (W >> 1) + (gx >> 1);
-            const uIdx = W * H + cOff;
-            const vIdx = uIdx + (W >> 1) * (H >> 1);
-            const rOff = (ly >> 1) * blurred.cw + (lx >> 1);
-            const bU = blurred.buf[blurred.lumaSize + rOff];
-            const bV = blurred.buf[blurred.lumaSize + blurred.chromaSize + rOff];
-            canvas[uIdx] = (canvas[uIdx] * (1 - cov) + bU * cov + 0.5) | 0;
-            canvas[vIdx] = (canvas[vIdx] * (1 - cov) + bV * cov + 0.5) | 0;
-          }
-        }
+      if (blurred) {
+        blendBlurredBackdropPixel(canvas, gx, gy, rx0, ry0, rw, blurred, cov);
+      }
 
-        blendYuvPixel(canvas, gx, gy, 12, 12, 14, opacity * cov);
-        if (borderOpacity > 0) {
-          const borderCov = Math.min(1, Math.max(0, 1.1 - Math.abs(dist - (rSafe - 0.6))));
-          if (borderCov > 0) {
-            blendYuvPixel(canvas, gx, gy, 255, 255, 255, borderOpacity * borderCov * cov);
-          }
+      blendYuvPixel(canvas, gx, gy, 12, 12, 14, opacity * cov);
+      if (borderOpacity > 0) {
+        const borderCov = Math.min(1, Math.max(0, 1.1 - Math.abs(dist - (rSafe - 0.6))));
+        if (borderCov > 0) {
+          blendYuvPixel(canvas, gx, gy, 255, 255, 255, borderOpacity * borderCov * cov);
         }
       }
     }
@@ -325,17 +345,23 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
  * @returns {{ boxX: number, boxY: number }}
  */
 function getCardBoxCoords(position, boxW, boxH) {
-  if (position === 'center') {
-    return {
-      boxX: Math.round((W - boxW) / 2),
-      boxY: Math.round((H - boxH) / 2),
-    };
-  }
   const margin = 24;
-  return {
-    boxX: position.endsWith('right') ? W - boxW - margin : margin,
-    boxY: position.startsWith('bottom') ? H - boxH - margin : margin,
-  };
+  switch (position) {
+    case 'top-left':
+      return {boxX: margin, boxY: margin};
+    case 'top-right':
+      return {boxX: W - boxW - margin, boxY: margin};
+    case 'bottom-left':
+      return {boxX: margin, boxY: H - boxH - margin};
+    case 'bottom-right':
+      return {boxX: W - boxW - margin, boxY: H - boxH - margin};
+    case 'center':
+    default:
+      return {
+        boxX: Math.round((W - boxW) / 2),
+        boxY: Math.round((H - boxH) / 2),
+      };
+  }
 }
 
 /**
@@ -386,7 +412,9 @@ function copyYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH) {
   const x1 = Math.min(W, (boxX + boxW + 1) & ~1);
   const y1 = Math.min(H, (boxY + boxH + 1) & ~1);
   const rw = x1 - x0;
-  if (rw <= 0 || y1 <= y0) return;
+  if (rw <= 0 || y1 <= y0) {
+    return;
+  }
 
   for (let y = y0; y < y1; y++) {
     const off = y * W + x0;
@@ -414,6 +442,7 @@ module.exports = {
   drawYuvLine,
   boxBlurPlane,
   extractBlurredRegion,
+  blendBlurredBackdropPixel,
   drawRoundedBox,
   getCardBoxCoords,
   prepareBackgroundCanvas,

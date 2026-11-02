@@ -11,6 +11,59 @@
 const fs = require('fs');
 const {log, initLogger} = require('./logger');
 
+const REQUIRED_CONFIG_KEYS = ['eufy_ws', 'rtsp_publish', 'go2rtc_api'];
+const SUPPORTED_HWACCEL_MODES = new Set(['vaapi', 'qsv', 'nvenc', 'v4l2m2m']);
+
+const TRIGGER_EVENT_ALIASES = Object.freeze({
+  motion: ['motion detected'],
+  person: ['person detected', 'identity person detected', 'stranger person detected'],
+  pet: ['pet detected'],
+  vehicle: ['vehicle detected'],
+  dog: ['dog detected'],
+  stranger: ['stranger person detected'],
+  'identity person': ['identity person detected'],
+  sound: ['sound detected', 'crying detected'],
+  ring: ['rings'],
+  rings: ['rings'],
+  ringing: ['rings'],
+});
+
+const DEFAULT_TRIGGER_EVENTS = Object.freeze([
+  'motion detected',
+  'person detected',
+  'pet detected',
+  'vehicle detected',
+  'dog detected',
+  'stranger person detected',
+  'identity person detected',
+  'sound detected',
+  'rings',
+]);
+
+// Built-in priority boosts by Eufy event type (combined with per-camera config priority).
+const EVENT_PRIORITIES = Object.freeze([
+  ['ring', 1000],
+  ['identity person', 300],
+  ['stranger', 200],
+  ['person', 200],
+  ['vehicle', 100],
+  ['pet', 100],
+  ['dog', 100],
+  ['crying', 50],
+  ['sound', 50],
+  ['motion', 10],
+]);
+
+// Semantic palette used across 'default', 'icons', and 'minimal' themes:
+// Red = Live only, Grey = Asleep, Green = Healthy, Blue = Waking/Charging/Good/Cold,
+// Yellow = Waiting/Medium/Fair/Warm, Purple = Critical/Low-Battery/Poor/Hot.
+const COLOR_RED = [239, 68, 68];
+const COLOR_GREY = [180, 180, 190];
+const COLOR_GREEN = [74, 222, 128];
+const COLOR_BLUE = [56, 189, 248];
+const COLOR_YELLOW = [250, 204, 21];
+const COLOR_PURPLE = [232, 121, 249];
+
 /**
  * Clamps a numeric configuration value to [min, max], returning fallback if undefined or NaN.
  *
@@ -21,24 +74,238 @@ const {log, initLogger} = require('./logger');
  * @returns {number}
  */
 function clampNum(val, min, max, fallback) {
-  const n = Number(val ?? fallback);
-  return Number.isNaN(n) ? fallback : Math.min(max, Math.max(min, n));
+  const numeric = Number(val ?? fallback);
+  if (Number.isNaN(numeric)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, numeric));
+}
+
+/**
+ * Validates a parsed configuration object and throws descriptive errors on invalid structure.
+ *
+ * @param {Record<string, *>} rawCfg - Parsed JSON configuration object.
+ */
+function validateConfig(rawCfg) {
+  for (const key of REQUIRED_CONFIG_KEYS) {
+    if (!rawCfg[key]) {
+      throw new Error('config.json: "' + key + '" is required');
+    }
+  }
+
+  const hasValidCameras =
+      Array.isArray(rawCfg.cameras) &&
+      rawCfg.cameras.length > 0 &&
+      rawCfg.cameras.every((cam) => Boolean(cam.name && cam.serial));
+
+  if (!hasValidCameras) {
+    throw new Error('config.json: "cameras" must list at least one {"name", "serial"}');
+  }
+
+  if (!rawCfg.rtsp_publish.includes('{name}')) {
+    throw new Error('config.json: "rtsp_publish" must contain {name}');
+  }
+}
+
+/**
+ * Returns the built-in priority boost for a Eufy trigger event name.
+ *
+ * @param {string} evName - Eufy event string.
+ * @returns {number} Priority boost score.
+ */
+function getEventPriority(evName) {
+  const normalized = String(evName || '').toLowerCase();
+  for (const [keyword, score] of EVENT_PRIORITIES) {
+    if (normalized.includes(keyword)) {
+      return score;
+    }
+  }
+  return 10;
+}
+
+/**
+ * Builds the normalized Set of Eufy event names that wake a camera.
+ *
+ * @param {string[]|undefined} rawEvents - Optional array of trigger event strings from config.json.
+ * @returns {Set<string>} Normalized set of Eufy event names.
+ */
+function buildTriggerSet(rawEvents) {
+  const sourceEvents =
+      Array.isArray(rawEvents) && rawEvents.length > 0 ? rawEvents : DEFAULT_TRIGGER_EVENTS;
+  const triggers = new Set();
+
+  for (const item of sourceEvents) {
+    const key = String(item).toLowerCase().trim();
+    triggers.add(key);
+    const expandedList = TRIGGER_EVENT_ALIASES[key];
+    if (expandedList) {
+      for (const expanded of expandedList) {
+        triggers.add(expanded);
+      }
+    }
+  }
+  return triggers;
+}
+
+/**
+ * Normalizes a card placement string into one of the 5 supported positions.
+ *
+ * @param {*} rawPos - Raw position value from config.
+ * @param {string} [scope='bridge'] - Log scope for warnings.
+ * @returns {'center'|'top-left'|'top-right'|'bottom-left'|'bottom-right'}
+ */
+function normalizeCardPosition(rawPos, scope = 'bridge') {
+  const token = String(rawPos || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[_\s]+/g, '-');
+
+  switch (token) {
+    case '':
+    case 'center':
+    case 'middle':
+      return 'center';
+    case 'tl':
+    case 'top-left':
+    case 'topleft':
+    case 'left-top':
+    case 'lefttop':
+      return 'top-left';
+    case 'tr':
+    case 'top-right':
+    case 'topright':
+    case 'right-top':
+    case 'righttop':
+      return 'top-right';
+    case 'bl':
+    case 'bottom-left':
+    case 'bottomleft':
+    case 'left-bottom':
+    case 'leftbottom':
+    case 'corner':
+      return 'bottom-left';
+    case 'br':
+    case 'bottom-right':
+    case 'bottomright':
+    case 'right-bottom':
+    case 'rightbottom':
+      return 'bottom-right';
+    default:
+      log.warn(scope, 'unknown card_position "' + rawPos + '", defaulting to "center"');
+      return 'center';
+  }
+}
+
+/**
+ * Normalizes a card theme string and optional legacy corner shorthand.
+ *
+ * @param {*} rawTheme - Raw card_theme value from config.
+ * @param {string} currentPosition - Already normalized card_position.
+ * @param {string} [scope='bridge'] - Log scope for warnings.
+ * @returns {{ theme: 'default'|'icons'|'minimal'|'none', position: string, themeImpliesBlackBg: boolean }}
+ */
+function normalizeCardTheme(rawTheme, currentPosition, scope = 'bridge') {
+  if (rawTheme === false) {
+    return {theme: 'none', position: currentPosition, themeImpliesBlackBg: false};
+  }
+
+  const token = String(rawTheme ?? 'default')
+      .toLowerCase()
+      .trim()
+      .replace(/[_\s]+/g, '-');
+
+  switch (token) {
+    case 'default':
+      return {theme: 'default', position: currentPosition, themeImpliesBlackBg: false};
+    case 'none':
+    case 'blank':
+    case 'off':
+    case 'disabled':
+      return {theme: 'none', position: currentPosition, themeImpliesBlackBg: false};
+    case 'black':
+      return {theme: 'none', position: currentPosition, themeImpliesBlackBg: true};
+    case 'icons':
+    case 'icons-only':
+    case 'icon':
+    case 'corner-icons':
+      return {theme: 'icons', position: currentPosition, themeImpliesBlackBg: false};
+    case 'minimal':
+    case 'dots':
+    case 'three-dots':
+    case '3dots':
+    case 'corner-minimal':
+    case 'corner-simple':
+      return {theme: 'minimal', position: currentPosition, themeImpliesBlackBg: false};
+    case 'corner':
+    case 'corner-card':
+    case 'corner-full':
+    case 'top-left':
+    case 'topleft':
+    case 'left-top':
+    case 'tl':
+    case 'top-right':
+    case 'topright':
+    case 'right-top':
+    case 'tr':
+    case 'bottom-left':
+    case 'bottomleft':
+    case 'left-bottom':
+    case 'bl':
+    case 'bottom-right':
+    case 'bottomright':
+    case 'right-bottom':
+    case 'br': {
+      const nextPos =
+          currentPosition === 'center' ? normalizeCardPosition(token, scope) : currentPosition;
+      return {theme: 'default', position: nextPos, themeImpliesBlackBg: false};
+    }
+    default:
+      log.warn(scope, 'unknown card_theme "' + rawTheme + '", defaulting to "default"');
+      return {theme: 'default', position: currentPosition, themeImpliesBlackBg: false};
+  }
+}
+
+/**
+ * Normalizes the card_background setting ('snapshot', 'slate', or 'black').
+ *
+ * @param {*} rawBg - Raw card_background value.
+ * @param {boolean} hasExplicitBg - Whether card_background was explicitly configured.
+ * @param {boolean} themeImpliesBlackBg - True if card_theme was set to 'black'.
+ * @param {string} [scope='bridge'] - Log scope for warnings.
+ * @returns {'snapshot'|'slate'|'black'}
+ */
+function normalizeCardBackground(rawBg, hasExplicitBg, themeImpliesBlackBg, scope = 'bridge') {
+  if (!hasExplicitBg) {
+    return themeImpliesBlackBg ? 'black' : 'snapshot';
+  }
+  if (rawBg === false) {
+    return 'black';
+  }
+
+  const token = String(rawBg).toLowerCase().trim();
+  switch (token) {
+    case 'snapshot':
+      return 'snapshot';
+    case 'slate':
+    case 'gray':
+    case 'grey':
+    case 'solid':
+      return 'slate';
+    case 'none':
+    case 'blank':
+    case 'black':
+    case 'off':
+      return 'black';
+    default:
+      log.warn(scope, 'unknown card_background "' + rawBg + '", defaulting to "snapshot"');
+      return 'snapshot';
+  }
 }
 
 // Load and validate configuration from BRIDGE_CONFIG, CONFIG_PATH, or the default container path.
 const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || '/config/config.json';
 const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-for (const k of ['eufy_ws', 'rtsp_publish', 'go2rtc_api']) {
-  if (!cfg[k]) {
-    throw new Error('config.json: "' + k + '" is required');
-  }
-}
-if (!Array.isArray(cfg.cameras) || !cfg.cameras.length || cfg.cameras.some((c) => !c.name || !c.serial)) {
-  throw new Error('config.json: "cameras" must list at least one {"name", "serial"}');
-}
-if (!cfg.rtsp_publish.includes('{name}')) {
-  throw new Error('config.json: "rtsp_publish" must contain {name}');
-}
+validateConfig(cfg);
 
 const ACTIVE_LOG_LEVEL_NAME = initLogger(process.env.LOG_LEVEL || cfg.log_level || 'info');
 
@@ -74,10 +341,24 @@ const ENFORCE_QUALITY = cfg.enforce_streaming_quality ?? true;
 const TELEMETRY_POLL_MS = clampNum(cfg.telemetry_poll_secs, 0, 86400, 300) * 1000;
 const GLOBAL_STARTUP_SNAPSHOT = cfg.startup_snapshot !== undefined ? cfg.startup_snapshot : true;
 
-// Optional hardware-accelerated encoding ('vaapi', 'qsv', 'nvenc', 'v4l2m2m').
-const RAW_HWACCEL =
-    cfg.hwaccel === true ? 'vaapi' : typeof cfg.hwaccel === 'string' ? cfg.hwaccel.toLowerCase().trim() : '';
-const HWACCEL_MODE = ['vaapi', 'qsv', 'nvenc', 'v4l2m2m'].includes(RAW_HWACCEL) ? RAW_HWACCEL : '';
+/**
+ * Normalizes the requested hardware acceleration mode from config.json.
+ *
+ * @param {*} rawHwaccel - Raw hwaccel value from config.json.
+ * @returns {string}
+ */
+function parseHwaccelMode(rawHwaccel) {
+  if (rawHwaccel === true) {
+    return 'vaapi';
+  }
+  if (typeof rawHwaccel !== 'string') {
+    return '';
+  }
+  const normalized = rawHwaccel.toLowerCase().trim();
+  return SUPPORTED_HWACCEL_MODES.has(normalized) ? normalized : '';
+}
+
+const HWACCEL_MODE = parseHwaccelMode(cfg.hwaccel);
 const HWACCEL_DEVICE = cfg.hwaccel_device || '/dev/dri/renderD128';
 
 // Video dimensions (enforced even for YUV420p) and raw frame size in bytes (1.5 bytes per pixel).
@@ -94,12 +375,6 @@ const AUDIO_TICK = 100;
 const AUDIO_CHUNK = (RATE * 2 * AUDIO_TICK) / 1000;
 const SILENCE = Buffer.alloc(AUDIO_CHUNK);
 
-// Four-color semantic palette used across 'default', 'icons', and 'minimal' themes.
-const COLOR_GREEN = [74, 222, 128];
-const COLOR_BLUE = [56, 189, 248];
-const COLOR_YELLOW = [250, 204, 21];
-const COLOR_RED = [248, 113, 113];
-
 // Mapping of Eufy event keywords to Frigate event labels.
 const LABELS = [
   ['person', 'person'],
@@ -108,81 +383,6 @@ const LABELS = [
   ['dog', 'dog'],
   ['pet', 'dog'],
 ];
-
-// Built-in priority boosts by Eufy event type (combined with per-camera config priority).
-const EVENT_PRIORITIES = [
-  ['ring', 1000],
-  ['identity person', 300],
-  ['stranger', 200],
-  ['person', 200],
-  ['vehicle', 100],
-  ['pet', 100],
-  ['dog', 100],
-  ['crying', 50],
-  ['sound', 50],
-  ['motion', 10],
-];
-
-/**
- * Returns the built-in priority boost for a Eufy trigger event name.
- *
- * @param {string} evName - Eufy event string.
- * @returns {number} Priority boost score.
- */
-function getEventPriority(evName) {
-  const s = String(evName || '').toLowerCase();
-  for (const [keyword, score] of EVENT_PRIORITIES) {
-    if (s.includes(keyword)) return score;
-  }
-  return 10;
-}
-
-/**
- * Builds the normalized Set of Eufy event names that wake a camera.
- * Accepts both full eufy-security-ws event names (such as 'motion detected') and shorthand
- * names from README.md (such as 'motion', 'person', 'stranger', 'ringing').
- *
- * @param {string[]|undefined} rawEvents - Optional array of trigger event strings from config.json.
- * @returns {Set<string>} Normalized set of Eufy event names.
- */
-function buildTriggerSet(rawEvents) {
-  const aliases = {
-    motion: ['motion detected'],
-    person: ['person detected', 'identity person detected', 'stranger person detected'],
-    pet: ['pet detected'],
-    vehicle: ['vehicle detected'],
-    dog: ['dog detected'],
-    stranger: ['stranger person detected'],
-    'identity person': ['identity person detected'],
-    sound: ['sound detected', 'crying detected'],
-    ring: ['rings'],
-    rings: ['rings'],
-    ringing: ['rings'],
-  };
-  const defaults = [
-    'motion detected',
-    'person detected',
-    'pet detected',
-    'vehicle detected',
-    'dog detected',
-    'stranger person detected',
-    'identity person detected',
-    'sound detected',
-    'rings',
-  ];
-  const input = Array.isArray(rawEvents) && rawEvents.length ? rawEvents : defaults;
-  const out = new Set();
-  for (const item of input) {
-    const key = String(item).toLowerCase().trim();
-    out.add(key);
-    if (aliases[key]) {
-      for (const expanded of aliases[key]) {
-        out.add(expanded);
-      }
-    }
-  }
-  return out;
-}
 
 const TRIGGERS = buildTriggerSet(cfg.trigger_events);
 
@@ -211,8 +411,11 @@ const CACHE_DIR = resolveCacheDir();
  * @returns {string} Validated hwaccel mode ('vaapi', 'qsv', 'nvenc', 'v4l2m2m') or '' for software.
  */
 function resolveHwaccel() {
-  if (!HWACCEL_MODE) return '';
-  if ((HWACCEL_MODE === 'vaapi' || HWACCEL_MODE === 'qsv') && !fs.existsSync(HWACCEL_DEVICE)) {
+  if (!HWACCEL_MODE) {
+    return '';
+  }
+  const requiresRenderDevice = HWACCEL_MODE === 'vaapi' || HWACCEL_MODE === 'qsv';
+  if (requiresRenderDevice && !fs.existsSync(HWACCEL_DEVICE)) {
     log.warn(
         'bridge',
         'hwaccel "' +
@@ -229,6 +432,23 @@ function resolveHwaccel() {
 const ACTIVE_HWACCEL = resolveHwaccel();
 
 /**
+ * Resolves a boolean flag from a telemetry config block (boolean or object).
+ *
+ * @param {boolean|Record<string, *>|undefined} block - Telemetry config block.
+ * @param {boolean} fallback - Default value when undefined.
+ * @returns {boolean}
+ */
+function isTelemetryBlockEnabled(block, fallback) {
+  if (block === undefined) {
+    return fallback;
+  }
+  if (typeof block === 'boolean') {
+    return block;
+  }
+  return block.enabled !== false;
+}
+
+/**
  * Resolves the effective telemetry configuration for a camera by merging global cfg.telemetry
  * settings with any per-camera camConfig.telemetry overrides.
  *
@@ -239,14 +459,16 @@ function resolveTelemetryConfig(camConfig) {
   const globalCfg = cfg.telemetry;
   const camCfg = camConfig.telemetry;
 
-  const globalEnabled =
-      globalCfg === undefined ? true : typeof globalCfg === 'boolean' ? globalCfg : globalCfg.enabled !== false;
-  const camEnabled =
-      camCfg === undefined ? globalEnabled : typeof camCfg === 'boolean' ? camCfg : camCfg.enabled !== false;
+  const globalEnabled = isTelemetryBlockEnabled(globalCfg, true);
+  const camEnabled = isTelemetryBlockEnabled(camCfg, globalEnabled);
 
   const pickOption = (key) => {
-    if (camCfg && typeof camCfg === 'object' && key in camCfg) return Boolean(camCfg[key]);
-    if (globalCfg && typeof globalCfg === 'object' && key in globalCfg) return Boolean(globalCfg[key]);
+    if (camCfg && typeof camCfg === 'object' && key in camCfg) {
+      return Boolean(camCfg[key]);
+    }
+    if (globalCfg && typeof globalCfg === 'object' && key in globalCfg) {
+      return Boolean(globalCfg[key]);
+    }
     return true;
   };
 
@@ -262,21 +484,14 @@ function resolveTelemetryConfig(camConfig) {
 }
 
 /**
- * Resolves the effective status card theme ('default', 'icons', 'minimal', 'none'),
- * card_position ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right'), and
- * card_background ('snapshot', 'slate', 'black') for a camera.
+ * Resolves the effective status card theme, position, background, and dimBackground setting for a camera.
  *
  * @param {Record<string, *>} camConfig - Individual camera configuration object from cfg.cameras.
  * @returns {{ theme: string, position: string, background: string, dimBackground: boolean }}
  */
 function resolveCardConfig(camConfig) {
   const scope = camConfig.name || 'bridge';
-  const rawTheme =
-      camConfig.card_theme !== undefined
-          ? camConfig.card_theme
-          : cfg.card_theme !== undefined
-              ? cfg.card_theme
-              : 'default';
+  const rawTheme = camConfig.card_theme ?? cfg.card_theme ?? 'default';
   const rawPos =
       camConfig.card_position ||
       camConfig.card_corner ||
@@ -290,85 +505,9 @@ function resolveCardConfig(camConfig) {
           ? Boolean(camConfig.card_dim_background)
           : GLOBAL_DIM_BACKGROUND;
 
-  const normalizePosition = (val) => {
-    const s = String(val || '')
-        .toLowerCase()
-        .trim()
-        .replace(/[_\s]+/g, '-');
-    if (['tl', 'top-left', 'topleft', 'left-top', 'lefttop'].includes(s)) return 'top-left';
-    if (['tr', 'top-right', 'topright', 'right-top', 'righttop'].includes(s)) return 'top-right';
-    if (['bl', 'bottom-left', 'bottomleft', 'left-bottom', 'leftbottom', 'corner'].includes(s)) {
-      return 'bottom-left';
-    }
-    if (['br', 'bottom-right', 'bottomright', 'right-bottom', 'rightbottom'].includes(s)) {
-      return 'bottom-right';
-    }
-    if (s && s !== 'center' && s !== 'middle') {
-      log.warn(scope, 'unknown card_position "' + val + '", defaulting to "center"');
-    }
-    return 'center';
-  };
-
-  let position = normalizePosition(rawPos);
-  let theme = 'default';
-  const themeStr = String(rawTheme)
-      .toLowerCase()
-      .trim()
-      .replace(/[_\s]+/g, '-');
-
-  if (
-      rawTheme === false ||
-      ['none', 'blank', 'black', 'off', 'disabled'].includes(themeStr)
-  ) {
-    theme = 'none';
-  } else if (['icons', 'icons-only', 'icon', 'corner-icons'].includes(themeStr)) {
-    theme = 'icons';
-  } else if (['minimal', 'dots', 'three-dots', '3dots', 'corner-minimal', 'corner-simple'].includes(themeStr)) {
-    theme = 'minimal';
-  } else if (
-      [
-        'corner',
-        'corner-card',
-        'corner-full',
-        'top-left',
-        'topleft',
-        'left-top',
-        'tl',
-        'top-right',
-        'topright',
-        'right-top',
-        'tr',
-        'bottom-left',
-        'bottomleft',
-        'left-bottom',
-        'bl',
-        'bottom-right',
-        'bottomright',
-        'right-bottom',
-        'br',
-      ].includes(themeStr)
-  ) {
-    theme = 'default';
-    if (position === 'center') {
-      position = normalizePosition(themeStr);
-    }
-  } else if (themeStr !== 'default') {
-    log.warn(scope, 'unknown card_theme "' + rawTheme + '", defaulting to "default"');
-  }
-
-  let background = 'snapshot';
-  if (!hasExplicitBg && themeStr === 'black') {
-    background = 'black';
-  } else if (hasExplicitBg) {
-    const bgStr = String(rawBg).toLowerCase().trim();
-    if (rawBg === false || ['none', 'blank', 'black', 'off'].includes(bgStr)) {
-      background = 'black';
-    } else if (bgStr === 'slate' || bgStr === 'gray' || bgStr === 'grey' || bgStr === 'solid') {
-      background = 'slate';
-    } else if (bgStr !== 'snapshot') {
-      log.warn(scope, 'unknown card_background "' + rawBg + '", defaulting to "snapshot"');
-    }
-  }
+  const initialPos = normalizeCardPosition(rawPos, scope);
+  const {theme, position, themeImpliesBlackBg} = normalizeCardTheme(rawTheme, initialPos, scope);
+  const background = normalizeCardBackground(rawBg, hasExplicitBg, themeImpliesBlackBg, scope);
 
   return {theme, position, background, dimBackground};
 }
@@ -377,6 +516,11 @@ module.exports = {
   cfgPath,
   cfg,
   clampNum,
+  validateConfig,
+  normalizeCardPosition,
+  normalizeCardTheme,
+  normalizeCardBackground,
+  parseHwaccelMode,
   ACTIVE_LOG_LEVEL_NAME,
   MAX_MS,
   VIEW_MAX_MS,
@@ -417,10 +561,12 @@ module.exports = {
   AUDIO_TICK,
   AUDIO_CHUNK,
   SILENCE,
+  COLOR_RED,
+  COLOR_GREY,
   COLOR_GREEN,
   COLOR_BLUE,
   COLOR_YELLOW,
-  COLOR_RED,
+  COLOR_PURPLE,
   LABELS,
   EVENT_PRIORITIES,
   TRIGGERS,

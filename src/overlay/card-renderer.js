@@ -4,9 +4,8 @@
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
- * Status card rendering engine ('default', 'icons', 'minimal', 'none'),
- * 4-color semantic telemetry evaluation, live-stream corner overlays,
- * and Frigate motion/object mask polygon calculation.
+ * Status card rendering engine ('default', 'icons', 'minimal', 'none')
+ * and live-stream corner overlay compositing.
  */
 'use strict';
 
@@ -18,30 +17,65 @@ const {
   W,
   H,
   FRAME,
-  LOW_BAT_THRESHOLD,
   LOW_BAT_WAKE_ON_VIEW,
-  COLOR_GREEN,
-  COLOR_BLUE,
-  COLOR_YELLOW,
-  COLOR_RED,
   resolveCardConfig,
 } = require('../config');
 const {log} = require('../logger');
-const {isLowBattery} = require('../domain/camera');
 const {
+  evaluateTelemetryState,
+  buildTelemetrySegments,
+} = require('../domain/telemetry');
+const {
+  getCardBoxCoords,
+  getCameraCardBounds,
+  computeFrigateMaskPolygon,
+} = require('../domain/status-card');
+const {
+  blendYuvPixel,
   fillYuvRect,
   drawYuvCircle,
   drawYuvRing,
   drawYuvLine,
   drawRoundedBox,
-  getCardBoxCoords,
   prepareBackgroundCanvas,
   copyYuvRegion,
 } = require('./yuv-canvas');
 
 /**
- * Draws the color-coded status ring and inner state glyph (dot for Asleep/Low-Battery,
- * play triangle for Waking Up / Live, pause bars for Waiting) at the requested scale.
+ * Draws an anti-aliased filled right-pointing play triangle centered at (cx, cy).
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} cx - Center X coordinate.
+ * @param {number} cy - Center Y coordinate.
+ * @param {number} scale - Size multiplier (1.0 = 20x20 icon, 3.0 = 60x60 modal icon).
+ * @param {number[]} rgb - RGB color array [r, g, b].
+ */
+function drawFilledPlayTriangle(canvas, cx, cy, scale, rgb) {
+  const [r, g, b] = rgb;
+  const xLeft = Math.round(cx - 4.8 * scale);
+  const xRight = Math.round(cx + 6.2 * scale);
+  const halfH = 6.6 * scale;
+  const width = Math.max(1, xRight - xLeft);
+
+  for (let x = xLeft; x <= xRight; x++) {
+    const progress = (x - xLeft) / width;
+    const span = halfH * (1 - progress);
+    const yMin = Math.floor(cy - span - 1);
+    const yMax = Math.ceil(cy + span + 1);
+    for (let y = yMin; y <= yMax; y++) {
+      const cov = Math.min(1, Math.max(0, span + 0.5 - Math.abs(y - cy)));
+      if (cov > 0) {
+        blendYuvPixel(canvas, x, y, r, g, b, 0.96 * cov);
+      }
+    }
+  }
+}
+
+/**
+ * Draws the status glyph for 'icons' and centered 'default' themes:
+ *   - 'live': Filled Play triangle (▶, Red)
+ *   - 'waking': Solid circle dot (●, Blue) matching minimal and corner default themes
+ *   - 'asleep' / 'waiting' / 'low': Pause bars (⏸, Grey / Yellow / Purple)
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
  * @param {number} cx - Center X coordinate.
@@ -50,45 +84,44 @@ const {
  * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
  */
 function drawStatusGlyph(canvas, cx, cy, scale, st) {
-  drawYuvRing(canvas, cx, cy, 8.2 * scale, Math.max(1.4, 1.1 * scale), st.statusRgb, 0.96);
-
-  if (st.statusKind === 'waiting') {
-    const barW = Math.max(2, Math.round(2.2 * scale));
-    const barH = Math.round(8.0 * scale);
-    const offset = Math.round(3.0 * scale);
-    fillYuvRect(
-        canvas,
-        cx - offset,
-        cy - barH / 2,
-        barW,
-        barH,
-        st.statusRgb[0],
-        st.statusRgb[1],
-        st.statusRgb[2],
-        0.95
-    );
-    fillYuvRect(
-        canvas,
-        cx + offset - barW,
-        cy - barH / 2,
-        barW,
-        barH,
-        st.statusRgb[0],
-        st.statusRgb[1],
-        st.statusRgb[2],
-        0.95
-    );
-  } else if (st.statusKind === 'waking' || st.statusKind === 'live') {
-    const xLeft = cx - 2.2 * scale;
-    const xRight = cx + 3.6 * scale;
-    const yHalf = 3.6 * scale;
-    const stroke = Math.max(1.3, 1.1 * scale);
-    drawYuvLine(canvas, xLeft, cy - yHalf, xRight, cy, stroke, st.statusRgb, 0.96);
-    drawYuvLine(canvas, xRight, cy, xLeft, cy + yHalf, stroke, st.statusRgb, 0.96);
-    drawYuvLine(canvas, xLeft, cy - yHalf, xLeft, cy + yHalf, stroke, st.statusRgb, 0.96);
-  } else {
-    drawYuvCircle(canvas, cx, cy, 4.0 * scale, st.statusRgb, 0.96);
+  switch (st.statusKind) {
+    case 'live':
+      drawFilledPlayTriangle(canvas, cx, cy, scale, st.statusRgb);
+      return;
+    case 'waking':
+      drawYuvCircle(canvas, cx, cy, 5.6 * scale, st.statusRgb, 0.96);
+      return;
+    default:
+      break;
   }
+
+  const barW = Math.max(3, Math.round(3.4 * scale));
+  const barH = Math.round(12.0 * scale);
+  const gapHalf = Math.max(2, Math.round(2.2 * scale));
+  const topY = cy - barH / 2;
+
+  fillYuvRect(
+      canvas,
+      cx - gapHalf - barW,
+      topY,
+      barW,
+      barH,
+      st.statusRgb[0],
+      st.statusRgb[1],
+      st.statusRgb[2],
+      0.95
+  );
+  fillYuvRect(
+      canvas,
+      cx + gapHalf,
+      topY,
+      barW,
+      barH,
+      st.statusRgb[0],
+      st.statusRgb[1],
+      st.statusRgb[2],
+      0.95
+  );
 }
 
 /**
@@ -132,14 +165,15 @@ function drawBatteryIcon(canvas, bx, batY, batPct, shellRgb, fillRgb, showBolt) 
  */
 function drawWifiArcsIcon(canvas, cx, bottomY, wifiBars, rgb) {
   const dotLit = wifiBars >= 1;
-  drawYuvCircle(canvas, cx, bottomY, 2.1, dotLit ? rgb : [113, 113, 122], dotLit ? 0.96 : 0.45);
+  const unlitRgb = [113, 113, 122];
+  drawYuvCircle(canvas, cx, bottomY, 2.1, dotLit ? rgb : unlitRgb, dotLit ? 0.96 : 0.45);
 
   const radii = [5.4, 9.2, 13.0];
   const strokeHalf = 1.25;
   for (let i = 0; i < 3; i++) {
     const rad = radii[i];
     const lit = wifiBars >= i + 2;
-    const [r, g, b] = lit ? rgb : [113, 113, 122];
+    const [r, g, b] = lit ? rgb : unlitRgb;
     const alpha = lit ? 0.95 : 0.42;
     const pad = Math.ceil(rad + strokeHalf + 1);
     for (let y = Math.floor(bottomY - pad); y <= Math.ceil(bottomY + 1); y++) {
@@ -151,217 +185,12 @@ function drawWifiArcsIcon(canvas, cx, bottomY, wifiBars, rgb) {
           const d = Math.hypot(dx, dy);
           const cov = Math.min(1, Math.max(0, strokeHalf + 0.5 - Math.abs(d - rad)));
           if (cov > 0) {
-            const {blendYuvPixel} = require('./yuv-canvas');
             blendYuvPixel(canvas, x, y, r, g, b, alpha * cov);
           }
         }
       }
     }
   }
-}
-
-/**
- * Evaluates the 4-color semantic state (Green, Blue, Yellow, Red) for camera status,
- * battery, Wi-Fi/RSSI, and temperature.
- *
- * @param {string} titleText - Card heading ('Asleep', 'Waking Up...', 'Waiting', 'Live', etc.).
- * @param {Record<string, *>|null} status - Camera telemetry state object.
- * @returns {Record<string, *>} Evaluated values and RGB colors for status, battery, wifi, temp, and lastSeen.
- */
-function evaluateTelemetryState(titleText, status) {
-  const telCfg = status && status.telCfg ? status.telCfg : {enabled: false};
-  const batRaw = status && status.battery != null ? status.battery : null;
-  const wifiRaw = status && status.wifi != null ? status.wifi : null;
-  const rssiRaw = status && status.rssi != null ? status.rssi : null;
-  const tempRaw = status && status.temp != null ? status.temp : null;
-  const seenRaw = status && status.lastSeen ? status.lastSeen : '';
-  const charging = Boolean(status && status.charging);
-  const economyMode = Boolean(status && status.economyMode);
-
-  // 1. Camera Status Color: Green = Asleep, Blue = Waking Up / Live, Yellow = Waiting, Red = Low-Bat Eco.
-  const statusKind = /^Live\b/i.test(titleText)
-      ? 'live'
-      : /Waking/i.test(titleText)
-          ? 'waking'
-          : /Waiting/i.test(titleText)
-              ? 'waiting'
-              : economyMode || /Low Battery/i.test(titleText)
-                  ? 'low'
-                  : 'asleep';
-  const statusRgb =
-      statusKind === 'waking' || statusKind === 'live'
-          ? COLOR_BLUE
-          : statusKind === 'waiting'
-              ? COLOR_YELLOW
-              : statusKind === 'low'
-                  ? COLOR_RED
-                  : COLOR_GREEN;
-
-  // 2. Battery Color: Blue = Charging/Solar/Plugged, Green >= 50%, Yellow 21..49%, Red <= 20% or n/a.
-  const redBatCutoff = LOW_BAT_THRESHOLD > 0 ? LOW_BAT_THRESHOLD : 20;
-  const hasBat = batRaw != null && !Number.isNaN(Number(batRaw));
-  const batPct = hasBat ? clampNum(Math.round(Number(batRaw)), 0, 100, 0) : 0;
-  const batRgb = charging
-      ? COLOR_BLUE
-      : !hasBat || batPct <= redBatCutoff
-          ? COLOR_RED
-          : batPct >= 50
-              ? COLOR_GREEN
-              : COLOR_YELLOW;
-  const batHex = charging
-      ? '0x38bdf8'
-      : !hasBat || batPct <= redBatCutoff
-          ? '0xf87171'
-          : batPct >= 50
-              ? '0x4ade80'
-              : '0xfacc15';
-
-  // 3. Wi-Fi & RSSI Color: Green = Strong (>= -65dBm or 4/4), Blue = Good (-66..-72dBm or 3/4),
-  // Yellow = Fair (-73..-80dBm or 2/4), Red = Poor (< -80dBm or 0-1/4).
-  const hasWifi = wifiRaw != null && !Number.isNaN(Number(wifiRaw));
-  const hasRssi = rssiRaw != null && !Number.isNaN(Number(rssiRaw));
-  const rssiNum = hasRssi ? Math.round(Number(rssiRaw)) : null;
-  const wifiBars = hasWifi
-      ? clampNum(Math.round(Number(wifiRaw)), 0, 4, 0)
-      : hasRssi
-          ? rssiNum >= -65
-              ? 4
-              : rssiNum >= -72
-                  ? 3
-                  : rssiNum >= -80
-                      ? 2
-                      : 1
-          : 0;
-  const wifiRgb = hasRssi
-      ? rssiNum >= -65
-          ? COLOR_GREEN
-          : rssiNum >= -72
-              ? COLOR_BLUE
-              : rssiNum >= -80
-                  ? COLOR_YELLOW
-                  : COLOR_RED
-      : hasWifi
-          ? wifiBars >= 4
-              ? COLOR_GREEN
-              : wifiBars === 3
-                  ? COLOR_BLUE
-                  : wifiBars === 2
-                      ? COLOR_YELLOW
-                      : COLOR_RED
-          : COLOR_RED;
-
-  // 4. Temperature Color: Blue <= 5C, Green 6..35C, Yellow 36..44C, Red >= 45C.
-  const hasTemp = tempRaw != null && !Number.isNaN(Number(tempRaw));
-  const tempNum = hasTemp ? Math.round(Number(tempRaw)) : null;
-  const tempRgb = !hasTemp
-      ? COLOR_GREEN
-      : tempNum <= 5
-          ? COLOR_BLUE
-          : tempNum <= 35
-              ? COLOR_GREEN
-              : tempNum < 45
-                  ? COLOR_YELLOW
-                  : COLOR_RED;
-  const tempHex =
-      tempNum !== null && tempNum <= 5
-          ? '0x38bdf8'
-          : tempNum !== null && tempNum >= 45
-              ? '0xf87171'
-              : tempNum !== null && tempNum >= 36
-                  ? '0xfacc15'
-                  : '0xd4d4d8';
-
-  return {
-    telCfg,
-    statusKind,
-    statusRgb,
-    hasBat,
-    batPct,
-    charging,
-    economyMode,
-    powerLabel: (status && status.powerLabel) || '',
-    batRgb,
-    batHex,
-    hasWifi,
-    wifiBars,
-    hasRssi,
-    rssiNum,
-    wifiRgb,
-    hasTemp,
-    tempNum,
-    tempRgb,
-    tempHex,
-    seenVal: seenRaw,
-  };
-}
-
-/**
- * Builds the list of enabled telemetry segments for rendering in the 'default' theme.
- *
- * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
- * @returns {Array<Record<string, *>>} Array of telemetry segment descriptors.
- */
-function buildTelemetrySegments(st) {
-  const {telCfg} = st;
-  if (!telCfg.enabled) return [];
-
-  const segments = [];
-  if (telCfg.battery && st.hasBat) {
-    const powerText =
-        telCfg.powerSource && st.powerLabel
-            ? ' ' + st.powerLabel
-            : st.charging
-                ? ' Charging'
-                : st.economyMode
-                    ? ' Eco'
-                    : '';
-    const label = st.batPct + '%' + powerText;
-    segments.push({
-      type: 'bat',
-      batPct: st.batPct,
-      charging: st.charging,
-      batHex: st.batHex,
-      batRgb: st.batRgb,
-      label,
-      width: 45 + label.length * 11,
-    });
-  }
-
-  if (telCfg.wifi && (st.hasWifi || st.hasRssi)) {
-    const showRssi = telCfg.rssi && st.hasRssi;
-    const label = showRssi ? st.rssiNum + ' dBm' : 'Wi-Fi';
-    segments.push({
-      type: 'wifi',
-      wifiBars: st.wifiBars,
-      wifiRgb: st.wifiRgb,
-      label,
-      width: 38 + label.length * 11,
-    });
-  }
-
-  if (telCfg.temperature && st.hasTemp) {
-    const label = st.tempNum + '°C';
-    segments.push({
-      type: 'temp',
-      tempHex: st.tempHex,
-      tempRgb: st.tempRgb,
-      tempNum: st.tempNum,
-      label,
-      width: label.length * 12,
-    });
-  }
-
-  if (telCfg.lastSeen && st.seenVal) {
-    const label = 'Last live ' + st.seenVal;
-    segments.push({
-      type: 'seen',
-      seenVal: st.seenVal,
-      label,
-      width: label.length * 11,
-    });
-  }
-
-  return segments;
 }
 
 /**
@@ -382,16 +211,23 @@ function drawTelemetryRow(canvas, segments, startX, textY, gap, buildDrawtext) {
   let cursorX = startX;
 
   for (const seg of segments) {
-    if (seg.type === 'bat') {
-      drawBatteryIcon(canvas, cursorX, textY - 1, seg.batPct, [212, 212, 216], seg.batRgb, false);
-      filters.push(buildDrawtext(seg.label, seg.batHex, 20, String(cursorX + 45), textY));
-    } else if (seg.type === 'wifi') {
-      drawWifiArcsIcon(canvas, cursorX + 16, textBaselineY - 1, seg.wifiBars, seg.wifiRgb);
-      filters.push(buildDrawtext(seg.label, '0xd4d4d8', 20, String(cursorX + 38), textY));
-    } else if (seg.type === 'temp') {
-      filters.push(buildDrawtext(seg.label, seg.tempHex, 20, String(cursorX), textY));
-    } else if (seg.type === 'seen') {
-      filters.push(buildDrawtext(seg.label, '0xa1a1aa', 20, String(cursorX), textY));
+    switch (seg.type) {
+      case 'bat':
+        drawBatteryIcon(canvas, cursorX, textY - 1, seg.batPct, seg.batRgb, seg.batRgb, Boolean(seg.showBolt));
+        filters.push(buildDrawtext(seg.label, seg.batHex, 20, String(cursorX + 45), textY));
+        break;
+      case 'wifi':
+        drawWifiArcsIcon(canvas, cursorX + 16, textBaselineY - 1, seg.wifiBars, seg.wifiRgb);
+        filters.push(buildDrawtext(seg.label, '0xd4d4d8', 20, String(cursorX + 38), textY));
+        break;
+      case 'temp':
+        filters.push(buildDrawtext(seg.label, seg.tempHex, 20, String(cursorX), textY));
+        break;
+      case 'seen':
+        filters.push(buildDrawtext(seg.label, '0xa1a1aa', 20, String(cursorX), textY));
+        break;
+      default:
+        break;
     }
     cursorX += seg.width + gap;
   }
@@ -418,6 +254,73 @@ function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
   drawYuvCircle(canvas, boxX + 22, cy, 6.8, st.statusRgb, 0.96);
   drawYuvCircle(canvas, boxX + 46, cy, 6.0, st.batRgb, 0.96);
   drawYuvCircle(canvas, boxX + 70, cy, 5.2, st.wifiRgb, 0.96);
+}
+
+/**
+ * Draws a 16x20 vector thermometer icon with tick marks and proportional mercury bar.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} cursorX - Left X coordinate.
+ * @param {number} cy - Vertical center Y coordinate.
+ * @param {Record<string, *>} st - Evaluated telemetry state.
+ */
+function drawThermometerIcon(canvas, cursorX, cy, st) {
+  const thermCx = cursorX + 6;
+  const bulbCy = cy + 5;
+  const stemTop = cy - 9;
+  const [tr, tg, tb] = st.tempRgb;
+
+  fillYuvRect(canvas, thermCx - 3, stemTop, 6, 12, tr, tg, tb, 0.85);
+  fillYuvRect(canvas, thermCx - 1, stemTop + 2, 2, 10, 24, 24, 28, 0.9);
+  fillYuvRect(canvas, thermCx + 5, stemTop + 2, 3, 1, tr, tg, tb, 0.8);
+  fillYuvRect(canvas, thermCx + 5, stemTop + 5, 3, 1, tr, tg, tb, 0.8);
+  fillYuvRect(canvas, thermCx + 5, stemTop + 8, 3, 1, tr, tg, tb, 0.8);
+  drawYuvCircle(canvas, thermCx, bulbCy, 4.8, st.tempRgb, 0.92);
+  drawYuvCircle(canvas, thermCx, bulbCy, 3.2, st.tempRgb, 0.98);
+
+  const clampedTemp = clampNum(st.tempNum, 0, 50, 22);
+  const mercuryH = Math.max(2, Math.round((clampedTemp / 50) * 10));
+  fillYuvRect(canvas, thermCx - 1, bulbCy - 2 - mercuryH, 2, mercuryH + 2, tr, tg, tb, 0.95);
+}
+
+/**
+ * Draws a 20x20 filled analog clock icon with hands positioned to the HH:MM lastSeen time.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} cursorX - Left X coordinate.
+ * @param {number} cy - Vertical center Y coordinate.
+ * @param {string} seenVal - Formatted 'HH:MM' string.
+ */
+function drawAnalogClockIcon(canvas, cursorX, cy, seenVal) {
+  const clockCx = cursorX + 10;
+  drawYuvCircle(canvas, clockCx, cy, 8.5, [244, 244, 245], 0.95);
+
+  const match = /^(\d{1,2}):(\d{2})/.exec(String(seenVal || ''));
+  const hours = match ? Number(match[1]) % 12 : 4;
+  const mins = match ? Number(match[2]) % 60 : 20;
+  const hourAngle = ((hours + mins / 60) / 12) * Math.PI * 2 - Math.PI / 2;
+  const minAngle = (mins / 60) * Math.PI * 2 - Math.PI / 2;
+
+  drawYuvLine(
+      canvas,
+      clockCx,
+      cy,
+      clockCx + Math.cos(hourAngle) * 4.4,
+      cy + Math.sin(hourAngle) * 4.4,
+      1.2,
+      [24, 24, 27],
+      0.95
+  );
+  drawYuvLine(
+      canvas,
+      clockCx,
+      cy,
+      clockCx + Math.cos(minAngle) * 6.2,
+      cy + Math.sin(minAngle) * 6.2,
+      1.0,
+      [24, 24, 27],
+      0.95
+  );
 }
 
 /**
@@ -451,72 +354,28 @@ function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.44, 0.16, blurBackdrop);
 
-  // 1. Status Icon (20x20): outer ring + inner state glyph.
   let cursorX = boxX + padX;
   drawStatusGlyph(canvas, cursorX + 10, cy, 1.0, st);
   cursorX += 20 + gap;
 
-  // 2. Battery + Power Source Icon (37x16) with inner bolt.
   if (showBat) {
     const showBolt = Boolean(telCfg.powerSource && (st.charging || st.powerLabel));
     drawBatteryIcon(canvas, cursorX, cy - 8, st.batPct, st.batRgb, st.batRgb, showBolt);
     cursorX += 37 + gap;
   }
 
-  // 3. Curved Wi-Fi Signal Arcs + RSSI Color (28x16).
   if (showWifi) {
     drawWifiArcsIcon(canvas, cursorX + 14, cy + 7, st.wifiBars, st.wifiRgb);
     cursorX += 28 + gap;
   }
 
-  // 4. Temperature Thermometer Icon with Tick Marks (16x20).
   if (showTemp) {
-    const thermCx = cursorX + 6;
-    const bulbCy = cy + 5;
-    const stemTop = cy - 9;
-    const [tr, tg, tb] = st.tempRgb;
-    fillYuvRect(canvas, thermCx - 3, stemTop, 6, 12, tr, tg, tb, 0.85);
-    fillYuvRect(canvas, thermCx - 1, stemTop + 2, 2, 10, 24, 24, 28, 0.9);
-    fillYuvRect(canvas, thermCx + 5, stemTop + 2, 3, 1, tr, tg, tb, 0.8);
-    fillYuvRect(canvas, thermCx + 5, stemTop + 5, 3, 1, tr, tg, tb, 0.8);
-    fillYuvRect(canvas, thermCx + 5, stemTop + 8, 3, 1, tr, tg, tb, 0.8);
-    drawYuvCircle(canvas, thermCx, bulbCy, 4.8, st.tempRgb, 0.92);
-    drawYuvCircle(canvas, thermCx, bulbCy, 3.2, st.tempRgb, 0.98);
-    const clampedTemp = clampNum(st.tempNum, 0, 50, 22);
-    const mercuryH = Math.max(2, Math.round((clampedTemp / 50) * 10));
-    fillYuvRect(canvas, thermCx - 1, bulbCy - 2 - mercuryH, 2, mercuryH + 2, tr, tg, tb, 0.95);
+    drawThermometerIcon(canvas, cursorX, cy, st);
     cursorX += 16 + gap;
   }
 
-  // 5. Last Seen Filled Analog Clock Icon (20x20) with HH:MM hands.
   if (showClock) {
-    const clockCx = cursorX + 10;
-    drawYuvCircle(canvas, clockCx, cy, 8.5, [244, 244, 245], 0.95);
-    const match = /^(\d{1,2}):(\d{2})/.exec(String(st.seenVal || ''));
-    const hours = match ? Number(match[1]) % 12 : 4;
-    const mins = match ? Number(match[2]) % 60 : 20;
-    const hourAngle = ((hours + mins / 60) / 12) * Math.PI * 2 - Math.PI / 2;
-    const minAngle = (mins / 60) * Math.PI * 2 - Math.PI / 2;
-    drawYuvLine(
-        canvas,
-        clockCx,
-        cy,
-        clockCx + Math.cos(hourAngle) * 4.4,
-        cy + Math.sin(hourAngle) * 4.4,
-        1.2,
-        [24, 24, 27],
-        0.95
-    );
-    drawYuvLine(
-        canvas,
-        clockCx,
-        cy,
-        clockCx + Math.cos(minAngle) * 6.2,
-        cy + Math.sin(minAngle) * 6.2,
-        1.0,
-        [24, 24, 27],
-        0.95
-    );
+    drawAnalogClockIcon(canvas, cursorX, cy, st.seenVal);
   }
 }
 
@@ -539,7 +398,9 @@ function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 26, 0.56, 0.16, blurBackdrop);
   drawStatusGlyph(canvas, W / 2, boxY + 114, 3.0, st);
 
-  if (!segments.length) return [];
+  if (!segments.length) {
+    return [];
+  }
 
   fillYuvRect(canvas, boxX + 44, boxY + 254, boxW - 88, 1, 255, 255, 255, 0.16);
   const gap = 32;
@@ -584,6 +445,23 @@ function drawCornerDefaultCard(canvas, position, headerText, dotRgb, segments, b
 }
 
 /**
+ * Locates the first available TrueType font file on disk for the 'default' text theme.
+ *
+ * @returns {string|undefined}
+ */
+function findAvailableFontFile() {
+  const candidates = [
+    cfg.font_file,
+    process.env.FONT_FILE,
+    '/usr/share/fonts/Inter.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf',
+  ].filter(Boolean);
+
+  return candidates.find((filePath) => fs.existsSync(filePath));
+}
+
+/**
  * Renders a static YUV420p status frame according to card_theme ('default', 'icons', 'minimal',
  * or 'none') and card_position ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
  *
@@ -607,24 +485,18 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
 
   const st = evaluateTelemetryState(titleText, status);
 
-  if (cardCfg.theme === 'minimal') {
-    drawMinimalDotsCard(canvas, cardCfg.position, st, hasBackground);
-    return canvas;
+  switch (cardCfg.theme) {
+    case 'minimal':
+      drawMinimalDotsCard(canvas, cardCfg.position, st, hasBackground);
+      return canvas;
+    case 'icons':
+      drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
+      return canvas;
+    default:
+      break;
   }
 
-  if (cardCfg.theme === 'icons') {
-    drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
-    return canvas;
-  }
-
-  const fontCandidates = [
-    cfg.font_file,
-    process.env.FONT_FILE,
-    '/usr/share/fonts/Inter.ttf',
-    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
-    '/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf',
-  ].filter(Boolean);
-  const font = fontCandidates.find((f) => fs.existsSync(f));
+  const font = findAvailableFontFile();
   if (!font) {
     log.warn(camScope, 'no TrueType font found for default theme, falling back to vector icons card');
     drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
@@ -727,35 +599,23 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
 
 /**
  * Renders the asleep, waking, busy, and live-corner status cards for a camera using its
- * latest telemetry and a single shared background buffer.
+ * Telemetry and StatusCard domain models and a single shared background buffer.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Record<string, *>} cam - Camera domain instance.
  */
 function renderCameraCards(cam) {
   const title = cam.title || cam.name;
-  const lowBat = isLowBattery(cam);
-  const status = {
-    camName: cam.name,
-    camTitle: title,
-    cardCfg: cam.cardCfg,
-    telCfg: cam.telCfg,
-    battery: cam.battery,
-    charging: cam.charging,
-    powerLabel: cam.powerLabel,
-    economyMode: lowBat,
-    wifi: cam.wifi,
-    rssi: cam.rssi,
-    temp: cam.temp,
-    lastSeen: cam.lastSeen,
-  };
-  const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.cardCfg, cam.lastFrame);
+  const lowBat = cam.isLowBattery();
+  const status = cam.telemetry.toStatusSnapshot(cam.name, title, cam.card.config);
+  const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
+
   const asleepTitle = lowBat ? 'Asleep (Low Battery)' : 'Asleep';
   const asleepLine2 =
       lowBat && !LOW_BAT_WAKE_ON_VIEW
           ? 'economy mode active, waking on motion events only'
           : 'feed, open this camera to wake it, or wait for motion';
 
-  cam.asleep = card(
+  cam.card.asleep = card(
       asleepTitle,
       'No active stream on the ' + title + ' detect',
       asleepLine2,
@@ -763,7 +623,7 @@ function renderCameraCards(cam) {
       baseCanvas,
       hasBackground
   );
-  cam.waking = card(
+  cam.card.waking = card(
       'Waking Up...',
       'Connecting to ' + title + ' P2P livestream,',
       'live video starts in a few seconds',
@@ -771,7 +631,7 @@ function renderCameraCards(cam) {
       baseCanvas,
       hasBackground
   );
-  cam.busy = card(
+  cam.card.busy = card(
       'Waiting',
       'Another camera is currently live on the HomeBase,',
       'only one battery camera can stream at a time',
@@ -779,146 +639,68 @@ function renderCameraCards(cam) {
       baseCanvas,
       hasBackground
   );
-  cam.liveTelState = evaluateTelemetryState('Live', status);
-  if (cam.showCardOnLive && cam.cardCfg.theme === 'default' && cam.cardCfg.position !== 'center') {
-    cam.liveCard = card('Live', '', '', status, baseCanvas, hasBackground);
+  cam.card.liveTelState = evaluateTelemetryState('Live', status);
+
+  if (cam.card.showOnLive && cam.card.theme === 'default' && cam.card.isCorner()) {
+    cam.card.liveCard = card('Live', '', '', status, baseCanvas, hasBackground);
   } else {
-    cam.liveCard = null;
+    cam.card.liveCard = null;
   }
   cam.burstUntil = Date.now() + 1200;
-}
-
-/**
- * Computes the bounding box { boxX, boxY, boxW, boxH } of a camera's corner status card
- * across all states so Frigate motion/object masks and live overlays cover the exact card footprint.
- *
- * @param {Record<string, *>} cam - Camera state object.
- * @returns {{ boxX: number, boxY: number, boxW: number, boxH: number }|null}
- */
-function getCameraCardBounds(cam) {
-  const {theme, position} = cam.cardCfg;
-  if (theme === 'none' || position === 'center') return null;
-
-  let boxW = 92;
-  let boxH = 36;
-  if (theme === 'icons') {
-    const tc = cam.telCfg;
-    let contentW = 20;
-    if (tc.enabled && tc.battery) contentW += 16 + 37;
-    if (tc.enabled && tc.wifi) contentW += 16 + 28;
-    if (tc.enabled && tc.temperature) contentW += 16 + 16;
-    if (tc.enabled && tc.lastSeen) contentW += 16 + 20;
-    boxW = contentW + 32;
-    boxH = 44;
-  } else if (theme === 'default') {
-    const title = cam.title || cam.name;
-    const maxHeader = 'Asleep (Low Battery)  -  ' + title;
-    const headerW = 42 + maxHeader.length * 11 + 24;
-    const st = cam.liveTelState || evaluateTelemetryState('Asleep', {
-      telCfg: cam.telCfg,
-      battery: cam.battery ?? 100,
-      charging: cam.charging,
-      powerLabel: cam.powerLabel || 'Charging',
-      wifi: cam.wifi ?? 4,
-      rssi: cam.rssi ?? -60,
-      temp: cam.temp ?? 25,
-      lastSeen: cam.lastSeen || '00:00',
-    });
-    const segments = buildTelemetrySegments(st);
-    const hasTelemetry = cam.telCfg.enabled && segments.length > 0;
-    const gap = 18;
-    const telW = hasTelemetry
-        ? segments.reduce((sum, seg) => sum + seg.width, 0) + gap * Math.max(0, segments.length - 1) + 44
-        : 0;
-    boxW = Math.min(W - 48, Math.max(hasTelemetry ? 540 : 400, telW, headerW));
-    boxH = hasTelemetry ? 88 : 48;
-  }
-
-  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
-  return {boxX, boxY, boxW, boxH};
 }
 
 /**
  * Composites the camera's corner status card onto a copy of a live video frame when
  * card_show_on_live is enabled, leaving the original raw frame (and cam.lastFrame) untouched.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Record<string, *>} cam - Camera domain instance.
  * @param {Uint8Array} rawFrame - Clean decoded YUV420p video frame.
  * @returns {Uint8Array} YUV420p frame buffer with corner overlay applied (or rawFrame if disabled).
  */
 function renderLiveFrameWithCard(cam, rawFrame) {
-  if (
-      !cam.showCardOnLive ||
-      cam.suppressLiveCard ||
-      cam.cardCfg.theme === 'none' ||
-      cam.cardCfg.position === 'center'
-  ) {
+  if (!cam.card.shouldOverlayOnLive()) {
     return rawFrame;
   }
-  const out = cam.liveOverlayBuf;
+  const out = cam.card.liveOverlayBuf;
   rawFrame.copy(out);
-  const st = cam.liveTelState || evaluateTelemetryState('Live', {
-    telCfg: cam.telCfg,
-    battery: cam.battery,
-    charging: cam.charging,
-    powerLabel: cam.powerLabel,
-    economyMode: isLowBattery(cam),
-    wifi: cam.wifi,
-    rssi: cam.rssi,
-    temp: cam.temp,
-    lastSeen: cam.lastSeen,
-  });
+  const st = cam.card.liveTelState || cam.telemetry.evaluateVisualState('Live');
 
-  if (cam.cardCfg.theme === 'minimal') {
-    drawMinimalDotsCard(out, cam.cardCfg.position, st, true);
-    return out;
+  switch (cam.card.theme) {
+    case 'minimal':
+      drawMinimalDotsCard(out, cam.card.position, st, true);
+      return out;
+    case 'icons':
+      drawIconsOnlyCard(out, cam.card.position, st, true);
+      return out;
+    case 'default':
+      if (Buffer.isBuffer(cam.card.liveCard)) {
+        const bounds = getCameraCardBounds(cam);
+        if (bounds) {
+          copyYuvRegion(cam.card.liveCard, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
+        }
+        return out;
+      }
+      return rawFrame;
+    default:
+      return rawFrame;
   }
-  if (cam.cardCfg.theme === 'icons') {
-    drawIconsOnlyCard(out, cam.cardCfg.position, st, true);
-    return out;
-  }
-  if (cam.cardCfg.theme === 'default' && Buffer.isBuffer(cam.liveCard)) {
-    const bounds = getCameraCardBounds(cam);
-    if (bounds) {
-      copyYuvRegion(cam.liveCard, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
-    }
-    return out;
-  }
-  return rawFrame;
-}
-
-/**
- * Computes the normalized Frigate mask polygon string ('x0,y0,x0,y1,x1,y1,x1,y0')
- * for a camera's status card with a 6px chroma/anti-aliasing safety margin.
- *
- * @param {Record<string, *>} cam - Camera state object.
- * @returns {string} Normalized polygon coordinates, or '' if no corner card is active.
- */
-function computeFrigateMaskPolygon(cam) {
-  const bounds = getCameraCardBounds(cam);
-  if (!bounds) return '';
-  const pad = 6;
-  const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
-  const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
-  const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
-  const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(3);
-  return x0 + ',' + y0 + ',' + x0 + ',' + y1 + ',' + x1 + ',' + y1 + ',' + x1 + ',' + y0;
 }
 
 module.exports = {
   drawStatusGlyph,
   drawBatteryIcon,
   drawWifiArcsIcon,
-  evaluateTelemetryState,
-  buildTelemetrySegments,
+  drawThermometerIcon,
+  drawAnalogClockIcon,
   drawTelemetryRow,
   drawMinimalDotsCard,
   drawIconsOnlyCard,
   drawFrigateModalGraphics,
   drawCornerDefaultCard,
+  findAvailableFontFile,
   card,
   renderCameraCards,
-  getCameraCardBounds,
   renderLiveFrameWithCard,
+  getCameraCardBounds,
   computeFrigateMaskPolygon,
 };
