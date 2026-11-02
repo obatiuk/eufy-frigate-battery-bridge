@@ -5,7 +5,10 @@
 	"frigate_api": "http://frigate:5000",
 	"ha_webhook": "http://homeassistant:8123/api/webhook/eufy_frigate_bridge",
 	"log_level": "info",
-	"preempt_event_streams": false,
+	"use_rtsp": true,
+	"backfill_downloads": true,
+	"backfill_delay_secs": 5,
+	"preempt_event_streams": true,
 	"let_eufy_decide_event_end": true,
 	"hold_secs": 60,
 	"max_secs": 900,
@@ -62,20 +65,23 @@
 			"name": "shed",
 			"title": "Shed",
 			"serial": "T8162T0000000000",
-			"priority": 10
+			"priority": 10,
+			"use_rtsp": true
 		},
 		{
 			"name": "backyard",
 			"title": "Backyard",
 			"serial": "T8162T1111111111",
-			"priority": 50
+			"priority": 50,
+			"use_rtsp": true
 		},
 		{
 			"name": "front_doorbell",
 			"title": "Front Doorbell",
 			"serial": "T8214T2222222222",
 			"priority": 100,
-			"preserve_aspect_ratio": false,
+			"use_rtsp": false,
+			"preserve_aspect_ratio": true,
 			"card_theme": "icons",
 			"card_position": "bottom-left",
 			"card_background": "snapshot",

@@ -32,21 +32,23 @@ SOFTWARE.
 
 Get **Eufy battery cameras** into **Frigate**: event-driven recordings, `Frigate` detections, and on-demand live view without draining batteries.
 
-Eufy battery cameras sleep almost all the time, have no `RTSP` stream, and only stream when woken over Eufy's `P2P` connection. Because `Frigate` requires a continuous `RTSP` feed, this bridge publishes a persistent per-camera `ffmpeg` stream into Frigate's `go2rtc`:
+Eufy battery cameras sleep almost all the time and only stream when woken. Because `Frigate` requires a continuous `RTSP` feed, this bridge publishes a persistent per-camera `ffmpeg` stream into Frigate's `go2rtc`:
 
 - **While asleep:** Displays the camera's last live frame with a customizable status and telemetry overlay (no pixel motion, so `Frigate` records nothing).
-- **On motion or doorbell ring:** Wakes the camera via [`eufy-security-ws`](https://github.com/bropat/eufy-security-ws), feeds live `P2P` video into the same unbroken `RTSP` stream, files a `Frigate` event (`person`, `car`, `dog`, or `motion`), and optionally notifies `Home Assistant`.
+- **On motion or doorbell ring:** Wakes the camera via [`eufy-security-ws`](https://github.com/bropat/eufy-security-ws) (using `HomeBase` `RTSP` when available or `P2P` livestreaming), feeds live video into the same unbroken `RTSP` stream, files a `Frigate` event (`person`, `car`, `dog`, or `motion`), and optionally notifies `Home Assistant`.
+- **On overlapping events:** Streams `RTSP`-capable cameras (`T8161`) and standalone Wi-Fi cameras/doorbells concurrently, uses priority arbitration (`priority` + event boosts) per `HomeBase` station, and backfills any missed `P2P` recordings from `HomeBase` storage (`backfill_downloads`).
 - **On live view:** Wakes the camera when a single-camera stream is opened in `Frigate`, while ignoring multi-camera dashboard grid views.
 
 ```
-Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P video)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
-                                       └──► Frigate API (event)      └──► HA webhook (optional)
+Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
+                                       └──► Frigate API (event)                 └──► HA webhook (optional)
 ```
 
 ## Enhancements in This Fork
 
 - [Customizable Status Themes & Corner Placement](#customizable-status-themes--corner-placement)
 - [Camera & Event Priority Arbitration](#camera--event-priority-arbitration)
+- [Concurrent HomeBase RTSP, Multi-Station P2P & Clip Backfill](#concurrent-homebase-rtsp-multi-station-p2p--clip-backfill)
 - [Low-Latency Stream & Drain-Aware Pipeline](#low-latency-stream--drain-aware-pipeline)
 - [Live Camera Telemetry & Battery Swap Detection](#live-camera-telemetry--battery-swap-detection)
 - [Persistent Snapshot Cache & Startup Probe](#persistent-snapshot-cache--startup-probe)
@@ -75,22 +77,27 @@ Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P video)�
 | `eufy_ws` | yes | — | `eufy-security-ws` `WebSocket` URL (e.g., `ws://eufy-security-ws:3000`) |
 | `go2rtc_api` | yes | — | Frigate's `go2rtc` HTTP API URL, normally `http://frigate:1984` |
 | `rtsp_publish` | yes | — | Where to publish each camera. `{name}` is replaced by the camera name. If Frigate's `go2rtc` has `rtsp.username/password` set, put them in the URL. |
-| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "priority", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card; `priority` sets the camera's base arbitration weight (default `0`). |
+| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card; `priority` sets the camera's base arbitration weight (default `0`). |
 | `frigate_api` | no | — | Frigate's internal HTTP API (`http://frigate:5000`). Without it, no `Frigate` events are filed and early-sleep object checks are skipped. |
 | `ha_webhook` | no | — | `Home Assistant` webhook URL (see [Home Assistant Notifications](#home-assistant-notifications)) |
 | `log_level` | no | `"info"` | Minimum log severity (`"debug"`, `"info"`, `"warn"`, `"error"`). Can also be set via the `LOG_LEVEL` environment variable. |
 
-### Stream Timing & Arbitration
+### Stream Timing, RTSP & Arbitration
 
 | Key | Default | Meaning |
 |---|---|---|
 | `priority` (per camera) | `0` | Base priority weight in `cameras[]` (`-10000` to `10000`). Combined with built-in event boosts (`rings`: `+1000`, `identity person`: `+300`, `person`: `+200`, `vehicle`/`pet`: `+100`, `sound`: `+50`, `motion`: `+10`) to decide stream takeovers with zero dwell delay. |
-| `hold_secs` | `60` | Stay live this long (seconds) after the last Eufy motion report |
+| `use_rtsp` | `true` | Automatically use `HomeBase` native `RTSP` (`rtspStreamUrl`) on cameras that support `NAS / RTSP Stream` so they stream concurrently without using the `HomeBase` `P2P` slot. Queues a `60 s` `P2P` fallback if `RTSP` does not connect within `14 s`. Can be overridden per camera. |
+| `rtsp_url` (per camera) | `""` | Optional explicit `rtsp://` URL override for a camera in `cameras[]` (auto-discovered from `device.get_properties` when omitted) |
+| `station_serial` (per camera) | `""` | Optional explicit station serial override in `cameras[]` (auto-discovered from `stationSerialNumber` in `device.get_properties`) |
+| `backfill_downloads` | `true` | Automatically query `HomeBase` local storage (`station.database_query_latest_info` / `station.database_query_by_date`) and replay missed event clips (`device.start_download`) at `15 fps` into `Frigate` once the station's `P2P` slot is free |
+| `backfill_delay_secs` | `5` | Seconds a station's `P2P` slot must remain idle before starting a queued post-event clip download |
+| `hold_secs` | `60` | Maximum time (seconds) to stay live after the last Eufy motion report |
 | `max_secs` | `900` | Hard cap (seconds) for one continuous live period |
 | `view_linger_secs` | `20` | Stay live this long (seconds) after the last viewer leaves |
 | `view_max_secs` | `300` | Hard cap (seconds) for a live period only viewers asked for |
 | `viewer_cooldown_secs` | `5` | Ignore single-camera viewers that connect this soon (seconds) after a camera finishes streaming |
-| `let_eufy_decide_event_end` | `true` | Allow Eufy/`HomeBase` to end event livestreams cleanly when the camera finishes recording, and extend active event streams in `5 s` increments (up to `max_secs`) while video is still flowing |
+| `let_eufy_decide_event_end` | `true` | End event livestreams cleanly when Eufy reports `livestream stopped` or `5 s` after Eufy reports activity cleared (`state: false`, once at least `10 s` of video has been shown) |
 | `preempt_event_streams` | `true` | Allow a newer motion event on an equal-priority camera to take over immediately |
 
 ### Events, Doorbell & HomeBase 3 Intelligence
@@ -225,15 +232,23 @@ Note: All samples are AI-generated.
 
 ### Camera & Event Priority Arbitration
 
-Because a Eufy `HomeBase` serves only one `P2P` livestream at a time, the bridge arbitrates stream access using an effective priority score (`camera.priority + eventBoost`):
+For cameras sharing a `HomeBase` `P2P` slot, the bridge arbitrates access using an effective priority score (`camera.priority + eventBoost`):
 
 - **Built-in event boosts:** `rings` (`+1000`) > `identity person` (`+300`) > `person` / `stranger` (`+200`) > `vehicle` / `pet` / `dog` (`+100`) > `crying` / `sound` (`+50`) > `motion` (`+10`).
-- **Instant zero-dwell switching:** Higher-priority events (such as a doorbell ring while a garage camera is streaming) and newer events across equal-priority cameras switch immediately with zero dwell delay.
+- **Instant zero-dwell switching:** Higher-priority events (such as a doorbell ring while a lower-priority camera is streaming) and newer events across equal-priority cameras switch immediately with zero dwell delay.
 - **Priority protection:** Lower-priority cameras never interrupt an active higher-priority event until its motion clears, and viewer clicks never block or preempt event-triggered streams.
+
+### Concurrent HomeBase RTSP, Multi-Station P2P & Clip Backfill
+
+To overcome the single-stream `HomeBase` `P2P` limitation when multiple cameras trigger at the same time, the bridge combines three mechanisms:
+
+- **HomeBase Native `RTSP` Ingestion (`use_rtsp: true`):** When `NAS (RTSP Stream)` is enabled for a camera in the Eufy app (such as `eufyCam 3C` / `T8161`), the bridge automatically discovers its `rtspStreamUrl`, wakes the camera's `RTSP` feed via `rtspStream=true` and `device.start_rtsp_livestream`, and streams multiple `RTSP` cameras in parallel (`WAKE [RTSP]`) without using the `HomeBase` `P2P` slot—leaving `P2P` completely free for `P2P`-only devices like video doorbells (`T8214`). If the `HomeBase` `RTSP` server does not deliver frames within `14 s`, the bridge queues a `60 s` `P2P` fallback through `arbitrate()`.
+- **Per-Station (`stationSerial`) Concurrent `P2P` Arbitration:** `P2P` arbitration and transition locks are scoped per `stationSerialNumber` rather than globally. Standalone Wi-Fi cameras/doorbells (or cameras paired to a second `HomeBase`) stream over `P2P` 100% concurrently alongside your primary `HomeBase`.
+- **Post-Event Clip Download Backfill (`backfill_downloads: true`):** If two `P2P`-only cameras on the same `HomeBase` trigger simultaneously, the `HomeBase` still records the secondary camera's clip to its internal storage. Once that station's `P2P` slot has been idle for `backfill_delay_secs` (`5 s`), the bridge queries `station.database_query_latest_info` and `station.database_query_by_date`, locates the missed `.zxvideo` recording (`storage_path` + `cipher_id`), streams it into `Frigate` at `15 fps` real-time speed via `device.start_download` (`WAKE [BACKFILL DOWNLOAD]`), and files the corresponding `Frigate` event. Any new live motion or viewer request immediately cancels and preempts an active backfill download.
 
 ### Low-Latency Stream & Drain-Aware Pipeline
 
-- **Zero-probe decoding:** Spawns the per-session `ffmpeg` decoder with `-fflags +genpts+nobuffer -flags low_delay -probesize 32768 -analyzeduration 0` so the very first keyframe is decoded immediately.
+- **Low-latency decoding:** Spawns per-session `P2P` `ffmpeg` decoders with `-fflags +genpts+nobuffer -flags low_delay -probesize 32768 -analyzeduration 0` and `RTSP` pull decoders with `-fflags +genpts+nobuffer -flags low_delay -rtsp_transport tcp` so the first keyframe is decoded immediately.
 - **Drain-aware pipe backpressure (`15 fps` live / `5 fps` idle):** Listens to `enc.stdin.on('drain')` to flush newly decoded `1.38 MB` `YUV420p` frames the millisecond `ffmpeg` drains the pipe, eliminating dropped frames and playback jerkiness.
 - **Fast handovers & keyframe bursts:** Uses a `150 ms` `P2P` settle transition, `750 ms` viewer polling, and `1.2 s` keyframe bursts on viewer connect or state change.
 
@@ -262,7 +277,7 @@ Telemetry on the sleeping overlay is **enabled by default** and can be customize
       "priority": 100,
       "card_theme": "icons",
       "card_position": "bottom-left",
-      "preserve_aspect_ratio": false,
+      "preserve_aspect_ratio": true,
       "telemetry": {
         "temperature": false
       }
@@ -297,14 +312,14 @@ Supports `vaapi` (Intel/AMD iGPUs, including AMD RDNA 3.5 `gfx1150`/`gfx1151` vi
 
 ### Smart Battery Conservation & Eufy-Controlled Event End
 
-- **Eufy-controlled event end (`let_eufy_decide_event_end`):** Lets Eufy/`HomeBase` end event livestreams cleanly when the camera finishes recording according to Eufy app Power Manager settings, and extends active event streams in `5 s` increments (up to `max_secs`) while video is still flowing.
+- **Eufy-controlled event end (`let_eufy_decide_event_end`):** Puts event-woken cameras to sleep `5 s` after Eufy reports activity cleared (`state: false`, once at least `10 s` of video has been shown) or immediately when Eufy sends `livestream stopped`, while capping continuous activity at `hold_secs` (`60 s`) after the last trigger.
 - **Low-Battery Economy Mode (`low_battery_threshold`):** When battery drops to or below `20%` (and is not charging), automatically shortens motion hold duration (`low_battery_hold_secs`) and blocks viewer-triggered wakeups (`low_battery_wake_on_view: false`).
 - **Optional early sleep (`early_sleep_secs`):** Can put a motion-woken camera to sleep early if Eufy motion has cleared and `Frigate` reports no active tracked detections (`0` / disabled by default).
 - **Auto-enforce streaming quality (`enforce_streaming_quality`):** Automatically switches cameras set to `"Auto"` (`0`) to `Medium` (`7`, `1280×720`) so `P2P` streams do not negotiate `4K` and stall.
 
 ### Cross-Camera Isolation & HomeBase Reboot Resilience
 
-Serializes `P2P` stop/start handovers on shared `HomeBase` stations, ignores `eufy-security-client` station-cached notification thumbnails (`properties.picture`), recovers cleanly from `HomeBase` station reboots (`station` disconnect/connect events) without interrupting `RTSP` feeds, ignores simultaneous multi-camera dashboard grid views, and handles mid-stream Eufy resolution changes in-band without restarting the decoder.
+Serializes `P2P` stop/start handovers per station, ignores `eufy-security-client` station-cached notification thumbnails (`properties.picture`), recovers cleanly from `HomeBase` station reboots (`station` disconnect/connect events) without interrupting `RTSP` feeds, ignores simultaneous multi-camera dashboard grid views, and handles mid-stream Eufy resolution changes in-band without restarting the decoder.
 
 ### Structured Logging for Grafana Alloy & Loki
 
@@ -372,11 +387,11 @@ Trigger an automation with `platform: webhook` and use `trigger.json.event_id` t
 ## Good to know
 
 - **Battery.** Every wake costs battery, the same as opening the camera in the Eufy app. `let_eufy_decide_event_end` and Low-Battery Economy Mode (`low_battery_threshold`) help minimize unnecessary live streaming time.
-- **Latency.** First video arrives about 3–4 s after the wake, so a quick walk-past may be half over. That's why the bridge files Eufy's own detection as a `Frigate` event.
+- **Latency.** First video arrives about 1–3 s after the wake on `RTSP` or 2–4 s on `P2P`, so a quick walk-past may be half over. That's why the bridge files Eufy's own detection as a `Frigate` event.
 - **Missed events are Eufy-side.** If Eufy's own detection doesn't fire, nothing wakes the camera.
-- **Asleep ↔ live switches look like motion to Frigate,** and Frigate's Live dashboard auto-opens cameras with activity. The bridge ignores viewers that connect while a camera is already live or just went to sleep, ignores simultaneous multi-camera grid views, cancels earlier viewer queues when switching cameras, keeps background pixels un-dimmed (`card_dim_background: false`), and supports corner placements, `icons`/`minimal` themes, or `none` mode so `Frigate` never triggers false detections on the sleeping overlay.
+- **Asleep ↔ live switches look like motion to Frigate,** and Frigate's Live dashboard auto-opens cameras with activity. The bridge ignores viewers that connect while a camera is already live or just went to sleep, ignores simultaneous multi-camera grid views, cancels earlier viewer queues when switching `P2P` cameras, keeps background pixels un-dimmed (`card_dim_background: false`), and supports corner placements, `icons`/`minimal` themes, or `none` mode so `Frigate` never triggers false detections on the sleeping overlay.
 - **CPU.** Idle ~1–3% of one core. While a camera is live, ~15–25% with `hwaccel: "vaapi"` or ~35–65% with software `libx264`.
-- **Test hook:** `docker kill -s USR2 eufy-frigate-battery-bridge` files a `"test"` event on the first camera without waking it.
+- **Test hooks:** `docker kill -s USR2 eufy-frigate-battery-bridge` files a synthetic `"test"` event on the first camera without waking it, and `docker kill -s USR1 eufy-frigate-battery-bridge` triggers an on-demand backfill download of the latest recorded HomeBase clip at `15 fps`.
 
 ## Tested with
 
