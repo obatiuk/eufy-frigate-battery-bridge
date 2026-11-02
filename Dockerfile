@@ -23,7 +23,7 @@ RUN apk add --no-cache \
 
 COPY --from=builder /tmp/Inter.ttf /usr/share/fonts/Inter.ttf
 COPY --from=builder /app/node_modules /app/node_modules
-COPY src/bridge.js /app/bridge.js
+COPY src/ /app/
 
 WORKDIR /app
 USER node

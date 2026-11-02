@@ -1,2 +1,7 @@
+.idea/
+.opencode/
 *.iml
-conversations
+*.jsonc
+conversations/
+config.json
+cache/

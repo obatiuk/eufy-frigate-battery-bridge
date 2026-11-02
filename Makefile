@@ -20,9 +20,11 @@ REGISTRY ?=
 PUBLISH_TAG ?= $(if $(strip $(REGISTRY)),$(patsubst %/,%,$(strip $(REGISTRY)))/$(BUILD_TAG),$(BUILD_TAG))
 PUBLISH_TAG_ARG := $(if $(strip $(REGISTRY)),-t $(PUBLISH_TAG),)
 
+SRC_FILES := $(shell find $(PROJECT_ROOT)/src -type f -name '*.js')
+
 .PHONY: check
 check:
-	@if command -v node >/dev/null 2>&1; then node --check $(SRC_FILE); fi
+	@if command -v node >/dev/null 2>&1; then for f in $(SRC_FILES); do node --check "$$f" || exit 1; done; fi
 
 .PHONY: docker-build
 docker-build: check
