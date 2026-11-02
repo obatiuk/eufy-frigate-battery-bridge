@@ -38,19 +38,20 @@ over Eufy's own `P2P` connection (the one the Eufy app uses). `Frigate` needs a 
 bridge sits in between:
 
 - **Frigate sees a normal, always-on camera.** While the Eufy camera sleeps, the stream displays the
-  camera's dimmed last live frame with a frosted-glass status overlay placed in the `"center"` or any
+  camera's last live frame with a frosted-glass status overlay placed in the `"center"` or any
   corner (`"top-left"`, `"top-right"`, `"bottom-left"`, `"bottom-right"`), using full text (`"default"`),
   vector icons only (`"icons"`), three color-coded status dots (`"minimal"`), or no overlay (`"none"`).
 - **On-screen telemetry while asleep.** Displays battery state, charging/solar/plugged/economy mode,
   Wi-Fi signal strength and `RSSI`, battery temperature, and the timestamp of the last live stream.
 - **Persistent snapshot cache & startup probe.** Last live frames are saved to `/config/cache` so
-  dimmed background snapshots survive container restarts. If a camera has no cached snapshot on
+  background snapshots survive container restarts. If a camera has no cached snapshot on
   startup, the bridge can briefly wake it once (`startup_snapshot`), capture a clean frame, and put it
   right back to sleep.
 - **Motion or doorbell ring wakes it.** When Eufy reports motion, a person, a pet, or a doorbell press
   (`rings`), the bridge starts a `P2P` livestream through [`eufy-security-ws`](https://github.com/bropat/eufy-security-ws)
-  and feeds the real video into the same stream for `hold_secs` after the last report (or sleeps early
-  once activity ends). `Frigate` records it and runs detection on it like any other camera.
+  and feeds the real video into the same stream until Eufy ends the event recording or `hold_secs`
+  elapses after the last report (`let_eufy_decide_event_end`). `Frigate` records it and runs detection
+  on it like any other camera.
 - **Eufy's detection becomes a Frigate event.** A walk-past is often over before the video arrives,
   so the bridge also files the event in `Frigate` directly (`person`, `car`, `dog` or `motion`, with
   `HomeBase 3` recognized face names forwarded as `sub_label` or `eufy` by default), with the recording
@@ -85,7 +86,9 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 	- **`"minimal"` theme:** Ultra-minimalist `92×36` frosted-glass capsule displaying three graduated
 	  color-coded dots (`[Camera Status]  [Battery]  [Wi-Fi]`) using a 4-color scale (`Green`, `Blue`, `Yellow`, `Red`).
 	- **`"none"` (`"blank"`) theme:** Hides the status overlay while honoring `card_background` (`"snapshot"`
-	  dimmed frame, `"slate"`, or `"black"` pitch-black frame).
+	  last live frame, `"slate"`, or `"black"` pitch-black frame).
+	- **Un-dimmed background by default (`card_dim_background: false`):** Keeps pixels outside the frosted-glass
+	  card identical across `Live ↔ Asleep` transitions so a corner motion mask in `Frigate` prevents false recordings.
 - **Low-latency stream & keyframe pipeline:** Zero-probe `ffmpeg` decoder startup (`nobuffer`, `low_delay`),
   event-driven frame pushing, `750 ms` viewer polling, and automatic keyframe bursts on viewer connect or
   state change for near-instant live view and motion recording.
@@ -117,10 +120,13 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 	- **Auto-enforce streaming quality (`enforce_streaming_quality`):** Automatically switches cameras set
 	  to `"Auto"` (`0`) to `Medium` (`7`, `1280×720`) so `P2P` streams do not negotiate `4K` and stall.
 - **Cross-camera frame isolation & spontaneous wakeup protection:** Serializes `P2P` stop/start
-  handovers on shared `HomeBase` stations, ignores simultaneous multi-camera dashboard grid views,
-  handles mid-stream Eufy resolution changes without restarting the decoder, cancels earlier viewer
-  queues when switching cameras, and suppresses mid-sleep card re-renders from triggering `Frigate`
-  motion.
+  handovers on shared `HomeBase` stations, saves `lastFrame` immediately on the first decoded keyframe,
+  recovers cleanly from `HomeBase` station reboots without interrupting `RTSP` feeds, ignores simultaneous
+  multi-camera dashboard grid views, handles mid-stream Eufy resolution changes in-band, and prioritizes
+  event streams over viewer clicks.
+- **Structured logging for `Grafana Alloy` & `Loki` (`log_level` / `LOG_LEVEL`):** Formats every log line
+  as `YYYY-MM-DD HH:MM:SS [LEVEL] [camera] message` with explicit `initiator=...` and `reason="..."`
+  lifecycle tags and ICU-free local ISO timestamps.
 - **Minimal multi-stage container image:** Built on `Alpine Linux 3.23` with `tini` as `PID 1`, running
   as a non-root `node` user (`UID 1000`).
 
@@ -142,9 +148,10 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 | `eufy_ws` | yes | — | `eufy-security-ws` `WebSocket` URL (e.g., `ws://eufy-security-ws:3000`) |
 | `go2rtc_api` | yes | — | Frigate's `go2rtc` HTTP API URL, normally `http://frigate:1984` |
 | `rtsp_publish` | yes | — | Where to publish each camera. `{name}` is replaced by the camera name. If Frigate's `go2rtc` has `rtsp.username/password` set, put them in the URL. |
-| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "telemetry", "card_theme", "card_position", "card_background", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card. |
+| `cameras` | yes | — | Array of camera objects: `[{ "name", "serial", "title", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card. |
 | `frigate_api` | no | — | Frigate's internal HTTP API (`http://frigate:5000`). Without it, no `Frigate` events are filed and early-sleep object checks are skipped. |
 | `ha_webhook` | no | — | `Home Assistant` webhook URL (see below) |
+| `log_level` | no | `"info"` | Minimum log severity (`"debug"`, `"info"`, `"warn"`, `"error"`). Can also be set via the `LOG_LEVEL` environment variable. |
 
 ### Stream Timing & Arbitration
 
@@ -156,6 +163,8 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 | `view_max_secs` | `300` | Hard cap (seconds) for a live period only viewers asked for |
 | `min_dwell_secs` | `15` | Minimum live video (seconds) a motion-woken camera gets before newer motion on another camera can take over |
 | `viewer_cooldown_secs` | `5` | Ignore single-camera viewers that connect this soon (seconds) after a camera finishes streaming |
+| `let_eufy_decide_event_end` | `true` | Allow Eufy/`HomeBase` to end event livestreams cleanly when the camera finishes recording, and extend active event streams in `5 s` increments (up to `max_secs`) while video is still flowing |
+| `preempt_event_streams` | `true` | Allow a newer motion event on another camera to take over once the current camera is ready to yield (`min_dwell_secs` of video, `8 s` no-video timeout, or motion cleared) |
 
 ### Events, Doorbell & HomeBase 3 Intelligence
 
@@ -171,7 +180,7 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 
 | Key | Default | Meaning |
 |---|---|---|
-| `early_sleep_secs` | `20` | Put a motion-woken camera to sleep early if motion has cleared and `Frigate` sees no active objects after this many seconds (`0` to disable) |
+| `early_sleep_secs` | `0` | Optional battery saver that puts a motion-woken camera to sleep early if motion has cleared and `Frigate` sees no active objects after this many seconds (`0` to disable; disabled by default) |
 | `low_battery_threshold` | `20` | Battery `%` at or below which uncharged cameras enter Low-Battery Economy Mode (`0` to disable) |
 | `low_battery_hold_secs` | `20` | Reduced motion hold duration in seconds while in Low-Battery Economy Mode |
 | `low_battery_wake_on_view` | `false` | Allow live-view requests to wake a camera in Low-Battery Economy Mode |
@@ -183,7 +192,8 @@ live, a second `ffmpeg` decodes the Eufy video (`H.265` or `H.264`, any size) an
 |---|---|---|
 | `card_theme` | `"default"` | `"default"` (text + icons), `"icons"` (vector icons only), `"minimal"` (three graduated status dots), or `"none"`/`"blank"` (no overlay; displays `card_background`). Can be overridden per camera. |
 | `card_position` | `"center"` | Overlay placement for any theme: `"center"`, `"bottom-left"`, `"bottom-right"`, `"top-left"`, or `"top-right"`. Can be overridden per camera. |
-| `card_background` | `"snapshot"` | Background behind the status card: `"snapshot"` (dimmed last frame), `"slate"` (solid dark gray), or `"black"` (pitch-black). Can be overridden per camera. |
+| `card_background` | `"snapshot"` | Background behind the status card: `"snapshot"` (last live frame), `"slate"` (solid dark gray), or `"black"` (pitch-black). Can be overridden per camera. |
+| `card_dim_background` | `false` | Dim the `"snapshot"` backdrop behind the status card (`true` / `false`). Disabled by default so unmasked background pixels outside the card do not trigger `Frigate` motion detection on sleep/wake transitions. Can be overridden per camera. |
 | `telemetry` | `true` | `true`, `false`, or an object controlling which telemetry items are shown on the sleeping card (see below). Can be overridden per camera. |
 | `telemetry_poll_secs` | `300` | Background telemetry poll interval in seconds to detect battery swaps and charging updates while sleeping (`0` to disable) |
 | `cache_dir` | `"/config/cache"` | Directory for persisting last live snapshots (`last_<name>_<serial>.jpg`) across container restarts (falls back to `"/tmp"`) |

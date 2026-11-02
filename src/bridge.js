@@ -34,7 +34,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const {spawn, spawnSync} = require('child_process');
 const WebSocket = require('ws');
 
 /**
@@ -66,6 +66,80 @@ if (!cfg.rtsp_publish.includes('{name}')) {
   throw new Error('config.json: "rtsp_publish" must contain {name}');
 }
 
+// Structured logging configuration (LOG_LEVEL env variable or config.json log_level; default: 'info').
+const LOG_LEVELS = {debug: 0, info: 1, warn: 2, warning: 2, error: 3};
+const RAW_LOG_LEVEL = String(process.env.LOG_LEVEL || cfg.log_level || 'info')
+    .toLowerCase()
+    .trim();
+const CURRENT_LOG_LEVEL = LOG_LEVELS[RAW_LOG_LEVEL] ?? LOG_LEVELS.info;
+const ACTIVE_LOG_LEVEL_NAME =
+    Object.keys(LOG_LEVELS).find((k) => k !== 'warning' && LOG_LEVELS[k] === CURRENT_LOG_LEVEL) || 'info';
+
+/**
+ * Formats a Date object as 'YYYY-MM-DD HH:MM:SS' in local time (via TZ) without ICU locale dependencies.
+ *
+ * @param {Date} [d=new Date()] - Date instance to format.
+ * @returns {string}
+ */
+function formatLocalTimestamp(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+      d.getFullYear() +
+      '-' +
+      pad(d.getMonth() + 1) +
+      '-' +
+      pad(d.getDate()) +
+      ' ' +
+      pad(d.getHours()) +
+      ':' +
+      pad(d.getMinutes()) +
+      ':' +
+      pad(d.getSeconds())
+  );
+}
+
+/**
+ * Formats a Date object as 'HH:MM' in local time (via TZ) without ICU locale dependencies.
+ *
+ * @param {Date} [d=new Date()] - Date instance to format.
+ * @returns {string}
+ */
+function formatLocalHm(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+/**
+ * Formats and writes a structured log line to stdout when `level` meets or exceeds CURRENT_LOG_LEVEL.
+ * Every line uses the identical prefix layout for Grafana Alloy parsing:
+ *   YYYY-MM-DD HH:MM:SS [LEVEL] [camera_or_bridge] message
+ *
+ * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
+ * @param {string|{name?: string}|null|undefined} scope - Camera state/config object, camera name, or 'bridge'.
+ * @param {...*} args - Message segments.
+ */
+function writeLog(level, scope, ...args) {
+  const normLevel = level === 'warning' ? 'warn' : level;
+  const weight = LOG_LEVELS[normLevel] ?? LOG_LEVELS.info;
+  if (weight < CURRENT_LOG_LEVEL) return;
+  const ts = formatLocalTimestamp();
+  const lvlTag = normLevel.toUpperCase();
+  const scopeName =
+      scope && typeof scope === 'object' ? scope.name || 'bridge' : String(scope || 'bridge');
+  console.log(ts + ' [' + lvlTag + '] [' + scopeName + '] ' + args.join(' '));
+}
+
+const log = {
+  debug: (scope, ...args) => writeLog('debug', scope, ...args),
+  info: (scope, ...args) => writeLog('info', scope, ...args),
+  warn: (scope, ...args) => writeLog('warn', scope, ...args),
+  error: (scope, ...args) => writeLog('error', scope, ...args),
+};
+
+if (!(RAW_LOG_LEVEL in LOG_LEVELS)) {
+  log.warn('bridge', 'unknown LOG_LEVEL "' + RAW_LOG_LEVEL + '", defaulting to "info"');
+}
+
 // Stream timing and arbitration limits (in milliseconds).
 const MAX_MS = clampNum(cfg.max_secs, 10, 86400, 900) * 1000;
 const VIEW_MAX_MS = clampNum(cfg.view_max_secs, 10, 86400, 300) * 1000;
@@ -80,9 +154,12 @@ const SNAP_DELAY_MS = clampNum(cfg.snapshot_delay_secs, 0, 60, 3) * 1000;
 const RING_LABEL = cfg.ring_label || 'person';
 const FORWARD_FACE_NAMES = cfg.forward_face_names !== false;
 const GLOBAL_PRESERVE_ASPECT = cfg.preserve_aspect_ratio !== false;
+const GLOBAL_DIM_BACKGROUND = Boolean(cfg.card_dim_background ?? false);
+const PREEMPT_EVENT_STREAMS = cfg.preempt_event_streams !== false;
+const LET_EUFY_DECIDE_END = cfg.let_eufy_decide_event_end !== false;
 
 // Smart battery conservation, periodic telemetry refresh, and startup snapshot probe options.
-const EARLY_SLEEP_MS = clampNum(cfg.early_sleep_secs, 0, 3600, 20) * 1000;
+const EARLY_SLEEP_MS = clampNum(cfg.early_sleep_secs, 0, 3600, 0) * 1000;
 const LOW_BAT_THRESHOLD = clampNum(cfg.low_battery_threshold, 0, 100, 20);
 const LOW_BAT_HOLD_MS = clampNum(cfg.low_battery_hold_secs, 5, 3600, 20) * 1000;
 const LOW_BAT_WAKE_ON_VIEW = Boolean(cfg.low_battery_wake_on_view ?? false);
@@ -124,13 +201,6 @@ const LABELS = [
   ['dog', 'dog'],
   ['pet', 'dog'],
 ];
-
-/**
- * Logs a timestamped message to stdout using the local timezone (via TZ environment variable).
- *
- * @param {...*} args - Message parts to log.
- */
-const log = (...args) => console.log(new Date().toLocaleString('sv-SE'), ...args);
 
 /**
  * Returns a Promise that resolves after the specified number of milliseconds.
@@ -199,10 +269,11 @@ const TRIGGERS = buildTriggerSet(cfg.trigger_events);
 function resolveCacheDir() {
   const preferred = cfg.cache_dir || '/config/cache';
   try {
-    fs.mkdirSync(preferred, { recursive: true });
+    fs.mkdirSync(preferred, {recursive: true});
     fs.accessSync(preferred, fs.constants.W_OK);
     return preferred;
   } catch (err) {
+    log.warn('bridge', 'cache directory "' + preferred + '" is not writable, falling back to /tmp');
     return '/tmp';
   }
 }
@@ -218,7 +289,8 @@ const CACHE_DIR = resolveCacheDir();
 function resolveHwaccel() {
   if (!HWACCEL_MODE) return '';
   if ((HWACCEL_MODE === 'vaapi' || HWACCEL_MODE === 'qsv') && !fs.existsSync(HWACCEL_DEVICE)) {
-    log(
+    log.warn(
+        'bridge',
         'hwaccel "' +
         HWACCEL_MODE +
         '" requested, but ' +
@@ -497,7 +569,7 @@ function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
     boxBlurPlane(regionBuf, lumaSize + chromaSize, cw, ch, 6);
   }
 
-  return { buf: regionBuf, lumaSize, chromaSize, cw };
+  return {buf: regionBuf, lumaSize, chromaSize, cw};
 }
 
 /**
@@ -724,6 +796,7 @@ function getCardBoxCoords(position, boxW, boxH) {
  * @returns {{ theme: string, position: string, background: string }}
  */
 function resolveCardConfig(camConfig) {
+  const scope = camConfig.name || 'bridge';
   const rawTheme =
       camConfig.card_theme !== undefined
           ? camConfig.card_theme
@@ -738,6 +811,10 @@ function resolveCardConfig(camConfig) {
       'center';
   const hasExplicitBg = camConfig.card_background !== undefined || cfg.card_background !== undefined;
   const rawBg = camConfig.card_background !== undefined ? camConfig.card_background : cfg.card_background;
+  const dimBackground =
+      camConfig.card_dim_background !== undefined
+          ? Boolean(camConfig.card_dim_background)
+          : GLOBAL_DIM_BACKGROUND;
 
   const normalizePosition = (val) => {
     const s = String(val || '')
@@ -753,7 +830,7 @@ function resolveCardConfig(camConfig) {
       return 'bottom-right';
     }
     if (s && s !== 'center' && s !== 'middle') {
-      log((camConfig.name || 'config') + ': unknown card_position "' + val + '", defaulting to "center"');
+      log.warn(scope, 'unknown card_position "' + val + '", defaulting to "center"');
     }
     return 'center';
   };
@@ -802,7 +879,7 @@ function resolveCardConfig(camConfig) {
       position = normalizePosition(themeStr);
     }
   } else if (themeStr !== 'default') {
-    log((camConfig.name || 'config') + ': unknown card_theme "' + rawTheme + '", defaulting to "default"');
+    log.warn(scope, 'unknown card_theme "' + rawTheme + '", defaulting to "default"');
   }
 
   let background = 'snapshot';
@@ -815,16 +892,11 @@ function resolveCardConfig(camConfig) {
     } else if (bgStr === 'slate' || bgStr === 'gray' || bgStr === 'grey' || bgStr === 'solid') {
       background = 'slate';
     } else if (bgStr !== 'snapshot') {
-      log(
-          (camConfig.name || 'config') +
-          ': unknown card_background "' +
-          rawBg +
-          '", defaulting to "snapshot"'
-      );
+      log.warn(scope, 'unknown card_background "' + rawBg + '", defaulting to "snapshot"');
     }
   }
 
-  return { theme, position, background };
+  return {theme, position, background, dimBackground};
 }
 
 /**
@@ -836,7 +908,7 @@ function resolveCardConfig(camConfig) {
  * @returns {Record<string, *>} Evaluated values and RGB colors for status, battery, wifi, temp, and lastSeen.
  */
 function evaluateTelemetryState(titleText, status) {
-  const telCfg = status && status.telCfg ? status.telCfg : { enabled: false };
+  const telCfg = status && status.telCfg ? status.telCfg : {enabled: false};
   const batRaw = status && status.battery != null ? status.battery : null;
   const wifiRaw = status && status.wifi != null ? status.wifi : null;
   const rssiRaw = status && status.rssi != null ? status.rssi : null;
@@ -967,7 +1039,7 @@ function evaluateTelemetryState(titleText, status) {
  * @returns {Array<Record<string, *>>} Array of telemetry segment descriptors.
  */
 function buildTelemetrySegments(st) {
-  const { telCfg } = st;
+  const {telCfg} = st;
   if (!telCfg.enabled) return [];
 
   const segments = [];
@@ -1078,7 +1150,7 @@ function drawTelemetryRow(canvas, segments, startX, textY, gap, buildDrawtext) {
 function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
   const boxW = 92;
   const boxH = 36;
-  const { boxX, boxY } = getCardBoxCoords(position, boxW, boxH);
+  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 18, 0.42, 0.16, blurBackdrop);
 
@@ -1100,7 +1172,7 @@ function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
  * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
  */
 function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
-  const { telCfg } = st;
+  const {telCfg} = st;
   const showBat = telCfg.enabled && telCfg.battery && st.hasBat;
   const showWifi = telCfg.enabled && telCfg.wifi && (st.hasWifi || st.hasRssi);
   const showTemp = telCfg.enabled && telCfg.temperature && st.hasTemp;
@@ -1116,7 +1188,7 @@ function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
 
   const boxW = contentW + padX * 2;
   const boxH = 44;
-  const { boxX, boxY } = getCardBoxCoords(position, boxW, boxH);
+  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
   const cy = boxY + 22;
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.44, 0.16, blurBackdrop);
@@ -1241,7 +1313,7 @@ function drawCornerDefaultCard(canvas, position, headerText, dotRgb, segments, b
   const headerContentW = 42 + headerText.length * 11 + 24;
   const boxW = Math.min(W - 48, Math.max(hasTelemetry ? 540 : 400, telContentW, headerContentW));
   const boxH = hasTelemetry ? 88 : 48;
-  const { boxX, boxY } = getCardBoxCoords(position, boxW, boxH);
+  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.58, 0.16, blurBackdrop);
   drawYuvCircle(canvas, boxX + 26, boxY + 23, 5.6, dotRgb, 0.96);
@@ -1269,19 +1341,21 @@ function prepareBackgroundCanvas(cardCfg, bgFrame) {
 
   if (hasBackground) {
     bgFrame.copy(baseCanvas);
-    const lumaEnd = W * H;
-    for (let i = 0; i < lumaEnd; i++) {
-      baseCanvas[i] = Math.max(16, ((baseCanvas[i] - 16) * 0.55 + 16.5) | 0);
-    }
-    for (let i = lumaEnd; i < FRAME; i++) {
-      baseCanvas[i] = ((baseCanvas[i] - 128) * 0.65 + 128.5) | 0;
+    if (cardCfg.dimBackground) {
+      const lumaEnd = W * H;
+      for (let i = 0; i < lumaEnd; i++) {
+        baseCanvas[i] = Math.max(16, ((baseCanvas[i] - 16) * 0.55 + 16.5) | 0);
+      }
+      for (let i = lumaEnd; i < FRAME; i++) {
+        baseCanvas[i] = ((baseCanvas[i] - 128) * 0.65 + 128.5) | 0;
+      }
     }
   } else {
     baseCanvas.fill(0x80, W * H);
     baseCanvas.fill(cardCfg.background === 'black' ? 0x10 : 0x22, 0, W * H);
   }
 
-  return { baseCanvas, hasBackground };
+  return {baseCanvas, hasBackground};
 }
 
 /**
@@ -1297,6 +1371,7 @@ function prepareBackgroundCanvas(cardCfg, bgFrame) {
  * @returns {Uint8Array} Raw YUV420p frame buffer of length FRAME.
  */
 function card(titleText, line1, line2, status, preparedBg, hasBackground) {
+  const camScope = (status && status.camName) || 'bridge';
   const cardCfg = (status && status.cardCfg) || resolveCardConfig({});
   const canvas = Buffer.allocUnsafe(FRAME);
   preparedBg.copy(canvas);
@@ -1329,6 +1404,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
   ].filter(Boolean);
   const font = fontCandidates.find((f) => fs.existsSync(f));
   if (!font) {
+    log.warn(camScope, 'no TrueType font found for default theme, falling back to vector icons card');
     drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
     return canvas;
   }
@@ -1370,7 +1446,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
     // 5. Default theme at 'center' position.
     const boxW = 820;
     const boxH = hasTelemetry ? 336 : 268;
-    const { boxX, boxY } = getCardBoxCoords('center', boxW, boxH);
+    const {boxX, boxY} = getCardBoxCoords('center', boxW, boxH);
     const modalTelFilters = drawFrigateModalGraphics(
         canvas,
         boxX,
@@ -1412,14 +1488,20 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
         'rawvideo',
         'pipe:1',
       ],
-      { input: canvas, maxBuffer: FRAME * 2 }
+      {input: canvas, maxBuffer: FRAME * 2}
   );
 
   if (r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME) {
     return r.stdout;
   }
 
-  log('could not render a text card, using a plain one:', String(r.stderr || '').trim().split('\n').pop());
+  log.warn(
+      camScope,
+      'could not render text card (' +
+      titleText +
+      '), using plain backdrop: ' +
+      String(r.stderr || '').trim().split('\n').pop()
+  );
   return canvas;
 }
 
@@ -1448,7 +1530,7 @@ function decodeJpegToYuv(filePath) {
         'rawvideo',
         'pipe:1',
       ],
-      { maxBuffer: FRAME * 2 }
+      {maxBuffer: FRAME * 2}
   );
   return r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME ? r.stdout : null;
 }
@@ -1478,18 +1560,17 @@ function loadCachedFrame(cam) {
         let lastSeen = '';
         try {
           const st = fs.statSync(file);
-          lastSeen = new Date(st.mtimeMs).toLocaleTimeString('sv-SE', {
-            hour: '2-digit',
-            minute: '2-digit',
-          });
+          lastSeen = formatLocalHm(new Date(st.mtimeMs));
         } catch (err) {
           // Ignore stat errors on cached snapshot.
         }
-        return { frame: decoded, lastSeen };
+        log.debug(cam, 'loaded cached snapshot from ' + file + (lastSeen ? ' (lastSeen=' + lastSeen + ')' : ''));
+        return {frame: decoded, lastSeen};
       }
+      log.warn(cam, 'failed to decode cached snapshot at ' + file);
     }
   }
-  return { frame: null, lastSeen: '' };
+  return {frame: null, lastSeen: ''};
 }
 
 /**
@@ -1499,8 +1580,9 @@ function loadCachedFrame(cam) {
  */
 function saveCachedFrame(cam) {
   if (!Buffer.isBuffer(cam.lastFrame) || cam.lastFrame.length !== FRAME) return;
+  const targetFile = getCacheFilePath(cam);
   try {
-    spawnSync(
+    const r = spawnSync(
         'ffmpeg',
         [
           '-hide_banner',
@@ -1519,12 +1601,20 @@ function saveCachedFrame(cam) {
           '1',
           '-q:v',
           '2',
-          getCacheFilePath(cam),
+          targetFile,
         ],
-        { input: cam.lastFrame }
+        {input: cam.lastFrame}
     );
+    if (r.status === 0) {
+      log.debug(cam, 'saved cached snapshot to ' + targetFile);
+    } else {
+      log.warn(
+          cam,
+          'failed to save cached snapshot: ' + String(r.stderr || '').trim().split('\n').pop()
+      );
+    }
   } catch (err) {
-    // Ignore transient disk write errors.
+    log.warn(cam, 'error saving cached snapshot: ' + err.message);
   }
 }
 
@@ -1555,6 +1645,7 @@ function renderCameraCards(cam) {
   const title = cam.title || cam.name;
   const lowBat = isLowBattery(cam);
   const status = {
+    camName: cam.name,
     camTitle: title,
     cardCfg: cam.cardCfg,
     telCfg: cam.telCfg,
@@ -1567,7 +1658,7 @@ function renderCameraCards(cam) {
     temp: cam.temp,
     lastSeen: cam.lastSeen,
   };
-  const { baseCanvas, hasBackground } = prepareBackgroundCanvas(cam.cardCfg, cam.lastFrame);
+  const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.cardCfg, cam.lastFrame);
   const asleepTitle = lowBat ? 'Asleep (Low Battery)' : 'Asleep';
   const asleepLine2 =
       lowBat && !LOW_BAT_WAKE_ON_VIEW
@@ -1623,6 +1714,7 @@ const cams = cfg.cameras.map((c) => {
     active: false,
     starting: false,
     startPromise: null,
+    eventActive: false,
     sessionId: 0,
     p2pReady: false,
     lastUnsolicitedStopAt: 0,
@@ -1636,6 +1728,7 @@ const cams = cfg.cameras.map((c) => {
     viewUntil: 0,
     viewSince: 0,
     reason: '',
+    wakeInitiator: '',
     sleptAt: 0,
     burstUntil: Date.now() + 2000,
     firstVideoAt: 0,
@@ -1702,12 +1795,17 @@ const inMotion = (cam) => Date.now() < cam.motionUntil;
  * consumers as ineligible to wake it until they disconnect and reconnect.
  *
  * @param {Record<string, *>} cam - Camera state object.
+ * @param {string} [clearReason=''] - Optional diagnostic context for why the viewer queue was cleared.
  */
-function clearViewerQueue(cam) {
+function clearViewerQueue(cam, clearReason = '') {
+  const hadViewers = cam.viewUntil > Date.now() || [...cam.viewerIds.values()].some(Boolean);
   cam.viewUntil = 0;
   cam.viewSince = 0;
   for (const id of cam.viewerIds.keys()) {
     cam.viewerIds.set(id, false);
+  }
+  if (hadViewers && clearReason) {
+    log.debug(cam, 'cleared pending viewer wake queue (' + clearReason + ')');
   }
 }
 
@@ -1724,6 +1822,10 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   if (!enc || !enc.stdin || !enc.stdin.writable) return;
   if (enc.stdin.writableNeedDrain) {
     if (now - cam.lastWrite > 10000) {
+      log.error(
+          cam,
+          'encoder stdin wedged for >10s (initiator=bridge-watchdog, reason=encoder_stdin_backpressure), killing encoder process'
+      );
       try {
         enc.kill('SIGKILL');
       } catch (err) {
@@ -1733,8 +1835,10 @@ function pushFrameToEncoder(cam, now = Date.now()) {
     return;
   }
 
-  const live = cam.active && cam.frame && now - cam.frameAt < 2000;
-  const frame = live ? cam.frame : cam.active ? cam.waking : now < want(cam) ? cam.busy : cam.asleep;
+  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < 2000);
+  const live = cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame)));
+  const liveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
+  const frame = live ? liveFrame : cam.active ? cam.waking : now < want(cam) ? cam.busy : cam.asleep;
   const stateChanged = frame !== cam.lastSent;
   if (stateChanged) {
     cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
@@ -1772,20 +1876,20 @@ const waiting = new Map();
 function call(commandPayload) {
   return new Promise((resolve) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return resolve({ success: false, errorCode: 'ws_closed' });
+      return resolve({success: false, errorCode: 'ws_closed'});
     }
     const id = 'b' + ++seq;
     const timer = setTimeout(() => {
-      if (waiting.delete(id)) resolve({ success: false, errorCode: 'no_reply' });
+      if (waiting.delete(id)) resolve({success: false, errorCode: 'no_reply'});
     }, 20000);
     waiting.set(id, (res) => {
       clearTimeout(timer);
       resolve(res);
     });
-    ws.send(JSON.stringify({ messageId: id, ...commandPayload }), (err) => {
+    ws.send(JSON.stringify({messageId: id, ...commandPayload}), (err) => {
       if (err && waiting.delete(id)) {
         clearTimeout(timer);
-        resolve({ success: false, errorCode: err.message });
+        resolve({success: false, errorCode: err.message});
       }
     });
   });
@@ -1820,9 +1924,9 @@ function checkStreamingQuality(cam, props) {
   const shouldUpdate = typeof ENFORCE_QUALITY === 'number' ? currentQuality !== targetQuality : currentQuality === 0;
 
   if (shouldUpdate) {
-    log(
-        cam.name +
-        ': videoStreamingQuality is ' +
+    log.info(
+        cam,
+        'videoStreamingQuality is ' +
         currentQuality +
         ' (Auto), setting to ' +
         targetQuality +
@@ -1835,7 +1939,7 @@ function checkStreamingQuality(cam, props) {
       value: targetQuality,
     }).then((res) => {
       if (!res.success) {
-        log(cam.name + ': could not set videoStreamingQuality: ' + (res.errorCode || 'unknown'));
+        log.warn(cam, 'could not set videoStreamingQuality: ' + (res.errorCode || 'unknown'));
       }
     });
   }
@@ -1861,6 +1965,9 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
   const hadInitialTelemetry = cam.battery !== null;
   const prevBattery = cam.battery;
   const prevCharging = cam.charging;
+  const prevWifi = cam.wifi;
+  const prevRssi = cam.rssi;
+  const prevTemp = cam.temp;
   const wasLowBat = isLowBattery(cam);
 
   const bat = unwrapProperty(props.battery ?? props.batteryLevel);
@@ -1913,6 +2020,13 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
   const stateChanged =
       hadInitialTelemetry &&
       (wasLowBat !== nowLowBat || prevCharging !== cam.charging || batterySwapped);
+  const minorTelemetryChanged =
+      hadInitialTelemetry &&
+      !stateChanged &&
+      (prevBattery !== cam.battery ||
+          prevWifi !== cam.wifi ||
+          prevRssi !== cam.rssi ||
+          prevTemp !== cam.temp);
 
   if (!hadInitialTelemetry && cam.battery !== null) {
     const hwInfo = model || swVer ? 'model=' + (model || 'n/a') + ', fw=' + (swVer || 'n/a') + ', ' : '';
@@ -1920,9 +2034,9 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
     const wifiVal = cam.wifi ?? 'n/a';
     const rssiVal = cam.rssi ?? 'n/a';
     const tempVal = cam.temp ?? 'n/a';
-    log(
-        cam.name +
-        ': telemetry loaded (' +
+    log.info(
+        cam,
+        'telemetry loaded (' +
         hwInfo +
         'battery=' +
         cam.battery +
@@ -1938,9 +2052,9 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
     );
   } else if (stateChanged) {
     const ecoStatus = nowLowBat ? 'entered low-battery economy mode' : 'normal mode restored';
-    log(
-        cam.name +
-        ': battery state updated (' +
+    log.info(
+        cam,
+        'battery state updated (' +
         (prevBattery ?? 'n/a') +
         '% -> ' +
         cam.battery +
@@ -1949,6 +2063,21 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
         ', ' +
         ecoStatus +
         ')'
+    );
+  } else if (minorTelemetryChanged) {
+    log.debug(
+        cam,
+        'telemetry updated (battery=' +
+        (cam.battery ?? 'n/a') +
+        '%, power=' +
+        (cam.powerLabel || 'battery') +
+        ', wifi=' +
+        (cam.wifi ?? 'n/a') +
+        '/4, rssi=' +
+        (cam.rssi ?? 'n/a') +
+        'dBm, temp=' +
+        (cam.temp ?? 'n/a') +
+        '°C)'
     );
   }
 
@@ -1970,14 +2099,17 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
 async function fetchAllCameraTelemetry(forceRefresh = false) {
   if (!wsReady) return;
   if (forceRefresh || cams.some((c) => isLowBattery(c))) {
-    await call({ command: 'driver.poll_refresh' });
+    log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
+    await call({command: 'driver.poll_refresh'});
     await sleep(2000);
   }
   for (const cam of cams) {
     if (!wsReady) return;
-    const res = await call({ command: 'device.get_properties', serialNumber: cam.serial });
+    const res = await call({command: 'device.get_properties', serialNumber: cam.serial});
     if (res.success && res.result && res.result.properties) {
       applyDeviceProperties(cam, res.result.properties, cam.battery === null);
+    } else if (!res.success) {
+      log.warn(cam, 'device.get_properties failed: ' + (res.errorCode || 'unknown'));
     }
   }
   initialTelemetryLoaded = true;
@@ -1991,25 +2123,27 @@ function connectWs() {
   if (shuttingDown) return;
   ws = new WebSocket(cfg.eufy_ws);
 
-  ws.on('open', () => log('eufy-security-ws connected'));
+  ws.on('open', () => log.info('bridge', 'eufy-security-ws connected (' + cfg.eufy_ws + ')'));
 
   ws.on('close', () => {
     wsReady = false;
     initialTelemetryLoaded = false;
     for (const [id, resolve] of waiting) {
       waiting.delete(id);
-      resolve({ success: false, errorCode: 'ws_closed' });
+      resolve({success: false, errorCode: 'ws_closed'});
     }
-    log('eufy-security-ws connection closed, retrying in 10 s');
+    log.warn('bridge', 'eufy-security-ws connection closed, retrying in 10 s');
     for (const c of cams) {
       c.motionUntil = 0;
-      clearViewerQueue(c);
-      if (c.active) stop(c, 'bridge lost eufy-security-ws');
+      clearViewerQueue(c, 'ws_closed');
+      if (c.active) {
+        stop(c, 'bridge lost eufy-security-ws connection', false, 'error/ws-disconnect');
+      }
     }
     if (!shuttingDown) setTimeout(connectWs, 10000);
   });
 
-  ws.on('error', (e) => log('eufy-security-ws error:', e.message));
+  ws.on('error', (e) => log.error('bridge', 'eufy-security-ws error: ' + e.message));
 
   ws.on('message', async (raw) => {
     let m;
@@ -2020,11 +2154,16 @@ function connectWs() {
     }
 
     if (m.type === 'version') {
-      await call({ command: 'set_api_schema', schemaVersion: Math.min(m.maxSchemaVersion, 21) });
-      const st = await call({ command: 'start_listening' });
+      const targetSchema = Math.min(m.maxSchemaVersion, 21);
+      await call({command: 'set_api_schema', schemaVersion: targetSchema});
+      const st = await call({command: 'start_listening'});
       wsReady = Boolean(st.success);
       wsReadyAt = Date.now();
-      log(wsReady ? 'listening for eufy events' : 'start_listening failed: ' + st.errorCode);
+      if (wsReady) {
+        log.info('bridge', 'listening for eufy events (apiSchema=' + targetSchema + ')');
+      } else {
+        log.error('bridge', 'start_listening failed: ' + (st.errorCode || 'unknown'));
+      }
 
       if (wsReady) {
         const devices = (st.result && st.result.state && st.result.state.devices) || [];
@@ -2048,7 +2187,11 @@ function connectWs() {
         r(m);
       }
     } else if (m.type === 'event') {
-      onEvent(m.event || {});
+      try {
+        onEvent(m.event || {});
+      } catch (err) {
+        log.error('bridge', 'unhandled error in onEvent: ' + err.message);
+      }
     }
   });
 }
@@ -2083,6 +2226,25 @@ function onEvent(e) {
     if (cam) applyDeviceProperties(cam, e.device, cam.battery === null);
     return;
   }
+  if (e.source === 'station') {
+    const stationId = e.serialNumber || 'homebase';
+    if (e.event === 'close' || e.event === 'connection error') {
+      log.warn('bridge', 'HomeBase station (' + stationId + ') P2P disconnected or restarting (' + e.event + ')');
+      for (const c of cams) {
+        c.motionUntil = 0;
+        clearViewerQueue(c, 'station_disconnected');
+        if (c.active) {
+          stop(c, 'HomeBase station P2P disconnected/restarting', false, 'error/station-disconnect');
+        }
+      }
+    } else if (e.event === 'connect') {
+      log.info('bridge', 'HomeBase station (' + stationId + ') P2P connected');
+      setTimeout(() => {
+        if (wsReady && !shuttingDown) void fetchAllCameraTelemetry();
+      }, 3000);
+    }
+    return;
+  }
 
   const cam = bySerial.get(e.serialNumber);
   if (!cam) return;
@@ -2093,8 +2255,14 @@ function onEvent(e) {
         const now = Date.now();
         if (now - cam.sleptAt > 5000 && now - cam.lastUnsolicitedStopAt > 5000) {
           cam.lastUnsolicitedStopAt = now;
-          log(cam.name + ': received video while inactive, stopping late livestream');
-          void call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+          const sleptAgo = cam.sleptAt ? Math.round((now - cam.sleptAt) / 1000) + 's' : 'never';
+          log.warn(
+              cam,
+              'received video while inactive, forcing stop of late stream (initiator=bridge, cause=eufy_unsolicited_video, sleptAgo=' +
+              sleptAgo +
+              ')'
+          );
+          void call({command: 'device.stop_livestream', serialNumber: cam.serial});
         }
         return;
       }
@@ -2105,22 +2273,63 @@ function onEvent(e) {
 
     case 'livestream started':
       if (!cam.active) {
-        log(cam.name + ': eufy livestream started after session was canceled, stopping it immediately');
-        void call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+        log.warn(
+            cam,
+            'eufy livestream started after session was already closed/canceled, forcing immediate stop (initiator=bridge, cause=eufy_late_start)'
+        );
+        void call({command: 'device.stop_livestream', serialNumber: cam.serial});
         return;
       }
       cam.p2pReady = true;
-      return log(cam.name + ': eufy livestream started');
+      return log.info(cam, 'eufy livestream started (session=' + cam.sessionId + ')');
 
-    case 'livestream stopped':
-      log(cam.name + ': eufy livestream stopped');
+    case 'livestream stopped': {
+      const now = Date.now();
+      const liveSecs = cam.startedAt ? Math.round((now - cam.startedAt) / 1000) : 0;
+      const lastVideoAgo = cam.lastVideoAt ? ((now - cam.lastVideoAt) / 1000).toFixed(1) + 's' : 'none';
       cam.p2pReady = false;
       stopDecoder(cam);
-      // Eufy ends P2P sessions after a few minutes; restart if the camera should still be live.
-      if (cam.active && Date.now() < want(cam)) {
+
+      // When Eufy/HomeBase ends an event stream according to app settings and no viewer is watching,
+      // let the camera sleep cleanly instead of forcing it to re-wake.
+      const eufyEndedEventCleanly =
+          cam.active &&
+          cam.eventActive &&
+          LET_EUFY_DECIDE_END &&
+          cam.gotVideo &&
+          now >= cam.viewUntil &&
+          (cam.motionClearedAt > cam.lastMotionAt || now - cam.firstVideoAt >= DWELL_MS);
+
+      if (eufyEndedEventCleanly) {
+        cam.motionUntil = 0;
+        stop(cam, 'eufy/camera ended event livestream', false, 'eufy/camera-event-end');
+        arbitrate();
+        return;
+      }
+
+      // Eufy/HomeBase ends P2P sessions after a few minutes or on camera sleep; restart if it should still be live.
+      if (cam.active && now < want(cam)) {
+        const remainingSecs = Math.round((want(cam) - now) / 1000);
+        log.warn(
+            cam,
+            'stream interrupted by eufy/camera (initiator=eufy/camera, reason="livestream stopped event while session active", live=' +
+            liveSecs +
+            's, gotVideo=' +
+            cam.gotVideo +
+            ', lastVideoAgo=' +
+            lastVideoAgo +
+            ', remainingHold=' +
+            remainingSecs +
+            's) - re-requesting livestream'
+        );
         void startLivestream(cam);
+      } else if (cam.active) {
+        stop(cam, 'eufy livestream stopped as hold/view timer expired', false, 'eufy/camera');
+      } else {
+        log.debug(cam, 'eufy confirmed livestream stopped (initiator=bridge/eufy)');
       }
       return;
+    }
 
     case 'property changed':
       if (
@@ -2139,7 +2348,7 @@ function onEvent(e) {
             'videoStreamingQuality',
           ].includes(e.name)
       ) {
-        applyDeviceProperties(cam, { [e.name]: e.value }, false);
+        applyDeviceProperties(cam, {[e.name]: e.value}, false);
       }
       return;
 
@@ -2148,6 +2357,7 @@ function onEvent(e) {
         // Track when Eufy reports that motion/person activity has ended for early-sleep battery conservation.
         if (e.state === false) {
           cam.motionClearedAt = Date.now();
+          log.debug(cam, 'eufy reported activity cleared (event="' + e.event + '")');
           return;
         }
         // Ignore cached state sync events during the first 5s after start_listening connects.
@@ -2158,7 +2368,7 @@ function onEvent(e) {
           const holdDuration = isLowBattery(cam) ? Math.min(HOLD_MS, LOW_BAT_HOLD_MS) : HOLD_MS;
           const personName = extractRecognizedPerson(e);
           const triggerDesc = personName ? e.event + ' (' + personName + ')' : e.event;
-          trigger(cam, triggerDesc, holdDuration, 'motion');
+          trigger(cam, triggerDesc, holdDuration, 'motion', 'eufy-event');
           frigateEvent(cam, e.event, personName);
         }
       }
@@ -2185,14 +2395,14 @@ function notifyHA(cam, extra) {
   }
   fetch(cfg.ha_webhook, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {'Content-Type': 'application/json'},
     signal: AbortSignal.timeout(5000),
     body: JSON.stringify(payload),
   })
       .then((r) => {
-        if (!r.ok) log(cam.name + ': HA webhook failed (' + r.status + ')');
+        if (!r.ok) log.warn(cam, 'HA webhook failed (HTTP ' + r.status + ')');
       })
-      .catch((err) => log(cam.name + ': HA webhook failed: ' + err.message));
+      .catch((err) => log.warn(cam, 'HA webhook failed: ' + err.message));
 }
 
 /**
@@ -2213,8 +2423,14 @@ function frigateEvent(cam, ev, personName = '') {
 
   // Upgrade "motion" to a specific label (person/car/dog) or attach face name while an event is pending.
   if (cam.evTimer || cam.evPending) {
-    if (cam.evLabel === 'motion' && label !== 'motion') cam.evLabel = label;
-    if (personName && !cam.evPerson) cam.evPerson = personName;
+    if (cam.evLabel === 'motion' && label !== 'motion') {
+      log.debug(cam, 'upgraded pending Frigate event label ("motion" -> "' + label + '")');
+      cam.evLabel = label;
+    }
+    if (personName && !cam.evPerson) {
+      log.debug(cam, 'attached recognized person "' + personName + '" to pending Frigate event');
+      cam.evPerson = personName;
+    }
     return;
   }
   if (Date.now() < (cam.evUntil || 0)) return;
@@ -2248,7 +2464,7 @@ function frigateEvent(cam, ev, personName = '') {
       const createUrl = cfg.frigate_api + '/api/events/' + cam.name + '/' + finalLabel + '/create';
       const r = await fetch(createUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {'Content-Type': 'application/json'},
         signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
           source_type: 'api',
@@ -2259,20 +2475,30 @@ function frigateEvent(cam, ev, personName = '') {
       });
       if (!r.ok) {
         const errBody = (await r.text()).slice(0, 200);
-        log(cam.name + ': Frigate event "' + finalLabel + '" failed (' + r.status + ' ' + errBody + ')');
+        log.error(cam, 'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + ' ' + errBody + ')');
         return;
       }
       const resJson = await r.json();
       const eventId = resJson.event_id;
       const personSuffix = finalPerson ? ' [person: ' + finalPerson + ']' : '';
-      const videoSuffix = noVideo ? ' (camera sent no live video, snapshot is a placeholder)' : '';
-      log(cam.name + ': Frigate event "' + finalLabel + '" created' + personSuffix + videoSuffix);
+      if (noVideo) {
+        log.warn(
+            cam,
+            'Frigate event "' +
+            finalLabel +
+            '" created' +
+            personSuffix +
+            ' (camera sent no live video, snapshot is a placeholder)'
+        );
+      } else {
+        log.info(cam, 'Frigate event "' + finalLabel + '" created' + personSuffix + ' (eventId=' + eventId + ')');
+      }
 
       await sleep(1500);
       let reviewId = '';
       try {
         const reviewUrl = cfg.frigate_api + '/api/review?cameras=' + cam.name + '&limit=5';
-        const rvRes = await fetch(reviewUrl, { signal: AbortSignal.timeout(5000) });
+        const rvRes = await fetch(reviewUrl, {signal: AbortSignal.timeout(5000)});
         const rv = rvRes.ok ? await rvRes.json() : null;
         if (Array.isArray(rv)) {
           const found = rv.find(
@@ -2283,15 +2509,18 @@ function frigateEvent(cam, ev, personName = '') {
       } catch (err) {
         // Fallback to general review page if lookup fails.
       }
-      notifyHA(cam, { event_id: eventId, review_id: reviewId, no_video: noVideo });
+      notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
-      log(cam.name + ': Frigate event failed: ' + err.message);
+      log.error(cam, 'Frigate event failed: ' + err.message);
     }
   }, 600);
 }
 
 // Test hook: "docker kill -s USR2 eufy-frigate-battery-bridge" files a "test" event on the first camera without waking it.
-process.on('SIGUSR2', () => frigateEvent(cams[0], 'test detected'));
+process.on('SIGUSR2', () => {
+  log.info(cams[0], 'received SIGUSR2 signal, triggering synthetic test event');
+  frigateEvent(cams[0], 'test detected');
+});
 
 /**
  * Checks whether Frigate currently has any active non-synthetic object detections in progress
@@ -2304,7 +2533,7 @@ async function isFrigateCameraIdle(cam) {
   if (!cfg.frigate_api) return true;
   try {
     const url = cfg.frigate_api + '/api/events?cameras=' + cam.name + '&in_progress=1&limit=10';
-    const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
+    const r = await fetch(url, {signal: AbortSignal.timeout(2500)});
     if (!r.ok) return false;
     const events = await r.json();
     if (!Array.isArray(events)) return false;
@@ -2339,8 +2568,17 @@ async function evaluateEarlySleep(cam, now) {
   if (!cam.active || !inMotion(cam) || now < cam.viewUntil) return;
 
   if (frigateIdle && Date.now() - cam.lastMotionAt >= Math.min(EARLY_SLEEP_MS, 10000)) {
+    const quietSecs = Math.round((Date.now() - cam.lastMotionAt) / 1000);
+    const initiator = clearedByEufy
+        ? 'bridge-early-sleep/eufy-cleared'
+        : 'bridge-early-sleep/quiet-timeout';
     cam.motionUntil = Date.now();
-    stop(cam, 'motion cleared early (battery saver)');
+    stop(
+        cam,
+        'motion cleared early (battery saver, quietFor=' + quietSecs + 's, frigateIdle=true)',
+        false,
+        initiator
+    );
     arbitrate();
   }
 }
@@ -2355,24 +2593,45 @@ async function evaluateEarlySleep(cam, now) {
  * @param {string} reason - Description of what triggered the wake request.
  * @param {number} ms - Duration in milliseconds to hold the camera awake.
  * @param {'motion'|'view'} kind - Type of wake trigger.
+ * @param {string} [initiator=''] - Who initiated the wake trigger ('eufy-event', 'viewer', 'bridge-probe').
  */
-function trigger(cam, reason, ms, kind) {
+function trigger(cam, reason, ms, kind, initiator = '') {
   const now = Date.now();
   if (!wsReady) return;
-  if (now >= want(cam)) cam.reason = reason;
+  const resolvedInitiator = initiator || (kind === 'motion' ? 'eufy-event' : 'viewer');
+  if (now >= want(cam)) {
+    cam.reason = reason;
+    cam.wakeInitiator = resolvedInitiator;
+  }
   if (kind === 'motion') {
-    if (!inMotion(cam) && !cam.active) cam.reason = reason;
+    if (!inMotion(cam) && !cam.active) {
+      cam.reason = reason;
+      cam.wakeInitiator = resolvedInitiator;
+    }
+    cam.eventActive = true;
     cam.motionUntil = Math.max(cam.motionUntil, now + ms);
     cam.lastMotionAt = now;
     if (cam.active) {
+      const holdSecs = Math.round((cam.motionUntil - now) / 1000);
       const ecoNote = isLowBattery(cam) ? ', low-battery eco hold ' + Math.round(ms / 1000) + 's' : '';
-      log(cam.name + ': ' + reason + ' (already live' + ecoNote + ')');
+      log.info(
+          cam,
+          'activity trigger "' +
+          reason +
+          '" (initiator=' +
+          resolvedInitiator +
+          ', already live, holdExtendedTo=' +
+          holdSecs +
+          's' +
+          ecoNote +
+          ')'
+      );
     }
   } else {
     // Only one camera can be requested by a viewer at a time; purge viewer queues on all other cameras.
     for (const other of cams) {
       if (other !== cam && (other.viewUntil > 0 || [...other.viewerIds.values()].some(Boolean))) {
-        clearViewerQueue(other);
+        clearViewerQueue(other, 'superseded by viewer on ' + cam.name);
       }
     }
     if (now >= cam.viewUntil) cam.viewSince = now;
@@ -2383,17 +2642,35 @@ function trigger(cam, reason, ms, kind) {
 
 /**
  * Arbitrates which camera gets the single HomeBase P2P livestream slot.
- * Motion beats a viewer, a newer viewer beats an older viewer, and newer motion on another
- * camera takes over once the current motion camera has streamed at least DWELL_MS of video.
- * Any viewer-only camera that is not selected to run is immediately removed from the queue
- * so it cannot wake up later after the active camera finishes.
+ * Event-triggered (motion/person/ring) streams ALWAYS take priority over viewer streams.
+ * If let_eufy_decide_event_end is enabled, active un-cleared event streams that are still
+ * receiving video are extended rather than cut off abruptly at hold_secs.
  */
 function arbitrate() {
   const now = Date.now();
   let cur = cams.find((c) => c.active);
   if (cur && now >= want(cur)) {
-    stop(cur, 'no more activity or viewers');
-    cur = null;
+    const hasNewerMotionWaiting = cams.some(
+        (c) => c !== cur && now < c.motionUntil && c.lastMotionAt > cur.lastMotionAt
+    );
+    const stillStreamingEvent =
+        cur.eventActive &&
+        LET_EUFY_DECIDE_END &&
+        !hasNewerMotionWaiting &&
+        cur.p2pReady &&
+        cur.gotVideo &&
+        now - cur.lastVideoAt < 3000 &&
+        now - cur.startedAt < MAX_MS;
+    if (stillStreamingEvent) {
+      cur.motionUntil = now + 5000;
+      log.debug(
+          cur,
+          'extending active event stream by 5s while eufy is still sending video'
+      );
+    } else {
+      stop(cur, 'hold/view timer expired, no more activity or viewers', false, 'bridge-timer');
+      cur = null;
+    }
   }
   const wanting = cams.filter((c) => !c.active && now < want(c));
   if (!wanting.length || !wsReady) return;
@@ -2405,25 +2682,48 @@ function arbitrate() {
   )[0];
 
   if (cur) {
+    const curReadyToYield =
+        (cur.gotVideo && now - cur.firstVideoAt >= DWELL_MS) ||
+        (!cur.gotVideo && now - cur.startedAt >= 8000) ||
+        (cur.motionClearedAt > cur.lastMotionAt && now - cur.startedAt >= 5000);
     const ok = inMotion(pick)
         ? !inMotion(cur) ||
-        (pick.lastMotionAt > cur.lastMotionAt && cur.gotVideo && now - cur.firstVideoAt >= DWELL_MS)
+        (pick.lastMotionAt > cur.lastMotionAt &&
+            curReadyToYield &&
+            (PREEMPT_EVENT_STREAMS || cur.motionClearedAt > cur.lastMotionAt))
         : !inMotion(cur) && pick.viewSince > cur.viewSince;
     if (!ok) {
       for (const c of wanting) {
-        if (!inMotion(c)) clearViewerQueue(c);
+        if (!inMotion(c)) {
+          clearViewerQueue(c, 'blocked by active stream on ' + cur.name);
+        } else if (!PREEMPT_EVENT_STREAMS && c.lastMotionAt > cur.lastMotionAt) {
+          c.motionUntil = 0;
+        }
         pushFrameToEncoder(c, now);
       }
       return;
     }
-    stop(cur, pick.name + ' takes over', !inMotion(pick));
+    const preemptInitiator = inMotion(pick)
+        ? !inMotion(cur)
+            ? 'bridge-arbitrator/motion-over-viewer'
+            : 'bridge-arbitrator/newer-motion'
+        : 'bridge-arbitrator/newer-viewer';
+    stop(
+        cur,
+        'preempted by ' + pick.name + ' (' + pick.reason + ')',
+        !inMotion(pick),
+        preemptInitiator
+    );
   }
 
   for (const c of wanting) {
-    if (c !== pick && !inMotion(c)) clearViewerQueue(c);
+    if (c !== pick && !inMotion(c)) {
+      clearViewerQueue(c, 'not selected by arbitrator, ' + pick.name + ' won slot');
+    }
   }
 
   pick.active = true;
+  pick.eventActive = inMotion(pick);
   pick.sessionId++;
   pick.p2pReady = false;
   pick.startedAt = now;
@@ -2433,7 +2733,17 @@ function arbitrate() {
   pick.burstUntil = now + 1500;
   pushFrameToEncoder(pick, now);
   const ecoTag = isLowBattery(pick) ? ' [low-battery economy mode]' : '';
-  log(pick.name + ': WAKE (' + pick.reason + ')' + ecoTag);
+  log.info(
+      pick,
+      'WAKE (initiator=' +
+      (pick.wakeInitiator || 'bridge') +
+      ', reason="' +
+      pick.reason +
+      '", session=' +
+      pick.sessionId +
+      ')' +
+      ecoTag
+  );
   void startLivestream(pick);
 }
 
@@ -2454,40 +2764,74 @@ async function startLivestream(cam) {
   const runStart = async () => {
     try {
       await p2pTransitionPromise;
-      if (!cam.active || cam.sessionId !== mySession) return;
+      if (!cam.active || cam.sessionId !== mySession) {
+        log.debug(
+            cam,
+            'aborted start_livestream before RPC call (initiator=bridge, reason=session_canceled_or_preempted, session=' +
+            mySession +
+            ')'
+        );
+        return;
+      }
 
       cam.p2pReady = true;
       cam.lastStartAt = Date.now();
-      let r = await call({ command: 'device.start_livestream', serialNumber: cam.serial });
+      let r = await call({command: 'device.start_livestream', serialNumber: cam.serial});
 
       // If this camera was preempted while start_livestream was waiting for the camera to wake,
       // stop the newly woken stream immediately so it does not stay live on the HomeBase.
       if (!cam.active || cam.sessionId !== mySession) {
         if (r.success) {
-          await call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+          log.info(
+              cam,
+              'stopping newly woken stream because session ' +
+              mySession +
+              ' was preempted/closed during wake (initiator=bridge)'
+          );
+          await call({command: 'device.stop_livestream', serialNumber: cam.serial});
         }
         return;
       }
 
       if (!r.success && /already_running/.test(r.errorCode || '')) {
-        log(cam.name + ': eufy-security-ws reports a stale livestream, restarting it');
+        log.warn(
+            cam,
+            'eufy-security-ws reports stale livestream (errorCode=' +
+            r.errorCode +
+            '), forcing stop and restart (initiator=bridge/eufy-ws, session=' +
+            mySession +
+            ')'
+        );
         cam.p2pReady = false;
-        await call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+        await call({command: 'device.stop_livestream', serialNumber: cam.serial});
         await sleep(1000);
         if (!cam.active || cam.sessionId !== mySession) return;
         cam.p2pReady = true;
         cam.lastStartAt = Date.now();
-        r = await call({ command: 'device.start_livestream', serialNumber: cam.serial });
+        r = await call({command: 'device.start_livestream', serialNumber: cam.serial});
         if (!cam.active || cam.sessionId !== mySession) {
           if (r.success) {
-            await call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+            log.info(
+                cam,
+                'stopping restarted stream because session ' +
+                mySession +
+                ' was preempted/closed during retry (initiator=bridge)'
+            );
+            await call({command: 'device.stop_livestream', serialNumber: cam.serial});
           }
           return;
         }
       }
 
       if (!r.success) {
-        log(cam.name + ': start_livestream failed: ' + r.errorCode);
+        log.error(
+            cam,
+            'start_livestream failed (initiator=eufy-ws, errorCode=' +
+            (r.errorCode || 'unknown') +
+            ', session=' +
+            mySession +
+            ')'
+        );
         if (cam.active && cam.sessionId === mySession) {
           cam.lastStartAt = Date.now() - 5000;
         }
@@ -2511,26 +2855,61 @@ async function startLivestream(cam) {
  * @param {Record<string, *>} cam - Camera state object.
  * @param {string} why - Reason the camera is going to sleep.
  * @param {boolean} [preemptedByViewer=false] - True if stopped because the user opened another camera.
+ * @param {string} [initiator='bridge'] - Decision maker ('bridge-timer', 'eufy/camera', 'bridge-arbitrator/...', 'error/...', etc.).
  */
-function stop(cam, why, preemptedByViewer = false) {
+function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
   if (!cam.active) return;
+  const now = Date.now();
   const inFlightStart = cam.startPromise;
   const hadVideo = cam.gotVideo;
+  const liveSecs = Math.round((now - cam.startedAt) / 1000);
+  const lastVideoAgo = cam.lastVideoAt ? ((now - cam.lastVideoAt) / 1000).toFixed(1) + 's' : 'none';
+  const restartsCount = cam.restarts;
+  const closedSession = cam.sessionId;
+
+  if (Buffer.isBuffer(cam.frame) && cam.frame.length === FRAME) {
+    cam.lastFrame = Buffer.from(cam.frame);
+  }
   cam.active = false;
   cam.starting = false;
   cam.startPromise = null;
+  cam.eventActive = false;
+  cam.motionUntil = 0;
   cam.p2pReady = false;
   cam.isStartupProbe = false;
   cam.motionClearedAt = 0;
   cam.sessionId++;
   if (hadVideo && !preemptedByViewer) {
-    cam.sleptAt = Date.now();
+    cam.sleptAt = now;
   }
-  cam.burstUntil = Date.now() + 1500;
+  cam.burstUntil = now + 1500;
   clearViewerQueue(cam);
 
-  const liveSecs = Math.round((Date.now() - cam.startedAt) / 1000);
-  log(cam.name + ': SLEEP (' + why + ') after ' + liveSecs + ' s live');
+  const sleepMsg =
+      'SLEEP (initiator=' +
+      initiator +
+      ', reason="' +
+      why +
+      '", live=' +
+      liveSecs +
+      's, gotVideo=' +
+      hadVideo +
+      ', lastVideoAgo=' +
+      lastVideoAgo +
+      ', restarts=' +
+      restartsCount +
+      ', session=' +
+      closedSession +
+      ')';
+
+  if (initiator.startsWith('error/')) {
+    log.error(cam, sleepMsg);
+  } else if (initiator === 'bridge-max-limit') {
+    log.warn(cam, sleepMsg);
+  } else {
+    log.info(cam, sleepMsg);
+  }
+
   stopDecoder(cam);
 
   // Wait for any in-flight start_livestream call to settle before sending stop_livestream,
@@ -2544,10 +2923,14 @@ function stop(cam, why, preemptedByViewer = false) {
             // Ignore errors from canceled start promise.
           }
         }
-        await call({ command: 'device.stop_livestream', serialNumber: cam.serial });
+        const res = await call({command: 'device.stop_livestream', serialNumber: cam.serial});
+        if (!res.success && res.errorCode && !/ws_closed|not_running/i.test(res.errorCode)) {
+          log.debug(cam, 'device.stop_livestream returned errorCode=' + res.errorCode);
+        }
         await sleep(400);
       })
-      .catch(() => {});
+      .catch(() => {
+      });
 
   if (cam.lastFrame) {
     saveCachedFrame(cam);
@@ -2555,7 +2938,7 @@ function stop(cam, why, preemptedByViewer = false) {
   renderCameraCards(cam);
   pushFrameToEncoder(cam);
 
-  call({ command: 'device.get_properties', serialNumber: cam.serial }).then((res) => {
+  call({command: 'device.get_properties', serialNumber: cam.serial}).then((res) => {
     if (res.success && res.result && res.result.properties) {
       applyDeviceProperties(cam, res.result.properties, false);
     }
@@ -2702,9 +3085,11 @@ function startEncoder(cam) {
   cam.lastWrite = Date.now();
   cam.burstUntil = Date.now() + 1500;
 
-  enc.on('error', (e) => log(cam.name + ': encoder error: ' + e.message));
-  enc.stdin.on('error', () => {});
-  if (AUDIO && enc.stdio[3]) enc.stdio[3].on('error', () => {});
+  enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
+  enc.stdin.on('error', () => {
+  });
+  if (AUDIO && enc.stdio[3]) enc.stdio[3].on('error', () => {
+  });
 
   let tail = '';
   enc.stderr.on('data', (d) => {
@@ -2722,9 +3107,9 @@ function startEncoder(cam) {
         /vaapi|qsv|nvenc|v4l2|hwupload|device|driver|Invalid argument|Function not implemented/i.test(tail)
     ) {
       cam.useHwaccel = false;
-      log(
-          cam.name +
-          ': hwaccel (' +
+      log.warn(
+          cam,
+          'hwaccel (' +
           hwMode +
           ') encoder failed (' +
           errSummary +
@@ -2736,14 +3121,14 @@ function startEncoder(cam) {
       return;
     }
 
-    log(cam.name + ': encoder exited (' + code + ') ' + errSummary + ' - restarting in 3 s');
+    log.error(cam, 'encoder exited (code=' + code + ') ' + errSummary + ' - restarting in 3 s');
     setTimeout(() => {
       if (!cam.enc && !shuttingDown) startEncoder(cam);
     }, 3000);
   });
 
   const codecLabel = hwMode ? 'h264_' + hwMode : 'libx264';
-  log(cam.name + ': encoder (' + codecLabel + ') publishing to go2rtc');
+  log.info(cam, 'encoder (' + codecLabel + ') publishing to go2rtc');
 }
 
 /**
@@ -2823,9 +3208,13 @@ function startDecoder(cam, codec) {
     stdio: ['pipe', 'pipe', 'pipe', AUDIO ? 'pipe' : 'ignore', AUDIO ? 'pipe' : 'ignore'],
   });
   cam.dec = dec;
-  dec.on('error', (e) => log(cam.name + ': decoder error: ' + e.message));
-  dec.stdin.on('error', () => {});
-  if (AUDIO && dec.stdio[3]) dec.stdio[3].on('error', () => {});
+  log.debug(cam, 'started FFmpeg decoder (codec=' + vfmt + ', session=' + mySession + ')');
+
+  dec.on('error', (e) => log.error(cam, 'decoder process error: ' + e.message));
+  dec.stdin.on('error', () => {
+  });
+  if (AUDIO && dec.stdio[3]) dec.stdio[3].on('error', () => {
+  });
 
   let buf = Buffer.allocUnsafe(FRAME);
   let fill = 0;
@@ -2843,23 +3232,23 @@ function startDecoder(cam, codec) {
           cam.frame = buf;
           cam.frameAt = now;
           cam.frameNew = true;
+          cam.lastFrame = Buffer.from(buf);
+          cam.needsStartupSnapshot = false;
+          cam.lastSeen = formatLocalHm(new Date(now));
           pushFrameToEncoder(cam, now);
 
-          // Only persist lastFrame once the camera's own stream has been stably decoding for >= 2s.
-          if (now - cam.firstFrameAt >= 2000) {
-            cam.lastFrame = Buffer.from(buf);
-            cam.needsStartupSnapshot = false;
-            cam.lastSeen = new Date(now).toLocaleTimeString('sv-SE', {
-              hour: '2-digit',
-              minute: '2-digit',
-            });
-            if (cam.isStartupProbe) {
-              cam.isStartupProbe = false;
-              const hasHumanViewer = [...cam.viewerIds.values()].some(Boolean);
-              if (!inMotion(cam) && !hasHumanViewer) {
-                stop(cam, 'startup snapshot captured');
-                return;
-              }
+          // For startup snapshot probes, allow 2s of video for auto-exposure to settle before stopping.
+          if (now - cam.firstFrameAt >= 2000 && cam.isStartupProbe) {
+            cam.isStartupProbe = false;
+            const hasHumanViewer = [...cam.viewerIds.values()].some(Boolean);
+            if (!inMotion(cam) && !hasHumanViewer) {
+              stop(
+                  cam,
+                  'startup snapshot captured after 2s stable video',
+                  false,
+                  'bridge-startup-probe'
+              );
+              return;
             }
           }
         }
@@ -2889,8 +3278,16 @@ function startDecoder(cam, codec) {
     if (cam.dec === dec) {
       cam.dec = null;
       if (cam.active && cam.sessionId === mySession) {
-        const lastLine = tail.trim().split('\n').pop();
-        log(cam.name + ': decoder exited (' + code + ') ' + lastLine);
+        const lastLine = tail.trim().split('\n').pop() || 'no stderr output';
+        log.warn(
+            cam,
+            'decoder exited while stream active (initiator=ffmpeg-decoder, code=' +
+            code +
+            ', session=' +
+            mySession +
+            '): ' +
+            lastLine
+        );
       }
     }
   });
@@ -2976,13 +3373,32 @@ function onVideo(cam, e) {
   // Only reset the decoder if the video codec itself changes; FFmpeg's scale filter handles
   // Eufy's dynamic P2P resolution shifts (e.g. 3840x2160 <-> 2304x1296) seamlessly in-band.
   if (cam.dec && cam.videoCodec && codec !== cam.videoCodec) {
-    log(cam.name + ': stream codec changed (' + cam.videoCodec + ' -> ' + codec + '), resetting decoder');
+    log.info(
+        cam,
+        'stream codec changed (' +
+        cam.videoCodec +
+        ' -> ' +
+        codec +
+        '), resetting decoder (initiator=camera-stream)'
+    );
     stopDecoder(cam);
   } else if (
       cam.dec &&
       ((width && cam.videoWidth && width !== cam.videoWidth) ||
           (height && cam.videoHeight && height !== cam.videoHeight))
   ) {
+    log.debug(
+        cam,
+        'stream resolution changed in-band (' +
+        cam.videoWidth +
+        'x' +
+        cam.videoHeight +
+        ' -> ' +
+        width +
+        'x' +
+        height +
+        ')'
+    );
     cam.videoWidth = width;
     cam.videoHeight = height;
   }
@@ -3003,7 +3419,20 @@ function onVideo(cam, e) {
     cam.gotVideo = true;
     cam.firstVideoAt = Date.now();
     const delaySec = ((Date.now() - cam.startedAt) / 1000).toFixed(1);
-    log(cam.name + ': first video (' + codec + ' ' + width + 'x' + height + ') ' + delaySec + ' s after the wake');
+    log.info(
+        cam,
+        'first video (' +
+        codec +
+        ' ' +
+        width +
+        'x' +
+        height +
+        ') ' +
+        delaySec +
+        ' s after wake (session=' +
+        cam.sessionId +
+        ')'
+    );
   }
 }
 
@@ -3053,11 +3482,12 @@ if (AUDIO) {
  * viewer connects so Frigate's MSE/WebRTC player renders the current frame without delay.
  */
 let isPollingViewers = false;
+
 async function pollViewers() {
   if (isPollingViewers || shuttingDown) return;
   isPollingViewers = true;
   try {
-    const activeMotionCam = cams.find((c) => c.active && inMotion(c));
+    const activeMotionCam = cams.find((c) => inMotion(c));
     const newConnections = [];
 
     for (const cam of cams) {
@@ -3081,11 +3511,23 @@ async function pollViewers() {
           cam.viewerIds.set(v.id, false);
           cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
           pushFrameToEncoder(cam, now);
-          newConnections.push({ cam, id: v.id, clientInfo: clientInfo.trim(), now });
+          newConnections.push({cam, id: v.id, clientInfo: clientInfo.trim(), now});
         }
 
-        for (const id of [...cam.viewerIds.keys()]) {
-          if (!seen.has(id)) cam.viewerIds.delete(id);
+        for (const [id, wasActiveViewer] of [...cam.viewerIds.entries()]) {
+          if (!seen.has(id)) {
+            cam.viewerIds.delete(id);
+            log.debug(
+                cam,
+                'viewer disconnected (id=' +
+                id +
+                ', wasWakingViewer=' +
+                wasActiveViewer +
+                ', remainingViewers=' +
+                viewers.length +
+                ')'
+            );
+          }
         }
         cam.viewers = viewers.length;
       } catch (err) {
@@ -3100,7 +3542,7 @@ async function pollViewers() {
     let newestViewerCam = null;
 
     for (const conn of newConnections) {
-      const { cam, id, clientInfo, now } = conn;
+      const {cam, id, clientInfo, now} = conn;
       const blockedByEco = isLowBattery(cam) && !LOW_BAT_WAKE_ON_VIEW;
       const asked =
           !isDashboardGrid &&
@@ -3115,7 +3557,7 @@ async function pollViewers() {
       }
       if (!isDashboardGrid && blockedByEco && now - cam.lastLowBatRefreshAt > 30000) {
         cam.lastLowBatRefreshAt = now;
-        log(cam.name + ': viewer connected while in low-battery mode, polling HomeBase for battery swap');
+        log.info(cam, 'viewer connected while in low-battery mode, polling HomeBase for battery swap');
         void fetchAllCameraTelemetry(true);
       }
 
@@ -3126,12 +3568,12 @@ async function pollViewers() {
               : isDashboardGrid
                   ? 'ignored, multi-camera dashboard grid view'
                   : activeMotionCam
-                      ? 'ignored, ' + activeMotionCam.name + ' is active with motion'
+                      ? 'ignored, ' + activeMotionCam.name + ' is active with motion/event'
                       : blockedByEco
                           ? 'ignored, camera is in low-battery economy mode (' + cam.battery + '%)'
-                          : 'ignored, camera just went to sleep';
+                          : 'ignored, camera just went to sleep (cooldown)';
 
-      log(cam.name + ': viewer connected (' + clientInfo + ') - ' + actionDesc);
+      log.info(cam, 'viewer connected (' + clientInfo + ') - ' + actionDesc);
     }
 
     if (newestViewerCam) {
@@ -3139,18 +3581,23 @@ async function pollViewers() {
       newestViewerCam.needsStartupSnapshot = false;
       for (const other of cams) {
         if (other !== newestViewerCam) {
-          clearViewerQueue(other);
+          clearViewerQueue(other, 'viewer switched to ' + newestViewerCam.name);
           if (other.active && !inMotion(other)) {
-            stop(other, newestViewerCam.name + ' live view opened', true);
+            stop(
+                other,
+                'preempted by live view opened on ' + newestViewerCam.name,
+                true,
+                'viewer-preempt'
+            );
           }
         }
       }
-      trigger(newestViewerCam, 'live view opened', LINGER_MS, 'view');
+      trigger(newestViewerCam, 'live view opened', LINGER_MS, 'view', 'viewer');
     } else {
       for (const cam of cams) {
         if ([...cam.viewerIds.values()].some(Boolean)) {
           cam.isStartupProbe = false;
-          trigger(cam, 'live view opened', LINGER_MS, 'view');
+          trigger(cam, 'live view opened', LINGER_MS, 'view', 'viewer');
         }
       }
     }
@@ -3158,6 +3605,7 @@ async function pollViewers() {
     isPollingViewers = false;
   }
 }
+
 setInterval(() => {
   void pollViewers();
 }, 750);
@@ -3178,7 +3626,7 @@ setInterval(() => {
     if (nextProbeCam) {
       nextProbeCam.needsStartupSnapshot = false;
       nextProbeCam.isStartupProbe = true;
-      trigger(nextProbeCam, 'startup snapshot probe', 25000, 'view');
+      trigger(nextProbeCam, 'startup snapshot probe', 25000, 'view', 'bridge-probe');
     }
   }
 
@@ -3186,23 +3634,55 @@ setInterval(() => {
     if (!cam.active) continue;
     if (now - cam.startedAt >= MAX_MS) {
       cam.motionUntil = 0;
-      stop(cam, 'reached the ' + MAX_MS / 60000 + '-minute limit');
+      stop(
+          cam,
+          'reached max_secs limit (' + Math.round(MAX_MS / 60000) + 'm)',
+          false,
+          'bridge-max-limit'
+      );
       continue;
     }
     if (!inMotion(cam) && now - Math.max(cam.startedAt, cam.motionUntil) >= VIEW_MAX_MS) {
-      stop(cam, 'viewer-only for ' + VIEW_MAX_MS / 60000 + ' minutes');
+      stop(
+          cam,
+          'reached view_max_secs limit (' + Math.round(VIEW_MAX_MS / 60000) + 'm)',
+          false,
+          'bridge-view-limit'
+      );
       continue;
     }
     void evaluateEarlySleep(cam, now);
     const quietSince = Math.max(cam.lastVideoAt, cam.lastStartAt);
     const retryAfterMs = cam.restarts === 0 ? 5500 : 8000;
     if (now - quietSince > retryAfterMs && !cam.starting) {
+      const quietSecs = ((now - quietSince) / 1000).toFixed(1);
+      const stallCause = cam.gotVideo ? 'stream_stalled_mid_session' : 'no_initial_video_after_wake';
       if (++cam.restarts > 3) {
         cam.motionUntil = 0;
-        stop(cam, 'camera is not sending video');
+        stop(
+            cam,
+            'camera stopped sending video after 3 retries (cause=' +
+            stallCause +
+            ', quietFor=' +
+            quietSecs +
+            's)',
+            false,
+            'error/watchdog-timeout'
+        );
         continue;
       }
-      log(cam.name + ': no video for ' + retryAfterMs / 1000 + ' s, asking eufy again (try ' + cam.restarts + ')');
+      log.warn(
+          cam,
+          'stream stalled (initiator=bridge-watchdog, cause=' +
+          stallCause +
+          ', quietFor=' +
+          quietSecs +
+          's, gotVideo=' +
+          cam.gotVideo +
+          ', retry=' +
+          cam.restarts +
+          '/3) - resetting decoder and re-requesting livestream from eufy'
+      );
       stopDecoder(cam);
       void startLivestream(cam);
     }
@@ -3224,9 +3704,10 @@ if (TELEMETRY_POLL_MS > 0) {
 const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
   for (const c of cams) {
     c.motionUntil = 0;
-    stop(c, 'bridge shutting down');
+    stop(c, 'bridge container shutting down', false, 'system-shutdown');
     try {
       if (c.enc) c.enc.kill('SIGTERM');
     } catch (err) {
@@ -3237,26 +3718,38 @@ const shutdown = () => {
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+process.on('uncaughtException', (err) => {
+  log.error('bridge', 'uncaught exception (service continuing): ' + (err && err.stack ? err.stack : err));
+});
+process.on('unhandledRejection', (reason) => {
+  log.error('bridge', 'unhandled promise rejection (service continuing): ' + reason);
+});
 
 const camListStr = cams.map((c) => c.name).join(', ');
 const hwDesc = ACTIVE_HWACCEL ? ACTIVE_HWACCEL + ' (' + HWACCEL_DEVICE + ')' : 'software (libx264)';
 const startMsg =
-    'eufy-frigate-battery-bridge starting: ' +
+    'eufy-frigate-battery-bridge starting: cameras=[' +
     camListStr +
-    '; cache ' +
+    '], logLevel=' +
+    ACTIVE_LOG_LEVEL_NAME +
+    ', cache=' +
     CACHE_DIR +
-    ', encoder ' +
+    ', encoder=' +
     hwDesc +
-    ', hold ' +
+    ', letEufyDecideEnd=' +
+    LET_EUFY_DECIDE_END +
+    ', dimBg=' +
+    GLOBAL_DIM_BACKGROUND +
+    ', hold=' +
     HOLD_MS / 1000 +
-    's, early sleep ' +
+    's, earlySleep=' +
     EARLY_SLEEP_MS / 1000 +
-    's, viewer linger ' +
+    's, viewerLinger=' +
     LINGER_MS / 1000 +
-    's, max ' +
+    's, max=' +
     MAX_MS / 1000 +
     's';
-log(startMsg);
+log.info('bridge', startMsg);
 
 for (const c of cams) startEncoder(c);
 connectWs();

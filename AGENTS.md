@@ -70,14 +70,19 @@ podman exec eufy-frigate-battery-bridge node -e '
 ## Configuration Reference (`config.json`)
 
 ### Required Keys
+
 - `eufy_ws`: `WebSocket` URL for `eufy-security-ws` (e.g., `ws://eufy-security-ws:3000`)
 - `go2rtc_api`: Frigate's `go2rtc` HTTP API URL (e.g., `http://frigate:1984`)
 - `rtsp_publish`: `RTSP` publish URL template containing `{name}` (e.g., `rtsp://frigate:8554/{name}`)
-- `cameras`: Array of camera objects `[{ "name", "serial", "title", "telemetry", "card_theme", "card_position", "card_background", "preserve_aspect_ratio", "startup_snapshot" }]`
+- `cameras`: Array of camera objects `[{ "name", "serial", "title", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "preserve_aspect_ratio", "startup_snapshot" }]`
 
 ### Optional Core Keys
+
 - `frigate_api`: Frigate HTTP API URL (`http://frigate:5000`) for filing external events and checking active detections
 - `ha_webhook`: Home Assistant webhook URL (receives POST on trigger start and after Frigate event creation)
+- `log_level`: Minimum log level (`"debug"`, `"info"` [default], `"warn"`, `"error"`); also configurable via `LOG_LEVEL` env var
+- `let_eufy_decide_event_end`: Allow Eufy/HomeBase to end event livestreams cleanly and extend active un-cleared event streams while video is flowing (default: `true`)
+- `preempt_event_streams`: Allow newer motion on another camera to preempt an active event stream once ready to yield (default: `true`)
 - `audio`: Enable audio passthrough (default: `true`)
 - `hold_secs`: Stay live after the last Eufy motion report (default: `60`)
 - `max_secs`: Hard cap for a single continuous live period (default: `900`)
@@ -93,13 +98,15 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `font_file`: Path to `.ttf` font (defaults to `/usr/share/fonts/Inter.ttf` from `Dockerfile`)
 
 ### Optional Card Themes, Placement, Telemetry, Doorbell, Smart Battery & Hardware Acceleration Keys
+
 - `card_theme`:
 	- `"default"` (default): Frosted-glass panel with full text (`Asleep`, `Asleep (Low Battery)`, `Waking Up...`, `Waiting`) + graphical telemetry icons. Renders the centered `820x336` modal with a color-coded status glyph when `card_position` is `"center"`, or a compact `540x88` card when `card_position` is a corner.
 	- `"icons"` (alias `"icons-only"`): Crisp vector icons inside a `44px`-high frosted-glass capsule (`44%` opacity) with zero text and no `ffmpeg` spawn (Status glyph, Battery + charging bolt, Curved Wi-Fi arcs colored by `RSSI`, Thermometer with tick marks, and `Last live` analog clock with `HH:MM` hands).
 	- `"minimal"` (alias `"dots"`): Three graduated color-coded semantic dots (`[Status]  [Battery]  [Wi-Fi]`) inside a `92x36` frosted-glass capsule (`42%` opacity) with zero text and no `ffmpeg` spawn.
 	- `"none"` (aliases `"blank"`, `"black"`, `false`): Hides the status overlay while honoring `card_background` (`"snapshot"`, `"slate"`, or `"black"`).
 - `card_position` (alias `card_corner`): `"center"` (default), `"bottom-left"`, `"bottom-right"`, `"top-left"`, or `"top-right"` (also accepts `"left-bottom"`, `"right-top"`, etc.). Applies to `"default"`, `"icons"`, and `"minimal"` themes. Can be overridden per camera.
-- `card_background`: `"snapshot"` (default dimmed last frame), `"slate"` (solid dark slate `0x22`), or `"black"`/`"none"` (pitch-black `0x10` background). Can be overridden per camera.
+- `card_background`: `"snapshot"` (default last live frame), `"slate"` (solid dark slate `0x22`), or `"black"`/`"none"` (pitch-black `0x10` background). Can be overridden per camera.
+- `card_dim_background`: `false` (default) or `true`. Controls whether `"snapshot"` backgrounds are dimmed across the entire frame behind status cards. Disabled by default so unmasked background pixels do not trigger Frigate motion detection on sleep/wake transitions. Can be overridden per camera.
 - `telemetry`: `true` (default), `false`, or object `{ "enabled": true, "battery": true, "power_source": true, "wifi": true, "rssi": true, "temperature": true, "last_seen": true }`. Can also be overridden per camera in `cameras[]`.
 - `telemetry_poll_secs`: Interval in seconds to poll `device.get_properties` (and `driver.poll_refresh` when in Low-Battery Economy Mode) so battery swaps and charging updates are detected while sleeping (default: `300`, `0` to disable).
 - `cache_dir`: Directory for storing persistent camera snapshots `last_<name>_<serial>.jpg` across container restarts (default: `/config/cache`, falls back to `/tmp`).
@@ -109,7 +116,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `preserve_aspect_ratio`: `true` (default) scales non-16:9 streams (such as 4:3 or dual-lens `T8214` doorbells) proportionally with Lanczos scaling and dark letterbox/pillarbox padding instead of stretching. Can be overridden per camera.
 - `forward_face_names`: `true` (default) forwards recognized face names from HomeBase 3 (`identity person detected`) as Frigate's `sub_label` and includes `person` in the Home Assistant webhook payload.
 - `ring_label`: Frigate event label used when a doorbell `rings` event fires (default: `'person'`).
-- `early_sleep_secs`: Shortens the motion hold window and puts the camera to sleep early once at least `min_dwell_secs` of video has been shown and `early_sleep_secs` (default: `20`, set `0` to disable) has elapsed since motion cleared with no active Frigate object detections.
+- `early_sleep_secs`: Optional battery saver that shortens the motion hold window once at least `min_dwell_secs` of video has been shown and `early_sleep_secs` (default: `0` [disabled]) has elapsed since motion cleared with no active Frigate object detections.
 - `low_battery_threshold`: Battery percentage at or below which uncharged cameras enter Low-Battery Economy Mode (default: `20`, set `0` to disable).
 - `low_battery_hold_secs`: Reduced `hold_secs` used when a camera is in Low-Battery Economy Mode (default: `20`).
 - `low_battery_wake_on_view`: Whether live-view requests are allowed to wake a camera in Low-Battery Economy Mode (default: `false`).
@@ -117,7 +124,57 @@ podman exec eufy-frigate-battery-bridge node -e '
 
 ## Architecture & Hardware Environment
 
+### Stream Lifecycle, Event Priority & Card Rendering Rules
+
+- Single P2P Stream Arbitration (`arbitrate`): Eufy HomeBase stations multiplex only one active P2P livestream at a time. Event-triggered streams (`motion`, `person`, `pet`, `ring`, etc.) always take priority over human viewer connections (`go2rtc` consumers).
+- Eufy-Controlled Event End (`let_eufy_decide_event_end`): Enabled (`true`) by default. When Eufy/HomeBase sends `livestream stopped` on an active event stream (after `min_dwell_secs` or after Eufy reports `state: false`), the bridge puts the camera to sleep cleanly (`initiator=eufy/camera-event-end`) rather than forcing a re-wake. While Eufy is still actively sending video and no newer camera motion event is waiting, the bridge extends `motionUntil` in 5s increments up to `max_secs`.
+- Event Preemption (`preempt_event_streams`): Enabled (`true`) by default. Allows a newer motion event on another camera to take over once the current camera is ready to yield (`min_dwell_secs` of video, 8s no-video timeout, or motion cleared).
+- Early Sleep (`early_sleep_secs`): Disabled (`0`) by default so Frigate's internal object tracker cannot prematurely terminate Eufy-triggered event recordings.
+- Immediate Snapshot Persistence (`lastFrame`): `cam.lastFrame` and `cam.lastSeen` update on the very first decoded keyframe of every session (the 2s settle delay applies only to `startup_snapshot` probes). While `cam.active && cam.gotVideo`, the encoder holds `cam.frame || cam.lastFrame` so preempted or stopping streams never flash the pre-stream `waking` card.
+- Background Dimming (`card_dim_background`): Disabled (`false`) by default (configurable globally and per-camera). Keeps background snapshot pixels outside the status card 100% unchanged across `Live <-> Asleep` transitions so Frigate does not record false full-frame motion when the card area is covered by a Frigate motion mask.
+- HomeBase Reboot Resilience: `onEvent` handles `source === 'station'` events (`close`, `connection error`, `connect`), cleanly stopping active streams (`initiator=error/station-disconnect`) and re-fetching telemetry on reconnect without dropping FFmpeg RTSP feeds to `go2rtc`.
+
+### Structured Logging, Priorities & Stream Initiators
+
+All log output in `bridge.js` must use `log.debug()`, `log.info()`, `log.warn()`, or `log.error()` with a camera state object (or `'bridge'` for global events) as the first argument so every line is formatted identically for Grafana Alloy / Loki ingestion:
+
+    YYYY-MM-DD HH:MM:SS [LEVEL] [camera_or_bridge] message
+
+- Timestamps: Formatted via `formatLocalTimestamp()` (`YYYY-MM-DD HH:MM:SS`) using local `Date` getters (respecting `TZ`) with zero ICU locale dependencies so Grafana Alloy's ISO-8601 regex always matches.
+- Configuration: Controlled via the `LOG_LEVEL` environment variable or `log_level` in `config.json` (`debug`, `info` [default], `warn`, `error`).
+- Key-Value Context: Lifecycle and stream interruption logs must include structured `key=value` pairs (`initiator=...`, `reason="..."`, `live=...s`, `gotVideo=...`, `lastVideoAgo=...`, `session=...`).
+
+#### Log Priority Levels
+
+| Level | Usage Guidelines |
+| :--- | :--- |
+| `ERROR` | Unrecoverable session or subsystem failures: `eufy-security-ws` socket errors, `start_listening` failures, `device.start_livestream` RPC failures, watchdog forced stream closures after 3 failed retries (`initiator=error/watchdog-timeout`), wedged FFmpeg encoder `stdin` (>10s backpressure), FFmpeg encoder/decoder spawn failures, and Frigate HTTP event creation errors. |
+| `WARN` | Recoverable interruptions, fallbacks, or abnormal terminations: unsolicited `livestream stopped` from Eufy/camera while a session is still active (`initiator=eufy/camera`), watchdog stall retries 1-3 (`initiator=bridge-watchdog`), `already_running` stale stream recovery (`initiator=bridge/eufy-ws`), late video/start events arriving after a session closed (`initiator=bridge`), hitting `max_secs` (`initiator=bridge-max-limit`), WebSocket/station disconnects (`initiator=error/ws-disconnect`, `initiator=error/station-disconnect`), hardware acceleration fallback to `libx264`, Frigate events created without live video, Home Assistant webhook failures, and invalid config/font fallbacks. |
+| `INFO` | Normal operational lifecycle: bridge startup/shutdown, `eufy-security-ws` connected/listening, HomeBase station reconnects, encoder startup, initial camera telemetry and battery economy mode transitions, `WAKE` / `SLEEP` transitions, `eufy livestream started`, first decoded keyframe timing, mid-stream codec changes (`initiator=camera-stream`), Frigate event creation, and viewer connection decisions. |
+| `DEBUG` | High-frequency or diagnostic details: routine telemetry refreshes, Eufy motion-cleared (`state=false`) signals, 5s event stream hold extensions, clean `livestream stopped` confirmations after `SLEEP`, in-band resolution changes, mid-flight `start_livestream` cancellations when preempted, viewer disconnections, viewer queue clears, and snapshot cache read/write operations. |
+
+### Stream Interruption & Lifecycle Initiators (`initiator=...`)
+
+- `eufy-event`: Woken or hold-extended by a Eufy motion/person/pet/ring event.
+- `eufy/camera-event-end`: Cleanly ended by Eufy/HomeBase when the camera finishes its event recording.
+- `eufy/camera`: Stream interrupted or stopped by Eufy/HomeBase while hold/view timer is still active.
+- `viewer`: Woken or extended by a human viewer connecting via `go2rtc`.
+- `viewer-preempt`: Active viewer-only stream stopped because a human viewer opened a different camera.
+- `bridge-probe` / `bridge-startup-probe`: Woken for initial startup snapshot capture and stopped once 2s of stable video is saved.
+- `bridge-timer`: Normal `SLEEP` when both `hold_secs` and `view_linger_secs` timers expire.
+- `bridge-early-sleep/eufy-cleared` / `bridge-early-sleep/quiet-timeout`: Closed early by optional battery saver once `min_dwell_secs` has elapsed and Frigate confirms no active tracked objects.
+- `bridge-arbitrator/motion-over-viewer` / `bridge-arbitrator/newer-motion` / `bridge-arbitrator/newer-viewer`: Active camera preempted on the single HomeBase P2P slot by a higher-priority request.
+- `bridge-max-limit` / `bridge-view-limit`: Forced `SLEEP` upon reaching `max_secs` or `view_max_secs`.
+- `bridge/eufy-ws`: Forced stop/restart when `eufy-security-ws` reports `already_running` on a stale P2P session.
+- `bridge-watchdog`: Stream stalled (`no_initial_video_after_wake` or `stream_stalled_mid_session`), triggering decoder reset and re-request (retries 1-3), or killing a wedged encoder process.
+- `error/watchdog-timeout`: Forced `SLEEP` after 3 failed watchdog retries with no video from the camera.
+- `error/ws-disconnect` / `error/station-disconnect`: Forced `SLEEP` across active cameras when `eufy-security-ws` or the HomeBase P2P connection drops.
+- `camera-stream`: Decoder reset triggered by an in-band video codec change (`H264` <-> `H265`).
+- `ffmpeg-decoder`: Unexpected FFmpeg decoder process exit while the camera session is still active.
+- `system-shutdown`: Graceful stream stop on container `SIGTERM`/`SIGINT`.
+
 ### Tested Hardware Stack
+
 - Station: Eufy HomeBase 3 (S380) (`T8030`, fw `3.8.7.4`, hw `V05`) + Video Doorbell Dual Chime (`T8023`, fw `3.3.2.2m_0.1`, hw `P0`)
 - Cameras: Eufy Video Doorbell E340 Dual (`T8214`, fw `3.2.7.2`, hw `P2`) and two eufyCam S300 (eufyCam 3C) (`T8161`, fw `3.4.3.0`, hw `P1`)
 - Host & GPU: Fedora 44 with AMD Radeon 8060S Graphics (`radeonsi`, `gfx1151`, VCN 4.0.5)
@@ -136,7 +193,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 3. Cross-Camera Residual Frame Contamination (Doorbell Showing Another Camera's View):
 - Cause 1: `eufy-security-client` caches notification thumbnails (`properties.picture`) at the HomeBase station level, frequently returning the last event picture from a different camera on the same HomeBase.
 - Cause 2: Unsynchronized `P2P` channel switching (`stop_livestream` vs. `start_livestream`) caused residual packets in the HomeBase `P2P` buffer from Camera A to be emitted after Camera B started.
-- Fix: Never decode `properties.picture`. Key cached snapshots by both name and serial (`last_<name>_<serial>.jpg`). Serialize all `P2P` handovers via `p2pTransitionPromise` (awaiting `stop_livestream` + 400ms settle delay) and only save `cam.lastFrame` after >= 2 seconds of stable decoding in the current session.
+- Fix: Never decode `properties.picture`. Key cached snapshots by both name and serial (`last_<name>_<serial>.jpg`). Serialize all `P2P` handovers via `p2pTransitionPromise` (awaiting `stop_livestream` + 400ms settle delay), update `cam.lastFrame` immediately on the first decoded keyframe of the session, and hold `cam.frame || cam.lastFrame` while `cam.active && cam.gotVideo`.
 
 4. Spontaneous Camera Wakeups, Multi-Camera Grid Wakeups & Decoder Resets:
 - Cause 1 (IPv6 / Docker Bridge Recorder Filter): The original viewer filter required `127.0.0.1` alongside `FFmpeg Frigate`.
@@ -176,3 +233,6 @@ podman exec eufy-frigate-battery-bridge node -e '
 	- [ ] Expose `/healthz` for container healthchecks and `/metrics` for Prometheus (battery %, charging state, Wi-Fi RSSI, battery temperature, wake counts by reason, total live seconds, and P2P wake latency histogram).
 - [ ] Block 4 - Parallel Python Prototype (`eufy-frigate-battery-bridge-python`):
 	- [ ] Build a separate container (`Dockerfile.python` + `bridge.py` using `asyncio`, `websockets`, `aiohttp`, and `Pillow`) to benchmark memory footprint, CPU usage, and native `Pillow` overlay rendering against the Node.js container in parallel.
+
+### Uncategorized
+- [x] Add log levels to logs. Allow to set log level via environment variable.
