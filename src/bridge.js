@@ -145,7 +145,6 @@ const MAX_MS = clampNum(cfg.max_secs, 10, 86400, 900) * 1000;
 const VIEW_MAX_MS = clampNum(cfg.view_max_secs, 10, 86400, 300) * 1000;
 const HOLD_MS = Math.min(MAX_MS, clampNum(cfg.hold_secs, 5, 86400, 60) * 1000);
 const LINGER_MS = Math.min(VIEW_MAX_MS, clampNum(cfg.view_linger_secs, 5, 86400, 20) * 1000);
-const DWELL_MS = clampNum(cfg.min_dwell_secs, 1, 3600, 15) * 1000;
 const COOLDOWN_MS = clampNum(cfg.viewer_cooldown_secs, 0, 3600, 5) * 1000;
 const EVENT_SECS = clampNum(cfg.event_secs, 1, 3600, 30);
 const SNAP_DELAY_MS = clampNum(cfg.snapshot_delay_secs, 0, 60, 3) * 1000;
@@ -177,8 +176,8 @@ const HWACCEL_DEVICE = cfg.hwaccel_device || '/dev/dri/renderD128';
 const W = clampNum(cfg.width, 320, 3840, 1280) & ~1;
 const H = clampNum(cfg.height, 240, 2160, 720) & ~1;
 const FRAME = (W * H * 3) / 2;
-const LIVE_FPS = clampNum(cfg.live_fps, 1, 60, 10);
-const IDLE_FPS = clampNum(cfg.idle_fps, 1, 30, 4);
+const LIVE_FPS = clampNum(cfg.live_fps, 1, 60, 15);
+const IDLE_FPS = clampNum(cfg.idle_fps, 1, 30, 5);
 
 // Audio configuration: 16 kHz, 16-bit signed little-endian mono PCM sent in 100 ms chunks.
 const AUDIO = cfg.audio !== false;
@@ -201,6 +200,34 @@ const LABELS = [
   ['dog', 'dog'],
   ['pet', 'dog'],
 ];
+
+// Built-in priority boosts by Eufy event type (combined with per-camera config priority).
+const EVENT_PRIORITIES = [
+  ['ring', 1000],
+  ['identity person', 300],
+  ['stranger', 200],
+  ['person', 200],
+  ['vehicle', 100],
+  ['pet', 100],
+  ['dog', 100],
+  ['crying', 50],
+  ['sound', 50],
+  ['motion', 10],
+];
+
+/**
+ * Returns the built-in priority boost for a Eufy trigger event name.
+ *
+ * @param {string} evName - Eufy event string.
+ * @returns {number} Priority boost score.
+ */
+function getEventPriority(evName) {
+  const s = String(evName || '').toLowerCase();
+  for (const [keyword, score] of EVENT_PRIORITIES) {
+    if (s.includes(keyword)) return score;
+  }
+  return 10;
+}
 
 /**
  * Returns a Promise that resolves after the specified number of milliseconds.
@@ -1705,6 +1732,8 @@ const cams = cfg.cameras.map((c) => {
 
   const cam = {
     ...c,
+    priority: clampNum(c.priority, -10000, 10000, 0),
+    eventPriority: 0,
     preserveAspect,
     cardCfg,
     telCfg: resolveTelemetryConfig(c),
@@ -1789,6 +1818,15 @@ const want = (cam) => Math.max(cam.motionUntil, cam.viewUntil);
  * @returns {boolean}
  */
 const inMotion = (cam) => Date.now() < cam.motionUntil;
+
+/**
+ * Returns the effective arbitration priority score for a camera (camera priority + active event boost).
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @returns {number}
+ */
+const getEffectivePriority = (cam) =>
+    inMotion(cam) ? cam.priority + (cam.eventPriority || 0) : cam.priority;
 
 /**
  * Clears any pending viewer wake timer on a camera and marks all of its current go2rtc
@@ -2298,7 +2336,7 @@ function onEvent(e) {
           LET_EUFY_DECIDE_END &&
           cam.gotVideo &&
           now >= cam.viewUntil &&
-          (cam.motionClearedAt > cam.lastMotionAt || now - cam.firstVideoAt >= DWELL_MS);
+          (cam.motionClearedAt > cam.lastMotionAt || now - cam.firstVideoAt >= 3000);
 
       if (eufyEndedEventCleanly) {
         cam.motionUntil = 0;
@@ -2368,7 +2406,8 @@ function onEvent(e) {
           const holdDuration = isLowBattery(cam) ? Math.min(HOLD_MS, LOW_BAT_HOLD_MS) : HOLD_MS;
           const personName = extractRecognizedPerson(e);
           const triggerDesc = personName ? e.event + ' (' + personName + ')' : e.event;
-          trigger(cam, triggerDesc, holdDuration, 'motion', 'eufy-event');
+          const evPrio = getEventPriority(e.event);
+          trigger(cam, triggerDesc, holdDuration, 'motion', 'eufy-event', evPrio);
           frigateEvent(cam, e.event, personName);
         }
       }
@@ -2556,7 +2595,7 @@ async function isFrigateCameraIdle(cam) {
  */
 async function evaluateEarlySleep(cam, now) {
   if (EARLY_SLEEP_MS <= 0 || !cam.active || !inMotion(cam) || now < cam.viewUntil) return;
-  if (!cam.gotVideo || now - cam.firstVideoAt < DWELL_MS) return;
+  if (!cam.gotVideo || now - cam.firstVideoAt < EARLY_SLEEP_MS) return;
   if (now - cam.lastEarlySleepCheckAt < 5000) return;
 
   const clearedByEufy = cam.motionClearedAt > cam.lastMotionAt && now - cam.motionClearedAt >= 5000;
@@ -2595,7 +2634,7 @@ async function evaluateEarlySleep(cam, now) {
  * @param {'motion'|'view'} kind - Type of wake trigger.
  * @param {string} [initiator=''] - Who initiated the wake trigger ('eufy-event', 'viewer', 'bridge-probe').
  */
-function trigger(cam, reason, ms, kind, initiator = '') {
+function trigger(cam, reason, ms, kind, initiator = '', evPriority = 10) {
   const now = Date.now();
   if (!wsReady) return;
   const resolvedInitiator = initiator || (kind === 'motion' ? 'eufy-event' : 'viewer');
@@ -2607,6 +2646,10 @@ function trigger(cam, reason, ms, kind, initiator = '') {
     if (!inMotion(cam) && !cam.active) {
       cam.reason = reason;
       cam.wakeInitiator = resolvedInitiator;
+      cam.eventPriority = evPriority;
+    } else if (evPriority >= (cam.eventPriority || 0)) {
+      cam.eventPriority = evPriority;
+      cam.reason = reason;
     }
     cam.eventActive = true;
     cam.motionUntil = Math.max(cam.motionUntil, now + ms);
@@ -2622,7 +2665,8 @@ function trigger(cam, reason, ms, kind, initiator = '') {
           resolvedInitiator +
           ', already live, holdExtendedTo=' +
           holdSecs +
-          's' +
+          's, priority=' +
+          getEffectivePriority(cam) +
           ecoNote +
           ')'
       );
@@ -2650,13 +2694,18 @@ function arbitrate() {
   const now = Date.now();
   let cur = cams.find((c) => c.active);
   if (cur && now >= want(cur)) {
-    const hasNewerMotionWaiting = cams.some(
-        (c) => c !== cur && now < c.motionUntil && c.lastMotionAt > cur.lastMotionAt
+    const curScore = getEffectivePriority(cur);
+    const hasUrgentMotionWaiting = cams.some(
+        (c) =>
+            c !== cur &&
+            now < c.motionUntil &&
+            (getEffectivePriority(c) > curScore ||
+                (getEffectivePriority(c) === curScore && c.lastMotionAt > cur.lastMotionAt))
     );
     const stillStreamingEvent =
         cur.eventActive &&
         LET_EUFY_DECIDE_END &&
-        !hasNewerMotionWaiting &&
+        !hasUrgentMotionWaiting &&
         cur.p2pReady &&
         cur.gotVideo &&
         now - cur.lastVideoAt < 3000 &&
@@ -2678,26 +2727,39 @@ function arbitrate() {
   const pick = wanting.sort(
       (a, b) =>
           Number(inMotion(b)) - Number(inMotion(a)) ||
-          (inMotion(a) ? b.lastMotionAt - a.lastMotionAt : b.viewSince - a.viewSince)
+          (inMotion(a)
+              ? getEffectivePriority(b) - getEffectivePriority(a) || b.lastMotionAt - a.lastMotionAt
+              : b.viewSince - a.viewSince)
   )[0];
 
   if (cur) {
-    const curReadyToYield =
-        (cur.gotVideo && now - cur.firstVideoAt >= DWELL_MS) ||
-        (!cur.gotVideo && now - cur.startedAt >= 8000) ||
-        (cur.motionClearedAt > cur.lastMotionAt && now - cur.startedAt >= 5000);
-    const ok = inMotion(pick)
-        ? !inMotion(cur) ||
-        (pick.lastMotionAt > cur.lastMotionAt &&
-            curReadyToYield &&
-            (PREEMPT_EVENT_STREAMS || cur.motionClearedAt > cur.lastMotionAt))
-        : !inMotion(cur) && pick.viewSince > cur.viewSince;
+    const pickScore = getEffectivePriority(pick);
+    const curScore = getEffectivePriority(cur);
+    const curFinishedOrStalled =
+        cur.motionClearedAt > cur.lastMotionAt || (!cur.gotVideo && now - cur.startedAt >= 8000);
+
+    let ok = false;
+    if (inMotion(pick)) {
+      if (!inMotion(cur)) {
+        ok = true;
+      } else if (pickScore > curScore) {
+        ok = true;
+      } else if (pickScore === curScore && pick.lastMotionAt > cur.lastMotionAt) {
+        ok = PREEMPT_EVENT_STREAMS || curFinishedOrStalled;
+      } else if (pickScore < curScore && curFinishedOrStalled) {
+        ok = true;
+      }
+    } else {
+      ok = !inMotion(cur) && pick.viewSince > cur.viewSince;
+    }
+
     if (!ok) {
       for (const c of wanting) {
         if (!inMotion(c)) {
           clearViewerQueue(c, 'blocked by active stream on ' + cur.name);
         } else if (!PREEMPT_EVENT_STREAMS && c.lastMotionAt > cur.lastMotionAt) {
           c.motionUntil = 0;
+          c.eventPriority = 0;
         }
         pushFrameToEncoder(c, now);
       }
@@ -2706,11 +2768,13 @@ function arbitrate() {
     const preemptInitiator = inMotion(pick)
         ? !inMotion(cur)
             ? 'bridge-arbitrator/motion-over-viewer'
-            : 'bridge-arbitrator/newer-motion'
+            : pickScore > curScore
+                ? 'bridge-arbitrator/higher-priority-event'
+                : 'bridge-arbitrator/newer-motion'
         : 'bridge-arbitrator/newer-viewer';
     stop(
         cur,
-        'preempted by ' + pick.name + ' (' + pick.reason + ')',
+        'preempted by ' + pick.name + ' (' + pick.reason + ', priority=' + pickScore + ' vs ' + curScore + ')',
         !inMotion(pick),
         preemptInitiator
     );
@@ -2739,7 +2803,9 @@ function arbitrate() {
       (pick.wakeInitiator || 'bridge') +
       ', reason="' +
       pick.reason +
-      '", session=' +
+      '", priority=' +
+      getEffectivePriority(pick) +
+      ', session=' +
       pick.sessionId +
       ')' +
       ecoTag
@@ -2875,6 +2941,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
   cam.startPromise = null;
   cam.eventActive = false;
   cam.motionUntil = 0;
+  cam.eventPriority = 0;
   cam.p2pReady = false;
   cam.isStartupProbe = false;
   cam.motionClearedAt = 0;
@@ -2927,7 +2994,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
         if (!res.success && res.errorCode && !/ws_closed|not_running/i.test(res.errorCode)) {
           log.debug(cam, 'device.stop_livestream returned errorCode=' + res.errorCode);
         }
-        await sleep(400);
+        await sleep(150);
       })
       .catch(() => {
       });
@@ -3087,6 +3154,9 @@ function startEncoder(cam) {
 
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
   enc.stdin.on('error', () => {
+  });
+  enc.stdin.on('drain', () => {
+    if (cam.frameNew) pushFrameToEncoder(cam);
   });
   if (AUDIO && enc.stdio[3]) enc.stdio[3].on('error', () => {
   });

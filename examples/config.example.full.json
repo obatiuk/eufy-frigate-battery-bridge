@@ -11,7 +11,6 @@
 	"max_secs": 900,
 	"view_linger_secs": 20,
 	"view_max_secs": 300,
-	"min_dwell_secs": 15,
 	"viewer_cooldown_secs": 5,
 	"event_secs": 30,
 	"snapshot_delay_secs": 3,
@@ -56,23 +55,26 @@
 	"hwaccel_device": "/dev/dri/renderD128",
 	"width": 1280,
 	"height": 720,
-	"live_fps": 10,
-	"idle_fps": 4,
+	"live_fps": 15,
+	"idle_fps": 5,
 	"cameras": [
 		{
 			"name": "shed",
 			"title": "Shed",
-			"serial": "T8162T0000000000"
+			"serial": "T8162T0000000000",
+			"priority": 10
 		},
 		{
 			"name": "backyard",
 			"title": "Backyard",
-			"serial": "T8162T1111111111"
+			"serial": "T8162T1111111111",
+			"priority": 50
 		},
 		{
 			"name": "front_doorbell",
 			"title": "Front Doorbell",
 			"serial": "T8214T2222222222",
+			"priority": 100,
 			"preserve_aspect_ratio": false,
 			"card_theme": "icons",
 			"card_position": "bottom-left",
