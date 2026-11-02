@@ -167,27 +167,27 @@ exits and restarts every 3 s with `"Failed reading RTSP data: End of file"`).
 
 ```yaml
 go2rtc:
-	streams:
-		shed:        # empty on purpose: the bridge publishes into it
+  streams:
+    shed: # empty on purpose: the bridge publishes into it
 cameras:
-	shed:
-		ffmpeg:
-			inputs:
-				-   path: rtsp://127.0.0.1:8554/shed
-					input_args: preset-rtsp-restream
-					roles: [ record, detect ]
-			output_args:
-				record: preset-record-generic-audio-copy   # or preset-record-generic without audio
-		detect:
-			width: 1280
-			height: 720
-			fps: 5
-		record:
-			continuous:
-				days: 0          # keep only motion/alerts/detections, not hours of "camera asleep"
-		live:
-			streams:
-				Main: shed
+  shed:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/shed
+          input_args: preset-rtsp-restream
+          roles: [record, detect]
+      output_args:
+        record: preset-record-generic-audio-copy # or preset-record-generic without audio
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    record:
+      continuous:
+        days: 0 # keep only motion/alerts/detections, not hours of "camera asleep"
+    live:
+      streams:
+        Main: shed
 ```
 
 **3. Run it:** `docker compose -f examples/docker-compose.example.yml --project-directory . up -d --build`.
