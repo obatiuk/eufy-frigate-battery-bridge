@@ -33,12 +33,14 @@ const {
 } = require('./services/eufy-client');
 const {
   initOrchestrator,
+  wakeCameraExternal,
   trigger,
   stop,
   onEvent,
   processBackfillQueue,
   startHousekeepingLoop,
 } = require('./services/stream-orchestrator');
+const {startHttpServer, stopHttpServer} = require('./services/http-server');
 
 let shuttingDown = false;
 const isShuttingDown = () => shuttingDown;
@@ -119,6 +121,7 @@ function shutdownBridge(cams) {
     return;
   }
   shuttingDown = true;
+  stopHttpServer();
   log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
 
   for (const cam of cams) {
@@ -215,6 +218,10 @@ function startServices(cams) {
   for (const cam of cams) {
     startEncoder(cam);
   }
+  startHttpServer(cams, {
+    wakeCameraExternal,
+    isShuttingDown: () => shuttingDown,
+  });
   connectWs();
   setTimeout(() => void syncFrigateMotionMasks(cams, false, shuttingDown), 2500);
 }

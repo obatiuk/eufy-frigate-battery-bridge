@@ -33,6 +33,7 @@
         ├── eufy-client.js             # eufy-security-ws WebSocket RPC client & telemetry sync
         ├── frigate-service.js         # Frigate events, auto-mask sync, idle check & viewer poll
         ├── ha-notifier.js             # Home Assistant webhook notification client
+        ├── http-server.js             # Built-in HTTP server (/api/wake/:cameras & /healthz)
         └── stream-orchestrator.js     # Per-station arbitration, RTSP/P2P wake, backfill & watchdog
 ```
 
@@ -47,6 +48,8 @@
   with `--tls-verify=false`)
 - Clean Images: `make clean` (removes local build and publish tags)
 - Print Makefile Variables: `make print-vars`
+- Check Bridge Readiness: `curl -s http://127.0.0.1:8080/healthz`
+- Trigger External Camera Pre-Wake: `curl -s -X POST http://127.0.0.1:8080/api/wake/all -H "Content-Type: application/json" -d '{"reason":"test wake","duration":30}'`
 - Trigger Test Frigate Event: `podman kill -s USR2 eufy-frigate-battery-bridge` (files a `"test"` event on the first
   camera without waking it)
 - Trigger Test Backfill Download: `podman kill -s USR1 eufy-frigate-battery-bridge` (queries HomeBase 3 and replays the
@@ -127,6 +130,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 ### Optional Core Keys
 
 - `frigate_api`: Frigate HTTP API URL (`http://frigate:5000`) for filing external events and checking active detections
+- `http_port`: Internal HTTP server port for `/api/wake/:cameras` and `/healthz` (default: `8080`, `0` to disable; also configurable via `HTTP_PORT` env var)
 - `ha_webhook`: Home Assistant webhook URL (receives POST on trigger start and after Frigate event creation)
 - `log_level`: Minimum log level (`"debug"`, `"info"` [default], `"warn"`, `"error"`); also configurable via `LOG_LEVEL`
   env var
@@ -233,29 +237,29 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
 (`domain/camera.js`, `config.js`, `logger.js`) with zero circular `require()` dependencies:
 
 ```text
-                       ┌──────────────────────┐
-                       │    src/bridge.js     │  (Composition Root & Signal Hooks)
-                       └──────────┬───────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼
-   ┌────────────────────┐ ┌───────────────┐ ┌──────────────────┐
-   │stream-orchestrator │ │frigate-service│ │   eufy-client    │  (Service Layer)
-   └─────────┬──────────┘ └───────┬───────┘ └────────┬─────────┘
-             │                    │                  │
-             ▼                    ▼                  ▼
-      ┌─────────────┐      ┌─────────────┐    ┌─────────────┐
-      │ media/*     │      │ overlay/*   │    │ ha-notifier │  (Media & Overlay Layer)
-      │ (enc / dec) │      │ (card / yuv)│    └─────────────┘
-      └──────┬──────┘      └──────┬──────┘
-             │                    │
-             └─────────┬──────────┘
-                       ▼
-          ┌─────────────────────────┐
-          │ domain/* (camera, card, │  (Domain & Foundation Layer)
-          │ telemetry, backfill)    │
-          │ config.js / logger.js   │
-          └─────────────────────────┘
+                          ┌──────────────────────┐
+                          │    src/bridge.js     │  (Composition Root & Signal Hooks)
+                          └──────────┬───────────┘
+                                     │
+        ┌───────────────────┬────────┴─────────┬────────────────┐
+        ▼                   ▼                  ▼                ▼
+┌───────────────┐ ┌────────────────────┐ ┌───────────┐ ┌──────────────────┐
+│  http-server  │ │stream-orchestrator │ │eufy-client│ │ frigate-service  │  (Service Layer)
+└───────┬───────┘ └─────────┬──────────┘ └─────┬─────┘ └────────┬─────────┘
+        │                   │                  │                │
+        │                   ▼                  ▼                ▼
+        │            ┌─────────────┐    ┌─────────────┐  ┌─────────────┐
+        │            │ media/*     │    │ overlay/*   │  │ ha-notifier │  (Media & Overlay Layer)
+        │            │ (enc / dec) │    │ (card / yuv)│  └──────┬──────┘
+        │            └──────┬──────┘    └──────┬──────┘         │
+        │                   │                  │                │
+        └───────────────────┴────────┬─────────┴────────────────┘
+                                     ▼
+                        ┌─────────────────────────┐
+                        │ domain/* (camera, card, │  (Domain & Foundation Layer)
+                        │ telemetry, backfill)    │
+                        │ config.js / logger.js   │
+                        └─────────────────────────┘
 ```
 
 ### Stream Lifecycle, Event Priority, RTSP, Backfill & Multi-Station Rules
@@ -269,7 +273,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
   the camera via `rtspStream=true` and `device.start_rtsp_livestream`, and streams them in `activeMode = 'rtsp'`
   concurrently alongside P2P cameras (`usesP2pSlot(cam) === false`). Retries RTSP connection every `750ms` during the
   wake window, re-sends `start_rtsp_livestream` at `6.5s` if needed, and queues a `60s` P2P fallback
-  (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `14s`.
+  (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `18s`.
 - Post-Event Clip Download Backfill (`backfill_downloads`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
   (`true`) by default. When a P2P camera triggers motion while its station's P2P slot is busy (or is preempted before
   capturing 5s of video), `pendingBackfill` records the event metadata. Once the P2P slot is idle for
@@ -306,6 +310,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
 - Background Dimming (`card_dim_background`): Disabled (`false`) by default (configurable globally and per-camera).
   Keeps background snapshot pixels outside the status card 100% unchanged across `Live <-> Asleep` transitions so
   Frigate does not record false full-frame motion when the card area is covered by a Frigate motion mask.
+- External HTTP Pre-Wake & Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Exposes `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe checking `isWsReady()`) and `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`). Uses the `view` hold path by default (`create_event: false`) and staggers multi-camera wakes by `2000ms` per sleeping camera to avoid HomeBase radio contention.
 - HomeBase Reboot Resilience: `onEvent` handles `source === 'station'` events (`close`, `connection error`, `connect`),
   cleanly stopping active streams on that station (`initiator=error/station-disconnect`) and re-fetching telemetry on
   reconnect without dropping FFmpeg RTSP feeds to `go2rtc`.
@@ -329,14 +334,15 @@ Alloy / Loki ingestion:
 
 | Level   | Usage Guidelines                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 |:--------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ERROR` | Unrecoverable session or subsystem failures: `eufy-security-ws` socket errors, `start_listening` failures, `device.start_livestream` RPC failures, watchdog forced stream closures after 3 failed retries (`initiator=error/watchdog-timeout`), wedged FFmpeg encoder `stdin` (>10s backpressure), FFmpeg encoder/decoder spawn failures, and Frigate HTTP event creation errors.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ERROR` | Unrecoverable session or subsystem failures: `eufy-security-ws` socket errors, `start_listening` failures, `device.start_livestream` RPC failures, watchdog forced stream closures after 3 failed retries (`initiator=error/watchdog-timeout`), wedged FFmpeg encoder `stdin` (>10s backpressure), FFmpeg encoder/decoder spawn failures, HTTP server listen errors, and Frigate HTTP event creation errors.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `WARN`  | Recoverable interruptions, fallbacks, or abnormal terminations: unsolicited `livestream stopped` from Eufy/camera while a session is still active (`initiator=eufy/camera`), RTSP wake timeout fallback to P2P, backfill download RPC/timeout failures (`initiator=error/download-failed`, `initiator=error/download-timeout`), watchdog stall retries 1-3 (`initiator=bridge-watchdog`), `already_running` stale stream recovery (`initiator=bridge/eufy-ws`), late video/start events arriving after a session closed (`initiator=bridge`), hitting `max_secs` (`initiator=bridge-max-limit`), WebSocket/station disconnects (`initiator=error/ws-disconnect`, `initiator=error/station-disconnect`), hardware acceleration fallback to `libx264`, Frigate events created without live video, Home Assistant webhook failures, and invalid config/font fallbacks. |
-| `INFO`  | Normal operational lifecycle: bridge startup/shutdown, `eufy-security-ws` connected/listening, HomeBase station reconnects, encoder startup, initial camera telemetry and RTSP URL discovery, battery economy mode transitions, `WAKE` / `WAKE [RTSP]` / `WAKE [BACKFILL DOWNLOAD]` / `SLEEP` transitions, `eufy livestream started`, first decoded keyframe timing, activity-cleared 5s countdown, mid-stream codec changes (`initiator=camera-stream`), Frigate event creation, and viewer connection decisions.                                                                                                                                                                                                                                                                                                                                                  |
+| `INFO`  | Normal operational lifecycle: bridge and HTTP server startup/shutdown, `eufy-security-ws` connected/listening, HomeBase station reconnects, encoder startup, initial camera telemetry and RTSP URL discovery, battery economy mode transitions, `WAKE` / `WAKE [RTSP]` / `WAKE [BACKFILL DOWNLOAD]` / `SLEEP` transitions, `eufy livestream started`, first decoded keyframe timing, activity-cleared 5s countdown, mid-stream codec changes (`initiator=camera-stream`), Frigate event creation, and viewer connection decisions.                                                                                                                                                                                                                                                                                                                                                  |
 | `DEBUG` | High-frequency or diagnostic details: routine telemetry refreshes, companion event deduplication, HomeBase local database queries, 750ms RTSP wake retries, clean `livestream stopped` confirmations after `SLEEP`, in-band resolution changes, mid-flight `start_livestream` cancellations when preempted, viewer disconnections, viewer queue clears, and snapshot cache read/write operations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 ### Stream Interruption & Lifecycle Initiators (`initiator=...`)
 
 - `eufy-event`: Woken or hold-extended by a Eufy motion/person/pet/ring event.
+- `api-wake`: Woken or extended via the external `POST/GET /api/wake/:cameras` HTTP endpoint.
 - `eufy/camera-event-end` / `eufy/rtsp-end` / `eufy/download-finished`: Cleanly ended by Eufy/HomeBase when the camera
   finishes its P2P event recording, RTSP stream, or post-event clip download.
 - `eufy/camera`: Stream interrupted or stopped by Eufy/HomeBase while hold/view timer is still active.
@@ -489,12 +495,13 @@ Alloy / Loki ingestion:
 - [x] Block 7 - Enterprise Modular Refactoring (`src/config.js`, `src/logger.js`, `src/domain/*` [`camera.js`,
   `status-card.js`, `telemetry.js`, `backfill-job.js`], `src/overlay/*`, `src/media/*`, `src/services/*`) & 6-Color
   Semantic Palette (`Red`, `Grey`, `Green`, `Blue`, `Yellow`, `Purple`)
+- [x] Block 8 (Step 1) - Built-In HTTP Server (`src/services/http-server.js`, `http_port`), Container Readiness `/healthz` Probe (`Dockerfile` `HEALTHCHECK`), and External Camera Pre-Wake Endpoint (`/api/wake/:cameras` & `/api/wake/all` with `2000ms` multi-camera wake staggering)
 
 ### Pending (Next Up)
 
-- [ ] Block 3 (Part 2) - Built-In Prometheus `/metrics` & `/healthz` HTTP Server (`metrics_port`):
-	- [ ] Expose `/healthz` for container healthchecks and `/metrics` for Prometheus (battery %, charging state, Wi-Fi
-	  RSSI, battery temperature, wake counts by reason, total live seconds, and P2P wake latency histogram).
+- [ ] Block 3 (Part 2) - Prometheus `/metrics` Endpoint on Built-In HTTP Server (`http_port`):
+	- [ ] Expose `/metrics` in Prometheus text format (battery %, charging state, Wi-Fi RSSI, battery temperature, wake
+	  counts by reason, total live seconds, and P2P/RTSP wake latency histogram).
 - [ ] Block 4 - Parallel Python Prototype (`eufy-frigate-battery-bridge-python`):
 	- [ ] Build a separate container (`Dockerfile.python` + `bridge.py` using `asyncio`, `websockets`, `aiohttp`, and
 	  `Pillow`) to benchmark memory footprint, CPU usage, and native `Pillow` overlay rendering against the Node.js

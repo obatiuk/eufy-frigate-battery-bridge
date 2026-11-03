@@ -339,6 +339,7 @@ const LOW_BAT_HOLD_MS = clampNum(cfg.low_battery_hold_secs, 5, 3600, 20) * 1000;
 const LOW_BAT_WAKE_ON_VIEW = Boolean(cfg.low_battery_wake_on_view ?? false);
 const ENFORCE_QUALITY = cfg.enforce_streaming_quality ?? true;
 const TELEMETRY_POLL_MS = clampNum(cfg.telemetry_poll_secs, 0, 86400, 300) * 1000;
+const HTTP_PORT = clampNum(cfg.http_port ?? process.env.HTTP_PORT, 0, 65535, 8080);
 const GLOBAL_STARTUP_SNAPSHOT = cfg.startup_snapshot !== undefined ? cfg.startup_snapshot : true;
 
 /**
@@ -547,6 +548,7 @@ module.exports = {
   LOW_BAT_WAKE_ON_VIEW,
   ENFORCE_QUALITY,
   TELEMETRY_POLL_MS,
+  HTTP_PORT,
   GLOBAL_STARTUP_SNAPSHOT,
   HWACCEL_MODE,
   HWACCEL_DEVICE,

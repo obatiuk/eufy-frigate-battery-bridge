@@ -201,6 +201,51 @@ async function evaluateEarlySleep(cam, now) {
 }
 
 /**
+ * Wakes or extends a camera stream in response to an external /api/wake HTTP request.
+ * Uses the 'view' hold path by default (matching UI viewer clicks).
+ *
+ * @param {Record<string, *>} cam - Target Camera instance.
+ * @param {{ durationMs: number, reason: string, createEvent: boolean, delayMs?: number }} opts - Wake options.
+ * @returns {{ camera: string, title: string, status: string, mode: string, hold_secs: number, delay_ms: number }}
+ */
+function wakeCameraExternal(cam, opts) {
+  const {durationMs, reason, createEvent, delayMs = 0} = opts;
+  const wasActive = cam.active;
+  cam.isStartupProbe = false;
+  cam.needsStartupSnapshot = false;
+
+  const execWake = () => {
+    if (isShuttingDownFn()) {
+      return;
+    }
+    if (createEvent) {
+      cam.motionClearedAt = 0;
+      trigger(cam, reason, durationMs, 'motion', 'api-wake', 250);
+      if (cam.active && cam.activeMode !== 'download') {
+        frigateEvent(cam, 'motion detected', '');
+      }
+    } else {
+      trigger(cam, reason, durationMs, 'view', 'api-wake');
+    }
+  };
+
+  if (delayMs > 0 && !wasActive) {
+    setTimeout(execWake, delayMs);
+  } else {
+    execWake();
+  }
+
+  return {
+    camera: cam.name,
+    title: cam.title || cam.name,
+    status: wasActive ? 'extended' : delayMs > 0 ? 'scheduled' : 'waking',
+    mode: cam.activeMode || (isRtspCapable(cam) ? 'rtsp' : 'p2p'),
+    hold_secs: Math.round(durationMs / 1000),
+    delay_ms: wasActive ? 0 : delayMs,
+  };
+}
+
+/**
  * Extends a camera's wake timer for either a motion event or an active live viewer and runs
  * stream arbitration across all cameras.
  *
@@ -208,7 +253,7 @@ async function evaluateEarlySleep(cam, now) {
  * @param {string} reason - Description of what triggered the wake request.
  * @param {number} ms - Duration in milliseconds to hold the camera awake.
  * @param {'motion'|'view'} kind - Type of wake trigger.
- * @param {string} [initiator=''] - Who initiated the wake trigger ('eufy-event', 'viewer', 'bridge-probe').
+ * @param {string} [initiator=''] - Who initiated the wake trigger ('eufy-event', 'viewer', 'bridge-probe', 'api-wake').
  * @param {number} [evPriority=10] - Event priority boost score.
  */
 function trigger(cam, reason, ms, kind, initiator = '', evPriority = 10) {
@@ -271,6 +316,17 @@ function trigger(cam, reason, ms, kind, initiator = '', evPriority = 10) {
       cam.viewSince = now;
     }
     cam.viewUntil = Math.max(cam.viewUntil, now + ms);
+    if (cam.active && resolvedInitiator === 'api-wake') {
+      const holdSecs = Math.round((want(cam) - now) / 1000);
+      log.info(
+          cam,
+          'activity trigger "' +
+          reason +
+          '" (initiator=api-wake, already live, holdExtendedTo=' +
+          holdSecs +
+          's)'
+      );
+    }
   }
   arbitrate();
 }
@@ -1217,10 +1273,10 @@ function checkRtspSessionHealth(cam, now, quietSince) {
     );
     stopDecoder(cam);
     void startRtspStream(cam);
-  } else if (!cam.gotVideo && now - cam.startedAt > 14000) {
+  } else if (!cam.gotVideo && now - cam.startedAt > 18000) {
     log.warn(
         cam,
-        'HomeBase RTSP stream yielded no video after 14s, queueing P2P fallback for 60s (session=' +
+        'HomeBase RTSP stream yielded no video after 18s, queueing P2P fallback for 60s (session=' +
         cam.sessionId +
         ')'
     );
@@ -1385,6 +1441,7 @@ module.exports = {
   canPreemptActiveStream,
   resolvePreemptInitiator,
   evaluateEarlySleep,
+  wakeCameraExternal,
   trigger,
   activateRtspCamera,
   arbitrateStationP2pSlot,

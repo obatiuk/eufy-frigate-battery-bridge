@@ -50,8 +50,11 @@ Eufy battery cameras sleep almost all the time and only stream when woken. Becau
   dashboard grid views.
 
 ```
-Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
-                                       └──► Frigate API (event)                 └──► HA webhook (optional)
+Eufy event ──► eufy-security-ws ──┐
+                                  ▼
+HA /api/wake ─────────────► bridge (:8080) ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
+                              ├──► /healthz (container readiness probe)
+                              └──► Frigate API (event) ──► HA webhook (optional)
 ```
 
 ## Enhancements in This Fork
@@ -69,6 +72,7 @@ Eufy event ──► eufy-security-ws ──► bridge ──(wake, P2P / RTSP /
 - [Structured Logging for Grafana Alloy & Loki](#structured-logging-for-grafana-alloy--loki)
 - [Minimal Multi-Stage Container Image](#minimal-multi-stage-container-image)
 - [Home Assistant Notifications](#home-assistant-notifications)
+- [HTTP API (`/api/wake` & `/healthz`)](#http-api-apiwake--healthz)
 
 ## Requirements
 
@@ -90,6 +94,7 @@ fill it in. Settings are grouped by function below:
 | `rtsp_publish` | yes      | —        | Where to publish each camera. `{name}` is replaced by the camera name. If Frigate's `go2rtc` has `rtsp.username/password` set, put them in the URL.                                                                                                                                                                                                                                                                                                  |
 | `cameras`      | yes      | —        | Array of camera objects: `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "card_show_on_live", "auto_frigate_mask", "preserve_aspect_ratio", "startup_snapshot" }]`. `name` must match the `Frigate` camera name; `title` is shown on the status card; `priority` sets the camera's base arbitration weight (default `0`). |
 | `frigate_api`  | no       | —        | Frigate's internal HTTP API (`http://frigate:5000`). Without it, no `Frigate` events are filed and early-sleep object checks are skipped.                                                                                                                                                                                                                                                                                                            |
+| `http_port`    | no       | `8080`   | Internal HTTP server port for `/api/wake/:cameras` and `/healthz` (`0` to disable, or set via the `HTTP_PORT` environment variable).                                                                                                                                                                                                                                                                                                      |
 | `ha_webhook`   | no       | —        | `Home Assistant` webhook URL (see [Home Assistant Notifications](#home-assistant-notifications))                                                                                                                                                                                                                                                                                                                                                     |
 | `log_level`    | no       | `"info"` | Minimum log severity (`"debug"`, `"info"`, `"warn"`, `"error"`). Can also be set via the `LOG_LEVEL` environment variable.                                                                                                                                                                                                                                                                                                                           |
 
@@ -98,7 +103,7 @@ fill it in. Settings are grouped by function below:
 | Key                           | Default | Meaning                                                                                                                                                                                                                                                                              |
 |-------------------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `priority` (per camera)       | `0`     | Base priority weight in `cameras[]` (`-10000` to `10000`). Combined with built-in event boosts (`rings`: `+1000`, `identity person`: `+300`, `person`: `+200`, `vehicle`/`pet`: `+100`, `sound`: `+50`, `motion`: `+10`) to decide stream takeovers with zero dwell delay.           |
-| `use_rtsp`                    | `true`  | Automatically use `HomeBase` native `RTSP` (`rtspStreamUrl`) on cameras that support `NAS / RTSP Stream` so they stream concurrently without using the `HomeBase` `P2P` slot. Queues a `60 s` `P2P` fallback if `RTSP` does not connect within `14 s`. Can be overridden per camera. |
+| `use_rtsp`                    | `true`  | Automatically use `HomeBase` native `RTSP` (`rtspStreamUrl`) on cameras that support `NAS / RTSP Stream` so they stream concurrently without using the `HomeBase` `P2P` slot. Queues a `60 s` `P2P` fallback if `RTSP` does not connect within `18 s`. Can be overridden per camera. |
 | `rtsp_url` (per camera)       | `""`    | Optional explicit `rtsp://` URL override for a camera in `cameras[]` (auto-discovered from `device.get_properties` when omitted)                                                                                                                                                     |
 | `station_serial` (per camera) | `""`    | Optional explicit station serial override in `cameras[]` (auto-discovered from `stationSerialNumber` in `device.get_properties`)                                                                                                                                                     |
 | `backfill_downloads`          | `true`  | Automatically query `HomeBase` local storage (`station.database_query_latest_info` / `station.database_query_by_date`) and replay missed event clips (`device.start_download`) at `15 fps` into `Frigate` once the station's `P2P` slot is free                                      |
@@ -275,7 +280,7 @@ combines three mechanisms:
   app (such as `eufyCam 3C` / `T8161`), the bridge automatically discovers its `rtspStreamUrl`, wakes the camera's
   `RTSP` feed via `rtspStream=true` and `device.start_rtsp_livestream`, and streams multiple `RTSP` cameras in parallel
   (`WAKE [RTSP]`) without using the `HomeBase` `P2P` slot—leaving `P2P` completely free for `P2P`-only devices like
-  video doorbells (`T8214`). If the `HomeBase` `RTSP` server does not deliver frames within `14 s`, the bridge queues a
+  video doorbells (`T8214`). If the `HomeBase` `RTSP` server does not deliver frames within `18 s`, the bridge queues a
   `60 s` `P2P` fallback through `arbitrate()`.
 - **Per-Station (`stationSerial`) Concurrent `P2P` Arbitration:** `P2P` arbitration and transition locks are scoped per
   `stationSerialNumber` rather than globally. Standalone Wi-Fi cameras/doorbells (or cameras paired to a second
@@ -411,6 +416,34 @@ With `ha_webhook` set, the bridge `POST`s `JSON` twice per Eufy event:
    page.
 
 Trigger an automation with `platform: webhook` and use `trigger.json.event_id` to tell the two apart.
+
+### HTTP API (`/api/wake` & `/healthz`)
+
+The bridge runs a lightweight built-in HTTP server on port `8080` (configurable via `http_port` in `config.json` or the `HTTP_PORT` environment variable; set to `0` to disable):
+
+- **`GET /healthz`** (or `HEAD /healthz`): Returns HTTP `200` (`{"ok":true,"ws_connected":true,"uptime_secs":...,"active_cameras":[...]}`) when the bridge is running and connected to `eufy-security-ws`, or HTTP `503` otherwise. Used by the container `HEALTHCHECK`.
+- **`POST /api/wake/:cameras`** (or `GET /api/wake/:cameras`): Pre-wakes one or more cameras before physical PIR motion occurs (for example, when a `Home Assistant` door or garage sensor opens).
+  - `:cameras` accepts a camera `name`, `serial`, slugified `title` (e.g. `front_doorbell`), a comma-separated list (`backyard,front_doorbell`), or `all` (`/api/wake/all` or `/api/wake`).
+  - Multi-camera wake requests automatically stagger sleeping cameras by `2000 ms` to prevent simultaneous `HomeBase` radio collisions.
+  - Optional `JSON` body (or query string) parameters:
+    - `duration` (number, `5`–`900`, default `hold_secs`): Seconds to keep the camera stream awake.
+    - `reason` (string, default `"external api wake"`): Reason logged on wake.
+    - `create_event` (boolean, default `false`): Whether to immediately file a synthetic `"motion"` event in `Frigate`.
+
+```bash
+# Health check
+curl -s http://127.0.0.1:8080/healthz
+
+# Pre-wake two cameras for 60s when a door opens
+curl -s -X POST "http://127.0.0.1:8080/api/wake/backyard,front_doorbell" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Backyard door opened", "duration": 60}'
+
+# Pre-wake all configured cameras for 30s
+curl -s -X POST "http://127.0.0.1:8080/api/wake/all" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Perimeter check", "duration": 30}'
+```
 
 ## Troubleshooting
 
