@@ -50,9 +50,9 @@ Eufy battery cameras sleep almost all the time and only stream when woken. Becau
   dashboard grid views.
 
 ```
-Eufy event ──► eufy-security-ws ──┐
-                                  ▼
-HA /api/wake ─────────────► bridge (:8080) ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
+Eufy event / HA WS ──► eufy-security-ws ──┐
+                                          ▼
+CLI / external /api/wake ─────────► bridge (:8080) ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
                               ├──► /healthz (container readiness probe)
                               └──► Frigate API (event) ──► HA webhook (optional)
 ```
@@ -429,7 +429,8 @@ Trigger an automation with `platform: webhook` and use `trigger.json.event_id` t
 The bridge runs a lightweight built-in HTTP server on port `8080` (configurable via `http_port` in `config.json` or the `HTTP_PORT` environment variable; set to `0` to disable):
 
 - **`GET /healthz`** (or `HEAD /healthz`): Returns HTTP `200` (`{"ok":true,"ws_connected":true,"uptime_secs":...,"active_cameras":[...]}`) when the bridge is running and connected to `eufy-security-ws`, or HTTP `503` otherwise. Used by the container `HEALTHCHECK`.
-- **`POST /api/wake/:cameras`** (or `GET /api/wake/:cameras`): Pre-wakes one or more cameras before physical PIR motion occurs (for example, when a `Home Assistant` door or garage sensor opens).
+- **Direct `eufy-security-ws` wakes vs. `/api/wake/:cameras`:** Services that already integrate with `eufy-security-ws` (such as `Home Assistant`) can start `RTSP` or `P2P` streams directly via `eufy-security-ws` without calling the HTTP API—the bridge automatically detects and adopts externally started streams (`initiator=ha-ws`) for `hold_secs` (`60 s`).
+- **`POST /api/wake/:cameras`** (or **`GET /api/wake/:cameras`**): Built-in HTTP endpoint for **CLI testing** (using the `curl` commands below) or for **external services and webhooks** that do not have direct access to `eufy-security-ws`.
   - `:cameras` accepts a camera `name`, `serial`, slugified `title` (e.g. `front_doorbell`), a comma-separated list (`backyard,front_doorbell`), or `all` (`/api/wake/all` or `/api/wake`).
   - Multi-camera and burst wake requests order `RTSP` cameras ahead of `P2P` cameras, pace sleeping camera wakes by `2500 ms` per `HomeBase` station, and coalesce duplicate sensor triggers to prevent simultaneous `HomeBase` radio collisions.
   - Optional `JSON` body (or query string) parameters:
@@ -441,10 +442,10 @@ The bridge runs a lightweight built-in HTTP server on port `8080` (configurable 
 # Health check
 curl -s http://127.0.0.1:8080/healthz
 
-# Pre-wake two cameras for 60s when a door opens
+# Test waking two cameras concurrently for 60s
 curl -s -X POST "http://127.0.0.1:8080/api/wake/backyard,front_doorbell" \
   -H "Content-Type: application/json" \
-  -d '{"reason": "Backyard door opened", "duration": 60}'
+  -d '{"reason": "Concurrent wake test", "duration": 60}'
 
 # Pre-wake all configured cameras for 30s
 curl -s -X POST "http://127.0.0.1:8080/api/wake/all" \

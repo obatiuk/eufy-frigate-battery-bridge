@@ -16,6 +16,7 @@ const {inMotion} = require('../domain/camera');
 const {pushFrameToEncoder} = require('./encoder');
 
 let stopCameraCallback = null;
+let rtspDropCallback = null;
 
 /**
  * Registers the callback used to stop a camera session once a 2-second startup snapshot probe completes.
@@ -24,6 +25,15 @@ let stopCameraCallback = null;
  */
 function setDecoderStopHandler(fn) {
   stopCameraCallback = fn;
+}
+
+/**
+ * Registers the callback invoked immediately when an active RTSP stream drops mid-session.
+ *
+ * @param {(cam: Record<string, *>, code: number|null, lastLine: string) => void} fn - RTSP drop handler.
+ */
+function setRtspDropHandler(fn) {
+  rtspDropCallback = fn;
 }
 
 /**
@@ -132,7 +142,7 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
     '-rtsp_transport',
     'tcp',
     '-timeout',
-    '5000000',
+    '2500000',
     '-i',
     rtspUrl,
     '-map',
@@ -346,8 +356,18 @@ function startRtspDecoder(cam, rtspUrl) {
           if (!cam.gotVideo) {
             cam.gotVideo = true;
             cam.firstVideoAt = now;
+            cam.rtspRewaking = false;
+            cam.restarts = 0;
             const delaySec = ((now - cam.startedAt) / 1000).toFixed(1);
             log.info(cam, 'first RTSP video ' + delaySec + ' s after wake (session=' + mySession + ')');
+          } else if (cam.rtspRewaking) {
+            cam.rtspRewaking = false;
+            cam.restarts = 0;
+            const resumeSec = ((now - (cam.rtspRewakeStartedAt || cam.lastStartAt || now)) / 1000).toFixed(1);
+            log.info(
+                cam,
+                'RTSP video resumed ' + resumeSec + ' s after mid-session re-wake (session=' + mySession + ')'
+            );
           }
           if (!cam.firstFrameAt) {
             cam.firstFrameAt = now;
@@ -383,6 +403,10 @@ function startRtspDecoder(cam, rtspUrl) {
       cam.dec = null;
       if (cam.active && cam.sessionId === mySession && cam.activeMode === 'rtsp') {
         const lastLine = tail.trim().split('\n').pop() || 'no stderr output';
+        if (cam.gotVideo && !cam.rtspRewaking && rtspDropCallback) {
+          rtspDropCallback(cam, code, lastLine);
+          return;
+        }
         log.debug(
             cam,
             'RTSP decoder exited while camera waking/streaming (code=' +
@@ -604,6 +628,7 @@ function onAudio(cam, e) {
 
 module.exports = {
   setDecoderStopHandler,
+  setRtspDropHandler,
   buildScaleFilter,
   buildP2pDecoderArgs,
   buildRtspDecoderArgs,

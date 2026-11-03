@@ -311,7 +311,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
 - Background Dimming (`card_dim_background`): Disabled (`false`) by default (configurable globally and per-camera).
   Keeps background snapshot pixels outside the status card 100% unchanged across `Live <-> Asleep` transitions so
   Frigate does not record false full-frame motion when the card area is covered by a Frigate motion mask.
-- External HTTP Pre-Wake & Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Exposes `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe checking `isWsReady()`) and `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`). Uses the `view` hold path by default (`create_event: false`), orders `RTSP` targets ahead of `P2P` targets, paces wakes by `2500ms` per station (`stationNextWakeAt`), and coalesces duplicate burst triggers (`cam.apiWakeTimer`) to avoid HomeBase radio contention.
+- External Stream Adoption (`initiator=ha-ws`) & HTTP Pre-Wake/Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Wakes initiated directly through `eufy-security-ws` (such as the `Home Assistant` `eufy_security` integration starting an `RTSP` or `P2P` stream) are automatically adopted by `onEvent` (`initiator=ha-ws`) for `HOLD_MS` (`60s`). For CLI testing or external services without direct `eufy-security-ws` access, the HTTP server exposes `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`, with `RTSP`-first ordering, `2500ms` per-station pacing, and burst coalescing) alongside `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe).
 - HomeBase Reboot Resilience: `onEvent` handles `source === 'station'` events (`close`, `connection error`, `connect`),
   cleanly stopping active streams on that station (`initiator=error/station-disconnect`) and re-fetching telemetry on
   reconnect without dropping FFmpeg RTSP feeds to `go2rtc`.
@@ -343,7 +343,8 @@ Alloy / Loki ingestion:
 ### Stream Interruption & Lifecycle Initiators (`initiator=...`)
 
 - `eufy-event`: Woken or hold-extended by a Eufy motion/person/pet/ring event.
-- `api-wake`: Woken or extended via the external `POST/GET /api/wake/:cameras` HTTP endpoint.
+- `ha-ws`: Woken externally via `eufy-security-ws` (e.g., `Home Assistant` starting an `RTSP` or `P2P` stream directly) and automatically adopted by the bridge.
+- `api-wake`: Woken or extended via the `POST/GET /api/wake/:cameras` HTTP endpoint (for CLI testing or external services without direct `eufy-security-ws` access).
 - `eufy/camera-event-end` / `eufy/rtsp-end` / `eufy/download-finished`: Cleanly ended by Eufy/HomeBase when the camera
   finishes its P2P event recording, RTSP stream, or post-event clip download.
 - `eufy/camera`: Stream interrupted or stopped by Eufy/HomeBase while hold/view timer is still active.
