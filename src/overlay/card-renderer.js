@@ -17,15 +17,30 @@ const {
   W,
   H,
   FRAME,
+  SHORT_KEYFRAME_BURST_MS,
+  MAX_FFMPEG_BUFFER_MULTIPLIER,
   LOW_BAT_WAKE_ON_VIEW,
   resolveCardConfig,
 } = require('../config');
 const {log} = require('../logger');
 const {
+  TEL_BAT_LABEL_OFFSET_X,
+  TEL_WIFI_LABEL_OFFSET_X,
   evaluateTelemetryState,
   buildTelemetrySegments,
 } = require('../domain/telemetry');
 const {
+  MINIMAL_CARD_WIDTH,
+  MINIMAL_CARD_HEIGHT,
+  ICONS_CARD_HEIGHT,
+  ICONS_CARD_PAD_X,
+  ICONS_CARD_ITEM_GAP,
+  ICONS_STATUS_WIDTH,
+  ICONS_BATTERY_WIDTH,
+  ICONS_WIFI_WIDTH,
+  ICONS_TEMP_WIDTH,
+  computeIconsCardWidth,
+  computeCornerDefaultCardDimensions,
   getCardBoxCoords,
   getCameraCardBounds,
   computeFrigateMaskPolygon,
@@ -40,6 +55,10 @@ const {
   prepareBackgroundCanvas,
   copyYuvRegion,
 } = require('./yuv-canvas');
+
+const CENTER_MODAL_WIDTH = 820;
+const CENTER_MODAL_HEIGHT_WITH_TEL = 336;
+const CENTER_MODAL_HEIGHT_NO_TEL = 268;
 
 /**
  * Draws an anti-aliased filled right-pointing play triangle centered at (cx, cy).
@@ -214,11 +233,11 @@ function drawTelemetryRow(canvas, segments, startX, textY, gap, buildDrawtext) {
     switch (seg.type) {
       case 'bat':
         drawBatteryIcon(canvas, cursorX, textY - 1, seg.batPct, seg.batRgb, seg.batRgb, Boolean(seg.showBolt));
-        filters.push(buildDrawtext(seg.label, seg.batHex, 20, String(cursorX + 45), textY));
+        filters.push(buildDrawtext(seg.label, seg.batHex, 20, String(cursorX + TEL_BAT_LABEL_OFFSET_X), textY));
         break;
       case 'wifi':
         drawWifiArcsIcon(canvas, cursorX + 16, textBaselineY - 1, seg.wifiBars, seg.wifiRgb);
-        filters.push(buildDrawtext(seg.label, '0xd4d4d8', 20, String(cursorX + 38), textY));
+        filters.push(buildDrawtext(seg.label, '0xd4d4d8', 20, String(cursorX + TEL_WIFI_LABEL_OFFSET_X), textY));
         break;
       case 'temp':
         filters.push(buildDrawtext(seg.label, seg.tempHex, 20, String(cursorX), textY));
@@ -244,8 +263,8 @@ function drawTelemetryRow(canvas, segments, startX, textY, gap, buildDrawtext) {
  * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
  */
 function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
-  const boxW = 92;
-  const boxH = 36;
+  const boxW = MINIMAL_CARD_WIDTH;
+  const boxH = MINIMAL_CARD_HEIGHT;
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 18, 0.42, 0.16, blurBackdrop);
@@ -339,39 +358,31 @@ function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
   const showTemp = telCfg.enabled && telCfg.temperature && st.hasTemp;
   const showClock = telCfg.enabled && telCfg.lastSeen && Boolean(st.seenVal);
 
-  const padX = 16;
-  const gap = 16;
-  let contentW = 20;
-  if (showBat) contentW += gap + 37;
-  if (showWifi) contentW += gap + 28;
-  if (showTemp) contentW += gap + 16;
-  if (showClock) contentW += gap + 20;
-
-  const boxW = contentW + padX * 2;
-  const boxH = 44;
+  const boxW = computeIconsCardWidth({showBat, showWifi, showTemp, showClock});
+  const boxH = ICONS_CARD_HEIGHT;
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
   const cy = boxY + 22;
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.44, 0.16, blurBackdrop);
 
-  let cursorX = boxX + padX;
+  let cursorX = boxX + ICONS_CARD_PAD_X;
   drawStatusGlyph(canvas, cursorX + 10, cy, 1.0, st);
-  cursorX += 20 + gap;
+  cursorX += ICONS_STATUS_WIDTH + ICONS_CARD_ITEM_GAP;
 
   if (showBat) {
     const showBolt = Boolean(telCfg.powerSource && (st.charging || st.powerLabel));
     drawBatteryIcon(canvas, cursorX, cy - 8, st.batPct, st.batRgb, st.batRgb, showBolt);
-    cursorX += 37 + gap;
+    cursorX += ICONS_BATTERY_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showWifi) {
     drawWifiArcsIcon(canvas, cursorX + 14, cy + 7, st.wifiBars, st.wifiRgb);
-    cursorX += 28 + gap;
+    cursorX += ICONS_WIFI_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showTemp) {
     drawThermometerIcon(canvas, cursorX, cy, st);
-    cursorX += 16 + gap;
+    cursorX += ICONS_TEMP_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showClock) {
@@ -423,14 +434,7 @@ function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, 
  * @returns {string[]} Array of FFmpeg drawtext filter strings for the corner card.
  */
 function drawCornerDefaultCard(canvas, position, headerText, dotRgb, segments, buildDrawtext, blurBackdrop = true) {
-  const hasTelemetry = segments.length > 0;
-  const gap = 18;
-  const telContentW = hasTelemetry
-      ? segments.reduce((sum, s) => sum + s.width, 0) + gap * Math.max(0, segments.length - 1) + 44
-      : 0;
-  const headerContentW = 42 + headerText.length * 11 + 24;
-  const boxW = Math.min(W - 48, Math.max(hasTelemetry ? 540 : 400, telContentW, headerContentW));
-  const boxH = hasTelemetry ? 88 : 48;
+  const {boxW, boxH, hasTelemetry, gap} = computeCornerDefaultCardDimensions(headerText, segments);
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.58, 0.16, blurBackdrop);
@@ -536,8 +540,8 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
         )
     );
   } else {
-    const boxW = 820;
-    const boxH = hasTelemetry ? 336 : 268;
+    const boxW = CENTER_MODAL_WIDTH;
+    const boxH = hasTelemetry ? CENTER_MODAL_HEIGHT_WITH_TEL : CENTER_MODAL_HEIGHT_NO_TEL;
     const {boxX, boxY} = getCardBoxCoords('center', boxW, boxH);
     const modalTelFilters = drawFrigateModalGraphics(
         canvas,
@@ -580,7 +584,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
         'rawvideo',
         'pipe:1',
       ],
-      {input: canvas, maxBuffer: FRAME * 2}
+      {input: canvas, maxBuffer: FRAME * MAX_FFMPEG_BUFFER_MULTIPLIER}
   );
 
   if (r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME) {
@@ -646,7 +650,7 @@ function renderCameraCards(cam) {
   } else {
     cam.card.liveCard = null;
   }
-  cam.burstUntil = Date.now() + 1200;
+  cam.burstUntil = Date.now() + SHORT_KEYFRAME_BURST_MS;
 }
 
 /**

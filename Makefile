@@ -7,7 +7,7 @@ SHELL := /bin/bash
 
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 PROJECT_ROOT := $(abspath $(dir $(MKFILE_PATH)))
-SRC_FILE := $(PROJECT_ROOT)/src/bridge.js
+SRC_FILE := $(PROJECT_ROOT)/src/app.js
 
 DOCKER ?= /usr/bin/podman
 TLS_VERIFY ?= false

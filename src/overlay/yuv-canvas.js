@@ -11,6 +11,16 @@
 
 const {W, H, FRAME} = require('../config');
 
+const FROSTED_BLUR_PASSES = 3;
+const FROSTED_LUMA_BLUR_RADIUS = 12;
+const FROSTED_CHROMA_BLUR_RADIUS = 6;
+const ROUNDED_BOX_BLUR_PAD_PX = 28;
+const DIM_LUMA_FACTOR = 0.55;
+const DIM_CHROMA_FACTOR = 0.65;
+const BLACK_BG_LUMA = 0x10;
+const SLATE_BG_LUMA = 0x22;
+const NEUTRAL_CHROMA = 0x80;
+
 // Reusable scratch buffer for separable box-blur passes to avoid per-render heap allocations.
 let blurScratch = Buffer.allocUnsafe(0);
 
@@ -239,10 +249,10 @@ function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
     canvas.copy(regionBuf, lumaSize + chromaSize + cy * cw, srcV, srcV + cw);
   }
 
-  for (let pass = 0; pass < 3; pass++) {
-    boxBlurPlane(regionBuf, 0, rw, rh, 12);
-    boxBlurPlane(regionBuf, lumaSize, cw, ch, 6);
-    boxBlurPlane(regionBuf, lumaSize + chromaSize, cw, ch, 6);
+  for (let pass = 0; pass < FROSTED_BLUR_PASSES; pass++) {
+    boxBlurPlane(regionBuf, 0, rw, rh, FROSTED_LUMA_BLUR_RADIUS);
+    boxBlurPlane(regionBuf, lumaSize, cw, ch, FROSTED_CHROMA_BLUR_RADIUS);
+    boxBlurPlane(regionBuf, lumaSize + chromaSize, cw, ch, FROSTED_CHROMA_BLUR_RADIUS);
   }
 
   return {buf: regionBuf, lumaSize, chromaSize, cw};
@@ -293,7 +303,7 @@ function blendBlurredBackdropPixel(canvas, gx, gy, rx0, ry0, rw, blurred, cov) {
  * @param {boolean} [blurBackdrop=true] - Whether to run a frosted-glass blur on the underlying pixels.
  */
 function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderOpacity = 0.16, blurBackdrop = true) {
-  const pad = 28;
+  const pad = ROUNDED_BOX_BLUR_PAD_PX;
   const rx0 = Math.max(0, (boxX - pad) & ~1);
   const ry0 = Math.max(0, (boxY - pad) & ~1);
   const rx1 = Math.min(W, (boxX + boxW + pad + 1) & ~1);
@@ -336,35 +346,6 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
 }
 
 /**
- * Computes the top-left (boxX, boxY) coordinates for a card of size (boxW, boxH)
- * based on the configured card_position ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
- *
- * @param {string} position - Normalized position string.
- * @param {number} boxW - Card width in pixels.
- * @param {number} boxH - Card height in pixels.
- * @returns {{ boxX: number, boxY: number }}
- */
-function getCardBoxCoords(position, boxW, boxH) {
-  const margin = 24;
-  switch (position) {
-    case 'top-left':
-      return {boxX: margin, boxY: margin};
-    case 'top-right':
-      return {boxX: W - boxW - margin, boxY: margin};
-    case 'bottom-left':
-      return {boxX: margin, boxY: H - boxH - margin};
-    case 'bottom-right':
-      return {boxX: W - boxW - margin, boxY: H - boxH - margin};
-    case 'center':
-    default:
-      return {
-        boxX: Math.round((W - boxW) / 2),
-        boxY: Math.round((H - boxH) / 2),
-      };
-  }
-}
-
-/**
  * Prepares the base YUV420p background canvas once per renderCameraCards() cycle so it can be
  * shared across the asleep, waking, and busy cards without repeating full-frame pixel loops.
  *
@@ -382,15 +363,15 @@ function prepareBackgroundCanvas(cardCfg, bgFrame) {
     if (cardCfg.dimBackground) {
       const lumaEnd = W * H;
       for (let i = 0; i < lumaEnd; i++) {
-        baseCanvas[i] = Math.max(16, ((baseCanvas[i] - 16) * 0.55 + 16.5) | 0);
+        baseCanvas[i] = Math.max(BLACK_BG_LUMA, ((baseCanvas[i] - BLACK_BG_LUMA) * DIM_LUMA_FACTOR + 16.5) | 0);
       }
       for (let i = lumaEnd; i < FRAME; i++) {
-        baseCanvas[i] = ((baseCanvas[i] - 128) * 0.65 + 128.5) | 0;
+        baseCanvas[i] = ((baseCanvas[i] - NEUTRAL_CHROMA) * DIM_CHROMA_FACTOR + 128.5) | 0;
       }
     }
   } else {
-    baseCanvas.fill(0x80, W * H);
-    baseCanvas.fill(cardCfg.background === 'black' ? 0x10 : 0x22, 0, W * H);
+    baseCanvas.fill(NEUTRAL_CHROMA, W * H);
+    baseCanvas.fill(cardCfg.background === 'black' ? BLACK_BG_LUMA : SLATE_BG_LUMA, 0, W * H);
   }
 
   return {baseCanvas, hasBackground};
@@ -444,7 +425,6 @@ module.exports = {
   extractBlurredRegion,
   blendBlurredBackdropPixel,
   drawRoundedBox,
-  getCardBoxCoords,
   prepareBackgroundCanvas,
   copyYuvRegion,
 };

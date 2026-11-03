@@ -11,6 +11,8 @@
 const {cfg} = require('../config');
 const {log} = require('../logger');
 
+const HA_WEBHOOK_TIMEOUT_MS = 5000;
+
 /**
  * Builds the JSON payload sent to the Home Assistant webhook.
  *
@@ -46,7 +48,7 @@ function notifyHA(cam, extra = {}) {
   fetch(cfg.ha_webhook, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(HA_WEBHOOK_TIMEOUT_MS),
     body: JSON.stringify(payload),
   })
       .then((r) => {

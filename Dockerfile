@@ -34,4 +34,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO- http://127.0.0.1:${HTTP_PORT:-8080}/healthz >/dev/null || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "bridge.js"]
+CMD ["node", "app.js"]

@@ -6,7 +6,7 @@
  *
  * Telemetry domain model encapsulating camera sensor readings (battery, charging,
  * power source, Wi-Fi bars, RSSI, temperature, lastSeen), Eufy property parsing,
- * low-battery economy rules, and 4-color semantic visual evaluation.
+ * low-battery economy rules, and 6-color semantic visual evaluation.
  */
 'use strict';
 
@@ -21,6 +21,20 @@ const {
   COLOR_PURPLE,
   resolveTelemetryConfig,
 } = require('../config');
+
+const RSSI_STRONG_DBM = -65;
+const RSSI_GOOD_DBM = -72;
+const RSSI_FAIR_DBM = -80;
+const DEFAULT_LOW_BAT_CUTOFF_PCT = 20;
+const HEALTHY_BAT_THRESHOLD_PCT = 50;
+const BATTERY_SWAP_DELTA_PCT = 10;
+const TEMP_COLD_MAX_C = 5;
+const TEMP_NORMAL_MAX_C = 35;
+const TEMP_WARM_MAX_C = 45;
+const TEL_BAT_LABEL_OFFSET_X = 45;
+const TEL_WIFI_LABEL_OFFSET_X = 38;
+const TEL_TEXT_CHAR_WIDTH = 11;
+const TEL_TEMP_CHAR_WIDTH = 12;
 
 /**
  * Unwraps a property value returned by eufy-security-ws, handling both direct values
@@ -99,24 +113,13 @@ function parseChargingState(chgStatus, chgBool, pwrSrc, prevCharging = false, pr
  * @returns {number}
  */
 function rssiToWifiSignalLevel(dbm) {
-  if (dbm >= -65) return 4;
-  if (dbm >= -72) return 3;
-  if (dbm >= -80) return 2;
+  if (dbm >= RSSI_STRONG_DBM) return 4;
+  if (dbm >= RSSI_GOOD_DBM) return 3;
+  if (dbm >= RSSI_FAIR_DBM) return 2;
   return 1;
 }
 
-/**
- * Converts an RSSI value (dBm) into a 1..4 semantic bar count for overlay rendering.
- *
- * @param {number} rssiNum - RSSI in dBm.
- * @returns {number}
- */
-function rssiToBars(rssiNum) {
-  if (rssiNum >= -65) return 4;
-  if (rssiNum >= -72) return 3;
-  if (rssiNum >= -80) return 2;
-  return 1;
-}
+const rssiToBars = rssiToWifiSignalLevel;
 
 /**
  * Resolves the status kind and RGB color for a card title ('Live', 'Waking Up...', 'Waiting', 'Asleep').
@@ -149,7 +152,7 @@ function resolveStatusVisual(titleText, economyMode) {
  * @returns {{ hasBat: boolean, batPct: number, batRgb: number[], batHex: string }}
  */
 function resolveBatteryVisual(batRaw, charging) {
-  const redBatCutoff = LOW_BAT_THRESHOLD > 0 ? LOW_BAT_THRESHOLD : 20;
+  const redBatCutoff = LOW_BAT_THRESHOLD > 0 ? LOW_BAT_THRESHOLD : DEFAULT_LOW_BAT_CUTOFF_PCT;
   const hasBat = batRaw != null && !Number.isNaN(Number(batRaw));
   const batPct = hasBat ? clampNum(Math.round(Number(batRaw)), 0, 100, 0) : 0;
 
@@ -159,7 +162,7 @@ function resolveBatteryVisual(batRaw, charging) {
   if (!hasBat || batPct <= redBatCutoff) {
     return {hasBat, batPct, batRgb: COLOR_PURPLE, batHex: '0xe879f9'};
   }
-  if (batPct >= 50) {
+  if (batPct >= HEALTHY_BAT_THRESHOLD_PCT) {
     return {hasBat, batPct, batRgb: COLOR_GREEN, batHex: '0x4ade80'};
   }
   return {hasBat, batPct, batRgb: COLOR_YELLOW, batHex: '0xfacc15'};
@@ -212,20 +215,20 @@ function resolveTempVisual(tempRaw) {
   if (!hasTemp) {
     return {hasTemp: false, tempNum: null, tempRgb: COLOR_GREEN, tempHex: '0xd4d4d8'};
   }
-  if (tempNum <= 5) {
+  if (tempNum <= TEMP_COLD_MAX_C) {
     return {hasTemp, tempNum, tempRgb: COLOR_BLUE, tempHex: '0x38bdf8'};
   }
-  if (tempNum <= 35) {
+  if (tempNum <= TEMP_NORMAL_MAX_C) {
     return {hasTemp, tempNum, tempRgb: COLOR_GREEN, tempHex: '0xd4d4d8'};
   }
-  if (tempNum < 45) {
+  if (tempNum < TEMP_WARM_MAX_C) {
     return {hasTemp, tempNum, tempRgb: COLOR_YELLOW, tempHex: '0xfacc15'};
   }
   return {hasTemp, tempNum, tempRgb: COLOR_PURPLE, tempHex: '0xe879f9'};
 }
 
 /**
- * Evaluates the 4-color semantic state (Green, Blue, Yellow, Red) for camera status,
+ * Evaluates the 6-color semantic state (Red, Grey, Green, Blue, Yellow, Purple) for camera status,
  * battery, Wi-Fi/RSSI, and temperature.
  *
  * @param {string} titleText - Card heading ('Asleep', 'Waking Up...', 'Waiting', 'Live', etc.).
@@ -299,7 +302,7 @@ function buildTelemetrySegments(st) {
       batHex: st.batHex,
       batRgb: st.batRgb,
       label,
-      width: 45 + label.length * 11,
+      width: TEL_BAT_LABEL_OFFSET_X + label.length * TEL_TEXT_CHAR_WIDTH,
     });
   }
 
@@ -311,7 +314,7 @@ function buildTelemetrySegments(st) {
       wifiBars: st.wifiBars,
       wifiRgb: st.wifiRgb,
       label,
-      width: 38 + label.length * 11,
+      width: TEL_WIFI_LABEL_OFFSET_X + label.length * TEL_TEXT_CHAR_WIDTH,
     });
   }
 
@@ -323,7 +326,7 @@ function buildTelemetrySegments(st) {
       tempRgb: st.tempRgb,
       tempNum: st.tempNum,
       label,
-      width: label.length * 12,
+      width: label.length * TEL_TEMP_CHAR_WIDTH,
     });
   }
 
@@ -333,7 +336,7 @@ function buildTelemetrySegments(st) {
       type: 'seen',
       seenVal: st.seenVal,
       label,
-      width: label.length * 11,
+      width: label.length * TEL_TEXT_CHAR_WIDTH,
     });
   }
 
@@ -429,7 +432,7 @@ class Telemetry {
 
     const nowLowBat = this.isLowBattery();
     const batterySwapped =
-        prevBattery !== null && this.battery !== null && Math.abs(this.battery - prevBattery) >= 10;
+        prevBattery !== null && this.battery !== null && Math.abs(this.battery - prevBattery) >= BATTERY_SWAP_DELTA_PCT;
     const stateChanged =
         hadInitialTelemetry &&
         (wasLowBat !== nowLowBat || prevCharging !== this.charging || batterySwapped);
@@ -478,7 +481,7 @@ class Telemetry {
   }
 
   /**
-   * Evaluates the 4-color visual state for the given status heading ('Live', 'Asleep', etc.).
+   * Evaluates the 6-color visual state for the given status heading ('Live', 'Asleep', etc.).
    *
    * @param {string} titleText - Card heading string.
    * @returns {Record<string, *>}
@@ -499,6 +502,9 @@ class Telemetry {
 }
 
 module.exports = {
+  TEL_BAT_LABEL_OFFSET_X,
+  TEL_WIFI_LABEL_OFFSET_X,
+  TEL_TEXT_CHAR_WIDTH,
   Telemetry,
   unwrapProperty,
   parseChargingState,

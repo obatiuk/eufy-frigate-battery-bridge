@@ -9,6 +9,13 @@
  */
 'use strict';
 
+const {DEFAULT_EVENT_PRIORITY} = require('../config');
+const DEFAULT_BACKFILL_MAX_AGE_MS = 300000;
+const BACKFILL_MATCH_LOOKBACK_MS = 45000;
+const BACKFILL_MATCH_LOOKAHEAD_MS = 180000;
+const TEST_BACKFILL_OFFSET_MS = 10000;
+const TEST_BACKFILL_PRIORITY = 9999;
+
 /**
  * Parses the recording timestamp (ms) from a HomeBase database record's start_time or storage_path.
  *
@@ -83,7 +90,7 @@ class BackfillJob {
     this.event = opts.event || 'motion detected';
     this.personName = opts.personName || '';
     this.reason = opts.reason || this.event;
-    this.priority = opts.priority ?? 10;
+    this.priority = opts.priority ?? DEFAULT_EVENT_PRIORITY;
     this.attempts = opts.attempts ?? 0;
     this.ignoreTimeWindow = Boolean(opts.ignoreTimeWindow);
   }
@@ -95,7 +102,7 @@ class BackfillJob {
    * @param {number} [maxAgeMs=300000] - Maximum age in milliseconds.
    * @returns {boolean}
    */
-  isExpired(now = Date.now(), maxAgeMs = 300000) {
+  isExpired(now = Date.now(), maxAgeMs = DEFAULT_BACKFILL_MAX_AGE_MS) {
     return now - this.at > maxAgeMs;
   }
 
@@ -113,7 +120,7 @@ class BackfillJob {
     if (this.ignoreTimeWindow || !candidate.clipMs) {
       return true;
     }
-    return candidate.clipMs >= this.at - 45000 && candidate.clipMs <= this.at + 180000;
+    return candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS && candidate.clipMs <= this.at + BACKFILL_MATCH_LOOKAHEAD_MS;
   }
 
   /**
@@ -140,18 +147,19 @@ class BackfillJob {
    */
   static createSigUsr1TestJob(now = Date.now()) {
     return new BackfillJob({
-      at: now - 10000,
+      at: now - TEST_BACKFILL_OFFSET_MS,
       ignoreTimeWindow: true,
       event: 'motion detected',
       personName: '',
       reason: 'SIGUSR1 backfill test',
-      priority: 9999,
+      priority: TEST_BACKFILL_PRIORITY,
       attempts: 0,
     });
   }
 }
 
 module.exports = {
+  DEFAULT_BACKFILL_MAX_AGE_MS,
   BackfillJob,
   parseClipTimestampMs,
   extractDatabaseRecordCandidate,

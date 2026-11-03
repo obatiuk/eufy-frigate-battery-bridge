@@ -4,7 +4,7 @@
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
- * Frigate & go2rtc integration service: external event creation, instant clean
+ * Frigate & go2rtc HTTP client: external event creation, instant clean
  * snapshot fallback, auto-synced motion/object masks, active object checks,
  * and go2rtc consumer polling.
  */
@@ -19,6 +19,9 @@ const {
   LOW_BAT_WAKE_ON_VIEW,
   COOLDOWN_MS,
   LINGER_MS,
+  KEYFRAME_BURST_MS,
+  SHORT_KEYFRAME_BURST_MS,
+  sleep,
 } = require('../config');
 const {log} = require('../logger');
 const {
@@ -32,7 +35,25 @@ const {computeFrigateMaskPolygon} = require('../domain/status-card');
 const {pushFrameToEncoder} = require('../media/encoder');
 const {notifyHA} = require('./ha-notifier');
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const FAST_RTSP_SNAP_DELAY_MS = 1200;
+const FRIGATE_CONFIG_PUT_TIMEOUT_MS = 8000;
+const FRIGATE_API_TIMEOUT_MS = 5000;
+const FRIGATE_FAST_QUERY_TIMEOUT_MS = 2500;
+const ENCODER_RECONNECT_MASK_SYNC_DELAY_MS = 6000;
+const FRIGATE_RECOVERY_MASK_SYNC_DELAY_MS = 3000;
+const MASK_SYNC_INTERVAL_MS = 60000;
+const EVENT_DISPATCH_DELAY_MS = 600;
+const FRESH_LIVE_FRAME_MS = 1500;
+const RECENT_VIDEO_FALLBACK_MS = 5000;
+const SNAPSHOT_POLL_INTERVAL_MS = 200;
+const SNAPSHOT_EXTRA_WAIT_MS = 15000;
+const MIN_SNAPSHOT_WAIT_LOOPS = 125;
+const CLEAN_SNAPSHOT_INJECT_DELAY_MS = 450;
+const REVIEW_LOOKUP_DELAY_MS = 1500;
+const LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS = 30000;
+const ERROR_SNIPPET_MAX_CHARS = 200;
+const REVIEW_QUERY_LIMIT = 5;
+const ACTIVE_EVENTS_QUERY_LIMIT = 10;
 
 let isSyncingMasks = false;
 let frigateApiDown = false;
@@ -120,7 +141,7 @@ function computeRequiredSnapshotDelay(
     case 'download':
       return 0;
     case 'rtsp':
-      return instantSnapshot ? Math.min(snapDelayMs, 1200) : snapDelayMs;
+      return instantSnapshot ? Math.min(snapDelayMs, FAST_RTSP_SNAP_DELAY_MS) : snapDelayMs;
     default:
       return snapDelayMs;
   }
@@ -154,7 +175,7 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
         const res = await fetch(cfg.frigate_api + '/api/config/set', {
           method: 'PUT',
           headers: {'Content-Type': 'application/json'},
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
           body: JSON.stringify(disablePayload),
         });
         return res.ok ? 'disabled' : 'failed';
@@ -175,7 +196,7 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
     const putRes = await fetch(cfg.frigate_api + '/api/config/set', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
       body: JSON.stringify(enablePayload),
     });
 
@@ -193,13 +214,13 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
         encodeURIComponent(poly);
     const legRes = await fetch(legacyUrl, {
       method: 'PUT',
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
     });
     if (legRes.ok) {
       return 'applied';
     }
 
-    const errText = (await putRes.text()).slice(0, 160);
+    const errText = (await putRes.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
     log.warn(
         cam,
         'could not auto-apply Frigate ' +
@@ -240,7 +261,7 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
     }
     let frigateCfg = null;
     try {
-      const r = await fetch(cfg.frigate_api + '/api/config', {signal: AbortSignal.timeout(5000)});
+      const r = await fetch(cfg.frigate_api + '/api/config', {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
       if (!r.ok) {
         frigateApiDown = true;
         return;
@@ -322,7 +343,7 @@ function handleEncoderReconnectMaskSync(cams, isShuttingDownFn) {
     if (!isShuttingDownFn()) {
       void syncFrigateMotionMasks(cams, true, isShuttingDownFn());
     }
-  }, 6000);
+  }, ENCODER_RECONNECT_MASK_SYNC_DELAY_MS);
 }
 
 /**
@@ -333,7 +354,7 @@ function handleEncoderReconnectMaskSync(cams, isShuttingDownFn) {
  * @param {boolean} shuttingDown - Whether the bridge is shutting down.
  */
 function checkPeriodicMaskSync(cams, now, shuttingDown) {
-  if (now - lastMaskCheckAt >= 60000) {
+  if (now - lastMaskCheckAt >= MASK_SYNC_INTERVAL_MS) {
     lastMaskCheckAt = now;
     void syncFrigateMotionMasks(cams, false, shuttingDown);
   }
@@ -348,8 +369,8 @@ function checkPeriodicMaskSync(cams, now, shuttingDown) {
  */
 async function lookupFrigateReviewId(cameraName, eventId) {
   try {
-    const reviewUrl = cfg.frigate_api + '/api/review?cameras=' + cameraName + '&limit=5';
-    const rvRes = await fetch(reviewUrl, {signal: AbortSignal.timeout(5000)});
+    const reviewUrl = cfg.frigate_api + '/api/review?cameras=' + cameraName + '&limit=' + REVIEW_QUERY_LIMIT;
+    const rvRes = await fetch(reviewUrl, {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
     const rv = rvRes.ok ? await rvRes.json() : null;
     if (!Array.isArray(rv)) {
       return '';
@@ -402,21 +423,24 @@ function frigateEvent(cam, ev, personName = '') {
     const showing = () =>
         (cam.active &&
             cam.frame &&
-            Date.now() - cam.frameAt < 1500 &&
+            Date.now() - cam.frameAt < FRESH_LIVE_FRAME_MS &&
             Date.now() - cam.firstFrameAt >= requiredDelayMs) ||
-        (INSTANT_EVENT_SNAPSHOT && !cam.active && cam.gotVideo && Date.now() - cam.lastVideoAt < 5000);
+        (INSTANT_EVENT_SNAPSHOT && !cam.active && cam.gotVideo && Date.now() - cam.lastVideoAt < RECENT_VIDEO_FALLBACK_MS);
 
-    const maxWaitLoops = Math.max(125, Math.ceil((SNAP_DELAY_MS + 15000) / 200));
+    const maxWaitLoops = Math.max(
+        MIN_SNAPSHOT_WAIT_LOOPS,
+        Math.ceil((SNAP_DELAY_MS + SNAPSHOT_EXTRA_WAIT_MS) / SNAPSHOT_POLL_INTERVAL_MS)
+    );
     for (let i = 0; i < maxWaitLoops && cam.evLabel !== 'test' && !showing(); i++) {
-      await sleep(200);
+      await sleep(SNAPSHOT_POLL_INTERVAL_MS);
     }
 
     const noVideo = cam.evLabel !== 'test' && !showing();
     if (noVideo && INSTANT_EVENT_SNAPSHOT && Buffer.isBuffer(cam.lastFrame)) {
       cam.suppressLiveCard = true;
-      cam.burstUntil = Date.now() + 1500;
+      cam.burstUntil = Date.now() + KEYFRAME_BURST_MS;
       pushFrameToEncoder(cam, Date.now());
-      await sleep(450);
+      await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
     }
     const finalLabel = cam.evLabel;
     const finalPerson = cam.evPerson;
@@ -429,7 +453,7 @@ function frigateEvent(cam, ev, personName = '') {
       const r = await fetch(createUrl, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS),
         body: JSON.stringify({
           source_type: 'api',
           sub_label: subLabel,
@@ -438,7 +462,7 @@ function frigateEvent(cam, ev, personName = '') {
         }),
       });
       if (!r.ok) {
-        const errBody = (await r.text()).slice(0, 200);
+        const errBody = (await r.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
         log.error(cam, 'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + ' ' + errBody + ')');
         return;
       }
@@ -458,7 +482,7 @@ function frigateEvent(cam, ev, personName = '') {
         log.info(cam, 'Frigate event "' + finalLabel + '" created' + personSuffix + ' (eventId=' + eventId + ')');
       }
 
-      await sleep(1500);
+      await sleep(REVIEW_LOOKUP_DELAY_MS);
       const reviewId = await lookupFrigateReviewId(cam.name, eventId);
       notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
@@ -469,7 +493,7 @@ function frigateEvent(cam, ev, personName = '') {
         pushFrameToEncoder(cam, Date.now());
       }
     }
-  }, 600);
+  }, EVENT_DISPATCH_DELAY_MS);
 }
 
 /**
@@ -484,8 +508,8 @@ async function isFrigateCameraIdle(cam) {
     return true;
   }
   try {
-    const url = cfg.frigate_api + '/api/events?cameras=' + cam.name + '&in_progress=1&limit=10';
-    const r = await fetch(url, {signal: AbortSignal.timeout(2500)});
+    const url = cfg.frigate_api + '/api/events?cameras=' + cam.name + '&in_progress=1&limit=' + ACTIVE_EVENTS_QUERY_LIMIT;
+    const r = await fetch(url, {signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS)});
     if (!r.ok) {
       return false;
     }
@@ -504,7 +528,7 @@ async function isFrigateCameraIdle(cam) {
 
 /**
  * Classifies how the bridge should handle a newly connected go2rtc viewer and returns
- * both the boolean wake decision (`asked`) and human-readable log description (`actionDesc`).
+ * both the boolean wake decision ('asked') and human-readable log description ('actionDesc').
  *
  * @param {Record<string, *>} params - Viewer connection context.
  * @returns {{ asked: boolean, actionDesc: string }}
@@ -577,7 +601,7 @@ async function pollViewers(cams, hooks) {
     for (const cam of cams) {
       try {
         const r = await fetch(cfg.go2rtc_api + '/api/streams?src=' + cam.name, {
-          signal: AbortSignal.timeout(2500),
+          signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS),
         });
         if (!r.ok) {
           continue;
@@ -599,7 +623,7 @@ async function pollViewers(cams, hooks) {
 
           const clientInfo = (v.format_name || v.protocol || '') + ' ' + (v.remote_addr || '');
           cam.viewerIds.set(v.id, false);
-          cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
+          cam.burstUntil = Math.max(cam.burstUntil || 0, now + SHORT_KEYFRAME_BURST_MS);
           pushFrameToEncoder(cam, now);
           newConnections.push({cam, id: v.id, clientInfo: clientInfo.trim(), now});
         }
@@ -633,7 +657,7 @@ async function pollViewers(cams, hooks) {
         if (!isShuttingDown()) {
           void syncFrigateMotionMasks(cams, true, isShuttingDown());
         }
-      }, 3000);
+      }, FRIGATE_RECOVERY_MASK_SYNC_DELAY_MS);
     }
 
     const activeViewerCams = cams.filter((c) => c.viewers > 0);
@@ -666,7 +690,7 @@ async function pollViewers(cams, hooks) {
       if (asked) {
         newestViewerCam = cam;
       }
-      if (!isDashboardGrid && blockedByEco && now - cam.lastLowBatRefreshAt > 30000) {
+      if (!isDashboardGrid && blockedByEco && now - cam.lastLowBatRefreshAt > LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS) {
         cam.lastLowBatRefreshAt = now;
         log.info(cam, 'viewer connected while in low-battery mode, polling HomeBase for battery swap');
         void fetchAllCameraTelemetry(true);

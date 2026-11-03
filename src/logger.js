@@ -112,7 +112,7 @@ function formatLogLine(level, scope, args, now = new Date()) {
 }
 
 /**
- * Writes a structured log line to stdout when `level` meets or exceeds currentLogLevel.
+ * Writes a structured log line to stdout when 'level' meets or exceeds currentLogLevel.
  *
  * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
  * @param {string|{name?: string}|null|undefined} scope - Camera state/config object or 'bridge'.

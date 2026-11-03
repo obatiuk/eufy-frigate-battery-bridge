@@ -50,7 +50,7 @@ Eufy battery cameras sleep almost all the time and only stream when woken. Becau
   dashboard grid views.
 
 ```
-Eufy event / HA WS ──► eufy-security-ws ──┐
+Eufy event / External WS ──► eufy-security-ws ──┐
                                           ▼
 CLI / external /api/wake ─────────► bridge (:8080) ──(wake, P2P / RTSP / Backfill)──► ffmpeg ──RTSP──► Frigate's go2rtc ──► Frigate
                               ├──► /healthz (container readiness probe)
@@ -108,7 +108,7 @@ fill it in. Settings are grouped by function below:
 | `station_serial` (per camera) | `""`    | Optional explicit station serial override in `cameras[]` (auto-discovered from `stationSerialNumber` in `device.get_properties`)                                                                                                                                                     |
 | `backfill_downloads`          | `true`  | Automatically query `HomeBase` local storage (`station.database_query_latest_info` / `station.database_query_by_date`) and replay missed event clips (`device.start_download`) at `15 fps` into `Frigate` once the station's `P2P` slot is free                                      |
 | `backfill_delay_secs`         | `5`     | Seconds a station's `P2P` slot must remain idle before starting a queued post-event clip download                                                                                                                                                                                    |
-| `hold_secs`                   | `60`    | Maximum time (seconds) to stay live after the last Eufy motion report                                                                                                                                                                                                                |
+| `hold_secs`                   | `60`    | Initial time (seconds) to stay live on wake; new mid-stream events, camera re-triggers, or active `Frigate` detections near timeout automatically extend the stream by `hold_secs / 2` (`+30 s`) up to `max_secs` (`900 s`)                                                            |
 | `max_secs`                    | `900`   | Hard cap (seconds) for one continuous live period                                                                                                                                                                                                                                    |
 | `view_linger_secs`            | `20`    | Stay live this long (seconds) after the last viewer leaves                                                                                                                                                                                                                           |
 | `view_max_secs`               | `300`   | Hard cap (seconds) for a live period only viewers asked for                                                                                                                                                                                                                          |
@@ -200,7 +200,7 @@ cameras:
 To build and publish to a local or remote container registry using the included `Makefile` (defaults to `Podman`):
 
 ```bash
-# Syntax-check src/bridge.js and build image locally
+# Syntax-check src/app.js and build image locally
 make docker-build
 
 # Build, tag, and push to a registry (default: publish locally with `latest` version when REGISTRY is omitted)
@@ -429,7 +429,7 @@ Trigger an automation with `platform: webhook` and use `trigger.json.event_id` t
 The bridge runs a lightweight built-in HTTP server on port `8080` (configurable via `http_port` in `config.json` or the `HTTP_PORT` environment variable; set to `0` to disable):
 
 - **`GET /healthz`** (or `HEAD /healthz`): Returns HTTP `200` (`{"ok":true,"ws_connected":true,"uptime_secs":...,"active_cameras":[...]}`) when the bridge is running and connected to `eufy-security-ws`, or HTTP `503` otherwise. Used by the container `HEALTHCHECK`.
-- **Direct `eufy-security-ws` wakes vs. `/api/wake/:cameras`:** Services that already integrate with `eufy-security-ws` (such as `Home Assistant`) can start `RTSP` or `P2P` streams directly via `eufy-security-ws` without calling the HTTP API—the bridge automatically detects and adopts externally started streams (`initiator=ha-ws`) for `hold_secs` (`60 s`).
+- **Direct `eufy-security-ws` wakes vs. `/api/wake/:cameras`:** Services that already integrate with `eufy-security-ws` (such as `Home Assistant`) can start `RTSP` or `P2P` streams directly via `eufy-security-ws` without calling the HTTP API—the bridge automatically detects and adopts externally started streams (`initiator=eufy-ws`) for `hold_secs` (`60 s`).
 - **`POST /api/wake/:cameras`** (or **`GET /api/wake/:cameras`**): Built-in HTTP endpoint for **CLI testing** (using the `curl` commands below) or for **external services and webhooks** that do not have direct access to `eufy-security-ws`.
   - `:cameras` accepts a camera `name`, `serial`, slugified `title` (e.g. `front_doorbell`), a comma-separated list (`backyard,front_doorbell`), or `all` (`/api/wake/all` or `/api/wake`).
   - Multi-camera and burst wake requests order `RTSP` cameras ahead of `P2P` cameras, pace sleeping camera wakes by `2500 ms` per `HomeBase` station, and coalesce duplicate sensor triggers to prevent simultaneous `HomeBase` radio collisions.

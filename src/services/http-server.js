@@ -5,15 +5,20 @@
  * SPDX-License-Identifier: MIT
  *
  * Built-in HTTP server exposing:
- *   - POST/GET /api/wake/:cameras (external pre-wake webhook for Home Assistant door/garage sensors)
+ *   - POST/GET /api/wake/:cameras (external pre-wake webhook for CLI testing or external services)
  *   - GET/HEAD /healthz (container readiness & WebSocket health check)
  */
 'use strict';
 
 const http = require('http');
-const {HTTP_PORT, HOLD_MS} = require('../config');
+const {HTTP_PORT, HOLD_MS, MAX_MS} = require('../config');
 const {log} = require('../logger');
 const {isWsReady} = require('./eufy-client');
+
+const MAX_JSON_BODY_BYTES = 16384;
+const MIN_WAKE_DURATION_SECS = 5;
+const MAX_WAKE_DURATION_SECS = Math.round(MAX_MS / 1000);
+const DEFAULT_HOLD_DURATION_SECS = Math.round(HOLD_MS / 1000);
 
 let httpServer = null;
 const startedAtMs = Date.now();
@@ -80,7 +85,7 @@ function readJsonBody(req) {
   return new Promise((resolve) => {
     let raw = '';
     req.on('data', (chunk) => {
-      if (raw.length < 16384) {
+      if (raw.length < MAX_JSON_BODY_BYTES) {
         raw += chunk;
       }
     });
@@ -157,8 +162,8 @@ function startHttpServer(cams, hooks) {
       const rawDuration = body.duration ?? urlObj.searchParams.get('duration');
       const durationSecs =
           rawDuration !== undefined && rawDuration !== null && !Number.isNaN(Number(rawDuration))
-              ? Math.max(5, Math.min(900, Number(rawDuration)))
-              : Math.round(HOLD_MS / 1000);
+              ? Math.max(MIN_WAKE_DURATION_SECS, Math.min(MAX_WAKE_DURATION_SECS, Number(rawDuration)))
+              : DEFAULT_HOLD_DURATION_SECS;
       const reason = String(
           body.reason || urlObj.searchParams.get('reason') || 'external api wake'
       ).trim();

@@ -21,12 +21,33 @@ const {
   AUDIO_TICK,
   AUDIO_CHUNK,
   SILENCE,
+  KEYFRAME_BURST_MS,
+  SHORT_KEYFRAME_BURST_MS,
+  STDERR_TAIL_MAX_CHARS,
   ACTIVE_HWACCEL,
   HWACCEL_DEVICE,
 } = require('../config');
 const {log, formatLocalHm} = require('../logger');
 const {want} = require('../domain/camera');
 const {renderLiveFrameWithCard} = require('../overlay/card-renderer');
+
+const DOWNLOAD_PACE_LEAD_MS = 4;
+const FRESH_FRAME_MAX_AGE_MS = 2000;
+const LIVE_HEARTBEAT_WRITE_MS = 500;
+const ENCODER_WEDGED_TIMEOUT_MS = 10000;
+const HWACCEL_FAIL_WINDOW_MS = 5000;
+const HWACCEL_FALLBACK_RESTART_MS = 1000;
+const ENCODER_DROP_MIN_UPTIME_MS = 10000;
+const ENCODER_RESTART_DELAY_MS = 3000;
+const MIN_GOP_FRAMES = 4;
+const VAAPI_QP = '18';
+const QSV_GLOBAL_QUALITY = '19';
+const NVENC_CQ = '19';
+const SOFTWARE_CRF = '19';
+const MAX_VIDEO_BITRATE = '3500k';
+const VIDEO_BUFSIZE = '5000k';
+const V4L2_VIDEO_BITRATE = '3000k';
+const AUDIO_BITRATE = '32k';
 
 let onEncoderDropCallback = null;
 let isShuttingDownFn = () => false;
@@ -54,7 +75,7 @@ function configureEncoderHooks(hooks = {}) {
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 function advanceDownloadPlaybackFrame(cam, now) {
-  const frameIntervalMs = Math.floor(1000 / LIVE_FPS) - 4;
+  const frameIntervalMs = Math.floor(1000 / LIVE_FPS) - DOWNLOAD_PACE_LEAD_MS;
   if (
       cam.active &&
       cam.activeMode === 'download' &&
@@ -80,7 +101,7 @@ function advanceDownloadPlaybackFrame(cam, now) {
  * @returns {{ frame: Uint8Array, isLive: boolean }}
  */
 function selectEncoderFrame(cam, now) {
-  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < 2000);
+  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < FRESH_FRAME_MAX_AGE_MS);
   const isLive = Boolean(cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame))));
 
   if (isLive) {
@@ -113,7 +134,7 @@ function selectEncoderFrame(cam, now) {
 function shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now) {
   const elapsedMs = now - cam.lastWrite;
   if (isLive) {
-    return Boolean(cam.frameNew || elapsedMs >= 500);
+    return Boolean(cam.frameNew || elapsedMs >= LIVE_HEARTBEAT_WRITE_MS);
   }
   return Boolean(stateChanged || inBurst || elapsedMs >= 1000 / IDLE_FPS);
 }
@@ -130,7 +151,7 @@ function pushFrameToEncoder(cam, now = Date.now()) {
     return;
   }
   if (enc.stdin.writableNeedDrain) {
-    if (now - cam.lastWrite > 10000) {
+    if (now - cam.lastWrite > ENCODER_WEDGED_TIMEOUT_MS) {
       log.error(
           cam,
           'encoder stdin wedged for >10s (initiator=bridge-watchdog, reason=encoder_stdin_backpressure), killing encoder process'
@@ -148,7 +169,7 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   const {frame, isLive} = selectEncoderFrame(cam, now);
   const stateChanged = frame !== cam.lastSent;
   if (stateChanged) {
-    cam.burstUntil = Math.max(cam.burstUntil || 0, now + 1200);
+    cam.burstUntil = Math.max(cam.burstUntil || 0, now + SHORT_KEYFRAME_BURST_MS);
   }
   const inBurst = now < (cam.burstUntil || 0);
 
@@ -178,7 +199,7 @@ function buildVideoCodecArgs(hwMode, gop) {
         '-bf',
         '0',
         '-qp',
-        '18',
+        VAAPI_QP,
         '-g',
         gop,
       ];
@@ -189,11 +210,11 @@ function buildVideoCodecArgs(hwMode, gop) {
         '-c:v',
         'h264_qsv',
         '-global_quality',
-        '19',
+        QSV_GLOBAL_QUALITY,
         '-maxrate',
-        '3500k',
+        MAX_VIDEO_BITRATE,
         '-bufsize',
-        '5000k',
+        VIDEO_BUFSIZE,
         '-g',
         gop,
       ];
@@ -208,16 +229,16 @@ function buildVideoCodecArgs(hwMode, gop) {
         '-pix_fmt',
         'yuv420p',
         '-cq',
-        '19',
+        NVENC_CQ,
         '-maxrate',
-        '3500k',
+        MAX_VIDEO_BITRATE,
         '-bufsize',
-        '5000k',
+        VIDEO_BUFSIZE,
         '-g',
         gop,
       ];
     case 'v4l2m2m':
-      return ['-c:v', 'h264_v4l2m2m', '-pix_fmt', 'yuv420p', '-b:v', '3000k', '-g', gop];
+      return ['-c:v', 'h264_v4l2m2m', '-pix_fmt', 'yuv420p', '-b:v', V4L2_VIDEO_BITRATE, '-g', gop];
     default:
       return [
         '-c:v',
@@ -229,11 +250,11 @@ function buildVideoCodecArgs(hwMode, gop) {
         '-pix_fmt',
         'yuv420p',
         '-crf',
-        '19',
+        SOFTWARE_CRF,
         '-maxrate',
-        '3500k',
+        MAX_VIDEO_BITRATE,
         '-bufsize',
-        '5000k',
+        VIDEO_BUFSIZE,
         '-g',
         gop,
       ];
@@ -248,7 +269,7 @@ function buildVideoCodecArgs(hwMode, gop) {
  * @returns {string[]}
  */
 function buildEncoderArgs(cam, hwMode) {
-  const gop = String(Math.max(4, LIVE_FPS));
+  const gop = String(Math.max(MIN_GOP_FRAMES, LIVE_FPS));
   const args = ['-hide_banner', '-loglevel', 'warning'];
 
   if (hwMode === 'vaapi') {
@@ -292,7 +313,7 @@ function buildEncoderArgs(cam, hwMode) {
   args.push('-fps_mode', 'passthrough', ...buildVideoCodecArgs(hwMode, gop));
 
   if (AUDIO) {
-    args.push('-af', 'aresample=async=1', '-c:a', 'aac', '-b:a', '32k');
+    args.push('-af', 'aresample=async=1', '-c:a', 'aac', '-b:a', AUDIO_BITRATE);
   }
   args.push('-f', 'rtsp', '-rtsp_transport', 'tcp', cfg.rtsp_publish.replace('{name}', cam.name));
   return args;
@@ -318,7 +339,7 @@ function startEncoder(cam) {
   cam.enc = enc;
   cam.lastSent = null;
   cam.lastWrite = Date.now();
-  cam.burstUntil = Date.now() + 1500;
+  cam.burstUntil = Date.now() + KEYFRAME_BURST_MS;
 
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
   enc.stdin.on('error', () => {});
@@ -333,7 +354,7 @@ function startEncoder(cam) {
 
   let tail = '';
   enc.stderr.on('data', (d) => {
-    tail = (tail + d).slice(-500);
+    tail = (tail + d).slice(-STDERR_TAIL_MAX_CHARS);
   });
 
   enc.on('exit', (code) => {
@@ -347,7 +368,7 @@ function startEncoder(cam) {
 
     if (
         hwMode &&
-        Date.now() - spawnAt < 5000 &&
+        Date.now() - spawnAt < HWACCEL_FAIL_WINDOW_MS &&
         /vaapi|qsv|nvenc|v4l2|hwupload|device|driver|Invalid argument|Function not implemented/i.test(tail)
     ) {
       cam.useHwaccel = false;
@@ -363,19 +384,19 @@ function startEncoder(cam) {
         if (!cam.enc && !isShuttingDownFn()) {
           startEncoder(cam);
         }
-      }, 1000);
+      }, HWACCEL_FALLBACK_RESTART_MS);
       return;
     }
 
     log.error(cam, 'encoder exited (code=' + code + ') ' + errSummary + ' - restarting in 3 s');
-    if (Date.now() - spawnAt > 10000 && onEncoderDropCallback) {
+    if (Date.now() - spawnAt > ENCODER_DROP_MIN_UPTIME_MS && onEncoderDropCallback) {
       onEncoderDropCallback();
     }
     setTimeout(() => {
       if (!cam.enc && !isShuttingDownFn()) {
         startEncoder(cam);
       }
-    }, 3000);
+    }, ENCODER_RESTART_DELAY_MS);
   });
 
   const codecLabel = hwMode ? 'h264_' + hwMode : 'libx264';

@@ -14,6 +14,7 @@ const {
   ENFORCE_QUALITY,
   FORWARD_FACE_NAMES,
   TELEMETRY_POLL_MS,
+  sleep,
 } = require('../config');
 const {log} = require('../logger');
 const {isLowBattery, clearViewerQueue} = require('../domain/camera');
@@ -22,9 +23,14 @@ const {renderCameraCards} = require('../overlay/card-renderer');
 const {pushFrameToEncoder} = require('../media/encoder');
 const {startRtspDecoder} = require('../media/decoder');
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const WS_OPEN = 1;
+const WS_RPC_TIMEOUT_MS = 20000;
+const WS_RECONNECT_DELAY_MS = 10000;
+const INITIAL_TELEMETRY_RETRY_MS = 10000;
+const POLL_REFRESH_SETTLE_MS = 2000;
+const MAX_SUPPORTED_API_SCHEMA = 21;
+const AUTO_STREAMING_QUALITY = 0;
+const MEDIUM_STREAMING_QUALITY = 7;
 let WebSocketCtor = null;
 
 /**
@@ -119,7 +125,7 @@ function call(commandPayload) {
       if (waiting.delete(id)) {
         resolve({success: false, errorCode: 'no_reply'});
       }
-    }, 20000);
+    }, WS_RPC_TIMEOUT_MS);
     waiting.set(id, (res) => {
       clearTimeout(timer);
       resolve(res);
@@ -155,9 +161,9 @@ function checkStreamingQuality(cam, props) {
   if (ENFORCE_QUALITY === true && isDoorbellT8214) {
     return;
   }
-  const targetQuality = typeof ENFORCE_QUALITY === 'number' ? ENFORCE_QUALITY : 7;
+  const targetQuality = typeof ENFORCE_QUALITY === 'number' ? ENFORCE_QUALITY : MEDIUM_STREAMING_QUALITY;
   const shouldUpdate =
-      typeof ENFORCE_QUALITY === 'number' ? currentQuality !== targetQuality : currentQuality === 0;
+      typeof ENFORCE_QUALITY === 'number' ? currentQuality !== targetQuality : currentQuality === AUTO_STREAMING_QUALITY;
 
   if (shouldUpdate) {
     log.info(
@@ -320,7 +326,7 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
   if (forceRefresh || camsRef.some((c) => isLowBattery(c))) {
     log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
     await call({command: 'driver.poll_refresh'});
-    await sleep(2000);
+    await sleep(POLL_REFRESH_SETTLE_MS);
   }
   for (const cam of camsRef) {
     if (!wsReady) {
@@ -348,7 +354,7 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
  * @param {Record<string, *>} m - Parsed 'version' message from eufy-security-ws.
  */
 async function handleVersionMessage(m) {
-  const targetSchema = Math.min(m.maxSchemaVersion, 21);
+  const targetSchema = Math.min(m.maxSchemaVersion, MAX_SUPPORTED_API_SCHEMA);
   await call({command: 'set_api_schema', schemaVersion: targetSchema});
   const st = await call({command: 'start_listening'});
   wsReady = Boolean(st.success);
@@ -374,7 +380,7 @@ async function handleVersionMessage(m) {
     if (wsReady && camsRef.some((c) => c.battery === null)) {
       void fetchAllCameraTelemetry();
     }
-  }, 10000);
+  }, INITIAL_TELEMETRY_RETRY_MS);
 }
 
 /**
@@ -405,7 +411,7 @@ function connectWs() {
       }
     }
     if (!isShuttingDownFn()) {
-      setTimeout(connectWs, 10000);
+      setTimeout(connectWs, WS_RECONNECT_DELAY_MS);
     }
   });
 

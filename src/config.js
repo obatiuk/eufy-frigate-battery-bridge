@@ -40,7 +40,18 @@ const DEFAULT_TRIGGER_EVENTS = Object.freeze([
   'rings',
 ]);
 
+// Shared priority bounds, keyframe burst durations, buffer limits, and async sleep helper.
+const MIN_CAMERA_PRIORITY = -10000;
+const MAX_CAMERA_PRIORITY = 10000;
+const DEFAULT_CAMERA_PRIORITY = 0;
+const KEYFRAME_BURST_MS = 1500;
+const SHORT_KEYFRAME_BURST_MS = 1200;
+const STDERR_TAIL_MAX_CHARS = 500;
+const MAX_FFMPEG_BUFFER_MULTIPLIER = 2;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // Built-in priority boosts by Eufy event type (combined with per-camera config priority).
+const DEFAULT_EVENT_PRIORITY = 10;
 const EVENT_PRIORITIES = Object.freeze([
   ['ring', 1000],
   ['identity person', 300],
@@ -51,7 +62,7 @@ const EVENT_PRIORITIES = Object.freeze([
   ['dog', 100],
   ['crying', 50],
   ['sound', 50],
-  ['motion', 10],
+  ['motion', DEFAULT_EVENT_PRIORITY],
 ]);
 
 // Semantic palette used across 'default', 'icons', and 'minimal' themes:
@@ -120,7 +131,7 @@ function getEventPriority(evName) {
       return score;
     }
   }
-  return 10;
+  return DEFAULT_EVENT_PRIORITY;
 }
 
 /**
@@ -569,6 +580,15 @@ module.exports = {
   COLOR_BLUE,
   COLOR_YELLOW,
   COLOR_PURPLE,
+  MIN_CAMERA_PRIORITY,
+  MAX_CAMERA_PRIORITY,
+  DEFAULT_CAMERA_PRIORITY,
+  DEFAULT_EVENT_PRIORITY,
+  KEYFRAME_BURST_MS,
+  SHORT_KEYFRAME_BURST_MS,
+  STDERR_TAIL_MAX_CHARS,
+  MAX_FFMPEG_BUFFER_MULTIPLIER,
+  sleep,
   LABELS,
   EVENT_PRIORITIES,
   TRIGGERS,

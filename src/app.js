@@ -24,7 +24,7 @@ const {
   handleEncoderReconnectMaskSync,
   frigateEvent,
   pollViewers,
-} = require('./services/frigate-service');
+} = require('./services/frigate-client');
 const {
   configureEufyClientHooks,
   connectWs,
@@ -41,6 +41,11 @@ const {
   startHousekeepingLoop,
 } = require('./services/stream-orchestrator');
 const {startHttpServer, stopHttpServer} = require('./services/http-server');
+
+const SIGUSR1_BACKFILL_DELAY_MS = 300;
+const SHUTDOWN_EXIT_DELAY_MS = 1500;
+const VIEWER_POLL_INTERVAL_MS = 750;
+const INITIAL_MASK_SYNC_DELAY_MS = 2500;
 
 let shuttingDown = false;
 const isShuttingDown = () => shuttingDown;
@@ -108,7 +113,7 @@ function handleSigUsr1BackfillTest(cams) {
   targetCam.backfillClip = null;
   targetCam.lastBackfillQueryAt = 0;
   targetCam.pendingBackfill = BackfillJob.createSigUsr1TestJob(Date.now());
-  setTimeout(() => void processBackfillQueue(Date.now()), 300);
+  setTimeout(() => void processBackfillQueue(Date.now()), SIGUSR1_BACKFILL_DELAY_MS);
 }
 
 /**
@@ -135,7 +140,7 @@ function shutdownBridge(cams) {
       // Ignore errors when stopping encoder on shutdown.
     }
   }
-  setTimeout(() => process.exit(0), 1500);
+  setTimeout(() => process.exit(0), SHUTDOWN_EXIT_DELAY_MS);
 }
 
 /**
@@ -210,7 +215,7 @@ function startServices(cams) {
       stopCam: stop,
       triggerCam: trigger,
     });
-  }, 750);
+  }, VIEWER_POLL_INTERVAL_MS);
 
   startHousekeepingLoop();
   startTelemetryPoller();
@@ -223,7 +228,7 @@ function startServices(cams) {
     isShuttingDown: () => shuttingDown,
   });
   connectWs();
-  setTimeout(() => void syncFrigateMotionMasks(cams, false, shuttingDown), 2500);
+  setTimeout(() => void syncFrigateMotionMasks(cams, false, shuttingDown), INITIAL_MASK_SYNC_DELAY_MS);
 }
 
 /**

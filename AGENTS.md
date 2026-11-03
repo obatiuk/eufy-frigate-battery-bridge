@@ -14,7 +14,7 @@
 │   ├── docker-compose.example.yml     # Example Docker Compose deployment
 │   └── icons-theme-sample.jpeg        # Visual preview of the icons status card theme
 └── src/
-    ├── bridge.js                      # Application composition root, wiring & signal handlers
+    ├── app.js                         # Application composition root, wiring & signal handlers
     ├── config.js                      # Config loader, validation, numeric clamping & constants
     ├── logger.js                      # Structured Alloy/Loki logger & ICU-free local ISO timestamps
     ├── domain/
@@ -31,7 +31,7 @@
     │   └── decoder.js                 # Per-session P2P Annex-B & RTSP pull FFmpeg decoders
     └── services/
         ├── eufy-client.js             # eufy-security-ws WebSocket RPC client & telemetry sync
-        ├── frigate-service.js         # Frigate events, auto-mask sync, idle check & viewer poll
+        ├── frigate-client.js          # Frigate & go2rtc HTTP client (events, masks, idle & viewer poll)
         ├── ha-notifier.js             # Home Assistant webhook notification client
         ├── http-server.js             # Built-in HTTP server (/api/wake/:cameras & /healthz)
         └── stream-orchestrator.js     # Per-station arbitration, RTSP/P2P wake, backfill & watchdog
@@ -40,7 +40,7 @@
 ## Key Commands
 
 - Syntax Check: `make check` (runs `node --check` across all `.js` modules in `src/`)
-- Build Image Locally: `make docker-build` (validates `src/bridge.js` and builds multi-stage `alpine:3.23` image using
+- Build Image Locally: `make docker-build` (validates `src/app.js` and builds multi-stage `alpine:3.23` image using
   `/usr/bin/podman` by default)
 - Publish Locally: `make publish` (builds and tags `localhost/eufy-frigate-battery-bridge:latest`; skips remote push
   when `REGISTRY` is empty)
@@ -97,9 +97,16 @@ podman exec eufy-frigate-battery-bridge node -e '
 
 ## Coding & Style Guidelines for Agents
 
-- Patch-First Workflow: When modifying `src/bridge.js`, provide unified diff patches (`diff -u` against
-  `a/src/bridge.js` and `b/src/bridge.js`) or deterministic Node patch scripts rather than regenerating the entire file
-  unless explicitly requested.
+- Step-by-Step Scoped Patches: Keep patch scripts small, modular, and scoped step-by-step per file rather than bundling
+  large multi-file rewrites into a single script. Never use nested backtick template literals inside patch scripts.
+- No Magic Numbers & Config-First Constants: Never embed unexplained magic numbers (such as raw millisecond timeouts,
+  retry counts, buffer sizes, or priority scores) inside functions. Always reference configurable values exported from
+  `src/config.js` (`HOLD_MS`, `MAX_MS`, `LOW_BAT_HOLD_MS`, `VIEW_MAX_MS`, `EARLY_SLEEP_MS`, `BACKFILL_DELAY_MS`,
+  `LIVE_FPS`, `getEventPriority`) and define descriptive `UPPER_SNAKE_CASE` module constants for internal protocol or
+  timing thresholds (except obvious unit conversions such as `* 1000` or `/ 1000`).
+- Idiomatic, Self-Documenting & Testable Code: Write clean, idiomatic Node.js with small, single-responsibility
+  functions. Extract complex boolean conditions into named variables or pure helper predicates, and structure
+  orchestrator and domain functions so state transitions can be unit-tested deterministically without live hardware.
 - Block-Grouped Roadmap Convention: Always organize grouped changes, multi-part enhancements, and sequential
   implementation steps (such as Step 1/2/3) into dedicated, numbered `Block` sections under `Roadmap & TODO List` in
   `AGENTS.md`.
@@ -108,7 +115,7 @@ podman exec eufy-frigate-battery-bridge node -e '
   behavior.
 - Comment Formatting: Always use clean, left-justified comments and comprehensive JSDoc blocks on every function. Never
   add decorative comment dividers (such as `// ----`).
-- String & Template Safety in `src/bridge.js`: Use standard single-quoted strings (`'...'`) with `+` concatenation
+- String & Template Safety in `src/app.js`: Use standard single-quoted strings (`'...'`) with `+` concatenation
   instead of multi-line backtick template literals or backticks inside comments to prevent parser/linter errors across
   strict IDEs.
 - Documentation Conventions in `README.md`: Always capitalize Eufy in prose, and wrap service names, binaries,
@@ -146,7 +153,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `preempt_event_streams`: Allow newer motion on an equal-priority camera to preempt an active event stream immediately
   (default: `true`)
 - `audio`: Enable audio passthrough (default: `true`)
-- `hold_secs`: Maximum duration to stay live after the last Eufy motion report (default: `60`)
+- `hold_secs`: Initial duration to stay live on wake (default: `60`). While active, subsequent events, mid-stream camera re-triggers, or active Frigate object detections within `4s` of timeout (`evaluateActiveHoldExtension`) extend the hold by `hold_secs / 2` (`+30s`) up to `max_secs` (`900s`).
 - `max_secs`: Hard cap for a single continuous live period (default: `900`)
 - `view_linger_secs`: Stay live after the last viewer disconnects (default: `20`)
 - `view_max_secs`: Hard cap for a viewer-only live session (default: `300`)
@@ -233,18 +240,18 @@ podman exec eufy-frigate-battery-bridge node -e '
 
 ### Modular Architecture & Dependency Flow
 
-Data and dependencies flow strictly top-down from the composition root (`src/bridge.js`) to the foundation layer
+Data and dependencies flow strictly top-down from the composition root (`src/app.js`) to the foundation layer
 (`domain/camera.js`, `config.js`, `logger.js`) with zero circular `require()` dependencies:
 
 ```text
                           ┌──────────────────────┐
-                          │    src/bridge.js     │  (Composition Root & Signal Hooks)
+                          │      src/app.js      │  (Composition Root & Signal Hooks)
                           └──────────┬───────────┘
                                      │
         ┌───────────────────┬────────┴─────────┬────────────────┐
         ▼                   ▼                  ▼                ▼
 ┌───────────────┐ ┌────────────────────┐ ┌───────────┐ ┌──────────────────┐
-│  http-server  │ │stream-orchestrator │ │eufy-client│ │ frigate-service  │  (Service Layer)
+│  http-server  │ │stream-orchestrator │ │eufy-client│ │  frigate-client  │  (Service Layer)
 └───────┬───────┘ └─────────┬──────────┘ └─────┬─────┘ └────────┬─────────┘
         │                   │                  │                │
         │                   ▼                  ▼                ▼
@@ -272,7 +279,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
   Automatically discovers `rtspStreamUrl` from `device.get_properties` on cameras with NAS/RTSP support (`T8161`), wakes
   the camera via `rtspStream=true` and `device.start_rtsp_livestream`, and streams them in `activeMode = 'rtsp'`
   concurrently alongside P2P cameras (`usesP2pSlot(cam) === false`). Retries RTSP connection every `750ms` during the
-  wake window, re-sends `start_rtsp_livestream` at `6.5s` if needed, and queues a `60s` P2P fallback
+  wake window, re-sends `start_rtsp_livestream` every `3.5s` (`RTSP_WAKE_RETRY_MS`) if needed, immediately re-wakes (`0ms`) on mid-session clip boundary drops, and queues a `60s` P2P fallback
   (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `22s`.
 - Post-Event Clip Download Backfill (`backfill_downloads`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
   (`true`) by default. When a P2P camera triggers motion while its station's P2P slot is busy (or is preempted before
@@ -294,7 +301,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
   (`pickScore < curScore`) are blocked from preempting an active higher-priority event until its motion clears or
   stalls.
 - Eufy Power Manager (`powerWorkingMode`) & Event Hold Interaction: Eufy cameras in `Optimal Battery Life` (`powerWorkingMode: 0`) send `state: false` (`activity cleared`) `10s` after motion starts regardless of `recordingClipLength`. Because `let_eufy_decide_event_end` defaults to `false`, the bridge ignores early `state: false` events and re-requests streams if stopped before `want(cam)`, keeping streams alive for the full `hold_secs` (`60s`). For uninterrupted `60s` hardware clips without camera-side re-wakes, cameras should be switched to `Customize Recording` (`powerWorkingMode: 2`, `recordingClipLength: 60`, `recordingEndClipMotionStops: false`, `recordingRetriggerInterval: 5`).
-- Eufy-Controlled Event End (`let_eufy_decide_event_end`): Disabled (`false`) by default. When explicitly enabled (`true`), When Eufy/HomeBase sends
+- Eufy-Controlled Event End (`let_eufy_decide_event_end`): Disabled (`false`) by default. When explicitly enabled (`true`), when Eufy/HomeBase sends
   `livestream stopped` on an active event stream (after 3s of video or after Eufy reports `state: false`), the bridge
   puts the camera to sleep cleanly (`initiator=eufy/camera-event-end`). Additionally, when Eufy reports `state: false`
   (`activity cleared`) on an active event stream with decoded video, `motionUntil` is shortened to
@@ -311,14 +318,14 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
 - Background Dimming (`card_dim_background`): Disabled (`false`) by default (configurable globally and per-camera).
   Keeps background snapshot pixels outside the status card 100% unchanged across `Live <-> Asleep` transitions so
   Frigate does not record false full-frame motion when the card area is covered by a Frigate motion mask.
-- External Stream Adoption (`initiator=ha-ws`) & HTTP Pre-Wake/Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Wakes initiated directly through `eufy-security-ws` (such as the `Home Assistant` `eufy_security` integration starting an `RTSP` or `P2P` stream) are automatically adopted by `onEvent` (`initiator=ha-ws`) for `HOLD_MS` (`60s`). For CLI testing or external services without direct `eufy-security-ws` access, the HTTP server exposes `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`, with `RTSP`-first ordering, `2500ms` per-station pacing, and burst coalescing) alongside `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe).
+- External Stream Adoption (`initiator=eufy-ws`) & HTTP Pre-Wake/Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Wakes initiated directly through `eufy-security-ws` (such as an external integration starting an `RTSP` or `P2P` stream) are automatically adopted by `onEvent` (`initiator=eufy-ws`) for `HOLD_MS` (`60s`). For CLI testing or external services without direct `eufy-security-ws` access, the HTTP server exposes `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`, with `RTSP`-first ordering, `2500ms` per-station pacing, and burst coalescing) alongside `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe).
 - HomeBase Reboot Resilience: `onEvent` handles `source === 'station'` events (`close`, `connection error`, `connect`),
   cleanly stopping active streams on that station (`initiator=error/station-disconnect`) and re-fetching telemetry on
   reconnect without dropping FFmpeg RTSP feeds to `go2rtc`.
 
 ### Structured Logging, Priorities & Stream Initiators
 
-All log output in `bridge.js` must use `log.debug()`, `log.info()`, `log.warn()`, or `log.error()` with a camera state
+All log output in `app.js` and service modules must use `log.debug()`, `log.info()`, `log.warn()`, or `log.error()` with a camera state
 object (or `'bridge'` for global events) as the first argument so every line is formatted identically for Grafana
 Alloy / Loki ingestion:
 
@@ -343,7 +350,7 @@ Alloy / Loki ingestion:
 ### Stream Interruption & Lifecycle Initiators (`initiator=...`)
 
 - `eufy-event`: Woken or hold-extended by a Eufy motion/person/pet/ring event.
-- `ha-ws`: Woken externally via `eufy-security-ws` (e.g., `Home Assistant` starting an `RTSP` or `P2P` stream directly) and automatically adopted by the bridge.
+- `eufy-ws`: Woken externally via `eufy-security-ws` (e.g., an external integration starting an `RTSP` or `P2P` stream directly) and automatically adopted by the bridge.
 - `api-wake`: Woken or extended via the `POST/GET /api/wake/:cameras` HTTP endpoint (for CLI testing or external services without direct `eufy-security-ws` access).
 - `eufy/camera-event-end` / `eufy/rtsp-end` / `eufy/download-finished`: Cleanly ended by Eufy/HomeBase when the camera
   finishes its P2P event recording, RTSP stream, or post-event clip download.
@@ -498,7 +505,8 @@ Alloy / Loki ingestion:
   `status-card.js`, `telemetry.js`, `backfill-job.js`], `src/overlay/*`, `src/media/*`, `src/services/*`) & 6-Color
   Semantic Palette (`Red`, `Grey`, `Green`, `Blue`, `Yellow`, `Purple`)
 - [x] Block 8 (Step 1) - Built-In HTTP Server (`src/services/http-server.js`, `http_port`), Container Readiness `/healthz` Probe (`Dockerfile` `HEALTHCHECK`), and External Camera Pre-Wake Endpoint (`/api/wake/:cameras` & `/api/wake/all`)
-- [x] Block 8 (Step 2) - Cross-Camera Hold Persistence (`let_eufy_decide_event_end: false` default, RTSP early-stop re-wake, `5s` RTSP socket timeout), Per-Station Wake Pacing (`stationNextWakeAt`, RTSP-before-P2P ordering, P2P wait during active RTSP wake handshake), and Sensor Burst Deduplication (`cam.apiWakeTimer`)
+- [x] Block 8 (Step 2) - Cross-Camera Hold Persistence (`let_eufy_decide_event_end: false` default, RTSP early-stop re-wake, `2.5s` RTSP socket timeout), Per-Station Wake Pacing (`stationNextWakeAt`, RTSP-before-P2P ordering, P2P wait during active RTSP wake handshake), and Sensor Burst Deduplication (`cam.apiWakeTimer`)
+- [x] Block 8 (Step 3) - External `eufy-security-ws` Stream Adoption (`initiator=eufy-ws`), Instant (`0ms`) Mid-Session RTSP Re-Wake with `3.5s` Fast Retries, Active Hold Extension (`+30s` / `hold_secs / 2` on mid-stream events and `evaluateActiveHoldExtension`), and Config-First Named Constants Refactoring
 
 ### Pending (Next Up)
 

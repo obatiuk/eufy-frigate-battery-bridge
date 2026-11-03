@@ -11,6 +11,10 @@
 
 const {
   clampNum,
+  MIN_CAMERA_PRIORITY,
+  MAX_CAMERA_PRIORITY,
+  DEFAULT_CAMERA_PRIORITY,
+  KEYFRAME_BURST_MS,
   GLOBAL_PRESERVE_ASPECT,
   GLOBAL_STARTUP_SNAPSHOT,
   GLOBAL_USE_RTSP,
@@ -19,6 +23,8 @@ const {
 const {log} = require('../logger');
 const {Telemetry} = require('./telemetry');
 const {StatusCard} = require('./status-card');
+
+const INITIAL_KEYFRAME_BURST_MS = 2000;
 
 /**
  * Determines whether a camera needs a brief startup snapshot probe on boot.
@@ -56,7 +62,7 @@ class Camera {
 
     // 2. Identity, Priority & Routing Configuration
     const startupMode = rawCamCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT;
-    this.priority = clampNum(rawCamCfg.priority, -10000, 10000, 0);
+    this.priority = clampNum(rawCamCfg.priority, MIN_CAMERA_PRIORITY, MAX_CAMERA_PRIORITY, DEFAULT_CAMERA_PRIORITY);
     this.eventPriority = 0;
     this.stationSerial = rawCamCfg.station_serial || '';
     this.useRtsp = rawCamCfg.use_rtsp ?? (GLOBAL_USE_RTSP || Boolean(rawCamCfg.rtsp_url));
@@ -90,6 +96,9 @@ class Camera {
     this.eventActive = false;
     this.sessionId = 0;
     this.p2pReady = false;
+    this.rtspRewaking = false;
+    this.rtspRewakeStartedAt = 0;
+    this.rtspRetryTimer = null;
     this.lastStoppedAt = 0;
     this.lastUnsolicitedStopAt = 0;
     this.videoWidth = 0;
@@ -99,12 +108,18 @@ class Camera {
     this.lastMotionAt = 0;
     this.motionClearedAt = 0;
     this.lastEarlySleepCheckAt = 0;
+    this.lastExtendCheckAt = 0;
     this.viewUntil = 0;
     this.viewSince = 0;
+    this.apiWakeTimer = null;
+    this.apiWakePendingOpts = null;
+    this.apiWakeScheduledAt = 0;
+    this.lastApiWakeAt = 0;
+    this.lastApiTriggerLogAt = 0;
     this.reason = '';
     this.wakeInitiator = '';
     this.sleptAt = 0;
-    this.burstUntil = Date.now() + 2000;
+    this.burstUntil = Date.now() + INITIAL_KEYFRAME_BURST_MS;
     this.firstVideoAt = 0;
     this.firstFrameAt = 0;
     this.startedAt = 0;
@@ -184,6 +199,62 @@ class Camera {
   set lastLowBatRefreshAt(v) { this.telemetry.lastLowBatRefreshAt = v; }
   get qualityChecked() { return this.telemetry.qualityChecked; }
   set qualityChecked(v) { this.telemetry.qualityChecked = v; }
+
+  /**
+   * Initializes per-session runtime state when a camera transitions to active streaming.
+   *
+   * @param {'rtsp'|'p2p'|'download'} mode - Active stream mode.
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {boolean} [p2pReady=true] - Whether the stream is ready to receive video frames immediately.
+   */
+  beginSession(mode, now = Date.now(), p2pReady = true) {
+    this.active = true;
+    this.activeMode = mode;
+    this.sessionId++;
+    this.p2pReady = p2pReady;
+    this.startedAt = now;
+    this.lastStartAt = now;
+    this.gotVideo = false;
+    this.rtspRewaking = false;
+    this.rtspRewakeStartedAt = 0;
+    this.restarts = 0;
+    this.lastVideoAt = 0;
+    this.burstUntil = now + KEYFRAME_BURST_MS;
+  }
+
+  /**
+   * Resets per-session runtime state when an active stream stops and transitions to sleep.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {boolean} [hadVideo=false] - Whether decoded video was received during the session.
+   * @param {boolean} [preemptedByViewer=false] - Whether stopped due to viewer switching cameras.
+   * @param {string} [closedMode='p2p'] - Stream mode that just closed.
+   */
+  endSession(now = Date.now(), hadVideo = false, preemptedByViewer = false, closedMode = 'p2p') {
+    this.active = false;
+    this.activeMode = '';
+    this.isTestBackfill = false;
+    this.downloadFinished = false;
+    this.downloadFrames = [];
+    this.starting = false;
+    this.startPromise = null;
+    this.eventActive = false;
+    this.motionUntil = 0;
+    this.eventPriority = 0;
+    this.p2pReady = false;
+    this.rtspRewaking = false;
+    this.rtspRewakeStartedAt = 0;
+    this.isStartupProbe = false;
+    this.motionClearedAt = 0;
+    this.sessionId++;
+    this.lastStoppedAt = now;
+    this.rtspFallbackUntil = 0;
+    if (hadVideo && !preemptedByViewer && closedMode !== 'download') {
+      this.sleptAt = now;
+    }
+    this.burstUntil = now + KEYFRAME_BURST_MS;
+    this.clearViewerQueue();
+  }
 
   /**
    * Returns the timestamp until which the camera wants to remain awake.

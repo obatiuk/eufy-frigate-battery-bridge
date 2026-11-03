@@ -10,10 +10,23 @@
 'use strict';
 
 const {spawn} = require('child_process');
-const {W, H, FRAME, LIVE_FPS, AUDIO, RATE} = require('../config');
+const {W, H, FRAME, LIVE_FPS, AUDIO, RATE, STDERR_TAIL_MAX_CHARS} = require('../config');
 const {log, formatLocalHm} = require('../logger');
 const {inMotion} = require('../domain/camera');
 const {pushFrameToEncoder} = require('./encoder');
+
+const P2P_VIDEO_PROBESIZE_BYTES = '32768';
+const P2P_AUDIO_PROBESIZE_BYTES = '8192';
+const RTSP_SOCKET_TIMEOUT_US = '2500000';
+const RTSP_RETRY_DELAY_MS = 750;
+const DECODER_SIGKILL_DELAY_MS = 2000;
+const STARTUP_PROBE_CAPTURE_MS = 2000;
+const BACKFILL_CANCEL_VIDEO_MS = 5000;
+const MAX_DOWNLOAD_BUFFER_SECS = 60;
+const KEY_PACKET_SCAN_BYTES = 128;
+const HEVC_NAL_VPS = 32;
+const HEVC_NAL_SPS = 33;
+const H264_NAL_SPS = 7;
 
 let stopCameraCallback = null;
 let rtspDropCallback = null;
@@ -79,7 +92,7 @@ function buildP2pDecoderArgs(vfmt, scaleFilter) {
     '-use_wallclock_as_timestamps',
     '1',
     '-probesize',
-    '32768',
+    P2P_VIDEO_PROBESIZE_BYTES,
     '-analyzeduration',
     '0',
     '-f',
@@ -93,7 +106,7 @@ function buildP2pDecoderArgs(vfmt, scaleFilter) {
         '-use_wallclock_as_timestamps',
         '1',
         '-probesize',
-        '8192',
+        P2P_AUDIO_PROBESIZE_BYTES,
         '-analyzeduration',
         '0',
         '-f',
@@ -142,7 +155,7 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
     '-rtsp_transport',
     'tcp',
     '-timeout',
-    '2500000',
+    RTSP_SOCKET_TIMEOUT_US,
     '-i',
     rtspUrl,
     '-map',
@@ -183,6 +196,24 @@ function appendAudioPcmChunk(cam, chunk) {
 }
 
 /**
+ * Updates the camera live frame buffers, lastSeen timestamp, and pushes the frame to the encoder.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {Uint8Array} liveFrame - Frame buffer assigned to cam.frame.
+ * @param {Uint8Array} snapshotCopy - Independent Buffer copy assigned to cam.lastFrame.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ */
+function commitDecodedFrame(cam, liveFrame, snapshotCopy, now) {
+  cam.frame = liveFrame;
+  cam.frameAt = now;
+  cam.frameNew = true;
+  cam.lastFrame = snapshotCopy;
+  cam.needsStartupSnapshot = false;
+  cam.lastSeen = formatLocalHm(new Date(now));
+  pushFrameToEncoder(cam, now);
+}
+
+/**
  * Processes a complete decoded YUV420p frame from a P2P livestream or clip download decoder.
  *
  * @param {Record<string, *>} cam - Camera state object.
@@ -197,38 +228,26 @@ function handleDecodedP2pFrame(cam, rawBuf, now) {
 
   if (cam.activeMode === 'download') {
     if (!cam.frame) {
-      cam.frame = frameCopy;
-      cam.frameAt = now;
-      cam.frameNew = true;
-      cam.lastFrame = frameCopy;
-      cam.lastSeen = formatLocalHm(new Date(now));
-      pushFrameToEncoder(cam, now);
-    } else if (cam.downloadFrames.length < LIVE_FPS * 60) {
+      commitDecodedFrame(cam, frameCopy, frameCopy, now);
+    } else if (cam.downloadFrames.length < LIVE_FPS * MAX_DOWNLOAD_BUFFER_SECS) {
       cam.downloadFrames.push(frameCopy);
     }
     return;
   }
 
-  cam.frame = rawBuf;
-  cam.frameAt = now;
-  cam.frameNew = true;
-  cam.lastFrame = frameCopy;
-  cam.needsStartupSnapshot = false;
-
   if (
       cam.pendingBackfill &&
       !cam.pendingBackfill.ignoreTimeWindow &&
       cam.activeMode !== 'download' &&
-      now - cam.firstFrameAt >= 5000
+      now - cam.firstFrameAt >= BACKFILL_CANCEL_VIDEO_MS
   ) {
     cam.pendingBackfill = null;
     cam.backfillClip = null;
   }
 
-  cam.lastSeen = formatLocalHm(new Date(now));
-  pushFrameToEncoder(cam, now);
+  commitDecodedFrame(cam, rawBuf, frameCopy, now);
 
-  if (now - cam.firstFrameAt >= 2000 && cam.isStartupProbe) {
+  if (now - cam.firstFrameAt >= STARTUP_PROBE_CAPTURE_MS && cam.isStartupProbe) {
     cam.isStartupProbe = false;
     const hasHumanViewer = [...cam.viewerIds.values()].some(Boolean);
     if (!inMotion(cam) && !hasHumanViewer && stopCameraCallback) {
@@ -240,6 +259,83 @@ function handleDecodedP2pFrame(cam, rawBuf, now) {
       );
     }
   }
+}
+
+/**
+ * Processes a complete decoded YUV420p frame from a HomeBase RTSP pull decoder.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {Uint8Array} rawBuf - Raw frame buffer of length FRAME.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @param {number} mySession - Session identifier associated with the decoder.
+ */
+function handleDecodedRtspFrame(cam, rawBuf, now, mySession) {
+  cam.lastVideoAt = now;
+  if (!cam.gotVideo) {
+    cam.gotVideo = true;
+    cam.firstVideoAt = now;
+    cam.rtspRewaking = false;
+    cam.restarts = 0;
+    const delaySec = ((now - cam.startedAt) / 1000).toFixed(1);
+    log.info(cam, 'first RTSP video ' + delaySec + ' s after wake (session=' + mySession + ')');
+  } else if (cam.rtspRewaking) {
+    cam.rtspRewaking = false;
+    cam.restarts = 0;
+    const resumeSec = ((now - (cam.rtspRewakeStartedAt || cam.lastStartAt || now)) / 1000).toFixed(1);
+    log.info(
+        cam,
+        'RTSP video resumed ' + resumeSec + ' s after mid-session re-wake (session=' + mySession + ')'
+    );
+  }
+  if (!cam.firstFrameAt) {
+    cam.firstFrameAt = now;
+  }
+  commitDecodedFrame(cam, rawBuf, Buffer.from(rawBuf), now);
+}
+
+/**
+ * Attaches stdout rawvideo frame chunking, audio PCM pipe ingestion, and stderr tail
+ * buffering to a spawned FFmpeg decoder process.
+ *
+ * @param {Record<string, *>} cam - Camera state object.
+ * @param {import("child_process").ChildProcess} dec - Spawned FFmpeg decoder.
+ * @param {number} mySession - Session identifier.
+ * @param {(buf: Uint8Array, now: number) => void} onFrame - Callback invoked for each complete YUV420p frame.
+ * @returns {() => string} Getter returning the last line of stderr output.
+ */
+function attachDecoderStreams(cam, dec, mySession, onFrame) {
+  let buf = Buffer.allocUnsafe(FRAME);
+  let fill = 0;
+  dec.stdout.on('data', (d) => {
+    let off = 0;
+    while (off < d.length) {
+      const n = Math.min(FRAME - fill, d.length - off);
+      d.copy(buf, fill, off, off + n);
+      fill += n;
+      off += n;
+      if (fill === FRAME) {
+        if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
+          onFrame(buf, Date.now());
+        }
+        buf = Buffer.allocUnsafe(FRAME);
+        fill = 0;
+      }
+    }
+  });
+
+  if (AUDIO && dec.stdio[4]) {
+    dec.stdio[4].on('data', (d) => {
+      if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
+        appendAudioPcmChunk(cam, d);
+      }
+    });
+  }
+
+  let tail = '';
+  dec.stderr.on('data', (d) => {
+    tail = (tail + d).slice(-STDERR_TAIL_MAX_CHARS);
+  });
+  return () => tail.trim().split('\n').pop() || 'no stderr output';
 }
 
 /**
@@ -266,42 +362,14 @@ function startDecoder(cam, codec) {
     dec.stdio[3].on('error', () => {});
   }
 
-  let buf = Buffer.allocUnsafe(FRAME);
-  let fill = 0;
-  dec.stdout.on('data', (d) => {
-    let off = 0;
-    while (off < d.length) {
-      const n = Math.min(FRAME - fill, d.length - off);
-      d.copy(buf, fill, off, off + n);
-      fill += n;
-      off += n;
-      if (fill === FRAME) {
-        if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
-          handleDecodedP2pFrame(cam, buf, Date.now());
-        }
-        buf = Buffer.allocUnsafe(FRAME);
-        fill = 0;
-      }
-    }
+  const getLastStderrLine = attachDecoderStreams(cam, dec, mySession, (frameBuf, now) => {
+    handleDecodedP2pFrame(cam, frameBuf, now);
   });
 
-  if (AUDIO && dec.stdio[4]) {
-    dec.stdio[4].on('data', (d) => {
-      if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
-        appendAudioPcmChunk(cam, d);
-      }
-    });
-  }
-
-  let tail = '';
-  dec.stderr.on('data', (d) => {
-    tail = (tail + d).slice(-400);
-  });
   dec.on('exit', (code) => {
     if (cam.dec === dec) {
       cam.dec = null;
       if (cam.active && cam.sessionId === mySession) {
-        const lastLine = tail.trim().split('\n').pop() || 'no stderr output';
         log.warn(
             cam,
             'decoder exited while stream active (initiator=ffmpeg-decoder, code=' +
@@ -309,7 +377,7 @@ function startDecoder(cam, codec) {
             ', session=' +
             mySession +
             '): ' +
-            lastLine
+            getLastStderrLine()
         );
       }
     }
@@ -340,69 +408,15 @@ function startRtspDecoder(cam, rtspUrl) {
 
   dec.on('error', (e) => log.error(cam, 'RTSP decoder process error: ' + e.message));
 
-  let buf = Buffer.allocUnsafe(FRAME);
-  let fill = 0;
-  dec.stdout.on('data', (d) => {
-    let off = 0;
-    while (off < d.length) {
-      const n = Math.min(FRAME - fill, d.length - off);
-      d.copy(buf, fill, off, off + n);
-      fill += n;
-      off += n;
-      if (fill === FRAME) {
-        if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
-          const now = Date.now();
-          cam.lastVideoAt = now;
-          if (!cam.gotVideo) {
-            cam.gotVideo = true;
-            cam.firstVideoAt = now;
-            cam.rtspRewaking = false;
-            cam.restarts = 0;
-            const delaySec = ((now - cam.startedAt) / 1000).toFixed(1);
-            log.info(cam, 'first RTSP video ' + delaySec + ' s after wake (session=' + mySession + ')');
-          } else if (cam.rtspRewaking) {
-            cam.rtspRewaking = false;
-            cam.restarts = 0;
-            const resumeSec = ((now - (cam.rtspRewakeStartedAt || cam.lastStartAt || now)) / 1000).toFixed(1);
-            log.info(
-                cam,
-                'RTSP video resumed ' + resumeSec + ' s after mid-session re-wake (session=' + mySession + ')'
-            );
-          }
-          if (!cam.firstFrameAt) {
-            cam.firstFrameAt = now;
-          }
-          cam.frame = buf;
-          cam.frameAt = now;
-          cam.frameNew = true;
-          cam.lastFrame = Buffer.from(buf);
-          cam.needsStartupSnapshot = false;
-          cam.lastSeen = formatLocalHm(new Date(now));
-          pushFrameToEncoder(cam, now);
-        }
-        buf = Buffer.allocUnsafe(FRAME);
-        fill = 0;
-      }
-    }
+  const getLastStderrLine = attachDecoderStreams(cam, dec, mySession, (frameBuf, now) => {
+    handleDecodedRtspFrame(cam, frameBuf, now, mySession);
   });
 
-  if (AUDIO && dec.stdio[4]) {
-    dec.stdio[4].on('data', (d) => {
-      if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
-        appendAudioPcmChunk(cam, d);
-      }
-    });
-  }
-
-  let tail = '';
-  dec.stderr.on('data', (d) => {
-    tail = (tail + d).slice(-400);
-  });
   dec.on('exit', (code) => {
     if (cam.dec === dec) {
       cam.dec = null;
       if (cam.active && cam.sessionId === mySession && cam.activeMode === 'rtsp') {
-        const lastLine = tail.trim().split('\n').pop() || 'no stderr output';
+        const lastLine = getLastStderrLine();
         if (cam.gotVideo && !cam.rtspRewaking && rtspDropCallback) {
           rtspDropCallback(cam, code, lastLine);
           return;
@@ -415,7 +429,9 @@ function startRtspDecoder(cam, rtspUrl) {
             mySession +
             '): ' +
             lastLine +
-            ' - retrying in 750ms'
+            ' - retrying in ' +
+            RTSP_RETRY_DELAY_MS +
+            'ms'
         );
         if (cam.rtspRetryTimer) {
           clearTimeout(cam.rtspRetryTimer);
@@ -431,7 +447,7 @@ function startRtspDecoder(cam, rtspUrl) {
           ) {
             startRtspDecoder(cam, cam.rtspUrl);
           }
-        }, 750);
+        }, RTSP_RETRY_DELAY_MS);
       }
     }
   });
@@ -474,7 +490,7 @@ function stopDecoder(cam) {
     } catch (err) {
       // Ignore errors if decoder already exited.
     }
-  }, 2000);
+  }, DECODER_SIGKILL_DELAY_MS);
 }
 
 /**
@@ -487,7 +503,7 @@ const bytes = (e) => Buffer.from((e.buffer && e.buffer.data) ?? e.buffer ?? []);
 
 /**
  * Returns the byte index immediately following an Annex-B start code (00 00 01 or 00 00 00 01)
- * at position `i`, or -1 if no start code begins at `i`.
+ * at position 'i', or -1 if no start code begins at 'i'.
  *
  * @param {Uint8Array} buf - Raw video packet buffer.
  * @param {number} i - Current scan index.
@@ -516,14 +532,16 @@ function findNalHeaderOffset(buf, i) {
  */
 function isKeyPacket(buf, codec) {
   const isHevc = /265|hevc/i.test(codec);
-  const limit = Math.min(buf.length - 4, 128);
+  const limit = Math.min(buf.length - 4, KEY_PACKET_SCAN_BYTES);
   for (let i = 0; i < limit; i++) {
     const nalIdx = findNalHeaderOffset(buf, i);
     if (nalIdx < 0 || nalIdx >= buf.length) {
       continue;
     }
     const nalType = isHevc ? (buf[nalIdx] >> 1) & 0x3f : buf[nalIdx] & 0x1f;
-    const isParamSet = isHevc ? nalType === 32 || nalType === 33 : nalType === 7;
+    const isParamSet = isHevc
+        ? nalType === HEVC_NAL_VPS || nalType === HEVC_NAL_SPS
+        : nalType === H264_NAL_SPS;
     if (isParamSet) {
       return true;
     }
@@ -634,6 +652,7 @@ module.exports = {
   buildRtspDecoderArgs,
   appendAudioPcmChunk,
   handleDecodedP2pFrame,
+  handleDecodedRtspFrame,
   startDecoder,
   startRtspDecoder,
   stopDecoder,

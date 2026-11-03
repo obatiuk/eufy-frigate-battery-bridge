@@ -18,7 +18,69 @@ const {
   GLOBAL_CARD_SHOW_ON_LIVE,
   resolveCardConfig,
 } = require('../config');
-const {evaluateTelemetryState, buildTelemetrySegments} = require('./telemetry');
+const {TEL_TEXT_CHAR_WIDTH, evaluateTelemetryState, buildTelemetrySegments} = require('./telemetry');
+
+const CARD_CORNER_MARGIN_PX = 24;
+const MINIMAL_CARD_WIDTH = 92;
+const MINIMAL_CARD_HEIGHT = 36;
+const ICONS_CARD_HEIGHT = 44;
+const ICONS_CARD_PAD_X = 16;
+const ICONS_CARD_ITEM_GAP = 16;
+const ICONS_STATUS_WIDTH = 20;
+const ICONS_BATTERY_WIDTH = 37;
+const ICONS_WIFI_WIDTH = 28;
+const ICONS_TEMP_WIDTH = 16;
+const ICONS_CLOCK_WIDTH = 20;
+const DEFAULT_CORNER_MIN_WIDTH_WITH_TEL = 540;
+const DEFAULT_CORNER_MIN_WIDTH_NO_TEL = 400;
+const DEFAULT_CORNER_HEIGHT_WITH_TEL = 88;
+const DEFAULT_CORNER_HEIGHT_NO_TEL = 48;
+const DEFAULT_CORNER_TEL_GAP = 18;
+const DEFAULT_CORNER_TEL_PAD_X = 44;
+const DEFAULT_CORNER_HEADER_LEFT_X = 42;
+const DEFAULT_CORNER_HEADER_CHAR_W = TEL_TEXT_CHAR_WIDTH;
+const DEFAULT_CORNER_HEADER_RIGHT_PAD = 24;
+const FRIGATE_MASK_SAFETY_PAD_PX = 6;
+
+/**
+ * Computes the total width in pixels for the icons-only capsule card given visible icon flags.
+ *
+ * @param {{ showBat?: boolean, showWifi?: boolean, showTemp?: boolean, showClock?: boolean }} flags - Enabled icon flags.
+ * @returns {number}
+ */
+function computeIconsCardWidth(flags) {
+  let contentW = ICONS_STATUS_WIDTH;
+  if (flags.showBat) contentW += ICONS_CARD_ITEM_GAP + ICONS_BATTERY_WIDTH;
+  if (flags.showWifi) contentW += ICONS_CARD_ITEM_GAP + ICONS_WIFI_WIDTH;
+  if (flags.showTemp) contentW += ICONS_CARD_ITEM_GAP + ICONS_TEMP_WIDTH;
+  if (flags.showClock) contentW += ICONS_CARD_ITEM_GAP + ICONS_CLOCK_WIDTH;
+  return contentW + ICONS_CARD_PAD_X * 2;
+}
+
+/**
+ * Computes the bounding dimensions { boxW, boxH, hasTelemetry, gap } for a corner default card.
+ *
+ * @param {string} headerText - Header text rendered on the top row.
+ * @param {Array<Record<string, *>>} segments - Telemetry segments.
+ * @returns {{ boxW: number, boxH: number, hasTelemetry: boolean, gap: number }}
+ */
+function computeCornerDefaultCardDimensions(headerText, segments) {
+  const hasTelemetry = segments.length > 0;
+  const gap = DEFAULT_CORNER_TEL_GAP;
+  const telW = hasTelemetry
+      ? segments.reduce((sum, seg) => sum + seg.width, 0) +
+        gap * Math.max(0, segments.length - 1) +
+        DEFAULT_CORNER_TEL_PAD_X
+      : 0;
+  const headerW =
+      DEFAULT_CORNER_HEADER_LEFT_X +
+      headerText.length * DEFAULT_CORNER_HEADER_CHAR_W +
+      DEFAULT_CORNER_HEADER_RIGHT_PAD;
+  const minW = hasTelemetry ? DEFAULT_CORNER_MIN_WIDTH_WITH_TEL : DEFAULT_CORNER_MIN_WIDTH_NO_TEL;
+  const boxW = Math.min(W - CARD_CORNER_MARGIN_PX * 2, Math.max(minW, telW, headerW));
+  const boxH = hasTelemetry ? DEFAULT_CORNER_HEIGHT_WITH_TEL : DEFAULT_CORNER_HEIGHT_NO_TEL;
+  return {boxW, boxH, hasTelemetry, gap};
+}
 
 /**
  * Computes the top-left (boxX, boxY) coordinates for a card of size (boxW, boxH)
@@ -30,7 +92,7 @@ const {evaluateTelemetryState, buildTelemetrySegments} = require('./telemetry');
  * @returns {{ boxX: number, boxY: number }}
  */
 function getCardBoxCoords(position, boxW, boxH) {
-  const margin = 24;
+  const margin = CARD_CORNER_MARGIN_PX;
   switch (position) {
     case 'top-left':
       return {boxX: margin, boxY: margin};
@@ -62,25 +124,24 @@ function getCameraCardBounds(cam) {
     return null;
   }
 
-  let boxW = 92;
-  let boxH = 36;
+  let boxW = MINIMAL_CARD_WIDTH;
+  let boxH = MINIMAL_CARD_HEIGHT;
 
   switch (theme) {
     case 'icons': {
       const tc = cam.telCfg;
-      let contentW = 20;
-      if (tc.enabled && tc.battery) contentW += 16 + 37;
-      if (tc.enabled && tc.wifi) contentW += 16 + 28;
-      if (tc.enabled && tc.temperature) contentW += 16 + 16;
-      if (tc.enabled && tc.lastSeen) contentW += 16 + 20;
-      boxW = contentW + 32;
-      boxH = 44;
+      boxW = computeIconsCardWidth({
+        showBat: Boolean(tc.enabled && tc.battery),
+        showWifi: Boolean(tc.enabled && tc.wifi),
+        showTemp: Boolean(tc.enabled && tc.temperature),
+        showClock: Boolean(tc.enabled && tc.lastSeen),
+      });
+      boxH = ICONS_CARD_HEIGHT;
       break;
     }
     case 'default': {
       const title = cam.title || cam.name;
       const maxHeader = 'Asleep (Low Battery)  -  ' + title;
-      const headerW = 42 + maxHeader.length * 11 + 24;
       const st = cam.liveTelState || evaluateTelemetryState('Asleep', {
         telCfg: cam.telCfg,
         battery: cam.battery ?? 100,
@@ -91,14 +152,10 @@ function getCameraCardBounds(cam) {
         temp: cam.temp ?? 25,
         lastSeen: cam.lastSeen || '00:00',
       });
-      const segments = buildTelemetrySegments(st);
-      const hasTelemetry = cam.telCfg.enabled && segments.length > 0;
-      const gap = 18;
-      const telW = hasTelemetry
-          ? segments.reduce((sum, seg) => sum + seg.width, 0) + gap * Math.max(0, segments.length - 1) + 44
-          : 0;
-      boxW = Math.min(W - 48, Math.max(hasTelemetry ? 540 : 400, telW, headerW));
-      boxH = hasTelemetry ? 88 : 48;
+      const segments = cam.telCfg.enabled ? buildTelemetrySegments(st) : [];
+      const dims = computeCornerDefaultCardDimensions(maxHeader, segments);
+      boxW = dims.boxW;
+      boxH = dims.boxH;
       break;
     }
     case 'minimal':
@@ -122,7 +179,7 @@ function computeFrigateMaskPolygon(cam) {
   if (!bounds) {
     return '';
   }
-  const pad = 6;
+  const pad = FRIGATE_MASK_SAFETY_PAD_PX;
   const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
   const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
   const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
@@ -178,7 +235,19 @@ class StatusCard {
 }
 
 module.exports = {
+  CARD_CORNER_MARGIN_PX,
+  MINIMAL_CARD_WIDTH,
+  MINIMAL_CARD_HEIGHT,
+  ICONS_CARD_HEIGHT,
+  ICONS_CARD_PAD_X,
+  ICONS_CARD_ITEM_GAP,
+  ICONS_STATUS_WIDTH,
+  ICONS_BATTERY_WIDTH,
+  ICONS_WIFI_WIDTH,
+  ICONS_TEMP_WIDTH,
   StatusCard,
+  computeIconsCardWidth,
+  computeCornerDefaultCardDimensions,
   getCardBoxCoords,
   getCameraCardBounds,
   computeFrigateMaskPolygon,

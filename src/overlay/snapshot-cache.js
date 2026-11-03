@@ -11,8 +11,10 @@
 const fs = require('fs');
 const path = require('path');
 const {spawnSync} = require('child_process');
-const {W, H, FRAME, CACHE_DIR} = require('../config');
+const {W, H, FRAME, CACHE_DIR, MAX_FFMPEG_BUFFER_MULTIPLIER} = require('../config');
 const {log, formatLocalHm} = require('../logger');
+
+const JPEG_ENCODER_QUALITY = '2';
 
 /**
  * Builds the FFmpeg CLI arguments to decode a JPEG file into a scaled raw YUV420p frame.
@@ -62,7 +64,7 @@ function buildEncodeJpegArgs(targetFile) {
     '-frames:v',
     '1',
     '-q:v',
-    '2',
+    JPEG_ENCODER_QUALITY,
     targetFile,
   ];
 }
@@ -74,7 +76,7 @@ function buildEncodeJpegArgs(targetFile) {
  * @returns {Uint8Array|null} Decoded YUV420p Buffer of length FRAME, or null if decoding fails.
  */
 function decodeJpegToYuv(filePath) {
-  const r = spawnSync('ffmpeg', buildDecodeJpegArgs(filePath), {maxBuffer: FRAME * 2});
+  const r = spawnSync('ffmpeg', buildDecodeJpegArgs(filePath), {maxBuffer: FRAME * MAX_FFMPEG_BUFFER_MULTIPLIER});
   if (r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME) {
     return r.stdout;
   }
