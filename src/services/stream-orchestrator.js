@@ -63,6 +63,7 @@ let bySerial = new Map();
 let isShuttingDownFn = () => false;
 
 const stationTransitions = new Map();
+const stationNextWakeAt = new Map();
 const getStationTransition = (cam) => stationTransitions.get(getStationKey(cam)) || Promise.resolve();
 const setStationTransition = (cam, p) => stationTransitions.set(getStationKey(cam), p);
 
@@ -209,39 +210,112 @@ async function evaluateEarlySleep(cam, now) {
  * @returns {{ camera: string, title: string, status: string, mode: string, hold_secs: number, delay_ms: number }}
  */
 function wakeCameraExternal(cam, opts) {
-  const {durationMs, reason, createEvent, delayMs = 0} = opts;
-  const wasActive = cam.active;
+  const {durationMs, reason, createEvent, delayMs} = opts;
+  const now = Date.now();
   cam.isStartupProbe = false;
   cam.needsStartupSnapshot = false;
+  if (cam.useRtsp && cam.rtspUrl && !cam.active) {
+    cam.rtspFallbackUntil = 0;
+  }
 
-  const execWake = () => {
+  const applyWakeTrigger = (wakeReason, wakeDurationMs, wakeCreateEvent) => {
     if (isShuttingDownFn()) {
       return;
     }
-    if (createEvent) {
+    cam.lastApiWakeAt = Date.now();
+    if (wakeCreateEvent) {
       cam.motionClearedAt = 0;
-      trigger(cam, reason, durationMs, 'motion', 'api-wake', 250);
+      trigger(cam, wakeReason, wakeDurationMs, 'motion', 'api-wake', 250);
       if (cam.active && cam.activeMode !== 'download') {
         frigateEvent(cam, 'motion detected', '');
       }
     } else {
-      trigger(cam, reason, durationMs, 'view', 'api-wake');
+      trigger(cam, wakeReason, wakeDurationMs, 'view', 'api-wake');
     }
   };
 
-  if (delayMs > 0 && !wasActive) {
-    setTimeout(execWake, delayMs);
+  if (cam.active) {
+    if (cam.apiWakeTimer) {
+      clearTimeout(cam.apiWakeTimer);
+      cam.apiWakeTimer = null;
+      cam.apiWakePendingOpts = null;
+    }
+    applyWakeTrigger(reason, durationMs, createEvent);
+    if (cam.activeMode === 'rtsp' && !cam.gotVideo && now - cam.startedAt > 10000) {
+      log.info(
+          cam,
+          'refreshing stalled RTSP wake on new api-wake "' + reason + '" (session=' + cam.sessionId + ')'
+      );
+      cam.startedAt = now;
+      cam.lastStartAt = now;
+      cam.restarts = 0;
+      stopDecoder(cam);
+      void startRtspStream(cam);
+    }
+    return {
+      camera: cam.name,
+      title: cam.title || cam.name,
+      status: 'extended',
+      mode: cam.activeMode || (isRtspCapable(cam) ? 'rtsp' : 'p2p'),
+      hold_secs: Math.round(durationMs / 1000),
+      delay_ms: 0,
+    };
+  }
+
+  if (cam.apiWakeTimer) {
+    cam.apiWakePendingOpts = {
+      durationMs: Math.max(cam.apiWakePendingOpts ? cam.apiWakePendingOpts.durationMs : 0, durationMs),
+      reason,
+      createEvent: Boolean(
+          (cam.apiWakePendingOpts && cam.apiWakePendingOpts.createEvent) || createEvent
+      ),
+    };
+    const remainingDelayMs = Math.max(0, (cam.apiWakeScheduledAt || now) - now);
+    log.debug(
+        cam,
+        'coalesced duplicate api-wake "' +
+        reason +
+        '" into pending wake timer (in ' +
+        remainingDelayMs +
+        'ms)'
+    );
+    return {
+      camera: cam.name,
+      title: cam.title || cam.name,
+      status: 'scheduled',
+      mode: isRtspCapable(cam) ? 'rtsp' : 'p2p',
+      hold_secs: Math.round(cam.apiWakePendingOpts.durationMs / 1000),
+      delay_ms: remainingDelayMs,
+    };
+  }
+
+  const stationKey = getStationKey(cam);
+  const nextSlotAt = Math.max(now, stationNextWakeAt.get(stationKey) || 0);
+  const effectiveDelayMs =
+      delayMs !== undefined ? delayMs : Math.max(0, nextSlotAt - now);
+  stationNextWakeAt.set(stationKey, now + effectiveDelayMs + 2500);
+
+  if (effectiveDelayMs > 0) {
+    cam.apiWakePendingOpts = {durationMs, reason, createEvent};
+    cam.apiWakeScheduledAt = now + effectiveDelayMs;
+    cam.apiWakeTimer = setTimeout(() => {
+      const pending = cam.apiWakePendingOpts || {durationMs, reason, createEvent};
+      cam.apiWakeTimer = null;
+      cam.apiWakePendingOpts = null;
+      cam.apiWakeScheduledAt = 0;
+      applyWakeTrigger(pending.reason, pending.durationMs, pending.createEvent);
+    }, effectiveDelayMs);
   } else {
-    execWake();
+    applyWakeTrigger(reason, durationMs, createEvent);
   }
 
   return {
     camera: cam.name,
     title: cam.title || cam.name,
-    status: wasActive ? 'extended' : delayMs > 0 ? 'scheduled' : 'waking',
-    mode: cam.activeMode || (isRtspCapable(cam) ? 'rtsp' : 'p2p'),
+    status: effectiveDelayMs > 0 ? 'scheduled' : 'waking',
+    mode: isRtspCapable(cam) ? 'rtsp' : 'p2p',
     hold_secs: Math.round(durationMs / 1000),
-    delay_ms: wasActive ? 0 : delayMs,
+    delay_ms: effectiveDelayMs,
   };
 }
 
@@ -318,7 +392,10 @@ function trigger(cam, reason, ms, kind, initiator = '', evPriority = 10) {
     cam.viewUntil = Math.max(cam.viewUntil, now + ms);
     if (cam.active && resolvedInitiator === 'api-wake') {
       const holdSecs = Math.round((want(cam) - now) / 1000);
-      log.info(
+      const prevApiLogAt = cam.lastApiTriggerLogAt || 0;
+      const logFn = now - prevApiLogAt < 5000 ? log.debug : log.info;
+      cam.lastApiTriggerLogAt = now;
+      logFn(
           cam,
           'activity trigger "' +
           reason +
@@ -338,6 +415,8 @@ function trigger(cam, reason, ms, kind, initiator = '', evPriority = 10) {
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 function activateRtspCamera(rCam, now) {
+  const stationKey = getStationKey(rCam);
+  stationNextWakeAt.set(stationKey, Math.max(stationNextWakeAt.get(stationKey) || 0, now + 2500));
   rCam.active = true;
   rCam.activeMode = 'rtsp';
   rCam.eventActive = inMotion(rCam);
@@ -432,6 +511,7 @@ function arbitrateStationP2pSlot(stationKey, now) {
     }
   }
 
+  stationNextWakeAt.set(stationKey, Math.max(stationNextWakeAt.get(stationKey) || 0, now + 2500));
   pick.active = true;
   pick.activeMode = 'p2p';
   pick.eventActive = inMotion(pick);
@@ -759,6 +839,25 @@ async function startLivestream(cam) {
         return;
       }
 
+      for (let i = 0; i < 22; i++) {
+        const rtspWaking = cams.some(
+            (c) =>
+                c !== cam &&
+                c.active &&
+                c.activeMode === 'rtsp' &&
+                !c.gotVideo &&
+                Date.now() - c.startedAt < 5500 &&
+                getStationKey(c) === getStationKey(cam)
+        );
+        if (!rtspWaking || !cam.active || cam.sessionId !== mySession) {
+          break;
+        }
+        await sleep(250);
+      }
+      if (!cam.active || cam.sessionId !== mySession) {
+        return;
+      }
+
       cam.p2pReady = true;
       cam.lastStartAt = Date.now();
       let r = await call({command: 'device.start_livestream', serialNumber: cam.serial});
@@ -854,6 +953,12 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
   const closedSession = cam.sessionId;
   const closedMode = cam.activeMode || 'p2p';
 
+  if (cam.apiWakeTimer) {
+    clearTimeout(cam.apiWakeTimer);
+    cam.apiWakeTimer = null;
+    cam.apiWakePendingOpts = null;
+    cam.apiWakeScheduledAt = 0;
+  }
   if (Buffer.isBuffer(cam.frame) && cam.frame.length === FRAME) {
     cam.lastFrame = Buffer.from(cam.frame);
   }
@@ -1218,6 +1323,22 @@ function onEvent(e) {
 
     case 'rtsp livestream stopped':
       if (cam.active && cam.activeMode === 'rtsp') {
+        const now = Date.now();
+        if (!LET_EUFY_DECIDE_END && now < want(cam)) {
+          const remainingSecs = Math.round((want(cam) - now) / 1000);
+          log.info(
+              cam,
+              'eufy stopped RTSP stream early (remainingHold=' +
+              remainingSecs +
+              's), re-requesting RTSP livestream (session=' +
+              cam.sessionId +
+              ')'
+          );
+          stopDecoder(cam);
+          cam.lastStartAt = now;
+          void startRtspStream(cam);
+          return;
+        }
         stop(cam, 'eufy ended RTSP livestream', false, 'eufy/rtsp-end');
         arbitrate();
       }
@@ -1262,21 +1383,45 @@ function onEvent(e) {
  * @param {number} quietSince - Timestamp of last video packet or start attempt.
  */
 function checkRtspSessionHealth(cam, now, quietSince) {
-  if (!cam.gotVideo && now - quietSince > 6500 && cam.restarts === 0) {
-    cam.restarts = 1;
+  if (!cam.gotVideo && now - quietSince > 6500 && cam.restarts < 2) {
+    cam.restarts++;
     cam.lastStartAt = now;
     log.info(
         cam,
-        'RTSP wake still waiting for video after 6.5s, re-sending start_rtsp_livestream (session=' +
+        'RTSP wake still waiting for video after 6.5s (retry=' +
+        cam.restarts +
+        '/2), re-sending start_rtsp_livestream (session=' +
         cam.sessionId +
         ')'
     );
     stopDecoder(cam);
     void startRtspStream(cam);
-  } else if (!cam.gotVideo && now - cam.startedAt > 18000) {
+  } else if (!cam.gotVideo && now - cam.startedAt > 22000) {
+    const p2pSlotBusy = cams.some(
+        (c) =>
+            c !== cam &&
+            getStationKey(c) === getStationKey(cam) &&
+            (usesP2pSlot(c) || (!isRtspCapable(c) && now < want(c)))
+    );
+    if (p2pSlotBusy && cam.restarts < 5) {
+      cam.restarts++;
+      cam.lastStartAt = now;
+      cam.startedAt = now - 8000;
+      log.info(
+          cam,
+          'RTSP wake still waiting while station P2P slot is busy (retry=' +
+          cam.restarts +
+          '/5), retrying RTSP wake without P2P fallback (session=' +
+          cam.sessionId +
+          ')'
+      );
+      stopDecoder(cam);
+      void startRtspStream(cam);
+      return;
+    }
     log.warn(
         cam,
-        'HomeBase RTSP stream yielded no video after 18s, queueing P2P fallback for 60s (session=' +
+        'HomeBase RTSP stream yielded no video after 22s, queueing P2P fallback for 60s (session=' +
         cam.sessionId +
         ')'
     );

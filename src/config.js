@@ -324,7 +324,7 @@ const FORWARD_FACE_NAMES = cfg.forward_face_names !== false;
 const GLOBAL_PRESERVE_ASPECT = cfg.preserve_aspect_ratio !== false;
 const GLOBAL_DIM_BACKGROUND = Boolean(cfg.card_dim_background ?? false);
 const PREEMPT_EVENT_STREAMS = cfg.preempt_event_streams !== false;
-const LET_EUFY_DECIDE_END = cfg.let_eufy_decide_event_end !== false;
+const LET_EUFY_DECIDE_END = Boolean(cfg.let_eufy_decide_event_end ?? false);
 const GLOBAL_USE_RTSP = cfg.use_rtsp !== false;
 const BACKFILL_DOWNLOADS = cfg.backfill_downloads !== false;
 const BACKFILL_DELAY_MS = clampNum(cfg.backfill_delay_secs, 2, 120, 5) * 1000;

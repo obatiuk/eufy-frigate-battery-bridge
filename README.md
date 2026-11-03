@@ -103,7 +103,7 @@ fill it in. Settings are grouped by function below:
 | Key                           | Default | Meaning                                                                                                                                                                                                                                                                              |
 |-------------------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `priority` (per camera)       | `0`     | Base priority weight in `cameras[]` (`-10000` to `10000`). Combined with built-in event boosts (`rings`: `+1000`, `identity person`: `+300`, `person`: `+200`, `vehicle`/`pet`: `+100`, `sound`: `+50`, `motion`: `+10`) to decide stream takeovers with zero dwell delay.           |
-| `use_rtsp`                    | `true`  | Automatically use `HomeBase` native `RTSP` (`rtspStreamUrl`) on cameras that support `NAS / RTSP Stream` so they stream concurrently without using the `HomeBase` `P2P` slot. Queues a `60 s` `P2P` fallback if `RTSP` does not connect within `18 s`. Can be overridden per camera. |
+| `use_rtsp`                    | `true`  | Automatically use `HomeBase` native `RTSP` (`rtspStreamUrl`) on cameras that support `NAS / RTSP Stream` so they stream concurrently without using the `HomeBase` `P2P` slot. Queues a `60 s` `P2P` fallback if `RTSP` does not connect within `22 s`. Can be overridden per camera. |
 | `rtsp_url` (per camera)       | `""`    | Optional explicit `rtsp://` URL override for a camera in `cameras[]` (auto-discovered from `device.get_properties` when omitted)                                                                                                                                                     |
 | `station_serial` (per camera) | `""`    | Optional explicit station serial override in `cameras[]` (auto-discovered from `stationSerialNumber` in `device.get_properties`)                                                                                                                                                     |
 | `backfill_downloads`          | `true`  | Automatically query `HomeBase` local storage (`station.database_query_latest_info` / `station.database_query_by_date`) and replay missed event clips (`device.start_download`) at `15 fps` into `Frigate` once the station's `P2P` slot is free                                      |
@@ -113,7 +113,7 @@ fill it in. Settings are grouped by function below:
 | `view_linger_secs`            | `20`    | Stay live this long (seconds) after the last viewer leaves                                                                                                                                                                                                                           |
 | `view_max_secs`               | `300`   | Hard cap (seconds) for a live period only viewers asked for                                                                                                                                                                                                                          |
 | `viewer_cooldown_secs`        | `5`     | Ignore single-camera viewers that connect this soon (seconds) after a camera finishes streaming                                                                                                                                                                                      |
-| `let_eufy_decide_event_end`   | `true`  | End event livestreams cleanly when Eufy reports `livestream stopped` or `5 s` after Eufy reports activity cleared (`state: false`, once at least `10 s` of video has been shown)                                                                                                     |
+| `let_eufy_decide_event_end`   | `false` | Optional battery saver that ends event livestreams early when Eufy reports `livestream stopped` or `5 s` after Eufy reports activity cleared (`state: false`, once at least `10 s` of video has been shown). Disabled (`false`) by default so cameras stay awake for the full `hold_secs` (`60 s`). |
 | `preempt_event_streams`       | `true`  | Allow a newer motion event on an equal-priority camera to take over immediately                                                                                                                                                                                                      |
 
 ### Events, Doorbell & HomeBase 3 Intelligence
@@ -215,6 +215,15 @@ make clean
 `eufy-security-ws` so `P2P` sessions do not pick `4K` and stall. To force `Medium` even when a camera was manually set
 to `High`/`4K`, set `"enforce_streaming_quality": 7`.
 
+> [!IMPORTANT]
+> **Required for Cross-Camera Room-to-Room Tracking & Full `hold_secs` Recording:**
+> By default, Eufy cameras ship in **Optimal Battery Life** mode (`powerWorkingMode: 0`), which caps hardware clips at `10–20 s` and sends `activity cleared` (`state: false`) `10 s` after motion starts.
+>
+> Depending on your preference, choose one of the two setups below:
+> - **Keep `Optimal Battery Life` on the cameras:** Keep `"let_eufy_decide_event_end": false` (the default) in your `config.json`. The bridge ignores Eufy's early `10 s` `activity cleared` signal and automatically re-requests streams if the camera stops early so the stream stays open for the full `hold_secs` (`60 s`).
+> - **Maximum uninterrupted cross-camera tracking (`60 s` hardware clips + `60 s` bridge hold):** Keep `"let_eufy_decide_event_end": false` in `config.json` **and** switch each camera in the Eufy app (**Camera Settings → Power Manager**) from **Optimal Battery Life** (`0`) to **Customize Recording** (`powerWorkingMode: 2`, `recordingClipLength: 60`, `recordingEndClipMotionStops: false`, `recordingRetriggerInterval: 5`) so the camera hardware itself records continuously for `60 s` without interruption — or apply it via the foldable CLI script in [Troubleshooting](#troubleshooting).
+
+
 ## Detailed Feature Guide
 
 ### Customizable Status Themes & Corner Placement
@@ -280,7 +289,7 @@ combines three mechanisms:
   app (such as `eufyCam 3C` / `T8161`), the bridge automatically discovers its `rtspStreamUrl`, wakes the camera's
   `RTSP` feed via `rtspStream=true` and `device.start_rtsp_livestream`, and streams multiple `RTSP` cameras in parallel
   (`WAKE [RTSP]`) without using the `HomeBase` `P2P` slot—leaving `P2P` completely free for `P2P`-only devices like
-  video doorbells (`T8214`). If the `HomeBase` `RTSP` server does not deliver frames within `18 s`, the bridge queues a
+  video doorbells (`T8214`). If the `HomeBase` `RTSP` server does not deliver frames within `22 s`, the bridge queues a
   `60 s` `P2P` fallback through `arbitrate()`.
 - **Per-Station (`stationSerial`) Concurrent `P2P` Arbitration:** `P2P` arbitration and transition locks are scoped per
   `stationSerialNumber` rather than globally. Standalone Wi-Fi cameras/doorbells (or cameras paired to a second
@@ -376,9 +385,7 @@ if hardware initialization fails.
 
 ### Smart Battery Conservation & Eufy-Controlled Event End
 
-- **Eufy-controlled event end (`let_eufy_decide_event_end`):** Puts event-woken cameras to sleep `5 s` after Eufy
-  reports activity cleared (`state: false`, once at least `10 s` of video has been shown) or immediately when Eufy sends
-  `livestream stopped`, while capping continuous activity at `hold_secs` (`60 s`) after the last trigger.
+- **Full `hold_secs` persistence vs. Eufy-controlled event end (`let_eufy_decide_event_end: false` by default):** Keeps event-woken cameras live for the full `hold_secs` (`60 s`) and automatically re-requests `RTSP`/`P2P` streams if the camera stops early. When explicitly enabled (`true`), puts event-woken cameras to sleep `5 s` after Eufy reports activity cleared (`state: false`, once at least `10 s` of video has been shown).
 - **Low-Battery Economy Mode (`low_battery_threshold`):** When battery drops to or below `20%` (and is not charging),
   automatically shortens motion hold duration (`low_battery_hold_secs`) and blocks viewer-triggered wakeups
   (`low_battery_wake_on_view: false`).
@@ -424,7 +431,7 @@ The bridge runs a lightweight built-in HTTP server on port `8080` (configurable 
 - **`GET /healthz`** (or `HEAD /healthz`): Returns HTTP `200` (`{"ok":true,"ws_connected":true,"uptime_secs":...,"active_cameras":[...]}`) when the bridge is running and connected to `eufy-security-ws`, or HTTP `503` otherwise. Used by the container `HEALTHCHECK`.
 - **`POST /api/wake/:cameras`** (or `GET /api/wake/:cameras`): Pre-wakes one or more cameras before physical PIR motion occurs (for example, when a `Home Assistant` door or garage sensor opens).
   - `:cameras` accepts a camera `name`, `serial`, slugified `title` (e.g. `front_doorbell`), a comma-separated list (`backyard,front_doorbell`), or `all` (`/api/wake/all` or `/api/wake`).
-  - Multi-camera wake requests automatically stagger sleeping cameras by `2000 ms` to prevent simultaneous `HomeBase` radio collisions.
+  - Multi-camera and burst wake requests order `RTSP` cameras ahead of `P2P` cameras, pace sleeping camera wakes by `2500 ms` per `HomeBase` station, and coalesce duplicate sensor triggers to prevent simultaneous `HomeBase` radio collisions.
   - Optional `JSON` body (or query string) parameters:
     - `duration` (number, `5`–`900`, default `hold_secs`): Seconds to keep the camera stream awake.
     - `reason` (string, default `"external api wake"`): Reason logged on wake.
@@ -455,7 +462,113 @@ curl -s -X POST "http://127.0.0.1:8080/api/wake/all" \
   (step 4), its battery and Wi-Fi signal, and that the Eufy app can open it live.
 - **`"start_livestream failed"`:** `eufy-security-ws` lost its Eufy session or the `HomeBase` is busy with another `P2P`
   stream (the Eufy app counts too).
+- **Streams stop after `15–20 s` when walking between rooms (or ignore `hold_secs`):** By default, Eufy cameras run in **Optimal Battery Life** mode (`powerWorkingMode: 0`), which cuts off hardware clips after `10–20 s` and sends `activity cleared` (`state: false`) `10 s` after motion starts.
+  - If you want to **keep `Optimal Battery Life`** on your cameras, ensure `"let_eufy_decide_event_end": false` (the default) is set in `config.json` so the bridge ignores Eufy's `10 s` clear signal and honors the full `hold_secs` (`60 s`).
+  - If you also want the cameras themselves to record full `60 s` hardware clips without early cutoffs, switch **Power Manager** to **Customize Recording** (`powerWorkingMode: 2`, `60 s` clip length, `5 s` minimum retrigger interval) in the Eufy app or use the foldable CLI scripts below:
+  <details>
+  <summary><strong>CLI Script 1: Inspect camera Power Manager & recording properties</strong></summary>
+
+  ```bash
+  podman exec eufy-frigate-battery-bridge node -e '
+    const fs = require("fs");
+    const WS = require("ws");
+    const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || "/config/config.json";
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    const ws = new WS(cfg.eufy_ws);
+    let id = 0;
+    const send = (cmd) => ws.send(JSON.stringify({ messageId: String(++id), ...cmd }));
+    const unwrap = (v) => (v && typeof v === "object" && "value" in v ? v.value : v);
+
+    ws.on("message", (raw) => {
+      const m = JSON.parse(raw);
+      if (m.type === "version") {
+        send({ command: "set_api_schema", schemaVersion: Math.min(m.maxSchemaVersion, 21) });
+        send({ command: "start_listening" });
+      } else if (m.messageId === "2") {
+        for (const c of cfg.cameras) {
+          send({ command: "device.get_properties", serialNumber: c.serial });
+        }
+        setTimeout(() => process.exit(0), 1500);
+      } else if (m.type === "result" && m.result?.properties) {
+        const p = m.result.properties;
+        console.log(
+          unwrap(p.name) + " (" + unwrap(p.serialNumber) + "): " +
+            "powerWorkingMode=" + unwrap(p.powerWorkingMode) +
+            " (0=BatterySaver, 1=Surveillance, 2=Custom)" +
+            ", clipLength=" + unwrap(p.recordingClipLength) + "s" +
+            ", endEarly=" + unwrap(p.recordingEndClipMotionStops) +
+            ", retrigger=" + unwrap(p.recordingRetriggerInterval) + "s" +
+            ", rtspStream=" + unwrap(p.rtspStream)
+        );
+      }
+    });
+  '
+  ```
+  </details>
+  <details>
+  <summary><strong>CLI Script 2: Configure all cameras for 60s Custom Recording (powerWorkingMode=2)</strong></summary>
+
+  ```bash
+  podman exec eufy-frigate-battery-bridge node -e '
+    const fs = require("fs");
+    const WS = require("ws");
+    const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || "/config/config.json";
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    const ws = new WS(cfg.eufy_ws);
+    let id = 0;
+    const pending = new Map();
+    const send = (cmd) => {
+      const messageId = String(++id);
+      pending.set(messageId, cmd);
+      ws.send(JSON.stringify({ messageId, ...cmd }));
+    };
+    const unwrap = (v) => (v && typeof v === "object" && "value" in v ? v.value : v);
+
+    ws.on("message", (raw) => {
+      const m = JSON.parse(raw);
+      if (m.type === "version") {
+        send({ command: "set_api_schema", schemaVersion: Math.min(m.maxSchemaVersion, 21) });
+        send({ command: "start_listening" });
+      } else if (m.messageId === "2") {
+        for (const c of cfg.cameras) {
+          send({ command: "device.set_property", serialNumber: c.serial, name: "powerWorkingMode", value: 2 });
+          send({ command: "device.set_property", serialNumber: c.serial, name: "recordingClipLength", value: 60 });
+          send({ command: "device.set_property", serialNumber: c.serial, name: "recordingEndClipMotionStops", value: false });
+          send({ command: "device.set_property", serialNumber: c.serial, name: "recordingRetriggerInterval", value: 5 });
+        }
+        send({ command: "driver.poll_refresh" });
+        setTimeout(() => {
+          for (const c of cfg.cameras) {
+            send({ command: "device.get_properties", serialNumber: c.serial });
+          }
+        }, 2500);
+        setTimeout(() => process.exit(0), 4500);
+      } else if (m.type === "result") {
+        const req = pending.get(m.messageId) || {};
+        if (req.command === "device.set_property") {
+          console.log(
+            "set_property [" + req.serialNumber + "] " + req.name + "=" + req.value +
+              " -> " + (m.success ? "OK" : "FAILED (" + (m.errorCode || "unknown") + ")")
+          );
+        } else if (m.result?.properties) {
+          const p = m.result.properties;
+          console.log(
+            "Current " + unwrap(p.name) + " (" + unwrap(p.serialNumber) + "): " +
+              "powerWorkingMode=" + unwrap(p.powerWorkingMode) +
+              ", clipLength=" + unwrap(p.recordingClipLength) + "s" +
+              ", endEarly=" + unwrap(p.recordingEndClipMotionStops) +
+              ", retrigger=" + unwrap(p.recordingRetriggerInterval) + "s"
+          );
+        }
+      }
+    });
+  '
+  ```
+  </details>
 - **Inspecting Eufy device models, serials, and firmware versions:**
+  <details>
+  <summary><strong>CLI Script 3: Inspect device models, serial numbers & firmware versions</strong></summary>
+
   ```bash
   podman exec eufy-frigate-battery-bridge node -e '
     const fs = require("fs");
@@ -494,6 +607,7 @@ curl -s -X POST "http://127.0.0.1:8080/api/wake/all" \
     });
   '
   ```
+  </details>
 
 ## Good to know
 

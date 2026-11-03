@@ -141,8 +141,8 @@ podman exec eufy-frigate-battery-bridge node -e '
   speed into Frigate when a P2P camera triggers while its station P2P slot is busy (default: `true`)
 - `backfill_delay_secs`: Seconds a station's P2P slot must be idle before starting a queued backfill download (default:
   `5`)
-- `let_eufy_decide_event_end`: End event livestreams cleanly when Eufy sends `livestream stopped` or `5s` after Eufy
-  reports `state: false` (once at least `10s` of video has been shown) (default: `true`)
+- `let_eufy_decide_event_end`: Optional battery-saver mode to end event livestreams early when Eufy sends `livestream stopped` or `5s` after Eufy
+  reports `state: false` (once at least `10s` of video has been shown) (default: `false` so cameras stay live for the full `hold_secs`)
 - `preempt_event_streams`: Allow newer motion on an equal-priority camera to preempt an active event stream immediately
   (default: `true`)
 - `audio`: Enable audio passthrough (default: `true`)
@@ -273,7 +273,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
   the camera via `rtspStream=true` and `device.start_rtsp_livestream`, and streams them in `activeMode = 'rtsp'`
   concurrently alongside P2P cameras (`usesP2pSlot(cam) === false`). Retries RTSP connection every `750ms` during the
   wake window, re-sends `start_rtsp_livestream` at `6.5s` if needed, and queues a `60s` P2P fallback
-  (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `18s`.
+  (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `22s`.
 - Post-Event Clip Download Backfill (`backfill_downloads`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
   (`true`) by default. When a P2P camera triggers motion while its station's P2P slot is busy (or is preempted before
   capturing 5s of video), `pendingBackfill` records the event metadata. Once the P2P slot is idle for
@@ -293,7 +293,8 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
   the active camera immediately with a `150ms` P2P handover settle delay. Lower-priority cameras
   (`pickScore < curScore`) are blocked from preempting an active higher-priority event until its motion clears or
   stalls.
-- Eufy-Controlled Event End (`let_eufy_decide_event_end`): Enabled (`true`) by default. When Eufy/HomeBase sends
+- Eufy Power Manager (`powerWorkingMode`) & Event Hold Interaction: Eufy cameras in `Optimal Battery Life` (`powerWorkingMode: 0`) send `state: false` (`activity cleared`) `10s` after motion starts regardless of `recordingClipLength`. Because `let_eufy_decide_event_end` defaults to `false`, the bridge ignores early `state: false` events and re-requests streams if stopped before `want(cam)`, keeping streams alive for the full `hold_secs` (`60s`). For uninterrupted `60s` hardware clips without camera-side re-wakes, cameras should be switched to `Customize Recording` (`powerWorkingMode: 2`, `recordingClipLength: 60`, `recordingEndClipMotionStops: false`, `recordingRetriggerInterval: 5`).
+- Eufy-Controlled Event End (`let_eufy_decide_event_end`): Disabled (`false`) by default. When explicitly enabled (`true`), When Eufy/HomeBase sends
   `livestream stopped` on an active event stream (after 3s of video or after Eufy reports `state: false`), the bridge
   puts the camera to sleep cleanly (`initiator=eufy/camera-event-end`). Additionally, when Eufy reports `state: false`
   (`activity cleared`) on an active event stream with decoded video, `motionUntil` is shortened to
@@ -310,7 +311,7 @@ Data and dependencies flow strictly top-down from the composition root (`src/bri
 - Background Dimming (`card_dim_background`): Disabled (`false`) by default (configurable globally and per-camera).
   Keeps background snapshot pixels outside the status card 100% unchanged across `Live <-> Asleep` transitions so
   Frigate does not record false full-frame motion when the card area is covered by a Frigate motion mask.
-- External HTTP Pre-Wake & Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Exposes `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe checking `isWsReady()`) and `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`). Uses the `view` hold path by default (`create_event: false`) and staggers multi-camera wakes by `2000ms` per sleeping camera to avoid HomeBase radio contention.
+- External HTTP Pre-Wake & Readiness Server (`http_port`, `startHttpServer`, `wakeCameraExternal`): Exposes `GET/HEAD /healthz` (container `HEALTHCHECK` readiness probe checking `isWsReady()`) and `POST/GET /api/wake/:cameras` (supporting `name`, `serial`, slugified `title`, comma-separated lists, and `all`). Uses the `view` hold path by default (`create_event: false`), orders `RTSP` targets ahead of `P2P` targets, paces wakes by `2500ms` per station (`stationNextWakeAt`), and coalesces duplicate burst triggers (`cam.apiWakeTimer`) to avoid HomeBase radio contention.
 - HomeBase Reboot Resilience: `onEvent` handles `source === 'station'` events (`close`, `connection error`, `connect`),
   cleanly stopping active streams on that station (`initiator=error/station-disconnect`) and re-fetching telemetry on
   reconnect without dropping FFmpeg RTSP feeds to `go2rtc`.
@@ -495,7 +496,8 @@ Alloy / Loki ingestion:
 - [x] Block 7 - Enterprise Modular Refactoring (`src/config.js`, `src/logger.js`, `src/domain/*` [`camera.js`,
   `status-card.js`, `telemetry.js`, `backfill-job.js`], `src/overlay/*`, `src/media/*`, `src/services/*`) & 6-Color
   Semantic Palette (`Red`, `Grey`, `Green`, `Blue`, `Yellow`, `Purple`)
-- [x] Block 8 (Step 1) - Built-In HTTP Server (`src/services/http-server.js`, `http_port`), Container Readiness `/healthz` Probe (`Dockerfile` `HEALTHCHECK`), and External Camera Pre-Wake Endpoint (`/api/wake/:cameras` & `/api/wake/all` with `2000ms` multi-camera wake staggering)
+- [x] Block 8 (Step 1) - Built-In HTTP Server (`src/services/http-server.js`, `http_port`), Container Readiness `/healthz` Probe (`Dockerfile` `HEALTHCHECK`), and External Camera Pre-Wake Endpoint (`/api/wake/:cameras` & `/api/wake/all`)
+- [x] Block 8 (Step 2) - Cross-Camera Hold Persistence (`let_eufy_decide_event_end: false` default, RTSP early-stop re-wake, `5s` RTSP socket timeout), Per-Station Wake Pacing (`stationNextWakeAt`, RTSP-before-P2P ordering, P2P wait during active RTSP wake handshake), and Sensor Burst Deduplication (`cam.apiWakeTimer`)
 
 ### Pending (Next Up)
 

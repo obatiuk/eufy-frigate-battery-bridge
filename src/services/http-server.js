@@ -166,16 +166,16 @@ function startHttpServer(cams, hooks) {
           body.create_event ?? (urlObj.searchParams.get('create_event') === 'true')
       );
 
-      let sleepingIdx = 0;
-      const results = targets.map((cam) => {
-        const delayMs = cam.active ? 0 : sleepingIdx++ * 2000;
-        return wakeCameraExternal(cam, {
+      const orderedTargets = [...targets].sort(
+          (a, b) => Number(Boolean(b.useRtsp && b.rtspUrl)) - Number(Boolean(a.useRtsp && a.rtspUrl))
+      );
+      const results = orderedTargets.map((cam) =>
+        wakeCameraExternal(cam, {
           durationMs: durationSecs * 1000,
           reason,
           createEvent,
-          delayMs,
-        });
-      });
+        })
+      );
 
       res.writeHead(200, {'Content-Type': 'application/json'});
       res.end(JSON.stringify({ok: true, results}));

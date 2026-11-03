@@ -10,7 +10,7 @@
 	"backfill_downloads": true,
 	"backfill_delay_secs": 5,
 	"preempt_event_streams": true,
-	"let_eufy_decide_event_end": true,
+	"let_eufy_decide_event_end": false,
 	"hold_secs": 60,
 	"max_secs": 900,
 	"view_linger_secs": 20,

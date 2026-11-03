@@ -131,6 +131,8 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
     'low_delay',
     '-rtsp_transport',
     'tcp',
+    '-timeout',
+    '5000000',
     '-i',
     rtspUrl,
     '-map',
@@ -312,6 +314,10 @@ function startDecoder(cam, codec) {
  * @param {string} rtspUrl - HomeBase RTSP stream URL.
  */
 function startRtspDecoder(cam, rtspUrl) {
+  if (cam.rtspRetryTimer) {
+    clearTimeout(cam.rtspRetryTimer);
+    cam.rtspRetryTimer = null;
+  }
   const mySession = cam.sessionId;
   const scaleFilter = buildScaleFilter(cam.preserveAspect);
   const args = buildRtspDecoderArgs(rtspUrl, scaleFilter);
@@ -387,7 +393,11 @@ function startRtspDecoder(cam, rtspUrl) {
             lastLine +
             ' - retrying in 750ms'
         );
-        setTimeout(() => {
+        if (cam.rtspRetryTimer) {
+          clearTimeout(cam.rtspRetryTimer);
+        }
+        cam.rtspRetryTimer = setTimeout(() => {
+          cam.rtspRetryTimer = null;
           if (
               cam.active &&
               cam.sessionId === mySession &&
@@ -409,6 +419,10 @@ function startRtspDecoder(cam, rtspUrl) {
  * @param {Record<string, *>} cam - Camera state object.
  */
 function stopDecoder(cam) {
+  if (cam.rtspRetryTimer) {
+    clearTimeout(cam.rtspRetryTimer);
+    cam.rtspRetryTimer = null;
+  }
   const dec = cam.dec;
   cam.dec = null;
   cam.frame = null;
@@ -423,9 +437,12 @@ function stopDecoder(cam) {
     return;
   }
   try {
-    dec.stdin.end();
+    if (dec.stdin) {
+      dec.stdin.end();
+    }
+    dec.kill('SIGTERM');
   } catch (err) {
-    // Ignore errors when closing decoder stdin.
+    // Ignore errors when closing decoder stdin or sending SIGTERM.
   }
   setTimeout(() => {
     try {
