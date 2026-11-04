@@ -31,6 +31,7 @@ const {
   buildTelemetrySegments,
 } = require('../domain/telemetry');
 const {
+  DEFAULT_CORNER_CARD_RADIUS,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -51,7 +52,7 @@ const {
   drawYuvLine,
   drawRoundedBox,
   prepareBackgroundCanvas,
-  copyYuvRegion,
+  copyRoundedYuvRegion,
 } = require('./yuv-canvas');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
@@ -495,15 +496,16 @@ function drawCornerDefaultCard(
     canvas,
     position,
     headerText,
+    maxHeaderText,
     st,
     segments,
     buildDrawtext,
     blurBackdrop = true
 ) {
-  const {boxW, boxH, hasTelemetry, gap} = computeCornerDefaultCardDimensions(headerText, segments);
+  const {boxW, boxH, hasTelemetry, gap} = computeCornerDefaultCardDimensions(maxHeaderText, segments);
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.58, 0.16, blurBackdrop);
+  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, DEFAULT_CORNER_CARD_RADIUS, 0.58, 0.16, blurBackdrop);
   if (st.statusKind === 'backfill') {
     drawRewindGlyph(canvas, boxX + 26, boxY + 23, 0.95, st.statusRgb);
   } else {
@@ -598,11 +600,13 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
 
   if (cardCfg.position !== 'center') {
     const camLabel = status && status.camTitle ? '  -  ' + status.camTitle : '';
+    const maxHeaderText = 'Asleep (Low Battery)' + camLabel;
     drawtextList.push(
         ...drawCornerDefaultCard(
             canvas,
             cardCfg.position,
             titleText + camLabel,
+            maxHeaderText,
             st,
             segments,
             buildDrawtext,
@@ -756,7 +760,15 @@ function renderLiveFrameWithCard(cam, rawFrame) {
       if (Buffer.isBuffer(activeCardBuf)) {
         const bounds = cam.getCardBounds();
         if (bounds) {
-          copyYuvRegion(activeCardBuf, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
+          copyRoundedYuvRegion(
+              activeCardBuf,
+              out,
+              bounds.boxX,
+              bounds.boxY,
+              bounds.boxW,
+              bounds.boxH,
+              DEFAULT_CORNER_CARD_RADIUS
+          );
         }
         return out;
       }

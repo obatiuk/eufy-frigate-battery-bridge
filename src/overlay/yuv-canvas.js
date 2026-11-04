@@ -350,7 +350,9 @@ function prepareBackgroundCanvas(cardCfg, bgFrame) {
 }
 
 /**
- * Copies the rectangular sub-region (boxX, boxY, boxW, boxH) from srcYuv to dstYuv.
+ * Copies a rounded-rectangle sub-region (boxX, boxY, boxW, boxH) with corner radius from
+ * srcYuv onto dstYuv, leaving pixels outside the rounded corners untouched and smoothly
+ * alpha-blending the anti-aliased corner arc.
  *
  * @param {Uint8Array} srcYuv - Source YUV420p frame buffer.
  * @param {Uint8Array} dstYuv - Destination YUV420p frame buffer.
@@ -358,32 +360,52 @@ function prepareBackgroundCanvas(cardCfg, bgFrame) {
  * @param {number} boxY - Top Y coordinate.
  * @param {number} boxW - Width in pixels.
  * @param {number} boxH - Height in pixels.
+ * @param {number} radius - Corner radius in pixels.
  */
-function copyYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH) {
-  const x0 = Math.max(0, boxX & ~1);
-  const y0 = Math.max(0, boxY & ~1);
-  const x1 = Math.min(W, (boxX + boxW + 1) & ~1);
-  const y1 = Math.min(H, (boxY + boxH + 1) & ~1);
-  const rw = x1 - x0;
-  if (rw <= 0 || y1 <= y0) {
-    return;
-  }
-
-  for (let y = y0; y < y1; y++) {
-    const off = y * W + x0;
-    srcYuv.copy(dstYuv, off, off, off + rw);
-  }
+function copyRoundedYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH, radius) {
+  const rSafe = Math.min(radius, Math.floor(boxW / 2), Math.floor(boxH / 2));
   const cw = W >> 1;
   const cSize = cw * (H >> 1);
-  const cx0 = x0 >> 1;
-  const cy0 = y0 >> 1;
-  const cy1 = y1 >> 1;
-  const crw = rw >> 1;
-  for (let cy = cy0; cy < cy1; cy++) {
-    const uOff = W * H + cy * cw + cx0;
-    const vOff = uOff + cSize;
-    srcYuv.copy(dstYuv, uOff, uOff, uOff + crw);
-    srcYuv.copy(dstYuv, vOff, vOff, vOff + crw);
+
+  for (let py = 0; py < boxH; py++) {
+    const gy = boxY + py;
+    if (gy < 0 || gy >= H) {
+      continue;
+    }
+    const dy = Math.max(rSafe - py, 0, py - (boxH - 1 - rSafe));
+    const rowOff = gy * W;
+
+    for (let px = 0; px < boxW; px++) {
+      const gx = boxX + px;
+      if (gx < 0 || gx >= W) {
+        continue;
+      }
+      const dx = Math.max(rSafe - px, 0, px - (boxW - 1 - rSafe));
+      const cov =
+          dx === 0 && dy === 0 ? 1 : Math.min(1, Math.max(0, rSafe + 0.5 - Math.hypot(dx, dy)));
+      if (cov <= 0) {
+        continue;
+      }
+
+      const yIdx = rowOff + gx;
+      if (cov >= 1) {
+        dstYuv[yIdx] = srcYuv[yIdx];
+      } else {
+        dstYuv[yIdx] = (dstYuv[yIdx] * (1 - cov) + srcYuv[yIdx] * cov + 0.5) | 0;
+      }
+
+      if ((gx & 1) === 0 && (gy & 1) === 0) {
+        const uIdx = W * H + (gy >> 1) * cw + (gx >> 1);
+        const vIdx = uIdx + cSize;
+        if (cov >= 1) {
+          dstYuv[uIdx] = srcYuv[uIdx];
+          dstYuv[vIdx] = srcYuv[vIdx];
+        } else {
+          dstYuv[uIdx] = (dstYuv[uIdx] * (1 - cov) + srcYuv[uIdx] * cov + 0.5) | 0;
+          dstYuv[vIdx] = (dstYuv[vIdx] * (1 - cov) + srcYuv[vIdx] * cov + 0.5) | 0;
+        }
+      }
+    }
   }
 }
 
@@ -394,5 +416,5 @@ module.exports = {
   drawYuvLine,
   drawRoundedBox,
   prepareBackgroundCanvas,
-  copyYuvRegion,
+  copyRoundedYuvRegion,
 };
