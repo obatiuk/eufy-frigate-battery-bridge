@@ -13,6 +13,7 @@ const {DEFAULT_EVENT_PRIORITY} = require('../config');
 const DEFAULT_BACKFILL_MAX_AGE_MS = 300000;
 const BACKFILL_MATCH_LOOKBACK_MS = 45000;
 const BACKFILL_MATCH_LOOKAHEAD_MS = 180000;
+const BACKFILL_MAX_QUERY_ATTEMPTS = 4;
 const TEST_BACKFILL_OFFSET_MS = 10000;
 const TEST_BACKFILL_PRIORITY = 9999;
 
@@ -107,6 +108,27 @@ class BackfillJob {
   }
 
   /**
+   * Returns true if this backfill job was triggered by SIGUSR1 and ignores event time windows.
+   *
+   * @returns {boolean}
+   */
+  isUrgentTest() {
+    return Boolean(this.ignoreTimeWindow);
+  }
+
+  /**
+   * Increments the HomeBase database query attempt counter and returns true if this job
+   * is still within maxAttempts.
+   *
+   * @param {number} [maxAttempts=BACKFILL_MAX_QUERY_ATTEMPTS] - Maximum allowed database query attempts.
+   * @returns {boolean} True if the query attempt is allowed, false if exhausted.
+   */
+  consumeQueryAttempt(maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
+    this.attempts += 1;
+    return this.attempts <= maxAttempts;
+  }
+
+  /**
    * Checks whether a parsed HomeBase clip candidate falls within this job's trigger time window.
    *
    * @param {{ storagePath: string, clipMs: number }} candidate - Parsed clip candidate.
@@ -117,7 +139,7 @@ class BackfillJob {
     if (!candidate || downloadedPaths.has(candidate.storagePath)) {
       return false;
     }
-    if (this.ignoreTimeWindow || !candidate.clipMs) {
+    if (this.isUrgentTest() || !candidate.clipMs) {
       return true;
     }
     return candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS && candidate.clipMs <= this.at + BACKFILL_MATCH_LOOKAHEAD_MS;
@@ -160,7 +182,7 @@ class BackfillJob {
 
 module.exports = {
   DEFAULT_BACKFILL_MAX_AGE_MS,
+  BACKFILL_MAX_QUERY_ATTEMPTS,
   BackfillJob,
-  parseClipTimestampMs,
   extractDatabaseRecordCandidate,
 };

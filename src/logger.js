@@ -17,7 +17,6 @@ const LOG_LEVELS = Object.freeze({
 });
 
 let currentLogLevel = LOG_LEVELS.info;
-let activeLogLevelName = 'info';
 
 /**
  * Pads a number to 2 digits with a leading zero.
@@ -143,8 +142,7 @@ const log = {
 function initLogger(rawLevel) {
   const cleaned = String(rawLevel || 'info').toLowerCase().trim();
   const isKnown = cleaned in LOG_LEVELS;
-
-  activeLogLevelName = normalizeLevelName(cleaned);
+  const activeLogLevelName = normalizeLevelName(cleaned);
   currentLogLevel = LOG_LEVELS[activeLogLevelName];
 
   if (!isKnown) {
@@ -153,24 +151,8 @@ function initLogger(rawLevel) {
   return activeLogLevelName;
 }
 
-/**
- * Returns the currently active normalized log level name.
- *
- * @returns {string}
- */
-function getActiveLogLevelName() {
-  return activeLogLevelName;
-}
-
 module.exports = {
-  LOG_LEVELS,
-  formatLocalTimestamp,
   formatLocalHm,
-  normalizeLevelName,
-  resolveScopeName,
-  formatLogLine,
-  writeLog,
   log,
   initLogger,
-  getActiveLogLevelName,
 };

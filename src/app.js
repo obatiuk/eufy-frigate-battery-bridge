@@ -14,7 +14,6 @@
 const config = require('./config');
 const {log} = require('./logger');
 const {Camera} = require('./domain/camera');
-const {BackfillJob} = require('./domain/backfill-job');
 const {loadCachedFrame} = require('./overlay/snapshot-cache');
 const {renderCameraCards} = require('./overlay/card-renderer');
 const {configureEncoderHooks, startEncoder, startMediaTickers} = require('./media/encoder');
@@ -95,7 +94,7 @@ function wireServices(cams, bySerial) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function handleSigUsr1BackfillTest(cams) {
-  const targetCam = cams.find((cam) => !cam.useRtsp || !cam.rtspUrl) || cams[cams.length - 1];
+  const targetCam = cams.find((cam) => !cam.isRtspCapable()) || cams[cams.length - 1];
   if (!targetCam) {
     return;
   }
@@ -109,10 +108,7 @@ function handleSigUsr1BackfillTest(cams) {
     }
   }
 
-  targetCam.downloadedPaths.clear();
-  targetCam.backfillClip = null;
-  targetCam.lastBackfillQueryAt = 0;
-  targetCam.pendingBackfill = BackfillJob.createSigUsr1TestJob(Date.now());
+  targetCam.prepareSigUsr1BackfillTest(Date.now());
   setTimeout(() => void processBackfillQueue(Date.now()), SIGUSR1_BACKFILL_DELAY_MS);
 }
 
@@ -132,13 +128,7 @@ function shutdownBridge(cams) {
   for (const cam of cams) {
     cam.motionUntil = 0;
     stop(cam, 'bridge container shutting down', false, 'system-shutdown');
-    try {
-      if (cam.enc) {
-        cam.enc.kill('SIGTERM');
-      }
-    } catch (err) {
-      // Ignore errors when stopping encoder on shutdown.
-    }
+    cam.stopEncoderProcess();
   }
   setTimeout(() => process.exit(0), SHUTDOWN_EXIT_DELAY_MS);
 }
@@ -241,17 +231,4 @@ function main() {
   startServices(cams);
 }
 
-if (require.main === module) {
-  main();
-}
-
-module.exports = {
-  createCameras,
-  wireServices,
-  handleSigUsr1BackfillTest,
-  shutdownBridge,
-  registerSignalHandlers,
-  logStartupBanner,
-  startServices,
-  main,
-};
+main();

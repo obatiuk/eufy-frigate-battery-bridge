@@ -11,40 +11,22 @@
 const {cfg} = require('../config');
 const {log} = require('../logger');
 
-const HA_WEBHOOK_TIMEOUT_MS = 5000;
+/** @typedef {import("../domain/camera").Camera} Camera */
 
-/**
- * Builds the JSON payload sent to the Home Assistant webhook.
- *
- * @param {Record<string, *>} cam - Camera state object.
- * @param {Record<string, *>} [extra={}] - Additional fields (event_id, review_id, no_video).
- * @returns {Record<string, *>}
- */
-function buildHaWebhookPayload(cam, extra = {}) {
-  const payload = {
-    camera: cam.name,
-    title: cam.title || cam.name,
-    label: cam.evLabel,
-    ...extra,
-  };
-  if (cam.evPerson) {
-    payload.person = cam.evPerson;
-  }
-  return payload;
-}
+const HA_WEBHOOK_TIMEOUT_MS = 5000;
 
 /**
  * Sends an optional webhook POST notification to Home Assistant when an event starts and once
  * the corresponding Frigate event has been created.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera domain instance.
  * @param {Record<string, *>} [extra={}] - Additional JSON fields to include in the webhook body.
  */
 function notifyHA(cam, extra = {}) {
   if (!cfg.ha_webhook) {
     return;
   }
-  const payload = buildHaWebhookPayload(cam, extra);
+  const payload = cam.toHaWebhookPayload(extra);
   fetch(cfg.ha_webhook, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -60,6 +42,5 @@ function notifyHA(cam, extra = {}) {
 }
 
 module.exports = {
-  buildHaWebhookPayload,
   notifyHA,
 };

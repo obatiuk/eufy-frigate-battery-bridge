@@ -12,8 +12,9 @@
 const {spawn} = require('child_process');
 const {W, H, FRAME, LIVE_FPS, AUDIO, RATE, STDERR_TAIL_MAX_CHARS} = require('../config');
 const {log, formatLocalHm} = require('../logger');
-const {inMotion} = require('../domain/camera');
 const {pushFrameToEncoder} = require('./encoder');
+
+/** @typedef {import("../domain/camera").Camera} Camera */
 
 const P2P_VIDEO_PROBESIZE_BYTES = '32768';
 const P2P_AUDIO_PROBESIZE_BYTES = '8192';
@@ -34,7 +35,7 @@ let rtspDropCallback = null;
 /**
  * Registers the callback used to stop a camera session once a 2-second startup snapshot probe completes.
  *
- * @param {(cam: Record<string, *>, why: string, preemptedByViewer?: boolean, initiator?: string) => void} fn - Stop handler.
+ * @param {(cam: Camera, why: string, preemptedByViewer?: boolean, initiator?: string) => void} fn - Stop handler.
  */
 function setDecoderStopHandler(fn) {
   stopCameraCallback = fn;
@@ -43,7 +44,7 @@ function setDecoderStopHandler(fn) {
 /**
  * Registers the callback invoked immediately when an active RTSP stream drops mid-session.
  *
- * @param {(cam: Record<string, *>, code: number|null, lastLine: string) => void} fn - RTSP drop handler.
+ * @param {(cam: Camera, code: number|null, lastLine: string) => void} fn - RTSP drop handler.
  */
 function setRtspDropHandler(fn) {
   rtspDropCallback = fn;
@@ -181,42 +182,36 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
  * Appends a decoded s16le PCM audio chunk to a camera's audio queue, dropping oldest chunks
  * if the buffer exceeds 1 second of audio.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Uint8Array} chunk - Raw s16le PCM buffer.
  */
 function appendAudioPcmChunk(cam, chunk) {
-  cam.pcm.push(chunk);
-  cam.pcmLen += chunk.length;
-  while (cam.pcmLen > RATE * 2 && cam.pcm.length > 1) {
-    const dropped = cam.pcm.shift();
-    if (dropped) {
-      cam.pcmLen -= dropped.length;
-    }
-  }
+  cam.appendAudioChunk(chunk, RATE * 2);
 }
 
 /**
  * Updates the camera live frame buffers, lastSeen timestamp, and pushes the frame to the encoder.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Uint8Array} liveFrame - Frame buffer assigned to cam.frame.
  * @param {Uint8Array} snapshotCopy - Independent Buffer copy assigned to cam.lastFrame.
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 function commitDecodedFrame(cam, liveFrame, snapshotCopy, now) {
-  cam.frame = liveFrame;
-  cam.frameAt = now;
-  cam.frameNew = true;
-  cam.lastFrame = snapshotCopy;
-  cam.needsStartupSnapshot = false;
-  cam.lastSeen = formatLocalHm(new Date(now));
+  cam.recordDecodedFrame(
+      liveFrame,
+      snapshotCopy,
+      now,
+      formatLocalHm(new Date(now)),
+      BACKFILL_CANCEL_VIDEO_MS
+  );
   pushFrameToEncoder(cam, now);
 }
 
 /**
  * Processes a complete decoded YUV420p frame from a P2P livestream or clip download decoder.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Uint8Array} rawBuf - Raw frame buffer of length FRAME.
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
@@ -226,69 +221,42 @@ function handleDecodedP2pFrame(cam, rawBuf, now) {
   }
   const frameCopy = Buffer.from(rawBuf);
 
-  if (cam.activeMode === 'download') {
-    if (!cam.frame) {
+  if (cam.isCurrentSession(cam.sessionId, 'download')) {
+    if (!cam.bufferDownloadFrame(frameCopy, LIVE_FPS * MAX_DOWNLOAD_BUFFER_SECS)) {
       commitDecodedFrame(cam, frameCopy, frameCopy, now);
-    } else if (cam.downloadFrames.length < LIVE_FPS * MAX_DOWNLOAD_BUFFER_SECS) {
-      cam.downloadFrames.push(frameCopy);
     }
     return;
   }
 
-  if (
-      cam.pendingBackfill &&
-      !cam.pendingBackfill.ignoreTimeWindow &&
-      cam.activeMode !== 'download' &&
-      now - cam.firstFrameAt >= BACKFILL_CANCEL_VIDEO_MS
-  ) {
-    cam.pendingBackfill = null;
-    cam.backfillClip = null;
-  }
-
   commitDecodedFrame(cam, rawBuf, frameCopy, now);
 
-  if (now - cam.firstFrameAt >= STARTUP_PROBE_CAPTURE_MS && cam.isStartupProbe) {
-    cam.isStartupProbe = false;
-    const hasHumanViewer = [...cam.viewerIds.values()].some(Boolean);
-    if (!inMotion(cam) && !hasHumanViewer && stopCameraCallback) {
-      stopCameraCallback(
-          cam,
-          'startup snapshot captured after 2s stable video',
-          false,
-          'bridge-startup-probe'
-      );
-    }
+  if (cam.completeStartupProbeIfReady(now, STARTUP_PROBE_CAPTURE_MS) && stopCameraCallback) {
+    stopCameraCallback(
+        cam,
+        'startup snapshot captured after 2s stable video',
+        false,
+        'bridge-startup-probe'
+    );
   }
 }
 
 /**
  * Processes a complete decoded YUV420p frame from a HomeBase RTSP pull decoder.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Uint8Array} rawBuf - Raw frame buffer of length FRAME.
  * @param {number} now - Current epoch timestamp in milliseconds.
  * @param {number} mySession - Session identifier associated with the decoder.
  */
 function handleDecodedRtspFrame(cam, rawBuf, now, mySession) {
-  cam.lastVideoAt = now;
-  if (!cam.gotVideo) {
-    cam.gotVideo = true;
-    cam.firstVideoAt = now;
-    cam.rtspRewaking = false;
-    cam.restarts = 0;
-    const delaySec = ((now - cam.startedAt) / 1000).toFixed(1);
-    log.info(cam, 'first RTSP video ' + delaySec + ' s after wake (session=' + mySession + ')');
-  } else if (cam.rtspRewaking) {
-    cam.rtspRewaking = false;
-    cam.restarts = 0;
-    const resumeSec = ((now - (cam.rtspRewakeStartedAt || cam.lastStartAt || now)) / 1000).toFixed(1);
+  const {isFirstVideo, isRewakeResume, elapsedSec} = cam.markRtspFrameReceived(now);
+  if (isFirstVideo) {
+    log.info(cam, 'first RTSP video ' + elapsedSec + ' s after wake (session=' + mySession + ')');
+  } else if (isRewakeResume) {
     log.info(
         cam,
-        'RTSP video resumed ' + resumeSec + ' s after mid-session re-wake (session=' + mySession + ')'
+        'RTSP video resumed ' + elapsedSec + ' s after mid-session re-wake (session=' + mySession + ')'
     );
-  }
-  if (!cam.firstFrameAt) {
-    cam.firstFrameAt = now;
   }
   commitDecodedFrame(cam, rawBuf, Buffer.from(rawBuf), now);
 }
@@ -297,7 +265,7 @@ function handleDecodedRtspFrame(cam, rawBuf, now, mySession) {
  * Attaches stdout rawvideo frame chunking, audio PCM pipe ingestion, and stderr tail
  * buffering to a spawned FFmpeg decoder process.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {import("child_process").ChildProcess} dec - Spawned FFmpeg decoder.
  * @param {number} mySession - Session identifier.
  * @param {(buf: Uint8Array, now: number) => void} onFrame - Callback invoked for each complete YUV420p frame.
@@ -314,7 +282,7 @@ function attachDecoderStreams(cam, dec, mySession, onFrame) {
       fill += n;
       off += n;
       if (fill === FRAME) {
-        if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
+        if (cam.isActiveDecoder(dec, mySession)) {
           onFrame(buf, Date.now());
         }
         buf = Buffer.allocUnsafe(FRAME);
@@ -325,7 +293,7 @@ function attachDecoderStreams(cam, dec, mySession, onFrame) {
 
   if (AUDIO && dec.stdio[4]) {
     dec.stdio[4].on('data', (d) => {
-      if (cam.active && cam.dec === dec && cam.sessionId === mySession) {
+      if (cam.isActiveDecoder(dec, mySession)) {
         appendAudioPcmChunk(cam, d);
       }
     });
@@ -341,7 +309,7 @@ function attachDecoderStreams(cam, dec, mySession, onFrame) {
 /**
  * Spawns a low-latency per-session FFmpeg decoder for an active camera livestream.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {string} codec - Video codec name reported by eufy-security-ws ('H264' or 'H265').
  */
 function startDecoder(cam, codec) {
@@ -353,7 +321,7 @@ function startDecoder(cam, codec) {
   const dec = spawn('ffmpeg', args, {
     stdio: ['pipe', 'pipe', 'pipe', AUDIO ? 'pipe' : 'ignore', AUDIO ? 'pipe' : 'ignore'],
   });
-  cam.dec = dec;
+  cam.attachDecoder(dec);
   log.debug(cam, 'started FFmpeg decoder (codec=' + vfmt + ', session=' + mySession + ')');
 
   dec.on('error', (e) => log.error(cam, 'decoder process error: ' + e.message));
@@ -369,7 +337,7 @@ function startDecoder(cam, codec) {
   dec.on('exit', (code) => {
     if (cam.dec === dec) {
       cam.dec = null;
-      if (cam.active && cam.sessionId === mySession) {
+      if (cam.isCurrentSession(mySession)) {
         log.warn(
             cam,
             'decoder exited while stream active (initiator=ffmpeg-decoder, code=' +
@@ -388,7 +356,7 @@ function startDecoder(cam, codec) {
  * Spawns a low-latency FFmpeg RTSP client decoder that pulls directly from a camera's HomeBase
  * RTSP URL without using the shared P2P livestream slot.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {string} rtspUrl - HomeBase RTSP stream URL.
  */
 function startRtspDecoder(cam, rtspUrl) {
@@ -403,7 +371,7 @@ function startRtspDecoder(cam, rtspUrl) {
   const dec = spawn('ffmpeg', args, {
     stdio: ['ignore', 'pipe', 'pipe', 'ignore', AUDIO ? 'pipe' : 'ignore'],
   });
-  cam.dec = dec;
+  cam.attachDecoder(dec, Date.now());
   log.debug(cam, 'started FFmpeg RTSP pull decoder (session=' + mySession + ')');
 
   dec.on('error', (e) => log.error(cam, 'RTSP decoder process error: ' + e.message));
@@ -415,7 +383,8 @@ function startRtspDecoder(cam, rtspUrl) {
   dec.on('exit', (code) => {
     if (cam.dec === dec) {
       cam.dec = null;
-      if (cam.active && cam.sessionId === mySession && cam.activeMode === 'rtsp') {
+      cam.decSpawnedAt = 0;
+      if (cam.isCurrentSession(mySession, 'rtsp')) {
         const lastLine = getLastStderrLine();
         if (cam.gotVideo && !cam.rtspRewaking && rtspDropCallback) {
           rtspDropCallback(cam, code, lastLine);
@@ -438,13 +407,7 @@ function startRtspDecoder(cam, rtspUrl) {
         }
         cam.rtspRetryTimer = setTimeout(() => {
           cam.rtspRetryTimer = null;
-          if (
-              cam.active &&
-              cam.sessionId === mySession &&
-              cam.activeMode === 'rtsp' &&
-              !cam.dec &&
-              cam.rtspUrl
-          ) {
+          if (cam.isCurrentSession(mySession, 'rtsp') && !cam.dec && cam.rtspUrl) {
             startRtspDecoder(cam, cam.rtspUrl);
           }
         }, RTSP_RETRY_DELAY_MS);
@@ -456,23 +419,10 @@ function startRtspDecoder(cam, rtspUrl) {
 /**
  * Stops a camera's active FFmpeg decoder process and clears its temporary A/V buffers.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  */
 function stopDecoder(cam) {
-  if (cam.rtspRetryTimer) {
-    clearTimeout(cam.rtspRetryTimer);
-    cam.rtspRetryTimer = null;
-  }
-  const dec = cam.dec;
-  cam.dec = null;
-  cam.frame = null;
-  cam.firstFrameAt = 0;
-  cam.frameNew = false;
-  cam.videoWidth = 0;
-  cam.videoHeight = 0;
-  cam.videoCodec = '';
-  cam.pcm = [];
-  cam.pcmLen = 0;
+  const dec = cam.detachDecoder();
   if (!dec) {
     return;
   }
@@ -553,11 +503,11 @@ function isKeyPacket(buf, codec) {
 /**
  * Handles an incoming raw video packet from eufy-security-ws.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Record<string, *>} e - Livestream video data event.
  */
 function onVideo(cam, e) {
-  if (!cam.active || !cam.p2pReady) {
+  if (!cam.canIngestP2pPacket()) {
     return;
   }
 
@@ -566,7 +516,7 @@ function onVideo(cam, e) {
   const width = Number(meta.videoWidth) || 0;
   const height = Number(meta.videoHeight) || 0;
 
-  if (cam.dec && cam.videoCodec && codec !== cam.videoCodec) {
+  if (cam.hasCodecChanged(codec)) {
     log.info(
         cam,
         'stream codec changed (' +
@@ -576,11 +526,7 @@ function onVideo(cam, e) {
         '), resetting decoder (initiator=camera-stream)'
     );
     stopDecoder(cam);
-  } else if (
-      cam.dec &&
-      ((width && cam.videoWidth && width !== cam.videoWidth) ||
-          (height && cam.videoHeight && height !== cam.videoHeight))
-  ) {
+  } else if (cam.dec && cam.hasResolutionChanged(width, height)) {
     log.debug(
         cam,
         'stream resolution changed in-band (' +
@@ -593,28 +539,23 @@ function onVideo(cam, e) {
         height +
         ')'
     );
-    cam.videoWidth = width;
-    cam.videoHeight = height;
+    cam.updateStreamFormat(cam.videoCodec, width, height);
   }
 
-  cam.lastVideoAt = Date.now();
+  const now = Date.now();
   const buf = bytes(e);
   if (!cam.dec) {
     if (!isKeyPacket(buf, codec)) {
       return;
     }
-    cam.videoCodec = codec;
-    cam.videoWidth = width;
-    cam.videoHeight = height;
+    cam.updateStreamFormat(codec, width, height);
     startDecoder(cam, codec);
   }
   if (cam.dec && cam.dec.stdin && cam.dec.stdin.writable) {
     cam.dec.stdin.write(buf);
   }
-  if (!cam.gotVideo) {
-    cam.gotVideo = true;
-    cam.firstVideoAt = Date.now();
-    const delaySec = ((Date.now() - cam.startedAt) / 1000).toFixed(1);
+  const {isFirstVideo, elapsedSec} = cam.markP2pVideoPacketReceived(now);
+  if (isFirstVideo) {
     log.info(
         cam,
         'first video (' +
@@ -624,7 +565,7 @@ function onVideo(cam, e) {
         'x' +
         height +
         ') ' +
-        delaySec +
+        elapsedSec +
         ' s after wake (session=' +
         cam.sessionId +
         ')'
@@ -635,11 +576,11 @@ function onVideo(cam, e) {
 /**
  * Handles an incoming raw AAC audio packet from eufy-security-ws and forwards it to the active decoder.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Record<string, *>} e - Livestream audio data event.
  */
 function onAudio(cam, e) {
-  if (cam.active && cam.p2pReady && cam.dec && AUDIO && cam.dec.stdio[3] && cam.dec.stdio[3].writable) {
+  if (cam.canIngestP2pPacket() && cam.dec && AUDIO && cam.dec.stdio[3] && cam.dec.stdio[3].writable) {
     cam.dec.stdio[3].write(bytes(e));
   }
 }
@@ -647,18 +588,8 @@ function onAudio(cam, e) {
 module.exports = {
   setDecoderStopHandler,
   setRtspDropHandler,
-  buildScaleFilter,
-  buildP2pDecoderArgs,
-  buildRtspDecoderArgs,
-  appendAudioPcmChunk,
-  handleDecodedP2pFrame,
-  handleDecodedRtspFrame,
-  startDecoder,
   startRtspDecoder,
   stopDecoder,
-  bytes,
-  findNalHeaderOffset,
-  isKeyPacket,
   onVideo,
   onAudio,
 };

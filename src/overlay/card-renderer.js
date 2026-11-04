@@ -17,6 +17,7 @@ const {
   W,
   H,
   FRAME,
+  COLOR_GREY,
   SHORT_KEYFRAME_BURST_MS,
   MAX_FFMPEG_BUFFER_MULTIPLIER,
   LOW_BAT_WAKE_ON_VIEW,
@@ -42,23 +43,25 @@ const {
   computeIconsCardWidth,
   computeCornerDefaultCardDimensions,
   getCardBoxCoords,
-  getCameraCardBounds,
-  computeFrigateMaskPolygon,
 } = require('../domain/status-card');
 const {
   blendYuvPixel,
   fillYuvRect,
   drawYuvCircle,
-  drawYuvRing,
   drawYuvLine,
   drawRoundedBox,
   prepareBackgroundCanvas,
   copyYuvRegion,
 } = require('./yuv-canvas');
 
+/** @typedef {import("../domain/camera").Camera} Camera */
+
 const CENTER_MODAL_WIDTH = 820;
 const CENTER_MODAL_HEIGHT_WITH_TEL = 336;
 const CENTER_MODAL_HEIGHT_NO_TEL = 268;
+const MINIMAL_DOT_OUTER_RADIUS = 6.8;
+const MINIMAL_BULLSEYE_GAP_RADIUS = 4.3;
+const MINIMAL_BULLSEYE_KERNEL_RADIUS = 3.4;
 
 /**
  * Draws an anti-aliased filled right-pointing play triangle centered at (cx, cy).
@@ -91,8 +94,55 @@ function drawFilledPlayTriangle(canvas, cx, cy, scale, rgb) {
 }
 
 /**
+ * Draws a single anti-aliased filled left-pointing triangle between xApex (left) and xBase (right).
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} xApex - Left apex X coordinate.
+ * @param {number} xBase - Right base X coordinate.
+ * @param {number} cy - Vertical center Y coordinate.
+ * @param {number} halfH - Half-height of the triangle base in pixels.
+ * @param {number[]} rgb - RGB color array [r, g, b].
+ */
+function drawLeftRewindTriangle(canvas, xApex, xBase, cy, halfH, rgb) {
+  const [r, g, b] = rgb;
+  const width = Math.max(1, xBase - xApex);
+  for (let x = xApex; x <= xBase; x++) {
+    const progress = (x - xApex) / width;
+    const span = halfH * progress;
+    const yMin = Math.floor(cy - span - 1);
+    const yMax = Math.ceil(cy + span + 1);
+    for (let y = yMin; y <= yMax; y++) {
+      const cov = Math.min(1, Math.max(0, span + 0.5 - Math.abs(y - cy)));
+      if (cov > 0) {
+        blendYuvPixel(canvas, x, y, r, g, b, 0.96 * cov);
+      }
+    }
+  }
+}
+
+/**
+ * Draws an anti-aliased double left-pointing rewind icon (◀◀) centered at (cx, cy).
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} cx - Center X coordinate.
+ * @param {number} cy - Center Y coordinate.
+ * @param {number} scale - Size multiplier (1.0 = 20x20 icon, 3.0 = 60x60 modal icon).
+ * @param {number[]} rgb - RGB color array [r, g, b].
+ */
+function drawRewindGlyph(canvas, cx, cy, scale, rgb) {
+  const halfH = 5.8 * scale;
+  const leftApex = Math.round(cx - 7.4 * scale);
+  const leftBase = Math.round(cx - 0.2 * scale);
+  const rightApex = Math.round(cx - 0.6 * scale);
+  const rightBase = Math.round(cx + 6.8 * scale);
+  drawLeftRewindTriangle(canvas, leftApex, leftBase, cy, halfH, rgb);
+  drawLeftRewindTriangle(canvas, rightApex, rightBase, cy, halfH, rgb);
+}
+
+/**
  * Draws the status glyph for 'icons' and centered 'default' themes:
  *   - 'live': Filled Play triangle (▶, Red)
+ *   - 'backfill': Filled Rewind double-triangle (◀◀, Red)
  *   - 'waking': Solid circle dot (●, Blue) matching minimal and corner default themes
  *   - 'asleep' / 'waiting' / 'low': Pause bars (⏸, Grey / Yellow / Purple)
  *
@@ -106,6 +156,9 @@ function drawStatusGlyph(canvas, cx, cy, scale, st) {
   switch (st.statusKind) {
     case 'live':
       drawFilledPlayTriangle(canvas, cx, cy, scale, st.statusRgb);
+      return;
+    case 'backfill':
+      drawRewindGlyph(canvas, cx, cy, scale, st.statusRgb);
       return;
     case 'waking':
       drawYuvCircle(canvas, cx, cy, 5.6 * scale, st.statusRgb, 0.96);
@@ -270,7 +323,12 @@ function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 18, 0.42, 0.16, blurBackdrop);
 
   const cy = boxY + 18;
-  drawYuvCircle(canvas, boxX + 22, cy, 6.8, st.statusRgb, 0.96);
+  const statusCx = boxX + 22;
+  drawYuvCircle(canvas, statusCx, cy, MINIMAL_DOT_OUTER_RADIUS, st.statusRgb, 0.96);
+  if (st.statusKind === 'backfill') {
+    drawYuvCircle(canvas, statusCx, cy, MINIMAL_BULLSEYE_GAP_RADIUS, [20, 20, 24], 0.96);
+    drawYuvCircle(canvas, statusCx, cy, MINIMAL_BULLSEYE_KERNEL_RADIUS, COLOR_GREY, 0.98);
+  }
   drawYuvCircle(canvas, boxX + 46, cy, 6.0, st.batRgb, 0.96);
   drawYuvCircle(canvas, boxX + 70, cy, 5.2, st.wifiRgb, 0.96);
 }
@@ -433,12 +491,24 @@ function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, 
  * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
  * @returns {string[]} Array of FFmpeg drawtext filter strings for the corner card.
  */
-function drawCornerDefaultCard(canvas, position, headerText, dotRgb, segments, buildDrawtext, blurBackdrop = true) {
+function drawCornerDefaultCard(
+    canvas,
+    position,
+    headerText,
+    st,
+    segments,
+    buildDrawtext,
+    blurBackdrop = true
+) {
   const {boxW, boxH, hasTelemetry, gap} = computeCornerDefaultCardDimensions(headerText, segments);
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
   drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.58, 0.16, blurBackdrop);
-  drawYuvCircle(canvas, boxX + 26, boxY + 23, 5.6, dotRgb, 0.96);
+  if (st.statusKind === 'backfill') {
+    drawRewindGlyph(canvas, boxX + 26, boxY + 23, 0.95, st.statusRgb);
+  } else {
+    drawYuvCircle(canvas, boxX + 26, boxY + 23, 5.6, st.statusRgb, 0.96);
+  }
 
   const filters = [buildDrawtext(headerText, '0xffffff', 20, String(boxX + 42), boxY + 15)];
   if (hasTelemetry) {
@@ -533,7 +603,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
             canvas,
             cardCfg.position,
             titleText + camLabel,
-            st.statusRgb,
+            st,
             segments,
             buildDrawtext,
             hasBackground
@@ -605,10 +675,10 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
  * Renders the asleep, waking, busy, and live-corner status cards for a camera using its
  * Telemetry and StatusCard domain models and a single shared background buffer.
  *
- * @param {Record<string, *>} cam - Camera domain instance.
+ * @param {Camera} cam - Camera domain instance.
  */
 function renderCameraCards(cam) {
-  const title = cam.title || cam.name;
+  const title = cam.getDisplayTitle();
   const lowBat = cam.isLowBattery();
   const status = cam.telemetry.toStatusSnapshot(cam.name, title, cam.card.config);
   const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
@@ -619,45 +689,48 @@ function renderCameraCards(cam) {
           ? 'economy mode active, waking on motion events only'
           : 'feed, open this camera to wake it, or wait for motion';
 
-  cam.card.asleep = card(
-      asleepTitle,
-      'No active stream on the ' + title + ' detect',
-      asleepLine2,
-      status,
+  cam.card.setRenderedFrames({
+    asleep: card(
+        asleepTitle,
+        'No active stream on the ' + title + ' detect',
+        asleepLine2,
+        status,
       baseCanvas,
       hasBackground
-  );
-  cam.card.waking = card(
-      'Waking Up...',
-      'Connecting to ' + title + ' P2P livestream,',
-      'live video starts in a few seconds',
-      status,
-      baseCanvas,
-      hasBackground
-  );
-  cam.card.busy = card(
-      'Waiting',
-      'Another camera is currently live on the HomeBase,',
-      'only one battery camera can stream at a time',
-      status,
-      baseCanvas,
-      hasBackground
-  );
-  cam.card.liveTelState = evaluateTelemetryState('Live', status);
-
-  if (cam.card.showOnLive && cam.card.theme === 'default' && cam.card.isCorner()) {
-    cam.card.liveCard = card('Live', '', '', status, baseCanvas, hasBackground);
-  } else {
-    cam.card.liveCard = null;
-  }
-  cam.burstUntil = Date.now() + SHORT_KEYFRAME_BURST_MS;
+    ),
+    waking: card(
+        'Waking Up...',
+        'Connecting to ' + title + ' P2P livestream,',
+        'live video starts in a few seconds',
+        status,
+        baseCanvas,
+        hasBackground
+    ),
+    busy: card(
+        'Waiting',
+        'Another camera is currently live on the HomeBase,',
+        'only one battery camera can stream at a time',
+        status,
+        baseCanvas,
+        hasBackground
+    ),
+    liveTelState: evaluateTelemetryState('Live', status),
+    backfillTelState: evaluateTelemetryState('Backfill', status),
+    liveCard: cam.card.needsDefaultLiveCard()
+        ? card('Live', '', '', status, baseCanvas, hasBackground)
+        : null,
+    backfillCard: cam.card.needsDefaultLiveCard()
+        ? card('Backfill', '', '', status, baseCanvas, hasBackground)
+        : null,
+  });
+  cam.triggerKeyframeBurst(Date.now(), SHORT_KEYFRAME_BURST_MS);
 }
 
 /**
  * Composites the camera's corner status card onto a copy of a live video frame when
  * card_show_on_live is enabled, leaving the original raw frame (and cam.lastFrame) untouched.
  *
- * @param {Record<string, *>} cam - Camera domain instance.
+ * @param {Camera} cam - Camera domain instance.
  * @param {Uint8Array} rawFrame - Clean decoded YUV420p video frame.
  * @returns {Uint8Array} YUV420p frame buffer with corner overlay applied (or rawFrame if disabled).
  */
@@ -665,9 +738,11 @@ function renderLiveFrameWithCard(cam, rawFrame) {
   if (!cam.card.shouldOverlayOnLive()) {
     return rawFrame;
   }
-  const out = cam.card.liveOverlayBuf;
-  rawFrame.copy(out);
-  const st = cam.card.liveTelState || cam.telemetry.evaluateVisualState('Live');
+  const out = cam.card.prepareLiveOverlayBuffer(rawFrame);
+  const isBackfill = cam.isBackfillPlayback();
+  const st = isBackfill
+      ? cam.card.backfillTelState || cam.telemetry.evaluateVisualState('Backfill')
+      : cam.card.liveTelState || cam.telemetry.evaluateVisualState('Live');
 
   switch (cam.card.theme) {
     case 'minimal':
@@ -676,35 +751,23 @@ function renderLiveFrameWithCard(cam, rawFrame) {
     case 'icons':
       drawIconsOnlyCard(out, cam.card.position, st, true);
       return out;
-    case 'default':
-      if (Buffer.isBuffer(cam.card.liveCard)) {
-        const bounds = getCameraCardBounds(cam);
+    case 'default': {
+      const activeCardBuf = isBackfill ? cam.card.backfillCard : cam.card.liveCard;
+      if (Buffer.isBuffer(activeCardBuf)) {
+        const bounds = cam.getCardBounds();
         if (bounds) {
-          copyYuvRegion(cam.card.liveCard, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
+          copyYuvRegion(activeCardBuf, out, bounds.boxX, bounds.boxY, bounds.boxW, bounds.boxH);
         }
         return out;
       }
       return rawFrame;
+    }
     default:
       return rawFrame;
   }
 }
 
 module.exports = {
-  drawStatusGlyph,
-  drawBatteryIcon,
-  drawWifiArcsIcon,
-  drawThermometerIcon,
-  drawAnalogClockIcon,
-  drawTelemetryRow,
-  drawMinimalDotsCard,
-  drawIconsOnlyCard,
-  drawFrigateModalGraphics,
-  drawCornerDefaultCard,
-  findAvailableFontFile,
-  card,
   renderCameraCards,
   renderLiveFrameWithCard,
-  getCameraCardBounds,
-  computeFrigateMaskPolygon,
 };

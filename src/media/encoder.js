@@ -21,15 +21,15 @@ const {
   AUDIO_TICK,
   AUDIO_CHUNK,
   SILENCE,
-  KEYFRAME_BURST_MS,
   SHORT_KEYFRAME_BURST_MS,
   STDERR_TAIL_MAX_CHARS,
   ACTIVE_HWACCEL,
   HWACCEL_DEVICE,
 } = require('../config');
 const {log, formatLocalHm} = require('../logger');
-const {want} = require('../domain/camera');
 const {renderLiveFrameWithCard} = require('../overlay/card-renderer');
+
+/** @typedef {import("../domain/camera").Camera} Camera */
 
 const DOWNLOAD_PACE_LEAD_MS = 4;
 const FRESH_FRAME_MAX_AGE_MS = 2000;
@@ -71,60 +71,44 @@ function configureEncoderHooks(hooks = {}) {
  * Advances the buffered download frame queue by one frame at LIVE_FPS pacing when a camera
  * is replaying a post-event HomeBase clip download.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 function advanceDownloadPlaybackFrame(cam, now) {
   const frameIntervalMs = Math.floor(1000 / LIVE_FPS) - DOWNLOAD_PACE_LEAD_MS;
-  if (
-      cam.active &&
-      cam.activeMode === 'download' &&
-      cam.downloadFrames.length > 0 &&
-      now - cam.lastWrite >= frameIntervalMs
-  ) {
-    const nextBuf = cam.downloadFrames.shift();
-    cam.frame = nextBuf;
-    cam.frameAt = now;
-    cam.lastVideoAt = now;
-    cam.frameNew = true;
-    cam.lastFrame = nextBuf;
-    cam.lastSeen = formatLocalHm(new Date(now));
-  }
+  cam.consumeNextDownloadFrame(now, frameIntervalMs, formatLocalHm(new Date(now)));
 }
 
 /**
  * Selects the YUV420p frame buffer to feed to the camera's encoder (live video with optional
  * corner card, clean snapshot fallback, waking card, busy card, or asleep card).
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {number} now - Current epoch timestamp in milliseconds.
  * @returns {{ frame: Uint8Array, isLive: boolean }}
  */
 function selectEncoderFrame(cam, now) {
-  const hasFreshFrame = Boolean(cam.frame && now - cam.frameAt < FRESH_FRAME_MAX_AGE_MS);
-  const isLive = Boolean(cam.active && (hasFreshFrame || (cam.gotVideo && Buffer.isBuffer(cam.lastFrame))));
-
-  if (isLive) {
-    const rawLiveFrame = hasFreshFrame ? cam.frame : cam.lastFrame;
+  if (cam.isStreamingLive(now, FRESH_FRAME_MAX_AGE_MS)) {
+    const rawLiveFrame = cam.hasFreshFrame(now, FRESH_FRAME_MAX_AGE_MS) ? cam.frame : cam.lastFrame;
     const liveFrame = rawLiveFrame ? renderLiveFrameWithCard(cam, rawLiveFrame) : rawLiveFrame;
     return {frame: liveFrame, isLive: true};
   }
-  if (cam.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)) {
+  if (cam.card.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)) {
     return {frame: cam.lastFrame, isLive: false};
   }
   if (cam.active) {
-    return {frame: cam.waking, isLive: false};
+    return {frame: cam.card.waking, isLive: false};
   }
-  if (now < want(cam)) {
-    return {frame: cam.busy, isLive: false};
+  if (now < cam.wantUntil()) {
+    return {frame: cam.card.busy, isLive: false};
   }
-  return {frame: cam.asleep, isLive: false};
+  return {frame: cam.card.asleep, isLive: false};
 }
 
 /**
  * Determines whether a frame should be written to the FFmpeg encoder stdin on the current tick.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {boolean} isLive - Whether the camera is currently streaming live video.
  * @param {boolean} stateChanged - Whether the selected frame buffer changed since last write.
  * @param {boolean} inBurst - Whether the camera is in a keyframe burst window.
@@ -142,7 +126,7 @@ function shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now) {
 /**
  * Pushes the appropriate video frame to a camera's persistent FFmpeg encoder stdin.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  */
 function pushFrameToEncoder(cam, now = Date.now()) {
@@ -169,15 +153,13 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   const {frame, isLive} = selectEncoderFrame(cam, now);
   const stateChanged = frame !== cam.lastSent;
   if (stateChanged) {
-    cam.burstUntil = Math.max(cam.burstUntil || 0, now + SHORT_KEYFRAME_BURST_MS);
+    cam.triggerKeyframeBurst(now, SHORT_KEYFRAME_BURST_MS);
   }
-  const inBurst = now < (cam.burstUntil || 0);
+  const inBurst = cam.isInKeyframeBurst(now);
 
   if (shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now)) {
     enc.stdin.write(frame);
-    cam.lastWrite = now;
-    cam.lastSent = frame;
-    cam.frameNew = false;
+    cam.markFrameEncoded(frame, now);
   }
 }
 
@@ -264,7 +246,7 @@ function buildVideoCodecArgs(hwMode, gop) {
 /**
  * Builds the full FFmpeg CLI argument list for a camera's persistent RTSP encoder.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {string} hwMode - Hardware acceleration mode ('vaapi', 'qsv', 'nvenc', 'v4l2m2m', or '').
  * @returns {string[]}
  */
@@ -322,7 +304,7 @@ function buildEncoderArgs(cam, hwMode) {
 /**
  * Spawns the persistent FFmpeg encoder process for a camera.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  */
 function startEncoder(cam) {
   if (isShuttingDownFn() || cam.enc) {
@@ -336,10 +318,7 @@ function startEncoder(cam) {
     stdio: ['pipe', 'ignore', 'pipe', AUDIO ? 'pipe' : 'ignore'],
   });
 
-  cam.enc = enc;
-  cam.lastSent = null;
-  cam.lastWrite = Date.now();
-  cam.burstUntil = Date.now() + KEYFRAME_BURST_MS;
+  cam.attachEncoder(enc, spawnAt);
 
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
   enc.stdin.on('error', () => {});
@@ -407,7 +386,7 @@ function startEncoder(cam) {
  * Starts the periodic video frame ticker (at LIVE_FPS) and 100ms PCM audio ticker
  * across all configured cameras.
  *
- * @param {Array<Record<string, *>>} cams - Array of Camera instances.
+ * @param {Camera[]} cams - Array of Camera instances.
  */
 function startMediaTickers(cams) {
   setInterval(() => {
@@ -424,15 +403,7 @@ function startMediaTickers(cams) {
         if (!enc || !enc.stdio[3] || !enc.stdio[3].writable || enc.stdio[3].writableNeedDrain) {
           continue;
         }
-        let out = SILENCE;
-        if (cam.pcmLen >= AUDIO_CHUNK) {
-          const all = cam.pcm.length === 1 ? cam.pcm[0] : Buffer.concat(cam.pcm);
-          out = all.subarray(0, AUDIO_CHUNK);
-          const rest = all.subarray(AUDIO_CHUNK);
-          cam.pcm = rest.length ? [rest] : [];
-          cam.pcmLen = rest.length;
-        }
-        enc.stdio[3].write(out);
+        enc.stdio[3].write(cam.consumeAudioChunk(AUDIO_CHUNK, SILENCE));
       }
     }, AUDIO_TICK);
   }
@@ -440,12 +411,7 @@ function startMediaTickers(cams) {
 
 module.exports = {
   configureEncoderHooks,
-  advanceDownloadPlaybackFrame,
-  selectEncoderFrame,
-  shouldWriteEncoderFrame,
   pushFrameToEncoder,
-  buildVideoCodecArgs,
-  buildEncoderArgs,
   startEncoder,
   startMediaTickers,
 };

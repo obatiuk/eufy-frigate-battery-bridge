@@ -104,9 +104,11 @@ podman exec eufy-frigate-battery-bridge node -e '
   `src/config.js` (`HOLD_MS`, `MAX_MS`, `LOW_BAT_HOLD_MS`, `VIEW_MAX_MS`, `EARLY_SLEEP_MS`, `BACKFILL_DELAY_MS`,
   `LIVE_FPS`, `getEventPriority`) and define descriptive `UPPER_SNAKE_CASE` module constants for internal protocol or
   timing thresholds (except obvious unit conversions such as `* 1000` or `/ 1000`).
-- Idiomatic, Self-Documenting & Testable Code: Write clean, idiomatic Node.js with small, single-responsibility
-  functions. Extract complex boolean conditions into named variables or pure helper predicates, and structure
-  orchestrator and domain functions so state transitions can be unit-tested deterministically without live hardware.
+- Idiomatic, Self-Documenting & Testable Code ("Tell, Don't Ask"): Write clean, idiomatic Node.js with small,
+  single-responsibility functions. Never write multi-clause `if` statements in service or media modules that inspect
+  multiple internal properties of `cam`—encapsulate multi-property camera state checks and transitions as expressive,
+  well-named methods on the `Camera` domain model (`src/domain/camera.js`, passing arguments such as `now` or thresholds
+  when needed) so state invariants live in the domain layer and can be unit-tested deterministically without live hardware.
 - Block-Grouped Roadmap Convention: Always organize grouped changes, multi-part enhancements, and sequential
   implementation steps (such as Step 1/2/3) into dedicated, numbered `Block` sections under `Roadmap & TODO List` in
   `AGENTS.md`.
@@ -196,13 +198,13 @@ podman exec eufy-frigate-battery-bridge node -e '
   entire frame behind status cards. Disabled by default so unmasked background pixels do not trigger Frigate motion
   detection on sleep/wake transitions. Can be overridden per camera.
 - `card_show_on_live`: `true` (default) or `true`/`false` per camera. Keeps corner status cards
-  (`card_position !== "center"`) visible on the live video stream (using a `Red` on-air live dot/play glyph) via a
+  (`card_position !== "center"`) visible on the live video stream (using a `Red` on-air play glyph/dot for live streams, or a `Red` rewind `◀◀` glyph + `"Backfill"` label in `default`/`icons` and a `Red`+`Grey` concentric bullseye dot in `minimal` during backfill playback) via a
   zero-allocation scratch buffer while keeping `cam.lastFrame` and `/config/cache` snapshots clean.
 - `auto_frigate_mask`: `true` (default) or `true`/`false` per camera. Computes the exact normalized bounding-box polygon
   for each camera's corner status card (with a `6px` chroma/anti-aliasing safety margin) and syncs both
   `motion.mask.eufy_bridge_card` and `objects.mask.eufy_bridge_card` into Frigate via `GET /api/config` and
   `PUT /api/config/set` (`requires_restart: 0`) on startup, every 60s, and automatically whenever Frigate restarts.
-- `instant_event_snapshot`: `true` (default). Uses a fast `1.2s` snapshot delay on RTSP wakes, files events immediately
+- `instant_event_snapshot`: `true` (default). Uses a fast `1.0s` snapshot delay (`FAST_LIVE_SNAP_DELAY_MS`) on both P2P and RTSP wakes, files events immediately
   if a clip ends early after receiving video, and temporarily pushes the clean un-overlayed `cam.lastFrame` on `noVideo`
   timeouts so Frigate never saves the `"Waking Up..."` card as an event thumbnail.
 - `telemetry`: `true` (default), `false`, or object
@@ -279,11 +281,9 @@ Data and dependencies flow strictly top-down from the composition root (`src/app
   Automatically discovers `rtspStreamUrl` from `device.get_properties` on cameras with NAS/RTSP support (`T8161`), wakes
   the camera via `rtspStream=true` and `device.start_rtsp_livestream`, and streams them in `activeMode = 'rtsp'`
   concurrently alongside P2P cameras (`usesP2pSlot(cam) === false`). Retries RTSP connection every `750ms` during the
-  wake window, re-sends `start_rtsp_livestream` every `3.5s` (`RTSP_WAKE_RETRY_MS`) if needed, immediately re-wakes (`0ms`) on mid-session clip boundary drops, and queues a `60s` P2P fallback
-  (`rtspFallbackUntil`, reset on `stop()`) routed cleanly through `arbitrate()` if no RTSP frames arrive within `22s`.
+  wake window, preserves active `ffmpeg` handshakes (`isRtspDecoderHandshaking`, `400ms..6000ms`), re-sends `start_rtsp_livestream` every `3.5s` (`RTSP_WAKE_RETRY_MS`, up to `5` retries) when idle, immediately re-wakes (`0ms`) on mid-session clip boundary drops, and sleeps cleanly after `25s` (`initiator=error/rtsp-wake-timeout`) without falling back to `P2P`.
 - Post-Event Clip Download Backfill (`backfill_downloads`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
-  (`true`) by default. When a P2P camera triggers motion while its station's P2P slot is busy (or is preempted before
-  capturing 5s of video), `pendingBackfill` records the event metadata. Once the P2P slot is idle for
+  (`true`) by default. When any camera triggers an event while its station's P2P slot is busy, fails an RTSP wake, or is preempted/stopped before capturing `5s` of live video, `pendingBackfill` preserves the highest-priority event metadata (`queueEventBackfill` prevents companion `"motion"` events from downgrading `"person"`/`"ring"` jobs, and cancels `pendingBackfill` once `5s` of live video is captured across decoder resets or whenever session runtime is extended via `runtimeExtended`). Once the P2P slot is idle for
   `backfill_delay_secs` (`5s`), the bridge connects to the station (`station.connect`), calls
   `station.database_query_latest_info` and `station.database_query_by_date`, matches the latest `.zxvideo` clip
   (`storage_path` / `crop_local_path` and `cipher_id`), buffers burst-downloaded frames into `downloadFrames` to play
@@ -372,8 +372,8 @@ Alloy / Loki ingestion:
 - `bridge/eufy-ws`: Forced stop/restart when `eufy-security-ws` reports `already_running` on a stale P2P session.
 - `bridge-watchdog`: Stream stalled (`no_initial_video_after_wake` or `stream_stalled_mid_session`), triggering decoder
   reset and re-request (retries 1-3), or killing a wedged encoder process.
-- `error/watchdog-timeout` / `error/download-failed` / `error/download-timeout`: Forced `SLEEP` after 3 failed watchdog
-  retries or failed/stalled clip download.
+- `error/watchdog-timeout` / `error/rtsp-wake-timeout` / `error/download-failed` / `error/download-timeout`: Forced `SLEEP` after 3 failed P2P watchdog
+  retries, 25s RTSP wake timeout, or failed/stalled clip download.
 - `error/ws-disconnect` / `error/station-disconnect`: Forced `SLEEP` across active cameras when `eufy-security-ws` or
   the station P2P connection drops.
 - `camera-stream`: Decoder reset triggered by an in-band video codec change (`H264` <-> `H265`).
@@ -493,7 +493,7 @@ Alloy / Loki ingestion:
 - [x] Block 6 (Step 1) - Configurable Camera Priority (`priority`), Built-In Event Priority Boosts (`EVENT_PRIORITIES`),
   Zero-Dwell Instant Event Switching, and `15 fps` / `5 fps` Drain-Aware Encoder Pipeline
 - [x] Block 6 (Step 2) - HomeBase Native RTSP Ingestion (`use_rtsp`, `rtsp_url`, `startRtspDecoder` with `750ms` wake
-  retries & `arbitrate()` P2P fallback) & HomeBase 3 Post-Event Clip Download Backfill (`backfill_downloads`,
+  retries & non-destructive handshake guard) & HomeBase 3 Post-Event Clip Download Backfill (`backfill_downloads`,
   `station.database_query_latest_info`/`by_date`, `device.start_download` with `15 fps` real-time playback & `SIGUSR1`
   test hook)
 - [x] Block 6 (Step 3) - Standalone Camera / Multi-Station Concurrent Streaming (`stationSerial` P2P Arbitration &
@@ -507,6 +507,7 @@ Alloy / Loki ingestion:
 - [x] Block 8 (Step 1) - Built-In HTTP Server (`src/services/http-server.js`, `http_port`), Container Readiness `/healthz` Probe (`Dockerfile` `HEALTHCHECK`), and External Camera Pre-Wake Endpoint (`/api/wake/:cameras` & `/api/wake/all`)
 - [x] Block 8 (Step 2) - Cross-Camera Hold Persistence (`let_eufy_decide_event_end: false` default, RTSP early-stop re-wake, `2.5s` RTSP socket timeout), Per-Station Wake Pacing (`stationNextWakeAt`, RTSP-before-P2P ordering, P2P wait during active RTSP wake handshake), and Sensor Burst Deduplication (`cam.apiWakeTimer`)
 - [x] Block 8 (Step 3) - External `eufy-security-ws` Stream Adoption (`initiator=eufy-ws`), Instant (`0ms`) Mid-Session RTSP Re-Wake with `3.5s` Fast Retries, Active Hold Extension (`+30s` / `hold_secs / 2` on mid-stream events and `evaluateActiveHoldExtension`), and Config-First Named Constants Refactoring
+- [x] Block 8 (Step 4) - Domain-Driven Encapsulation (`Camera`, `StatusCard`, `Telemetry`, `BackfillJob` with `@typedef {Camera}` JSDoc typing), Non-Destructive RTSP Handshake Guard (`isRtspDecoderHandshaking`), Backfill Visual Indicators (`◀◀` Rewind glyph & `minimal` Red+Grey bullseye dot), Backfill Cancellation on Runtime Extension (`runtimeExtended`), and `1.0s` Fast Snapshot Delay (`FAST_LIVE_SNAP_DELAY_MS`) across P2P & RTSP
 
 ### Pending (Next Up)
 

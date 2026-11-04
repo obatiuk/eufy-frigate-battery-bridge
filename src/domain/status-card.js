@@ -112,82 +112,6 @@ function getCardBoxCoords(position, boxW, boxH) {
 }
 
 /**
- * Computes the bounding box { boxX, boxY, boxW, boxH } of a camera's corner status card
- * across all states so Frigate motion/object masks and live overlays cover the exact card footprint.
- *
- * @param {Record<string, *>} cam - Camera state object.
- * @returns {{ boxX: number, boxY: number, boxW: number, boxH: number }|null}
- */
-function getCameraCardBounds(cam) {
-  const {theme, position} = cam.cardCfg;
-  if (theme === 'none' || position === 'center') {
-    return null;
-  }
-
-  let boxW = MINIMAL_CARD_WIDTH;
-  let boxH = MINIMAL_CARD_HEIGHT;
-
-  switch (theme) {
-    case 'icons': {
-      const tc = cam.telCfg;
-      boxW = computeIconsCardWidth({
-        showBat: Boolean(tc.enabled && tc.battery),
-        showWifi: Boolean(tc.enabled && tc.wifi),
-        showTemp: Boolean(tc.enabled && tc.temperature),
-        showClock: Boolean(tc.enabled && tc.lastSeen),
-      });
-      boxH = ICONS_CARD_HEIGHT;
-      break;
-    }
-    case 'default': {
-      const title = cam.title || cam.name;
-      const maxHeader = 'Asleep (Low Battery)  -  ' + title;
-      const st = cam.liveTelState || evaluateTelemetryState('Asleep', {
-        telCfg: cam.telCfg,
-        battery: cam.battery ?? 100,
-        charging: cam.charging,
-        powerLabel: cam.powerLabel || 'Charging',
-        wifi: cam.wifi ?? 4,
-        rssi: cam.rssi ?? -60,
-        temp: cam.temp ?? 25,
-        lastSeen: cam.lastSeen || '00:00',
-      });
-      const segments = cam.telCfg.enabled ? buildTelemetrySegments(st) : [];
-      const dims = computeCornerDefaultCardDimensions(maxHeader, segments);
-      boxW = dims.boxW;
-      boxH = dims.boxH;
-      break;
-    }
-    case 'minimal':
-    default:
-      break;
-  }
-
-  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
-  return {boxX, boxY, boxW, boxH};
-}
-
-/**
- * Computes the normalized Frigate mask polygon string ('x0,y0,x0,y1,x1,y1,x1,y0')
- * for a camera's status card with a 6px chroma/anti-aliasing safety margin.
- *
- * @param {Record<string, *>} cam - Camera state object.
- * @returns {string} Normalized polygon coordinates, or '' if no corner card is active.
- */
-function computeFrigateMaskPolygon(cam) {
-  const bounds = getCameraCardBounds(cam);
-  if (!bounds) {
-    return '';
-  }
-  const pad = FRIGATE_MASK_SAFETY_PAD_PX;
-  const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
-  const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
-  const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
-  const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(3);
-  return x0 + ',' + y0 + ',' + x0 + ',' + y1 + ',' + x1 + ',' + y1 + ',' + x1 + ',' + y0;
-}
-
-/**
  * Domain model representing a camera's status overlay card configuration, geometry, and frame buffers.
  */
 class StatusCard {
@@ -208,7 +132,9 @@ class StatusCard {
     this.suppressLiveCard = false;
 
     this.liveTelState = null;
+    this.backfillTelState = null;
     this.liveCard = null;
+    this.backfillCard = null;
     this.liveOverlayBuf = Buffer.allocUnsafe(FRAME);
     this.asleep = null;
     this.waking = null;
@@ -232,10 +158,146 @@ class StatusCard {
   shouldOverlayOnLive() {
     return Boolean(this.showOnLive && !this.suppressLiveCard && this.isCorner());
   }
+
+  /**
+   * Returns true if the pre-rendered default corner live card buffer needs to be built.
+   *
+   * @returns {boolean}
+   */
+  needsDefaultLiveCard() {
+    return Boolean(this.showOnLive && this.theme === 'default' && this.isCorner());
+  }
+
+  /**
+   * Returns true if the given non-empty polygon is already synced and intact in Frigate.
+   *
+   * @param {string} poly - Normalized polygon string.
+   * @param {boolean} masksIntact - Whether Frigate motion and object masks match poly.
+   * @returns {boolean}
+   */
+  isMaskSynced(poly, masksIntact) {
+    return Boolean(poly && this.lastSyncedMaskPoly === poly && masksIntact);
+  }
+
+  /**
+   * Clears the cached Frigate mask polygon so the next sync cycle re-verifies Frigate config.
+   */
+  resetMaskSync() {
+    this.lastSyncedMaskPoly = '';
+  }
+
+  /**
+   * Records the normalized polygon string that was verified or applied in Frigate.
+   *
+   * @param {string} poly - Normalized polygon coordinates.
+   */
+  markMaskSynced(poly) {
+    this.lastSyncedMaskPoly = poly;
+  }
+
+  /**
+   * Stores the pre-rendered YUV420p status card buffers and live/backfill telemetry visual states.
+   *
+   * @param {{ asleep: Uint8Array, waking: Uint8Array, busy: Uint8Array, liveTelState: Record<string, *>, backfillTelState: Record<string, *>, liveCard: Uint8Array|null, backfillCard: Uint8Array|null }} rendered - Rendered card buffers.
+   */
+  setRenderedFrames(rendered) {
+    this.asleep = rendered.asleep;
+    this.waking = rendered.waking;
+    this.busy = rendered.busy;
+    this.liveTelState = rendered.liveTelState;
+    this.backfillTelState = rendered.backfillTelState;
+    this.liveCard = rendered.liveCard;
+    this.backfillCard = rendered.backfillCard;
+  }
+
+  /**
+   * Copies a raw live YUV420p video frame into the reusable scratch buffer for corner card compositing.
+   *
+   * @param {Uint8Array} rawFrame - Source YUV420p frame buffer.
+   * @returns {Uint8Array} Scratch buffer containing a copy of rawFrame.
+   */
+  prepareLiveOverlayBuffer(rawFrame) {
+    rawFrame.copy(this.liveOverlayBuf);
+    return this.liveOverlayBuf;
+  }
+
+  /**
+   * Computes the corner bounding box { boxX, boxY, boxW, boxH } for this StatusCard,
+   * or returns null if the card is centered or hidden.
+   *
+   * @param {string} displayTitle - Camera display title.
+   * @param {import("./telemetry").Telemetry} telemetry - Camera Telemetry domain instance.
+   * @returns {{ boxX: number, boxY: number, boxW: number, boxH: number }|null}
+   */
+  getBounds(displayTitle, telemetry) {
+    if (!this.isCorner()) {
+      return null;
+    }
+    let boxW = MINIMAL_CARD_WIDTH;
+    let boxH = MINIMAL_CARD_HEIGHT;
+
+    switch (this.theme) {
+      case 'icons': {
+        const tc = telemetry.config;
+        boxW = computeIconsCardWidth({
+          showBat: Boolean(tc.enabled && tc.battery),
+          showWifi: Boolean(tc.enabled && tc.wifi),
+          showTemp: Boolean(tc.enabled && tc.temperature),
+          showClock: Boolean(tc.enabled && tc.lastSeen),
+        });
+        boxH = ICONS_CARD_HEIGHT;
+        break;
+      }
+      case 'default': {
+        const maxHeader = 'Asleep (Low Battery)  -  ' + displayTitle;
+        const tc = telemetry.config;
+        const st = this.liveTelState || evaluateTelemetryState('Asleep', {
+          telCfg: tc,
+          battery: telemetry.battery ?? 100,
+          charging: telemetry.charging,
+          powerLabel: telemetry.powerLabel || 'Charging',
+          wifi: telemetry.wifi ?? 4,
+          rssi: telemetry.rssi ?? -60,
+          temp: telemetry.temp ?? 25,
+          lastSeen: telemetry.lastSeen || '00:00',
+        });
+        const segments = tc.enabled ? buildTelemetrySegments(st) : [];
+        const dims = computeCornerDefaultCardDimensions(maxHeader, segments);
+        boxW = dims.boxW;
+        boxH = dims.boxH;
+        break;
+      }
+      case 'minimal':
+      default:
+        break;
+    }
+
+    const {boxX, boxY} = getCardBoxCoords(this.position, boxW, boxH);
+    return {boxX, boxY, boxW, boxH};
+  }
+
+  /**
+   * Computes the normalized Frigate mask polygon string for this StatusCard.
+   *
+   * @param {string} displayTitle - Camera display title.
+   * @param {import("./telemetry").Telemetry} telemetry - Camera Telemetry domain instance.
+   * @returns {string}
+   */
+  computeMaskPolygon(displayTitle, telemetry) {
+    const bounds = this.getBounds(displayTitle, telemetry);
+    if (!bounds) {
+      return '';
+    }
+    const pad = FRIGATE_MASK_SAFETY_PAD_PX;
+    const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
+    const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
+    const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
+    const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(3);
+    return x0 + ',' + y0 + ',' + x0 + ',' + y1 + ',' + x1 + ',' + y1 + ',' + x1 + ',' + y0;
+  }
 }
 
 module.exports = {
-  CARD_CORNER_MARGIN_PX,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -249,6 +311,4 @@ module.exports = {
   computeIconsCardWidth,
   computeCornerDefaultCardDimensions,
   getCardBoxCoords,
-  getCameraCardBounds,
-  computeFrigateMaskPolygon,
 };

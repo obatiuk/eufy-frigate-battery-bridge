@@ -109,34 +109,6 @@ function drawYuvCircle(canvas, cx, cy, radius, rgb, alpha) {
   }
 }
 
-/**
- * Draws an anti-aliased ring outline onto a YUV420p frame buffer.
- *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Center X coordinate.
- * @param {number} cy - Center Y coordinate.
- * @param {number} radius - Ring radius in pixels.
- * @param {number} strokeHalf - Half of the ring stroke width in pixels.
- * @param {number[]} rgb - RGB color array [r, g, b].
- * @param {number} alpha - Opacity (0..1).
- */
-function drawYuvRing(canvas, cx, cy, radius, strokeHalf, rgb, alpha) {
-  const [r, g, b] = rgb;
-  const pad = Math.ceil(radius + strokeHalf + 1);
-  const y0 = Math.max(0, Math.floor(cy - pad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + pad));
-  const x0 = Math.max(0, Math.floor(cx - pad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + pad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x - cx, y - cy);
-      const cov = Math.min(1, Math.max(0, strokeHalf + 0.5 - Math.abs(d - radius)));
-      if (cov > 0) {
-        blendYuvPixel(canvas, x, y, r, g, b, alpha * cov);
-      }
-    }
-  }
-}
 
 /**
  * Draws an anti-aliased line segment between (x1, y1) and (x2, y2) onto a YUV420p buffer.
@@ -419,11 +391,7 @@ module.exports = {
   blendYuvPixel,
   fillYuvRect,
   drawYuvCircle,
-  drawYuvRing,
   drawYuvLine,
-  boxBlurPlane,
-  extractBlurredRegion,
-  blendBlurredBackdropPixel,
   drawRoundedBox,
   prepareBackgroundCanvas,
   copyYuvRegion,

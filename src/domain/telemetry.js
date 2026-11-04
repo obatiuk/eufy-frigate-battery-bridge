@@ -13,6 +13,7 @@
 const {
   clampNum,
   LOW_BAT_THRESHOLD,
+  ENFORCE_QUALITY,
   COLOR_RED,
   COLOR_GREY,
   COLOR_GREEN,
@@ -35,6 +36,9 @@ const TEL_BAT_LABEL_OFFSET_X = 45;
 const TEL_WIFI_LABEL_OFFSET_X = 38;
 const TEL_TEXT_CHAR_WIDTH = 11;
 const TEL_TEMP_CHAR_WIDTH = 12;
+const AUTO_STREAMING_QUALITY = 0;
+const MEDIUM_STREAMING_QUALITY = 7;
+const LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS = 30000;
 
 /**
  * Unwraps a property value returned by eufy-security-ws, handling both direct values
@@ -119,16 +123,17 @@ function rssiToWifiSignalLevel(dbm) {
   return 1;
 }
 
-const rssiToBars = rssiToWifiSignalLevel;
-
 /**
- * Resolves the status kind and RGB color for a card title ('Live', 'Waking Up...', 'Waiting', 'Asleep').
+ * Resolves the status kind and RGB color for a card title ('Live', 'Backfill', 'Waking Up...', 'Waiting', 'Asleep').
  *
  * @param {string} titleText - Card heading string.
  * @param {boolean} economyMode - Whether the camera is in low-battery economy mode.
- * @returns {{ statusKind: 'live'|'waking'|'waiting'|'low'|'asleep', statusRgb: number[] }}
+ * @returns {{ statusKind: 'live'|'backfill'|'waking'|'waiting'|'low'|'asleep', statusRgb: number[] }}
  */
 function resolveStatusVisual(titleText, economyMode) {
+  if (/^Backfill\b/i.test(titleText)) {
+    return {statusKind: 'backfill', statusRgb: COLOR_RED};
+  }
   if (/^Live\b/i.test(titleText)) {
     return {statusKind: 'live', statusRgb: COLOR_RED};
   }
@@ -181,7 +186,7 @@ function resolveWifiVisual(wifiRaw, rssiRaw) {
   const rssiNum = hasRssi ? Math.round(Number(rssiRaw)) : null;
 
   const rawBars = hasWifi ? clampNum(Math.round(Number(wifiRaw)), 0, 4, 0) : 0;
-  const effectiveLevel = hasRssi ? rssiToBars(rssiNum) : rawBars;
+  const effectiveLevel = hasRssi ? rssiToWifiSignalLevel(rssiNum) : rawBars;
   const wifiBars = effectiveLevel;
   let wifiRgb = COLOR_PURPLE;
   switch (effectiveLevel) {
@@ -378,6 +383,54 @@ class Telemetry {
   }
 
   /**
+   * Returns true once an initial battery percentage has been populated from eufy-security-ws.
+   *
+   * @returns {boolean}
+   */
+  hasBatteryReading() {
+    return this.battery !== null;
+  }
+
+  /**
+   * Updates the formatted HH:MM timestamp of the last decoded live video frame.
+   *
+   * @param {string} hmString - Formatted local HH:MM string.
+   */
+  updateLastSeen(hmString) {
+    this.lastSeen = hmString;
+  }
+
+  /**
+   * Evaluates whether the camera's videoStreamingQuality property needs to be updated
+   * to prevent 4K P2P stream stalls, marking qualityChecked on first inspection.
+   *
+   * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+   * @param {string} serial - Camera hardware serial number.
+   * @returns {{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }}
+   */
+  evaluateQualityChange(props, serial) {
+    if (!ENFORCE_QUALITY || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
+      return {shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY};
+    }
+    const currentQuality = Number(unwrapProperty(props.videoStreamingQuality));
+    if (Number.isNaN(currentQuality)) {
+      return {shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY};
+    }
+    this.qualityChecked = true;
+    const isDoorbellT8214 = /^T8214/i.test(serial || '');
+    if (ENFORCE_QUALITY === true && isDoorbellT8214) {
+      return {shouldUpdate: false, currentQuality, targetQuality: MEDIUM_STREAMING_QUALITY};
+    }
+    const targetQuality =
+        typeof ENFORCE_QUALITY === 'number' ? ENFORCE_QUALITY : MEDIUM_STREAMING_QUALITY;
+    const shouldUpdate =
+        typeof ENFORCE_QUALITY === 'number'
+            ? currentQuality !== targetQuality
+            : currentQuality === AUTO_STREAMING_QUALITY;
+    return {shouldUpdate, currentQuality, targetQuality};
+  }
+
+  /**
    * Applies raw Eufy device properties to this Telemetry model and returns change flags.
    *
    * @param {Record<string, *>} props - Properties object from eufy-security-ws.
@@ -499,6 +552,93 @@ class Telemetry {
       lastSeen: this.lastSeen,
     });
   }
+
+  /**
+   * Returns true if a viewer connecting while in low-battery economy mode should trigger
+   * an immediate HomeBase poll_refresh to check for a physical battery swap.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {number} [cooldownMs=LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS] - Minimum interval between refreshes.
+   * @returns {boolean}
+   */
+  shouldRefreshLowBatteryOnView(now = Date.now(), cooldownMs = LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS) {
+    if (now - this.lastLowBatRefreshAt <= cooldownMs) {
+      return false;
+    }
+    this.lastLowBatRefreshAt = now;
+    return true;
+  }
+
+  /**
+   * Formats the initial telemetry summary log line when device properties are first loaded.
+   *
+   * @param {*} model - Unwrapped camera model name.
+   * @param {*} swVer - Unwrapped camera firmware version.
+   * @param {boolean} [nowLowBat=this.isLowBattery()] - Whether low-battery economy mode is active.
+   * @returns {string}
+   */
+  formatLoadedLog(model, swVer, nowLowBat = this.isLowBattery()) {
+    const hwInfo = model || swVer ? 'model=' + (model || 'n/a') + ', fw=' + (swVer || 'n/a') + ', ' : '';
+    const pwrMode = this.powerLabel || (nowLowBat ? 'battery [ECO]' : 'battery');
+    return (
+        'telemetry loaded (' +
+        hwInfo +
+        'battery=' +
+        this.battery +
+        '%, power=' +
+        pwrMode +
+        ', wifi=' +
+        (this.wifi ?? 'n/a') +
+        '/4, rssi=' +
+        (this.rssi ?? 'n/a') +
+        'dBm, temp=' +
+        (this.temp ?? 'n/a') +
+        '°C)'
+    );
+  }
+
+  /**
+   * Formats the battery/charging state transition log line.
+   *
+   * @param {number|null} prevBattery - Previous battery percentage.
+   * @param {boolean} [nowLowBat=this.isLowBattery()] - Whether low-battery economy mode is active.
+   * @returns {string}
+   */
+  formatStateChangeLog(prevBattery, nowLowBat = this.isLowBattery()) {
+    const ecoStatus = nowLowBat ? 'entered low-battery economy mode' : 'normal mode restored';
+    return (
+        'battery state updated (' +
+        (prevBattery ?? 'n/a') +
+        '% -> ' +
+        this.battery +
+        '%, power=' +
+        (this.powerLabel || 'battery') +
+        ', ' +
+        ecoStatus +
+        ')'
+    );
+  }
+
+  /**
+   * Formats a routine debug telemetry update log line.
+   *
+   * @returns {string}
+   */
+  formatUpdateLog() {
+    return (
+        'telemetry updated (battery=' +
+        (this.battery ?? 'n/a') +
+        '%, power=' +
+        (this.powerLabel || 'battery') +
+        ', wifi=' +
+        (this.wifi ?? 'n/a') +
+        '/4, rssi=' +
+        (this.rssi ?? 'n/a') +
+        'dBm, temp=' +
+        (this.temp ?? 'n/a') +
+        '°C)'
+    );
+  }
 }
 
 module.exports = {
@@ -507,14 +647,6 @@ module.exports = {
   TEL_TEXT_CHAR_WIDTH,
   Telemetry,
   unwrapProperty,
-  parseChargingState,
-  rssiToWifiSignalLevel,
-  rssiToBars,
-  resolveStatusVisual,
-  resolveBatteryVisual,
-  resolveWifiVisual,
-  resolveTempVisual,
   evaluateTelemetryState,
-  formatBatteryPowerSuffix,
   buildTelemetrySegments,
 };

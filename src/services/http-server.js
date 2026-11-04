@@ -15,6 +15,8 @@ const {HTTP_PORT, HOLD_MS, MAX_MS} = require('../config');
 const {log} = require('../logger');
 const {isWsReady} = require('./eufy-client');
 
+/** @typedef {import("../domain/camera").Camera} Camera */
+
 const MAX_JSON_BODY_BYTES = 16384;
 const MIN_WAKE_DURATION_SECS = 5;
 const MAX_WAKE_DURATION_SECS = Math.round(MAX_MS / 1000);
@@ -41,8 +43,8 @@ function normalizeLookupKey(str) {
  * into matching Camera instances.
  *
  * @param {string} targetSpec - URL path parameter after /api/wake/.
- * @param {Array<Record<string, *>>} cams - Configured Camera instances.
- * @returns {Array<Record<string, *>>}
+ * @param {Camera[]} cams - Configured Camera instances.
+ * @returns {Camera[]}
  */
 function resolveTargetCameras(targetSpec, cams) {
   const rawTokens = decodeURIComponent(String(targetSpec || ''))
@@ -62,12 +64,7 @@ function resolveTargetCameras(targetSpec, cams) {
     const lower = token.toLowerCase();
     const slug = normalizeLookupKey(token);
     for (const cam of cams) {
-      if (
-          String(cam.name).toLowerCase() === lower ||
-          String(cam.serial).toLowerCase() === lower ||
-          normalizeLookupKey(cam.name) === slug ||
-          normalizeLookupKey(cam.title) === slug
-      ) {
+      if (cam.matchesTargetToken(lower, slug, normalizeLookupKey)) {
         matched.add(cam);
       }
     }
@@ -107,7 +104,7 @@ function readJsonBody(req) {
 /**
  * Starts the HTTP server for /api/wake/:cameras and /healthz if HTTP_PORT > 0.
  *
- * @param {Array<Record<string, *>>} cams - Configured Camera instances.
+ * @param {Camera[]} cams - Configured Camera instances.
  * @param {Record<string, Function>} hooks - Callbacks into stream-orchestrator.
  */
 function startHttpServer(cams, hooks) {
@@ -152,7 +149,7 @@ function startHttpServer(cams, hooks) {
             JSON.stringify({
               ok: false,
               error: 'No matching camera found for: ' + rawTarget,
-              available: cams.map((c) => ({name: c.name, serial: c.serial, title: c.title})),
+              available: cams.map((c) => ({name: c.name, serial: c.serial, title: c.getDisplayTitle()})),
             })
         );
         return;
@@ -172,7 +169,7 @@ function startHttpServer(cams, hooks) {
       );
 
       const orderedTargets = [...targets].sort(
-          (a, b) => Number(Boolean(b.useRtsp && b.rtspUrl)) - Number(Boolean(a.useRtsp && a.rtspUrl))
+          (a, b) => Number(b.isRtspCapable()) - Number(a.isRtspCapable())
       );
       const results = orderedTargets.map((cam) =>
         wakeCameraExternal(cam, {
@@ -219,8 +216,6 @@ function stopHttpServer() {
 }
 
 module.exports = {
-  normalizeLookupKey,
-  resolveTargetCameras,
   startHttpServer,
   stopHttpServer,
 };

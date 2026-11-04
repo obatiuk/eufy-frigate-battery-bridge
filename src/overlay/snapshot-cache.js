@@ -14,6 +14,8 @@ const {spawnSync} = require('child_process');
 const {W, H, FRAME, CACHE_DIR, MAX_FFMPEG_BUFFER_MULTIPLIER} = require('../config');
 const {log, formatLocalHm} = require('../logger');
 
+/** @typedef {import("../domain/camera").Camera} Camera */
+
 const JPEG_ENCODER_QUALITY = '2';
 
 /**
@@ -102,7 +104,7 @@ function readFileLastSeenHm(filePath) {
  * Returns the unique cache file path in CACHE_DIR for a specific camera's last verified live frame,
  * keyed by both camera name and hardware serial number so frames can never collide across cameras.
  *
- * @param {Record<string, *>} cam - Camera configuration or state object.
+ * @param {{ name: string, serial: string }|Camera} cam - Camera configuration or state object.
  * @returns {string} Filesystem path in CACHE_DIR.
  */
 const getCacheFilePath = (cam) => path.join(CACHE_DIR, 'last_' + cam.name + '_' + cam.serial + '.jpg');
@@ -111,7 +113,7 @@ const getCacheFilePath = (cam) => path.join(CACHE_DIR, 'last_' + cam.name + '_' 
  * Loads the last cached live frame for a camera from CACHE_DIR (or legacy /tmp) if one was saved
  * prior to a container restart.
  *
- * @param {Record<string, *>} cam - Camera configuration object.
+ * @param {{ name: string, serial: string }|Camera} cam - Camera configuration object.
  * @returns {{ frame: Uint8Array|null, lastSeen: string }} YUV420p frame buffer and formatted mtime.
  */
 function loadCachedFrame(cam) {
@@ -135,10 +137,10 @@ function loadCachedFrame(cam) {
 /**
  * Saves the camera's latest verified raw YUV420p live frame to CACHE_DIR as a JPEG snapshot.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera domain instance.
  */
 function saveCachedFrame(cam) {
-  if (!Buffer.isBuffer(cam.lastFrame) || cam.lastFrame.length !== FRAME) {
+  if (!cam.hasValidSnapshotFrame()) {
     return;
   }
   const targetFile = getCacheFilePath(cam);
@@ -156,11 +158,6 @@ function saveCachedFrame(cam) {
 }
 
 module.exports = {
-  buildDecodeJpegArgs,
-  buildEncodeJpegArgs,
-  decodeJpegToYuv,
-  readFileLastSeenHm,
-  getCacheFilePath,
   loadCachedFrame,
   saveCachedFrame,
 };

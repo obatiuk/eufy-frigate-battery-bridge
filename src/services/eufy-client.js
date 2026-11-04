@@ -11,14 +11,12 @@
 
 const {
   cfg,
-  ENFORCE_QUALITY,
   FORWARD_FACE_NAMES,
   TELEMETRY_POLL_MS,
   sleep,
 } = require('../config');
 const {log} = require('../logger');
-const {isLowBattery, clearViewerQueue} = require('../domain/camera');
-const {unwrapProperty, parseChargingState, rssiToWifiSignalLevel} = require('../domain/telemetry');
+const {unwrapProperty} = require('../domain/telemetry');
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {pushFrameToEncoder} = require('../media/encoder');
 const {startRtspDecoder} = require('../media/decoder');
@@ -28,9 +26,9 @@ const WS_RPC_TIMEOUT_MS = 20000;
 const WS_RECONNECT_DELAY_MS = 10000;
 const INITIAL_TELEMETRY_RETRY_MS = 10000;
 const POLL_REFRESH_SETTLE_MS = 2000;
+/** @typedef {import("../domain/camera").Camera} Camera */
+
 const MAX_SUPPORTED_API_SCHEMA = 21;
-const AUTO_STREAMING_QUALITY = 0;
-const MEDIUM_STREAMING_QUALITY = 7;
 let WebSocketCtor = null;
 
 /**
@@ -69,7 +67,9 @@ let initialTelemetryLoaded = false;
 let seq = 0;
 const waiting = new Map();
 
+/** @type {Camera[]} */
 let camsRef = [];
+/** @type {Map<string, Camera>} */
 let bySerialRef = new Map();
 let isShuttingDownFn = () => false;
 let onEventCallback = null;
@@ -144,27 +144,14 @@ function call(commandPayload) {
  * automatically switches cameras configured as "Auto" (0) to Medium (7, 1280x720) so P2P streams
  * do not negotiate 4K and stall.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {Record<string, *>} props - Properties dictionary from device.get_properties.
  */
 function checkStreamingQuality(cam, props) {
-  if (!ENFORCE_QUALITY || cam.qualityChecked || !props || !('videoStreamingQuality' in props)) {
-    return;
-  }
-  const currentQuality = Number(unwrapProperty(props.videoStreamingQuality));
-  if (Number.isNaN(currentQuality)) {
-    return;
-  }
-  cam.qualityChecked = true;
-
-  const isDoorbellT8214 = /^T8214/i.test(cam.serial || '');
-  if (ENFORCE_QUALITY === true && isDoorbellT8214) {
-    return;
-  }
-  const targetQuality = typeof ENFORCE_QUALITY === 'number' ? ENFORCE_QUALITY : MEDIUM_STREAMING_QUALITY;
-  const shouldUpdate =
-      typeof ENFORCE_QUALITY === 'number' ? currentQuality !== targetQuality : currentQuality === AUTO_STREAMING_QUALITY;
-
+  const {shouldUpdate, currentQuality, targetQuality} = cam.telemetry.evaluateQualityChange(
+      props,
+      cam.serial
+  );
   if (shouldUpdate) {
     log.info(
         cam,
@@ -191,28 +178,20 @@ function checkStreamingQuality(cam, props) {
 /**
  * Applies RTSP URL discovery and automatic rtspStream property enabling from device properties.
  *
- * @param {Record<string, *>} cam - Camera state object.
+ * @param {Camera} cam - Camera state object.
  * @param {*} stationSn - Unwrapped stationSerialNumber.
  * @param {*} rtspUrlProp - Unwrapped rtspStreamUrl.
  * @param {*} rtspStreamProp - Unwrapped rtspStream boolean.
  */
 function syncCameraRtspProperties(cam, stationSn, rtspUrlProp, rtspStreamProp) {
-  if (stationSn && typeof stationSn === 'string') {
-    cam.stationSerial = stationSn;
-  }
-  if (rtspUrlProp && typeof rtspUrlProp === 'string' && !cam.rtsp_url) {
-    if (cam.rtspUrl !== rtspUrlProp) {
-      cam.rtspUrl = rtspUrlProp;
-      cam.rtspSupported = true;
-      const maskedUrl = rtspUrlProp.replace(/:\/\/[^@]+@/, '://***@');
-      log.info(cam, 'discovered HomeBase RTSP URL (' + maskedUrl + ')');
-      if (cam.active && cam.activeMode === 'rtsp' && !cam.dec) {
-        startRtspDecoder(cam, cam.rtspUrl);
-      }
+  if (cam.updateDiscoveredRtspConfig(stationSn, rtspUrlProp)) {
+    const maskedUrl = cam.rtspUrl.replace(/:\/\/[^@]+@/, '://***@');
+    log.info(cam, 'discovered HomeBase RTSP URL (' + maskedUrl + ')');
+    if (cam.isCurrentSession(cam.sessionId, 'rtsp') && !cam.dec) {
+      startRtspDecoder(cam, cam.rtspUrl);
     }
   }
-  if (cam.useRtsp && cam.rtspUrl && !cam.rtspEnabledChecked && rtspStreamProp === false) {
-    cam.rtspEnabledChecked = true;
+  if (cam.shouldEnableRtspProperty(rtspStreamProp)) {
     log.info(cam, 'enabling HomeBase RTSP stream (rtspStream=true) via eufy-security-ws');
     call({
       command: 'device.set_property',
@@ -230,7 +209,7 @@ function syncCameraRtspProperties(cam, stationSn, rtspUrlProp, rtspStreamProp) {
 /**
  * Applies device telemetry properties from eufy-security-ws to a camera's Telemetry domain model.
  *
- * @param {Record<string, *>} cam - Camera domain instance.
+ * @param {Camera} cam - Camera domain instance.
  * @param {Record<string, *>} props - Properties dictionary from device.get_properties or start_listening.
  * @param {boolean} [allowCardRebuild=false] - Whether to re-render the sleeping card immediately.
  */
@@ -257,54 +236,12 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
     swVer,
   } = cam.telemetry.applyProperties(props);
 
-  if (!hadInitialTelemetry && cam.battery !== null) {
-    const hwInfo = model || swVer ? 'model=' + (model || 'n/a') + ', fw=' + (swVer || 'n/a') + ', ' : '';
-    const pwrMode = cam.powerLabel || (nowLowBat ? 'battery [ECO]' : 'battery');
-    log.info(
-        cam,
-        'telemetry loaded (' +
-        hwInfo +
-        'battery=' +
-        cam.battery +
-        '%, power=' +
-        pwrMode +
-        ', wifi=' +
-        (cam.wifi ?? 'n/a') +
-        '/4, rssi=' +
-        (cam.rssi ?? 'n/a') +
-        'dBm, temp=' +
-        (cam.temp ?? 'n/a') +
-        '°C)'
-    );
+  if (!hadInitialTelemetry && cam.telemetry.hasBatteryReading()) {
+    log.info(cam, cam.telemetry.formatLoadedLog(model, swVer, nowLowBat));
   } else if (stateChanged) {
-    const ecoStatus = nowLowBat ? 'entered low-battery economy mode' : 'normal mode restored';
-    log.info(
-        cam,
-        'battery state updated (' +
-        (prevBattery ?? 'n/a') +
-        '% -> ' +
-        cam.battery +
-        '%, power=' +
-        (cam.powerLabel || 'battery') +
-        ', ' +
-        ecoStatus +
-        ')'
-    );
+    log.info(cam, cam.telemetry.formatStateChangeLog(prevBattery, nowLowBat));
   } else if (minorTelemetryChanged) {
-    log.debug(
-        cam,
-        'telemetry updated (battery=' +
-        (cam.battery ?? 'n/a') +
-        '%, power=' +
-        (cam.powerLabel || 'battery') +
-        ', wifi=' +
-        (cam.wifi ?? 'n/a') +
-        '/4, rssi=' +
-        (cam.rssi ?? 'n/a') +
-        'dBm, temp=' +
-        (cam.temp ?? 'n/a') +
-        '°C)'
-    );
+    log.debug(cam, cam.telemetry.formatUpdateLog());
   }
 
   if (allowCardRebuild || !hadInitialTelemetry || stateChanged) {
@@ -323,7 +260,7 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
   if (!wsReady) {
     return;
   }
-  if (forceRefresh || camsRef.some((c) => isLowBattery(c))) {
+  if (forceRefresh || camsRef.some((c) => c.isLowBattery())) {
     log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
     await call({command: 'driver.poll_refresh'});
     await sleep(POLL_REFRESH_SETTLE_MS);
@@ -334,7 +271,7 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
     }
     const res = await call({command: 'device.get_properties', serialNumber: cam.serial});
     if (res.success && res.result && res.result.properties) {
-      applyDeviceProperties(cam, res.result.properties, cam.battery === null);
+      applyDeviceProperties(cam, res.result.properties, !cam.telemetry.hasBatteryReading());
     } else if (!res.success) {
       log.warn(cam, 'device.get_properties failed: ' + (res.errorCode || 'unknown'));
     }
@@ -377,7 +314,7 @@ async function handleVersionMessage(m) {
   }
   await fetchAllCameraTelemetry();
   setTimeout(() => {
-    if (wsReady && camsRef.some((c) => c.battery === null)) {
+    if (wsReady && camsRef.some((c) => !c.telemetry.hasBatteryReading())) {
       void fetchAllCameraTelemetry();
     }
   }, INITIAL_TELEMETRY_RETRY_MS);
@@ -405,7 +342,7 @@ function connectWs() {
     log.warn('bridge', 'eufy-security-ws connection closed, retrying in 10 s');
     for (const c of camsRef) {
       c.motionUntil = 0;
-      clearViewerQueue(c, 'ws_closed');
+      c.clearViewerQueue('ws_closed');
       if (c.active && onWsClosedStopCallback) {
         onWsClosedStopCallback(c);
       }
@@ -496,14 +433,8 @@ module.exports = {
   isInitialTelemetryLoaded,
   isTrackedPropertyEvent,
   call,
-  unwrapProperty,
-  parseChargingState,
-  rssiToWifiSignalLevel,
-  checkStreamingQuality,
-  syncCameraRtspProperties,
   applyDeviceProperties,
   fetchAllCameraTelemetry,
-  handleVersionMessage,
   connectWs,
   startTelemetryPoller,
   extractRecognizedPerson,
