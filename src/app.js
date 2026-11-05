@@ -165,11 +165,12 @@ function registerSignalHandlers(cams) {
  */
 function logStartupBanner(cams) {
   const camNames = cams.map((cam) => cam.name).join(', ');
+  const alwaysBackfillCams = cams.filter((cam) => cam.alwaysBackfill).map((cam) => cam.name);
   const encoderDesc = config.ACTIVE_HWACCEL
       ? config.ACTIVE_HWACCEL + ' (' + config.HWACCEL_DEVICE + ')'
       : 'software (libx264)';
 
-  const summary = [
+  const summaryParts = [
     'cameras=[' + camNames + ']',
     'logLevel=' + config.ACTIVE_LOG_LEVEL_NAME,
     'cache=' + config.CACHE_DIR,
@@ -184,9 +185,12 @@ function logStartupBanner(cams) {
     'earlySleep=' + config.EARLY_SLEEP_MS / 1000 + 's',
     'viewerLinger=' + config.LINGER_MS / 1000 + 's',
     'max=' + config.MAX_MS / 1000 + 's',
-  ].join(', ');
+  ];
+  if (alwaysBackfillCams.length > 0) {
+    summaryParts.push('alwaysBackfill=[' + alwaysBackfillCams.join(', ') + ']');
+  }
 
-  log.info('bridge', 'eufy-frigate-battery-bridge starting: ' + summary);
+  log.info('bridge', 'eufy-frigate-battery-bridge starting: ' + summaryParts.join(', '));
 }
 
 /**

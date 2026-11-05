@@ -13,7 +13,6 @@
 const {
   clampNum,
   LOW_BAT_THRESHOLD,
-  ENFORCE_QUALITY,
   COLOR_RED,
   COLOR_GREY,
   COLOR_GREEN,
@@ -21,6 +20,7 @@ const {
   COLOR_YELLOW,
   COLOR_PURPLE,
   resolveTelemetryConfig,
+  resolveHardwareRecordingConfig,
 } = require('../config');
 
 const RSSI_STRONG_DBM = -65;
@@ -358,6 +358,7 @@ class Telemetry {
    */
   constructor(rawCamCfg = {}, initialLastSeen = '') {
     this.config = resolveTelemetryConfig(rawCamCfg);
+    this.hwRecordingCfg = resolveHardwareRecordingConfig(rawCamCfg);
     this.battery = null;
     this.charging = false;
     this.powerLabel = '';
@@ -367,6 +368,7 @@ class Telemetry {
     this.lastSeen = initialLastSeen;
     this.lastLowBatRefreshAt = 0;
     this.qualityChecked = false;
+    this.recordingModeChecked = false;
   }
 
   /**
@@ -409,7 +411,8 @@ class Telemetry {
    * @returns {{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }}
    */
   evaluateQualityChange(props, serial) {
-    if (!ENFORCE_QUALITY || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
+    const enforceQuality = this.hwRecordingCfg.enforceQuality;
+    if (!enforceQuality || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
       return {shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY};
     }
     const currentQuality = Number(unwrapProperty(props.videoStreamingQuality));
@@ -418,16 +421,85 @@ class Telemetry {
     }
     this.qualityChecked = true;
     const isDoorbellT8214 = /^T8214/i.test(serial || '');
-    if (ENFORCE_QUALITY === true && isDoorbellT8214) {
+    if (enforceQuality === true && isDoorbellT8214) {
       return {shouldUpdate: false, currentQuality, targetQuality: MEDIUM_STREAMING_QUALITY};
     }
     const targetQuality =
-        typeof ENFORCE_QUALITY === 'number' ? ENFORCE_QUALITY : MEDIUM_STREAMING_QUALITY;
+        typeof enforceQuality === 'number' ? enforceQuality : MEDIUM_STREAMING_QUALITY;
     const shouldUpdate =
-        typeof ENFORCE_QUALITY === 'number'
+        typeof enforceQuality === 'number'
             ? currentQuality !== targetQuality
             : currentQuality === AUTO_STREAMING_QUALITY;
     return {shouldUpdate, currentQuality, targetQuality};
+  }
+
+  /**
+   * Evaluates whether any configured Eufy hardware Power Manager properties (powerWorkingMode,
+   * recordingClipLength, recordingEndClipMotionStops, recordingRetriggerInterval) need to be
+   * synced to the camera via device.set_property on first full property inspection.
+   *
+   * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+   * @returns {Array<{ name: string, currentValue: *, targetValue: * }>}
+   */
+  evaluateRecordingModeChanges(props) {
+    if (this.recordingModeChecked || !props || typeof props !== 'object') {
+      return [];
+    }
+    const hasRecordingProps =
+        'powerWorkingMode' in props ||
+        'recordingClipLength' in props ||
+        'recordingEndClipMotionStops' in props ||
+        'recordingRetriggerInterval' in props;
+    if (!hasRecordingProps) {
+      return [];
+    }
+    this.recordingModeChecked = true;
+
+    const {
+      powerWorkingMode,
+      recordingClipLength,
+      recordingEndClipMotionStops,
+      recordingRetriggerInterval,
+    } = this.hwRecordingCfg;
+
+    const updates = [];
+    if (powerWorkingMode !== null) {
+      const cur = unwrapProperty(props.powerWorkingMode);
+      if (cur === undefined || Number(cur) !== powerWorkingMode) {
+        updates.push({name: 'powerWorkingMode', currentValue: cur, targetValue: powerWorkingMode});
+      }
+    }
+    if (recordingClipLength !== null) {
+      const cur = unwrapProperty(props.recordingClipLength);
+      if (cur === undefined || Number(cur) !== recordingClipLength) {
+        updates.push({
+          name: 'recordingClipLength',
+          currentValue: cur,
+          targetValue: recordingClipLength,
+        });
+      }
+    }
+    if (recordingEndClipMotionStops !== null) {
+      const cur = unwrapProperty(props.recordingEndClipMotionStops);
+      if (cur === undefined || Boolean(cur) !== recordingEndClipMotionStops) {
+        updates.push({
+          name: 'recordingEndClipMotionStops',
+          currentValue: cur,
+          targetValue: recordingEndClipMotionStops,
+        });
+      }
+    }
+    if (recordingRetriggerInterval !== null) {
+      const cur = unwrapProperty(props.recordingRetriggerInterval);
+      if (cur === undefined || Number(cur) !== recordingRetriggerInterval) {
+        updates.push({
+          name: 'recordingRetriggerInterval',
+          currentValue: cur,
+          targetValue: recordingRetriggerInterval,
+        });
+      }
+    }
+    return updates;
   }
 
   /**

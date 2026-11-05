@@ -56,6 +56,10 @@ const TRACKED_PROPERTY_NAMES = new Set([
   'batteryTemperature',
   'temperature',
   'videoStreamingQuality',
+  'powerWorkingMode',
+  'recordingClipLength',
+  'recordingEndClipMotionStops',
+  'recordingRetriggerInterval',
   'rtspStream',
   'rtspStreamUrl',
 ]);
@@ -176,6 +180,44 @@ function checkStreamingQuality(cam, props) {
 }
 
 /**
+ * Checks the camera's Eufy Power Manager recording properties and applies any configured
+ * per-camera overrides (powerWorkingMode, recordingClipLength, recordingEndClipMotionStops,
+ * recordingRetriggerInterval) via eufy-security-ws on initial property sync.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @param {Record<string, *>} props - Properties dictionary from device.get_properties.
+ */
+function checkHardwareRecordingSettings(cam, props) {
+  const updates = cam.telemetry.evaluateRecordingModeChanges(props);
+  if (!updates.length) {
+    return;
+  }
+  for (const upd of updates) {
+    log.info(
+        cam,
+        'syncing Eufy hardware property ' +
+        upd.name +
+        ' (' +
+        (upd.currentValue ?? 'n/a') +
+        ' -> ' +
+        upd.targetValue +
+        ')'
+    );
+    call({
+      command: 'device.set_property',
+      serialNumber: cam.serial,
+      name: upd.name,
+      value: upd.targetValue,
+    }).then((res) => {
+      if (!res.success) {
+        const logFn = res.errorCode === 'device_invalid_property_value' ? log.debug : log.warn;
+        logFn(cam, 'could not set ' + upd.name + ': ' + (res.errorCode || 'unknown'));
+      }
+    });
+  }
+}
+
+/**
  * Applies RTSP URL discovery and automatic rtspStream property enabling from device properties.
  *
  * @param {Camera} cam - Camera state object.
@@ -219,6 +261,7 @@ function applyDeviceProperties(cam, props, allowCardRebuild = false) {
   }
 
   checkStreamingQuality(cam, props);
+  checkHardwareRecordingSettings(cam, props);
   syncCameraRtspProperties(
       cam,
       unwrapProperty(props.stationSerialNumber),

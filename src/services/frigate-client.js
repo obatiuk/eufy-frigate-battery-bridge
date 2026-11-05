@@ -13,11 +13,9 @@
 const {
   cfg,
   LABELS,
-  EVENT_SECS,
   SNAP_DELAY_MS,
   INSTANT_EVENT_SNAPSHOT,
   LOW_BAT_WAKE_ON_VIEW,
-  LINGER_MS,
   KEYFRAME_BURST_MS,
   sleep,
 } = require('../config');
@@ -436,7 +434,7 @@ function frigateEvent(cam, ev, personName = '') {
         body: JSON.stringify({
           source_type: 'api',
           sub_label: subLabel,
-          duration: EVENT_SECS,
+          duration: cam.timers.eventSecs,
           include_recording: true,
         }),
       });
@@ -697,7 +695,7 @@ async function pollViewers(cams, hooks) {
     for (const cam of cams) {
       if (cam.hasWakingViewer()) {
         cam.isStartupProbe = false;
-        triggerCam(cam, 'live view opened', LINGER_MS, 'view', 'viewer');
+        triggerCam(cam, 'live view opened', cam.getViewLingerMs(), 'view', 'viewer');
       }
     }
   } finally {

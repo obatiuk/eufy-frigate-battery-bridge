@@ -12,15 +12,8 @@
 const {
   clampNum,
   FRAME,
-  MAX_MS,
-  VIEW_MAX_MS,
-  HOLD_MS,
-  LOW_BAT_HOLD_MS,
-  EARLY_SLEEP_MS,
   COOLDOWN_MS,
-  EVENT_SECS,
   PREEMPT_EVENT_STREAMS,
-  LET_EUFY_DECIDE_END,
   BACKFILL_DOWNLOADS,
   INSTANT_EVENT_SNAPSHOT,
   MIN_CAMERA_PRIORITY,
@@ -32,6 +25,7 @@ const {
   GLOBAL_STARTUP_SNAPSHOT,
   GLOBAL_USE_RTSP,
   ACTIVE_HWACCEL,
+  resolveCameraTimers,
 } = require('../config');
 const {log} = require('../logger');
 const {Telemetry} = require('./telemetry');
@@ -78,6 +72,8 @@ class Camera {
 
     // 2. Identity, Priority & Routing Configuration
     const startupMode = rawCamCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT;
+    this.timers = resolveCameraTimers(rawCamCfg);
+    this.alwaysBackfill = Boolean(this.timers.alwaysBackfill);
     this.priority = clampNum(
         rawCamCfg.priority,
         MIN_CAMERA_PRIORITY,
@@ -392,6 +388,73 @@ class Camera {
   }
 
   /**
+   * Returns the effective event hold duration in milliseconds for this camera, accounting
+   * for per-camera hold_secs and Low-Battery Economy Mode.
+   *
+   * @returns {number}
+   */
+  getEventHoldMs() {
+    return this.isLowBattery()
+        ? Math.min(this.timers.holdMs, this.timers.lowBatHoldMs)
+        : this.timers.holdMs;
+  }
+
+  /**
+   * Returns the effective viewer linger duration in milliseconds for this camera.
+   *
+   * @returns {number}
+   */
+  getViewLingerMs() {
+    return this.timers.lingerMs;
+  }
+
+  /**
+   * Returns true if this camera is configured with always_backfill: true and should skip
+   * waking for a live stream on Eufy motion/person/ring events in favor of HomeBase clip backfill.
+   *
+   * @returns {boolean}
+   */
+  shouldBackfillOnlyOnEvent() {
+    return Boolean(
+        BACKFILL_DOWNLOADS &&
+        this.alwaysBackfill &&
+        (!this.active || this.activeMode === 'download')
+    );
+  }
+
+  /**
+   * Returns true if this camera's HomeBase station P2P slot is idle and past the post-sleep
+   * backfill delay across all non-RTSP cameras on the same station.
+   *
+   * @param {Camera[]} allCams - All configured Camera instances.
+   * @param {number} now - Current epoch timestamp in milliseconds.
+   * @param {number} delayMs - Required idle delay after P2P sleep in milliseconds.
+   * @returns {boolean}
+   */
+  isStationIdleForBackfill(allCams, now, delayMs) {
+    const stationKey = this.getStationKey();
+    const urgentTest = this.hasUrgentTestBackfill();
+    for (const other of allCams) {
+      if (other.getStationKey() !== stationKey) {
+        continue;
+      }
+      if (other.usesP2pSlot()) {
+        return false;
+      }
+      if (other.isRtspCapable()) {
+        continue;
+      }
+      if (!other.active && now < other.wantUntil()) {
+        return false;
+      }
+      if (!urgentTest && now - (other.sleptAt || 0) < delayMs) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * Returns true if at least one connected go2rtc consumer is an eligible waking human viewer.
    *
    * @returns {boolean}
@@ -484,13 +547,19 @@ class Camera {
    * @returns {boolean}
    */
   canQueryBackfill(now, minEventAgeMs, queryCooldownMs) {
-    return Boolean(
-        !this.active &&
-        this.pendingBackfill &&
-        !this.backfillClip &&
-        now - this.pendingBackfill.at >= minEventAgeMs &&
-        now - this.lastBackfillQueryAt >= queryCooldownMs
-    );
+    if (
+        this.active ||
+        !this.pendingBackfill ||
+        this.backfillClip ||
+        now - this.lastBackfillQueryAt < queryCooldownMs
+    ) {
+      return false;
+    }
+    const isReady =
+        typeof this.pendingBackfill.isReadyToQuery === 'function'
+            ? this.pendingBackfill.isReadyToQuery(now, minEventAgeMs)
+            : now - this.pendingBackfill.at >= minEventAgeMs;
+    return Boolean(isReady);
   }
 
   /**
@@ -682,7 +751,7 @@ class Camera {
     if (!canEvaluate) {
       return {shouldPoll: false, needsTimeoutExtendCheck: false};
     }
-    const nearMaxLimit = now - this.startedAt >= MAX_MS - safetyMarginMs;
+    const nearMaxLimit = now - this.startedAt >= this.timers.maxMs - safetyMarginMs;
     const needsTimeoutExtendCheck = this.wantUntil() - now <= checkWindowMs && !nearMaxLimit;
     if (!needsTimeoutExtendCheck && !this.needsBackfillObjectCheck()) {
       return {shouldPoll: false, needsTimeoutExtendCheck: false};
@@ -703,10 +772,11 @@ class Camera {
    * @returns {{ due: boolean, clearedByEufy: boolean }}
    */
   checkEarlySleepDue(now, pollIntervalMs, settleMs) {
-    if (EARLY_SLEEP_MS <= 0 || !this.active || !this.isInMotion(now) || now < this.viewUntil) {
+    const earlySleepMs = this.timers.earlySleepMs;
+    if (earlySleepMs <= 0 || !this.active || !this.isInMotion(now) || now < this.viewUntil) {
       return {due: false, clearedByEufy: false};
     }
-    if (!this.gotVideo || now - this.firstVideoAt < EARLY_SLEEP_MS) {
+    if (!this.gotVideo || now - this.firstVideoAt < earlySleepMs) {
       return {due: false, clearedByEufy: false};
     }
     if (now - this.lastEarlySleepCheckAt < pollIntervalMs) {
@@ -714,7 +784,7 @@ class Camera {
     }
     const clearedByEufy =
         this.motionClearedAt > this.lastMotionAt && now - this.motionClearedAt >= settleMs;
-    const elapsedQuiet = now - this.lastMotionAt >= EARLY_SLEEP_MS;
+    const elapsedQuiet = now - this.lastMotionAt >= earlySleepMs;
     if (!clearedByEufy && !elapsedQuiet) {
       return {due: false, clearedByEufy: false};
     }
@@ -750,7 +820,7 @@ class Camera {
     return Boolean(
         this.active &&
         this.eventActive &&
-        LET_EUFY_DECIDE_END &&
+        this.timers.letEufyDecideEnd &&
         this.gotVideo &&
         now >= this.viewUntil &&
         (this.motionClearedAt > this.lastMotionAt || now - this.firstVideoAt >= minCleanVideoMs)
@@ -791,7 +861,7 @@ class Camera {
     this.reason = 'external P2P wake - eufy-security-ws';
     this.wakeInitiator = 'eufy-ws';
     this.viewSince = now;
-    this.viewUntil = Math.max(this.viewUntil, now + HOLD_MS);
+    this.viewUntil = Math.max(this.viewUntil, now + this.timers.holdMs);
     this.beginSession('p2p', now, true);
     return true;
   }
@@ -821,7 +891,7 @@ class Camera {
    * @returns {boolean}
    */
   hasReachedMaxDuration(now) {
-    return Boolean(this.active && now - this.startedAt >= MAX_MS);
+    return Boolean(this.active && now - this.startedAt >= this.timers.maxMs);
   }
 
   /**
@@ -834,7 +904,7 @@ class Camera {
     return Boolean(
         this.active &&
         !this.isInMotion(now) &&
-        now - Math.max(this.startedAt, this.motionUntil) >= VIEW_MAX_MS
+        now - Math.max(this.startedAt, this.motionUntil) >= this.timers.viewMaxMs
     );
   }
 
@@ -1498,7 +1568,7 @@ class Camera {
     const finalPerson = this.evPerson;
     const subLabel = finalPerson || 'eufy';
     this.evPending = false;
-    this.evUntil = now + EVENT_SECS * 1000;
+    this.evUntil = now + this.timers.eventSecs * 1000;
     return {finalLabel, finalPerson, subLabel};
   }
 
@@ -1553,7 +1623,7 @@ class Camera {
   }
 
   /**
-   * Extends an active camera hold timer by half of its base hold duration up to MAX_MS.
+   * Extends an active camera hold timer by half of its base hold duration up to maxMs.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} minExtendMs - Minimum hold extension in milliseconds.
@@ -1561,9 +1631,9 @@ class Camera {
    * @returns {{ extendMs: number, holdSecs: number }}
    */
   extendActiveHold(now, minExtendMs, capAtFullHold = true) {
-    const baseHoldMs = this.isLowBattery() ? Math.min(HOLD_MS, LOW_BAT_HOLD_MS) : HOLD_MS;
+    const baseHoldMs = this.getEventHoldMs();
     const extendMs = Math.max(minExtendMs, Math.round(baseHoldMs / 2));
-    const maxAllowedUntil = this.startedAt + MAX_MS;
+    const maxAllowedUntil = this.startedAt + this.timers.maxMs;
     const uncappedNext = Math.min(maxAllowedUntil, Math.max(this.wantUntil(), now) + extendMs);
     const nextUntil = capAtFullHold ? Math.min(now + baseHoldMs, uncappedNext) : uncappedNext;
     if (this.isInMotion(now)) {
@@ -1591,7 +1661,8 @@ class Camera {
       return now + ms;
     }
     const halfMs = Math.max(minExtendMs, Math.round(ms / 2));
-    const maxAllowedUntil = this.active && this.startedAt ? this.startedAt + MAX_MS : now + MAX_MS;
+    const maxMs = this.timers.maxMs;
+    const maxAllowedUntil = this.active && this.startedAt ? this.startedAt + maxMs : now + maxMs;
     return Math.min(maxAllowedUntil, now + ms, Math.max(this.wantUntil(), now) + halfMs);
   }
 
@@ -1625,12 +1696,15 @@ class Camera {
 
     const prevMotionAt = this.lastMotionAt || 0;
     const prevPriority = this.eventPriority || 0;
-    const isMidStream = this.active && now - this.startedAt > midStreamGraceMs;
+    const videoStartRef = this.firstFrameAt || this.firstVideoAt;
+    const hasSustainedLiveVideo =
+        this.active && this.gotVideo && videoStartRef > 0 && now - videoStartRef >= minExtendMs;
+    const isMidStream = hasSustainedLiveVideo && now - this.startedAt > midStreamGraceMs;
     const targetUntil = this.computeTriggerHoldUntil(now, ms, minExtendMs, isMidStream);
     this.eventActive = true;
     this.motionUntil = Math.max(this.motionUntil, targetUntil);
     this.lastMotionAt = now;
-    if (isMidStream || (this.active && this.gotVideo)) {
+    if (hasSustainedLiveVideo) {
       this.runtimeExtended = true;
       this.clearPendingBackfill();
     }
@@ -1868,7 +1942,11 @@ class Camera {
    */
   recordMotionCleared(now, settleMs, minVideoMs) {
     this.motionClearedAt = now;
-    if (LET_EUFY_DECIDE_END && this.active && this.isInMotion(now) && this.gotVideo) {
+    if (this.pendingBackfill && typeof this.pendingBackfill.markRecordingCleared === 'function') {
+      this.pendingBackfill.markRecordingCleared(now);
+      this.lastBackfillQueryAt = 0;
+    }
+    if (this.timers.letEufyDecideEnd && this.active && this.isInMotion(now) && this.gotVideo) {
       const minEnd = Math.max(now + settleMs, (this.firstVideoAt || now) + minVideoMs);
       if (this.motionUntil > minEnd) {
         this.motionUntil = minEnd;
@@ -1879,26 +1957,40 @@ class Camera {
   }
 
   /**
-   * Queues a pending BackfillJob when a Eufy trigger event fires and backfill_downloads is enabled.
+   * Queues or upgrades a pending BackfillJob when a Eufy trigger event fires and backfill_downloads is enabled.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {string} eventName - Raw Eufy event string.
    * @param {string} personName - Optional recognized person name.
    * @param {string} reason - Formatted trigger description.
    * @param {number} evPriority - Event priority boost score.
+   * @param {boolean} [recordingActive=true] - Whether the camera hardware clip is still actively recording.
    */
-  queueEventBackfill(now, eventName, personName, reason, evPriority) {
-    if (!BACKFILL_DOWNLOADS || this.runtimeExtended || (this.active && this.gotVideo)) {
+  queueEventBackfill(now, eventName, personName, reason, evPriority, recordingActive = true) {
+    if (
+        !BACKFILL_DOWNLOADS ||
+        (!this.alwaysBackfill && (this.runtimeExtended || (this.active && this.gotVideo)))
+    ) {
       return;
     }
     const nextPriority = this.priority + evPriority;
-    if (
-        this.pendingBackfill &&
-        !this.pendingBackfill.isExpired(now) &&
-        nextPriority < this.pendingBackfill.priority
-    ) {
-      if (personName && !this.pendingBackfill.personName) {
+    if (this.pendingBackfill && !this.pendingBackfill.isExpired(now)) {
+      if (typeof this.pendingBackfill.upgradeEvent === 'function') {
+        this.pendingBackfill.upgradeEvent(eventName, personName, reason, nextPriority);
+      } else if (nextPriority >= this.pendingBackfill.priority) {
+        this.pendingBackfill.event = eventName;
+        this.pendingBackfill.reason = reason;
+        this.pendingBackfill.priority = nextPriority;
+        if (personName) {
+          this.pendingBackfill.personName = personName;
+        }
+      } else if (personName && !this.pendingBackfill.personName) {
         this.pendingBackfill.personName = personName;
+      }
+      if (this.backfillClip) {
+        this.backfillClip.event = this.pendingBackfill.event;
+        this.backfillClip.personName = this.pendingBackfill.personName;
+        this.backfillClip.reason = this.pendingBackfill.reason;
       }
       return;
     }
@@ -1909,6 +2001,7 @@ class Camera {
       reason,
       priority: nextPriority,
       attempts: 0,
+      recordingActive,
     });
   }
 

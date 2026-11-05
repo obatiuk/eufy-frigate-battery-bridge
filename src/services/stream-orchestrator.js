@@ -10,13 +10,7 @@
 'use strict';
 
 const {
-  MAX_MS,
-  VIEW_MAX_MS,
-  HOLD_MS,
-  LOW_BAT_HOLD_MS,
-  EARLY_SLEEP_MS,
   PREEMPT_EVENT_STREAMS,
-  LET_EUFY_DECIDE_END,
   BACKFILL_DOWNLOADS,
   BACKFILL_DELAY_MS,
   LIVE_FPS,
@@ -160,7 +154,7 @@ async function evaluateEarlySleep(cam, now) {
     return;
   }
 
-  if (frigateIdle && Date.now() - cam.lastMotionAt >= Math.min(EARLY_SLEEP_MS, MIN_EVENT_VIDEO_DURATION_MS)) {
+  if (frigateIdle && Date.now() - cam.lastMotionAt >= Math.min(cam.timers.earlySleepMs, MIN_EVENT_VIDEO_DURATION_MS)) {
     const quietSecs = Math.round((Date.now() - cam.lastMotionAt) / 1000);
     const initiator = clearedByEufy
         ? 'bridge-early-sleep/eufy-cleared'
@@ -578,14 +572,6 @@ async function processBackfillQueue(now) {
   if (!BACKFILL_DOWNLOADS || !isWsReady() || isShuttingDownFn()) {
     return;
   }
-  if (cams.some((c) => c.usesP2pSlot() || (!c.active && !c.isRtspCapable() && now < c.wantUntil()))) {
-    return;
-  }
-  const hasUrgentTest = cams.some((c) => c.hasUrgentTestBackfill());
-  const lastP2pActivity = Math.max(0, ...cams.map((c) => c.sleptAt || 0));
-  if (!hasUrgentTest && now - lastP2pActivity < BACKFILL_DELAY_MS) {
-    return;
-  }
 
   for (const c of cams) {
     if (c.isBackfillExpired(now)) {
@@ -595,7 +581,7 @@ async function processBackfillQueue(now) {
   }
 
   const readyCam = cams
-      .filter((c) => c.isReadyForBackfillDownload())
+      .filter((c) => c.isReadyForBackfillDownload() && c.isStationIdleForBackfill(cams, now, BACKFILL_DELAY_MS))
       .sort((a, b) => (b.pendingBackfill?.priority || 0) - (a.pendingBackfill?.priority || 0))[0];
 
   if (readyCam) {
@@ -633,7 +619,11 @@ async function processBackfillQueue(now) {
   }
 
   const queryCam = cams
-      .filter((c) => c.canQueryBackfill(now, BACKFILL_MIN_EVENT_AGE_MS, BACKFILL_QUERY_COOLDOWN_MS))
+      .filter(
+          (c) =>
+            c.canQueryBackfill(now, BACKFILL_MIN_EVENT_AGE_MS, BACKFILL_QUERY_COOLDOWN_MS) &&
+            c.isStationIdleForBackfill(cams, now, BACKFILL_DELAY_MS)
+      )
       .sort((a, b) => b.pendingBackfill.priority - a.pendingBackfill.priority)[0];
 
   if (!queryCam) {
@@ -1019,6 +1009,18 @@ function handleTriggerEvent(cam, e) {
       );
       return;
     }
+    if (cam.pendingBackfill) {
+      const clearLog =
+          'eufy reported activity cleared (event="' +
+          e.event +
+          '"), queued clip backfill ready after HomeBase settle delay';
+      if (cam.alwaysBackfill) {
+        log.info(cam, clearLog);
+      } else {
+        log.debug(cam, clearLog);
+      }
+      return;
+    }
     log.debug(cam, 'eufy reported activity cleared (event="' + e.event + '")');
     return;
   }
@@ -1026,11 +1028,20 @@ function handleTriggerEvent(cam, e) {
   if (e.state === true && Date.now() - getWsReadyAt() > WS_READY_EVENT_SETTLE_MS) {
     cam.motionClearedAt = 0;
     cam.cancelStartupProbe();
-    const holdDuration = cam.isLowBattery() ? Math.min(HOLD_MS, LOW_BAT_HOLD_MS) : HOLD_MS;
     const personName = extractRecognizedPerson(e);
     const triggerDesc = personName ? e.event + ' (' + personName + ')' : e.event;
     const evPrio = getEventPriority(e.event);
-    cam.queueEventBackfill(Date.now(), e.event, personName, triggerDesc, evPrio);
+    cam.queueEventBackfill(Date.now(), e.event, personName, triggerDesc, evPrio, true);
+    if (cam.shouldBackfillOnlyOnEvent()) {
+      log.info(
+          cam,
+          'event trigger "' +
+          triggerDesc +
+          '" queued for HomeBase clip backfill (always_backfill=true, skipping live wake to conserve battery)'
+      );
+      return;
+    }
+    const holdDuration = cam.getEventHoldMs();
     trigger(cam, triggerDesc, holdDuration, 'motion', 'eufy-event', evPrio);
     if (cam.active && cam.activeMode !== 'download') {
       frigateEvent(cam, e.event, personName);
@@ -1171,7 +1182,7 @@ function onEvent(e) {
 
     case 'rtsp livestream started':
       if (cam.canAdoptExternalWake(Date.now(), EXTERNAL_WAKE_GUARD_MS, false)) {
-        trigger(cam, 'external RTSP wake - eufy-security-ws', HOLD_MS, 'view', 'eufy-ws');
+        trigger(cam, 'external RTSP wake - eufy-security-ws', cam.timers.holdMs, 'view', 'eufy-ws');
         return;
       }
       if (cam.isCurrentSession(cam.sessionId, 'rtsp')) {
@@ -1238,7 +1249,7 @@ function handleRtspStreamDropped(cam, code, reasonText) {
     return;
   }
   const now = Date.now();
-  if (LET_EUFY_DECIDE_END || now >= cam.wantUntil()) {
+  if (cam.timers.letEufyDecideEnd || now >= cam.wantUntil()) {
     stop(cam, 'eufy ended RTSP livestream', false, 'eufy/rtsp-end');
     arbitrate();
     return;
@@ -1368,7 +1379,7 @@ function startHousekeepingLoop() {
         cam.motionUntil = 0;
         stop(
             cam,
-            'reached max_secs limit (' + Math.round(MAX_MS / 60000) + 'm)',
+            'reached max_secs limit (' + Math.round(cam.timers.maxMs / 60000) + 'm)',
             false,
             'bridge-max-limit'
         );
@@ -1377,7 +1388,7 @@ function startHousekeepingLoop() {
       if (cam.hasReachedViewMaxDuration(now)) {
         stop(
             cam,
-            'reached view_max_secs limit (' + Math.round(VIEW_MAX_MS / 60000) + 'm)',
+            'reached view_max_secs limit (' + Math.round(cam.timers.viewMaxMs / 60000) + 'm)',
             false,
             'bridge-view-limit'
         );

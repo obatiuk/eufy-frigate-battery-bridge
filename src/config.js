@@ -524,6 +524,183 @@ function resolveCardConfig(camConfig) {
   return {theme, position, background, dimBackground};
 }
 
+// Per-camera timer and Eufy hardware Power Manager property bounds.
+const MIN_HOLD_SECS = 5;
+const MAX_HOLD_SECS = 86400;
+const DEFAULT_HOLD_SECS = 60;
+const MIN_SESSION_MAX_SECS = 10;
+const MAX_SESSION_MAX_SECS = 86400;
+const DEFAULT_MAX_SECS = 900;
+const DEFAULT_VIEW_MAX_SECS = 300;
+const DEFAULT_LINGER_SECS = 20;
+const MIN_EVENT_SECS = 1;
+const MAX_EVENT_SECS = 3600;
+const DEFAULT_EVENT_SECS = 30;
+const MIN_EARLY_SLEEP_SECS = 0;
+const MAX_EARLY_SLEEP_SECS = 3600;
+const DEFAULT_EARLY_SLEEP_SECS = 0;
+const MIN_LOW_BAT_HOLD_SECS = 5;
+const MAX_LOW_BAT_HOLD_SECS = 3600;
+const DEFAULT_LOW_BAT_HOLD_SECS = 20;
+const MIN_POWER_WORKING_MODE = 0;
+const MAX_POWER_WORKING_MODE = 2;
+const MIN_RECORDING_CLIP_SECS = 5;
+const MAX_RECORDING_CLIP_SECS = 300;
+const DEFAULT_RECORDING_CLIP_SECS = 60;
+const MIN_RETRIGGER_INTERVAL_SECS = 0;
+const MAX_RETRIGGER_INTERVAL_SECS = 60;
+const DEFAULT_RETRIGGER_INTERVAL_SECS = 5;
+
+/**
+ * Resolves per-camera stream timing and backfill mode overrides with fallback to global defaults.
+ *
+ * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
+ * @returns {{
+ *   maxMs: number,
+ *   viewMaxMs: number,
+ *   holdMs: number,
+ *   lingerMs: number,
+ *   eventSecs: number,
+ *   earlySleepMs: number,
+ *   lowBatHoldMs: number,
+ *   letEufyDecideEnd: boolean,
+ *   alwaysBackfill: boolean
+ * }}
+ */
+function resolveCameraTimers(camConfig = {}) {
+  const maxMs =
+      camConfig.max_secs !== undefined
+          ? clampNum(camConfig.max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) * 1000
+          : MAX_MS;
+  const viewMaxMs =
+      camConfig.view_max_secs !== undefined
+          ? clampNum(camConfig.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) * 1000
+          : VIEW_MAX_MS;
+  const holdMs = Math.min(
+      maxMs,
+      camConfig.hold_secs !== undefined
+          ? clampNum(camConfig.hold_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_HOLD_SECS) * 1000
+          : HOLD_MS
+  );
+  const lingerMs = Math.min(
+      viewMaxMs,
+      camConfig.view_linger_secs !== undefined
+          ? clampNum(camConfig.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * 1000
+          : LINGER_MS
+  );
+  const eventSecs =
+      camConfig.event_secs !== undefined
+          ? clampNum(camConfig.event_secs, MIN_EVENT_SECS, MAX_EVENT_SECS, DEFAULT_EVENT_SECS)
+          : EVENT_SECS;
+  const earlySleepMs =
+      camConfig.early_sleep_secs !== undefined
+          ? clampNum(camConfig.early_sleep_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) * 1000
+          : EARLY_SLEEP_MS;
+  const lowBatHoldMs =
+      camConfig.low_battery_hold_secs !== undefined
+          ? clampNum(camConfig.low_battery_hold_secs, MIN_LOW_BAT_HOLD_SECS, MAX_LOW_BAT_HOLD_SECS, DEFAULT_LOW_BAT_HOLD_SECS) * 1000
+          : LOW_BAT_HOLD_MS;
+  const letEufyDecideEnd =
+      camConfig.let_eufy_decide_event_end !== undefined
+          ? Boolean(camConfig.let_eufy_decide_event_end)
+          : LET_EUFY_DECIDE_END;
+  const alwaysBackfill = Boolean(
+      camConfig.always_backfill ?? camConfig.backfill_only ?? cfg.always_backfill ?? false
+  );
+
+  return {
+    maxMs,
+    viewMaxMs,
+    holdMs,
+    lingerMs,
+    eventSecs,
+    earlySleepMs,
+    lowBatHoldMs,
+    letEufyDecideEnd,
+    alwaysBackfill,
+  };
+}
+
+/**
+ * Resolves optional per-camera Eufy hardware Power Manager and streaming quality overrides.
+ *
+ * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
+ * @returns {{
+ *   enforceQuality: boolean|number,
+ *   powerWorkingMode: number|null,
+ *   recordingClipLength: number|null,
+ *   recordingEndClipMotionStops: boolean|null,
+ *   recordingRetriggerInterval: number|null
+ * }}
+ */
+function resolveHardwareRecordingConfig(camConfig = {}) {
+  const enforceQuality =
+      camConfig.enforce_streaming_quality !== undefined
+          ? camConfig.enforce_streaming_quality
+          : ENFORCE_QUALITY;
+
+  const rawPowerMode =
+      camConfig.power_working_mode ??
+      camConfig.power_mode ??
+      cfg.power_working_mode ??
+      cfg.power_mode;
+  const powerWorkingMode =
+      rawPowerMode !== undefined && rawPowerMode !== null && !Number.isNaN(Number(rawPowerMode))
+          ? clampNum(
+              Math.round(Number(rawPowerMode)),
+              MIN_POWER_WORKING_MODE,
+              MAX_POWER_WORKING_MODE,
+              MIN_POWER_WORKING_MODE
+          )
+          : null;
+
+  const rawClipLen =
+      camConfig.recording_clip_length ??
+      camConfig.clip_length ??
+      cfg.recording_clip_length ??
+      cfg.clip_length;
+  const recordingClipLength =
+      rawClipLen !== undefined && rawClipLen !== null && !Number.isNaN(Number(rawClipLen))
+          ? clampNum(
+              Math.round(Number(rawClipLen)),
+              MIN_RECORDING_CLIP_SECS,
+              MAX_RECORDING_CLIP_SECS,
+              DEFAULT_RECORDING_CLIP_SECS
+          )
+          : null;
+
+  const rawEndEarly =
+      camConfig.recording_end_early ??
+      camConfig.recording_end_clip_motion_stops ??
+      cfg.recording_end_early ??
+      cfg.recording_end_clip_motion_stops;
+  const recordingEndClipMotionStops =
+      rawEndEarly !== undefined && rawEndEarly !== null ? Boolean(rawEndEarly) : null;
+
+  const rawRetrigger =
+      camConfig.recording_retrigger_interval ??
+      camConfig.retrigger_interval ??
+      cfg.recording_retrigger_interval ??
+      cfg.retrigger_interval;
+  const recordingRetriggerInterval =
+      rawRetrigger !== undefined && rawRetrigger !== null && !Number.isNaN(Number(rawRetrigger))
+          ? clampNum(
+              Math.round(Number(rawRetrigger)),
+              MIN_RETRIGGER_INTERVAL_SECS,
+              MAX_RETRIGGER_INTERVAL_SECS,
+              DEFAULT_RETRIGGER_INTERVAL_SECS
+          )
+          : null;
+
+  return {
+    enforceQuality,
+    powerWorkingMode,
+    recordingClipLength,
+    recordingEndClipMotionStops,
+    recordingRetriggerInterval,
+  };
+}
+
 module.exports = {
   cfg,
   clampNum,
@@ -587,4 +764,6 @@ module.exports = {
   getEventPriority,
   resolveTelemetryConfig,
   resolveCardConfig,
+  resolveCameraTimers,
+  resolveHardwareRecordingConfig,
 };

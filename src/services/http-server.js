@@ -11,7 +11,7 @@
 'use strict';
 
 const http = require('http');
-const {HTTP_PORT, HOLD_MS, MAX_MS} = require('../config');
+const {HTTP_PORT} = require('../config');
 const {log} = require('../logger');
 const {isWsReady} = require('./eufy-client');
 
@@ -19,8 +19,6 @@ const {isWsReady} = require('./eufy-client');
 
 const MAX_JSON_BODY_BYTES = 16384;
 const MIN_WAKE_DURATION_SECS = 5;
-const MAX_WAKE_DURATION_SECS = Math.round(MAX_MS / 1000);
-const DEFAULT_HOLD_DURATION_SECS = Math.round(HOLD_MS / 1000);
 
 let httpServer = null;
 const startedAtMs = Date.now();
@@ -157,10 +155,8 @@ function startHttpServer(cams, hooks) {
 
       const body = req.method === 'POST' ? await readJsonBody(req) : {};
       const rawDuration = body.duration ?? urlObj.searchParams.get('duration');
-      const durationSecs =
-          rawDuration !== undefined && rawDuration !== null && !Number.isNaN(Number(rawDuration))
-              ? Math.max(MIN_WAKE_DURATION_SECS, Math.min(MAX_WAKE_DURATION_SECS, Number(rawDuration)))
-              : DEFAULT_HOLD_DURATION_SECS;
+      const hasExplicitDuration =
+          rawDuration !== undefined && rawDuration !== null && !Number.isNaN(Number(rawDuration));
       const reason = String(
           body.reason || urlObj.searchParams.get('reason') || 'external api wake'
       ).trim();
@@ -171,13 +167,18 @@ function startHttpServer(cams, hooks) {
       const orderedTargets = [...targets].sort(
           (a, b) => Number(b.isRtspCapable()) - Number(a.isRtspCapable())
       );
-      const results = orderedTargets.map((cam) =>
-        wakeCameraExternal(cam, {
+      const results = orderedTargets.map((cam) => {
+        const camMaxSecs = Math.round(cam.timers.maxMs / 1000);
+        const camHoldSecs = Math.round(cam.timers.holdMs / 1000);
+        const durationSecs = hasExplicitDuration
+            ? Math.max(MIN_WAKE_DURATION_SECS, Math.min(camMaxSecs, Number(rawDuration)))
+            : camHoldSecs;
+        return wakeCameraExternal(cam, {
           durationMs: durationSecs * 1000,
           reason,
           createEvent,
-        })
-      );
+        });
+      });
 
       res.writeHead(200, {'Content-Type': 'application/json'});
       res.end(JSON.stringify({ok: true, results}));

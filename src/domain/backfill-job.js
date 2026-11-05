@@ -13,7 +13,9 @@ const {DEFAULT_EVENT_PRIORITY} = require('../config');
 const DEFAULT_BACKFILL_MAX_AGE_MS = 300000;
 const BACKFILL_MATCH_LOOKBACK_MS = 45000;
 const BACKFILL_MATCH_LOOKAHEAD_MS = 180000;
-const BACKFILL_MAX_QUERY_ATTEMPTS = 4;
+const BACKFILL_MAX_QUERY_ATTEMPTS = 6;
+const BACKFILL_POST_CLEAR_SETTLE_MS = 2000;
+const BACKFILL_RECORDING_WAIT_CAP_MS = 25000;
 const TEST_BACKFILL_OFFSET_MS = 10000;
 const TEST_BACKFILL_PRIORITY = 9999;
 
@@ -94,6 +96,66 @@ class BackfillJob {
     this.priority = opts.priority ?? DEFAULT_EVENT_PRIORITY;
     this.attempts = opts.attempts ?? 0;
     this.ignoreTimeWindow = Boolean(opts.ignoreTimeWindow);
+    this.recordingActive = Boolean(opts.recordingActive);
+    this.clearedAt = opts.clearedAt ?? 0;
+  }
+
+  /**
+   * Upgrades this backfill job in-place when a higher- or equal-priority companion event
+   * arrives during the same motion window while preserving the original start timestamp.
+   *
+   * @param {string} eventName - New Eufy event string.
+   * @param {string} personName - Optional recognized person name.
+   * @param {string} reason - Formatted trigger description.
+   * @param {number} nextPriority - Combined camera + event priority score.
+   * @returns {boolean} True if event/priority or personName was upgraded.
+   */
+  upgradeEvent(eventName, personName, reason, nextPriority) {
+    let changed = false;
+    if (nextPriority >= this.priority) {
+      if (this.event !== eventName || this.reason !== reason || this.priority !== nextPriority) {
+        this.event = eventName;
+        this.reason = reason;
+        this.priority = nextPriority;
+        changed = true;
+      }
+    }
+    if (personName && !this.personName) {
+      this.personName = personName;
+      changed = true;
+    }
+    return changed;
+  }
+
+  /**
+   * Marks the hardware event recording as completed when Eufy reports activity cleared (state: false).
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   */
+  markRecordingCleared(now = Date.now()) {
+    this.recordingActive = false;
+    this.clearedAt = now;
+  }
+
+  /**
+   * Returns true if enough time has elapsed (or Eufy reported activity cleared + 2s settle)
+   * to query the HomeBase local database for the recorded clip.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {number} [minEventAgeMs=8000] - Fallback minimum event age in milliseconds.
+   * @returns {boolean}
+   */
+  isReadyToQuery(now = Date.now(), minEventAgeMs = 8000) {
+    if (this.isUrgentTest()) {
+      return true;
+    }
+    if (this.clearedAt > 0) {
+      return now - this.clearedAt >= BACKFILL_POST_CLEAR_SETTLE_MS;
+    }
+    if (this.recordingActive) {
+      return now - this.at >= BACKFILL_RECORDING_WAIT_CAP_MS;
+    }
+    return now - this.at >= minEventAgeMs;
   }
 
   /**
@@ -183,6 +245,8 @@ class BackfillJob {
 module.exports = {
   DEFAULT_BACKFILL_MAX_AGE_MS,
   BACKFILL_MAX_QUERY_ATTEMPTS,
+  BACKFILL_POST_CLEAR_SETTLE_MS,
+  BACKFILL_RECORDING_WAIT_CAP_MS,
   BackfillJob,
   extractDatabaseRecordCandidate,
 };

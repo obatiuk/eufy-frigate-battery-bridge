@@ -134,7 +134,7 @@ podman exec eufy-frigate-battery-bridge node -e '
 - `go2rtc_api`: Frigate's `go2rtc` HTTP API URL (e.g., `http://frigate:1984`)
 - `rtsp_publish`: `RTSP` publish URL template containing `{name}` (e.g., `rtsp://frigate:8554/{name}`)
 - `cameras`: Array of camera objects
-  `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "station_serial", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "card_show_on_live", "auto_frigate_mask", "preserve_aspect_ratio", "startup_snapshot" }]`
+  `[{ "name", "serial", "title", "priority", "use_rtsp", "rtsp_url", "always_backfill", "station_serial", "hold_secs", "max_secs", "event_secs", "early_sleep_secs", "let_eufy_decide_event_end", "low_battery_hold_secs", "view_linger_secs", "view_max_secs", "enforce_streaming_quality", "power_working_mode", "recording_clip_length", "recording_end_early", "recording_retrigger_interval", "telemetry", "card_theme", "card_position", "card_background", "card_dim_background", "card_show_on_live", "auto_frigate_mask", "preserve_aspect_ratio", "startup_snapshot" }]`
 
 ### Optional Core Keys
 
@@ -176,6 +176,13 @@ podman exec eufy-frigate-battery-bridge node -e '
   `+200`, `vehicle`/`pet`/`dog` `+100`, `crying`/`sound` `+50`, `motion` `+10`) to compute `getEffectivePriority(cam)`.
 - `use_rtsp` / `rtsp_url` (per camera in `cameras[]`): Enable/disable HomeBase RTSP pull for a specific camera or
   override the auto-discovered `rtspStreamUrl`.
+- `always_backfill` (alias `backfill_only`, per camera in `cameras[]`): When `true`, Eufy motion/person/ring events skip waking the camera for a live `P2P`/`RTSP` stream and instead queue a `BackfillJob` so the camera records its brief native clip to HomeBase 3 and immediately returns to sleep; once Eufy reports `state: false` (`activity cleared`), the bridge downloads the complete `.zxvideo` recording (including pre-roll from `t=0`) at `15 fps` into Frigate (default: `false`). Manual Frigate Live View and `/api/wake` requests still wake the live `P2P` stream on demand.
+- Per-camera timer & streaming overrides (in `cameras[]`): `hold_secs`, `max_secs`, `event_secs`, `early_sleep_secs`, `let_eufy_decide_event_end`, `low_battery_hold_secs`, `view_linger_secs`, `view_max_secs`, and `enforce_streaming_quality` can all be overridden per camera in `cameras[]` (inheriting the top-level global default when omitted).
+- Eufy Hardware Power Manager Recording Settings (global or per camera in `cameras[]`): Automatically synced to the camera/HomeBase via `device.set_property` on initial telemetry load whenever the hardware value differs:
+	- `power_working_mode` (alias `power_mode`): `0` (`Optimal Battery Life`), `1` (`Optimal Surveillance`), or `2` (`Customize Recording`). Automatically promoted to `2` if custom clip length, early-end, or retrigger interval is configured while the camera is in mode `0` or `1`.
+	- `recording_clip_length` (alias `clip_length`): Hardware recording clip duration in seconds (`5`..`120`, e.g., `20` for a battery doorbell or `60` for solar cameras).
+	- `recording_end_early` (alias `recording_end_clip_motion_stops`): `true` or `false` (`recordingEndClipMotionStops` — stop hardware clip early as soon as motion stops).
+	- `recording_retrigger_interval` (alias `retrigger_interval`): Hardware retrigger cooldown interval in seconds (`0`..`60`).
 - `station_serial` (per camera in `cameras[]`): Optional explicit station serial override (auto-populated from
   `stationSerialNumber` in `device.get_properties`).
 - `card_theme`:
@@ -282,9 +289,8 @@ Data and dependencies flow strictly top-down from the composition root (`src/app
   the camera via `rtspStream=true` and `device.start_rtsp_livestream`, and streams them in `activeMode = 'rtsp'`
   concurrently alongside P2P cameras (`usesP2pSlot(cam) === false`). Retries RTSP connection every `750ms` during the
   wake window, preserves active `ffmpeg` handshakes (`isRtspDecoderHandshaking`, `400ms..6000ms`), re-sends `start_rtsp_livestream` every `3.5s` (`RTSP_WAKE_RETRY_MS`, up to `5` retries) when idle, immediately re-wakes (`0ms`) on mid-session clip boundary drops, and sleeps cleanly after `25s` (`initiator=error/rtsp-wake-timeout`) without falling back to `P2P`.
-- Post-Event Clip Download Backfill (`backfill_downloads`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
-  (`true`) by default. When any camera triggers an event while its station's P2P slot is busy, fails an RTSP wake, or is preempted/stopped before capturing `5s` of live video, `pendingBackfill` preserves the highest-priority event metadata (`queueEventBackfill` prevents companion `"motion"` events from downgrading `"person"`/`"ring"` jobs, and cancels `pendingBackfill` once `5s` of live video is captured across decoder resets or whenever session runtime is extended via `runtimeExtended`). Once the P2P slot is idle for
-  `backfill_delay_secs` (`5s`), the bridge connects to the station (`station.connect`), calls
+- Post-Event Clip Download Backfill (`backfill_downloads`, `always_backfill`, `processBackfillQueue`, `handleDatabaseQueryResult`): Enabled
+  (`true`) by default. When any camera triggers an event while its station's P2P slot is busy, fails an RTSP wake, is preempted/stopped before capturing `5s` of live video, or has `always_backfill: true` configured (`shouldBackfillOnlyOnEvent`), `pendingBackfill` preserves the highest-priority event metadata (`queueEventBackfill` upgrades `pendingBackfill` in-place via `upgradeEvent` when companion `"person"`/`"identity person"`/`"ring"` events arrive after `"motion"`, and cancels `pendingBackfill` only once `5s` of live video is captured across decoder resets or whenever session runtime is extended after `5s` of decoded live video). While `recordingActive` is `true`, `BackfillJob.isReadyToQuery` waits until `2s` (`BACKFILL_POST_CLEAR_SETTLE_MS`) after Eufy reports `state: false` (`markRecordingCleared`, capped at `25s` `BACKFILL_RECORDING_WAIT_CAP_MS`) so HomeBase 3 has finished indexing the `.zxvideo` clip before querying. Station P2P idle and `backfill_delay_secs` (`5s`) cooldown checks are scoped per station across non-RTSP P2P cameras (`isStationIdleForBackfill`), ensuring RTSP camera activity never delays P2P backfill downloads. Once ready, the bridge connects to the station (`station.connect`), calls
   `station.database_query_latest_info` and `station.database_query_by_date`, matches the latest `.zxvideo` clip
   (`storage_path` / `crop_local_path` and `cipher_id`), buffers burst-downloaded frames into `downloadFrames` to play
   out at `15 fps` (`LIVE_FPS`) via `device.start_download` (`activeMode = 'download'`, `initiator = 'bridge-backfill'`),
@@ -475,6 +481,13 @@ Alloy / Loki ingestion:
   `station.database_query_latest_info` / `station.database_query_by_date` and pace buffered `downloadFrames` at `15 fps`
   (`LIVE_FPS`).
 
+9. Doorbell (`T8214`) Battery Drain, Late P2P Wake & Companion-Event Backfill Cancellation:
+
+- Cause 1: Global `hold_secs: 60` + `let_eufy_decide_event_end: false` (plus setting `recordingClipLength: 60` across all cameras) forced the battery doorbell to stay awake for `60s` on every hallway pass-by, while P2P wake latency (`3-6s`) missed the person walking past and recorded `60s` of an empty hallway.
+- Cause 2: In `applyMotionTrigger()`, companion AI events (`person detected` / `identity person detected` arriving `3-5s` after `motion detected`) set `runtimeExtended = true` and cleared `pendingBackfill` whenever `now - startedAt > 3000`, even if `0s` of live video had been decoded.
+- Cause 3: `processBackfillQueue()` checked `sleptAt` across all cameras globally (allowing RTSP sleeps to delay P2P backfills) and queried HomeBase DB at a fixed `+8s` while the hardware clip was still recording.
+- Fix: Added per-camera timer overrides (`resolveCameraTimers`), per-camera Eufy Power Manager auto-sync (`resolveHardwareRecordingConfig`), and `always_backfill` mode (`shouldBackfillOnlyOnEvent`) so the doorbell records a brief native clip (with `t=0` pre-roll) to HomeBase 3 and sleeps immediately; required `hasSustainedLiveVideo` (`>= 5s`) before clearing `pendingBackfill`; waited for `state: false` (`markRecordingCleared`) + `2s` settle before querying HomeBase DB; and scoped backfill idle checks per station across non-RTSP P2P cameras (`isStationIdleForBackfill`).
+
 ## Roadmap & TODO List
 
 ### Implemented
@@ -508,6 +521,7 @@ Alloy / Loki ingestion:
 - [x] Block 8 (Step 2) - Cross-Camera Hold Persistence (`let_eufy_decide_event_end: false` default, RTSP early-stop re-wake, `2.5s` RTSP socket timeout), Per-Station Wake Pacing (`stationNextWakeAt`, RTSP-before-P2P ordering, P2P wait during active RTSP wake handshake), and Sensor Burst Deduplication (`cam.apiWakeTimer`)
 - [x] Block 8 (Step 3) - External `eufy-security-ws` Stream Adoption (`initiator=eufy-ws`), Instant (`0ms`) Mid-Session RTSP Re-Wake with `3.5s` Fast Retries, Active Hold Extension (`+30s` / `hold_secs / 2` on mid-stream events and `evaluateActiveHoldExtension`), and Config-First Named Constants Refactoring
 - [x] Block 8 (Step 4) - Domain-Driven Encapsulation (`Camera`, `StatusCard`, `Telemetry`, `BackfillJob` with `@typedef {Camera}` JSDoc typing), Non-Destructive RTSP Handshake Guard (`isRtspDecoderHandshaking`), Backfill Visual Indicators (`◀◀` Rewind glyph & `minimal` Red+Grey bullseye dot), Backfill Cancellation on Runtime Extension (`runtimeExtended`), and `1.0s` Fast Snapshot Delay (`FAST_LIVE_SNAP_DELAY_MS`) across P2P & RTSP
+- [x] Block 9 - Per-Camera Recording Timers (`resolveCameraTimers`: `hold_secs`, `max_secs`, `event_secs`, `early_sleep_secs`, `let_eufy_decide_event_end`, `low_battery_hold_secs`, `view_linger_secs`, `view_max_secs`, `enforce_streaming_quality`), Eufy Hardware Power Manager Sync (`resolveHardwareRecordingConfig`: `power_working_mode`, `recording_clip_length`, `recording_end_early`, `recording_retrigger_interval`), Always-Backfill Event Mode (`always_backfill` / `backfill_only`), Event-End Aware Backfill (`state: false` post-clear settle), Companion-Event Backfill Preservation, and Per-Station Backfill Queue Isolation (`isStationIdleForBackfill`)
 
 ### Pending (Next Up)
 
