@@ -13,6 +13,7 @@
 const {
   clampNum,
   LOW_BAT_THRESHOLD,
+  LOW_BAT_WAKE_ON_VIEW,
   COLOR_RED,
   COLOR_GREY,
   COLOR_GREEN,
@@ -154,10 +155,11 @@ function resolveStatusVisual(titleText, economyMode) {
  *
  * @param {*} batRaw - Raw battery value.
  * @param {boolean} charging - Whether the camera is actively charging.
+ * @param {number} [lowBatThreshold=LOW_BAT_THRESHOLD] - Effective low-battery threshold percentage.
  * @returns {{ hasBat: boolean, batPct: number, batRgb: number[], batHex: string }}
  */
-function resolveBatteryVisual(batRaw, charging) {
-  const redBatCutoff = LOW_BAT_THRESHOLD > 0 ? LOW_BAT_THRESHOLD : DEFAULT_LOW_BAT_CUTOFF_PCT;
+function resolveBatteryVisual(batRaw, charging, lowBatThreshold = LOW_BAT_THRESHOLD) {
+  const redBatCutoff = lowBatThreshold > 0 ? lowBatThreshold : DEFAULT_LOW_BAT_CUTOFF_PCT;
   const hasBat = batRaw != null && !Number.isNaN(Number(batRaw));
   const batPct = hasBat ? clampNum(Math.round(Number(batRaw)), 0, 100, 0) : 0;
 
@@ -248,7 +250,9 @@ function evaluateTelemetryState(titleText, status) {
   const powerLabel = (status && status.powerLabel) || '';
 
   const statusVis = resolveStatusVisual(titleText, economyMode);
-  const batVis = resolveBatteryVisual(status ? status.battery : null, charging);
+  const lowBatCutoff =
+      status && status.lowBatThreshold !== undefined ? status.lowBatThreshold : LOW_BAT_THRESHOLD;
+  const batVis = resolveBatteryVisual(status ? status.battery : null, charging, lowBatCutoff);
   const wifiVis = resolveWifiVisual(status ? status.wifi : null, status ? status.rssi : null);
   const tempVis = resolveTempVisual(status ? status.temp : null);
 
@@ -266,7 +270,7 @@ function evaluateTelemetryState(titleText, status) {
 }
 
 /**
- * Formats the suffix text appended to the battery percentage in the 'default' theme.
+ * Formats the suffix text appended to the battery percentage in the 'detailed' theme.
  *
  * @param {Record<string, *>} st - Evaluated telemetry state.
  * @returns {string}
@@ -285,7 +289,7 @@ function formatBatteryPowerSuffix(st) {
 }
 
 /**
- * Builds the list of enabled telemetry segments for rendering in the 'default' theme.
+ * Builds the list of enabled telemetry segments for rendering in the 'detailed' theme.
  *
  * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
  * @returns {Array<Record<string, *>>} Array of telemetry segment descriptors.
@@ -355,10 +359,23 @@ class Telemetry {
   /**
    * @param {Record<string, *>} rawCamCfg - Camera entry from config.json.
    * @param {string} [initialLastSeen=''] - Initial lastSeen 'HH:MM' string from snapshot cache.
+   * @param {ReturnType<typeof import("../config").resolveCameraTimers>|null} [resolvedTimers=null] - Pre-resolved camera timers.
    */
-  constructor(rawCamCfg = {}, initialLastSeen = '') {
+  constructor(rawCamCfg = {}, initialLastSeen = '', resolvedTimers = null) {
     this.config = resolveTelemetryConfig(rawCamCfg);
-    this.hwRecordingCfg = resolveHardwareRecordingConfig(rawCamCfg);
+    this.hwRecordingCfg = resolveHardwareRecordingConfig(rawCamCfg, resolvedTimers);
+    this.lowBatThreshold =
+        resolvedTimers && resolvedTimers.lowBatThreshold !== undefined
+            ? resolvedTimers.lowBatThreshold
+            : rawCamCfg.low_battery_threshold !== undefined
+                ? clampNum(rawCamCfg.low_battery_threshold, 0, 100, DEFAULT_LOW_BAT_CUTOFF_PCT)
+                : LOW_BAT_THRESHOLD;
+    this.lowBatWakeOnView =
+        resolvedTimers && resolvedTimers.lowBatWakeOnView !== undefined
+            ? Boolean(resolvedTimers.lowBatWakeOnView)
+            : rawCamCfg.low_battery_wake_on_view !== undefined
+                ? Boolean(rawCamCfg.low_battery_wake_on_view)
+                : LOW_BAT_WAKE_ON_VIEW;
     this.battery = null;
     this.charging = false;
     this.powerLabel = '';
@@ -372,16 +389,16 @@ class Telemetry {
   }
 
   /**
-   * Returns true if battery level is at or below LOW_BAT_THRESHOLD and not charging.
+   * Returns true if battery level is at or below this camera's lowBatThreshold and not charging.
    *
    * @returns {boolean}
    */
   isLowBattery() {
-    if (LOW_BAT_THRESHOLD <= 0 || this.charging || this.battery === null) {
+    if (this.lowBatThreshold <= 0 || this.charging || this.battery === null) {
       return false;
     }
     const level = Number(this.battery);
-    return !Number.isNaN(level) && level <= LOW_BAT_THRESHOLD;
+    return !Number.isNaN(level) && level <= this.lowBatThreshold;
   }
 
   /**
@@ -594,6 +611,7 @@ class Telemetry {
       camTitle,
       cardCfg,
       telCfg: this.config,
+      lowBatThreshold: this.lowBatThreshold,
       battery: this.battery,
       charging: this.charging,
       powerLabel: this.powerLabel,
@@ -614,6 +632,7 @@ class Telemetry {
   evaluateVisualState(titleText) {
     return evaluateTelemetryState(titleText, {
       telCfg: this.config,
+      lowBatThreshold: this.lowBatThreshold,
       battery: this.battery,
       charging: this.charging,
       powerLabel: this.powerLabel,

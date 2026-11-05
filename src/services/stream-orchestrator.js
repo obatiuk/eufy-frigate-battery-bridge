@@ -11,10 +11,8 @@
 
 const {
   PREEMPT_EVENT_STREAMS,
-  BACKFILL_DOWNLOADS,
   BACKFILL_DELAY_MS,
   LIVE_FPS,
-  TRIGGERS,
   DEFAULT_EVENT_PRIORITY,
   sleep,
   getEventPriority,
@@ -72,7 +70,7 @@ const RTSP_HANDSHAKE_POLL_MS = 250;
 const RTSP_HANDSHAKE_WINDOW_MS = 5500;
 const ALREADY_RUNNING_RESTART_DELAY_MS = 1000;
 const FAILED_START_BACKOFF_MS = 5000;
-const RTSP_STOP_SETTLE_MS = 50;
+const RTSP_STOP_SETTLE_MS = 250;
 const P2P_STOP_SETTLE_MS = 150;
 
 // External wake adoption and WebSocket startup/reconnect guards.
@@ -490,14 +488,20 @@ async function startRtspStream(cam) {
   if (cam.eventActive && !cam.rtspRewaking && cam.restarts === 0) {
     frigateEvent(cam, cam.reason, '');
   }
-  await call({
-    command: 'device.set_property',
-    serialNumber: cam.serial,
-    name: 'rtspStream',
-    value: true,
-  });
+  await getStationTransition(cam);
   if (!cam.isCurrentSession(mySession, 'rtsp')) {
     return;
+  }
+  if (cam.restarts === 0) {
+    await call({
+      command: 'device.set_property',
+      serialNumber: cam.serial,
+      name: 'rtspStream',
+      value: true,
+    });
+    if (!cam.isCurrentSession(mySession, 'rtsp')) {
+      return;
+    }
   }
   const r = await call({command: 'device.start_rtsp_livestream', serialNumber: cam.serial});
   if (!r.success && r.errorCode && !/already_running/i.test(r.errorCode)) {
@@ -569,7 +573,7 @@ function handleDatabaseQueryResult(e) {
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 async function processBackfillQueue(now) {
-  if (!BACKFILL_DOWNLOADS || !isWsReady() || isShuttingDownFn()) {
+  if (!isWsReady() || isShuttingDownFn()) {
     return;
   }
 
@@ -1229,7 +1233,7 @@ function onEvent(e) {
       return;
 
     default:
-      if (TRIGGERS.has(String(e.event || '').toLowerCase())) {
+      if (cam.shouldTriggerOnEvent(e.event)) {
         handleTriggerEvent(cam, e);
       }
       return;
@@ -1249,7 +1253,7 @@ function handleRtspStreamDropped(cam, code, reasonText) {
     return;
   }
   const now = Date.now();
-  if (cam.timers.letEufyDecideEnd || now >= cam.wantUntil()) {
+  if (!cam.shouldRewakeRtspOnDrop(now)) {
     stop(cam, 'eufy ended RTSP livestream', false, 'eufy/rtsp-end');
     arbitrate();
     return;

@@ -15,7 +15,6 @@ const {
   LABELS,
   SNAP_DELAY_MS,
   INSTANT_EVENT_SNAPSHOT,
-  LOW_BAT_WAKE_ON_VIEW,
   KEYFRAME_BURST_MS,
   sleep,
 } = require('../config');
@@ -46,7 +45,7 @@ const ACTIVE_EVENTS_QUERY_LIMIT = 10;
 
 let isSyncingMasks = false;
 let frigateApiDown = false;
-let lastMaskCheckAt = 0;
+let lastMaskCheckAt = Date.now();
 let isPollingViewers = false;
 
 /**
@@ -88,10 +87,17 @@ function buildFrigateMaskPayload(cameraName, section, enabled, coordinates) {
  * @returns {boolean}
  */
 function isFrigateMaskIntact(maskEntry, expectedPoly) {
-  if (!maskEntry || typeof maskEntry !== 'object') {
+  if (!maskEntry || typeof maskEntry !== 'object' || maskEntry.enabled === false) {
     return false;
   }
-  return maskEntry.enabled !== false && maskEntry.coordinates === expectedPoly;
+  if (maskEntry.coordinates === expectedPoly) {
+    return true;
+  }
+  return (
+      Array.isArray(maskEntry.coordinates) &&
+      maskEntry.coordinates.length === 1 &&
+      maskEntry.coordinates[0] === expectedPoly
+  );
 }
 
 /**
@@ -175,6 +181,9 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
   if (isNamedDict && isFrigateMaskIntact(existingMasks.eufy_bridge_card, poly)) {
     return 'verified';
   }
+  if (section === 'objects' && cam.card.lastSyncedMaskPoly === poly) {
+    return 'verified';
+  }
 
   try {
     const enablePayload = buildFrigateMaskPayload(cam.name, section, true, poly);
@@ -238,6 +247,7 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
     return;
   }
   isSyncingMasks = true;
+  lastMaskCheckAt = Date.now();
   try {
     if (forceResync) {
       for (const c of cams) {
@@ -271,7 +281,9 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
 
       const motMask = camCfg.motion && camCfg.motion.mask ? camCfg.motion.mask.eufy_bridge_card : null;
       const objMask = camCfg.objects && camCfg.objects.mask ? camCfg.objects.mask.eufy_bridge_card : null;
-      const masksIntact = isFrigateMaskIntact(motMask, poly) && isFrigateMaskIntact(objMask, poly);
+      const masksIntact =
+          isFrigateMaskIntact(motMask, poly) &&
+          (isFrigateMaskIntact(objMask, poly) || cam.card.lastSyncedMaskPoly === poly);
 
       if (cam.card.isMaskSynced(poly, masksIntact)) {
         continue;
@@ -535,11 +547,11 @@ function classifyViewerAction(params) {
       actionDesc: camActive ? 'extending active live view' : 'waking the camera',
     };
   }
-  if (camActive) {
-    return {asked: false, actionDesc: 'joined while live, does not extend it'};
-  }
   if (isDashboardGrid) {
     return {asked: false, actionDesc: 'ignored, multi-camera dashboard grid view'};
+  }
+  if (camActive) {
+    return {asked: false, actionDesc: 'joined while live, does not extend it'};
   }
   if (blockedByP2pMotion) {
     return {
@@ -633,15 +645,13 @@ async function pollViewers(cams, hooks) {
     }
 
     const activeViewerCams = cams.filter((c) => c.viewers > 0);
-    const distinctSleepingNewCams = new Set(
-        newConnections.filter((x) => !x.cam.active).map((x) => x.cam)
-    );
-    const isDashboardGrid = distinctSleepingNewCams.size > 1 && activeViewerCams.length > 1;
+    const distinctNewCams = new Set(newConnections.map((x) => x.cam));
+    const isDashboardGrid = distinctNewCams.size > 1 && activeViewerCams.length > 1;
     let newestViewerCam = null;
 
     for (const conn of newConnections) {
       const {cam, id, clientInfo, now} = conn;
-      const blockedByEco = cam.isLowBattery() && !LOW_BAT_WAKE_ON_VIEW;
+      const blockedByEco = !cam.canWakeOnViewerInLowBattery();
       const activeP2pMotionCam = findStationMotionCam(cam);
       const blockedByP2pMotion = !cam.isRtspCapable() && Boolean(activeP2pMotionCam);
       const alreadyViewing = cam.isActivelyViewing(now);
@@ -672,22 +682,17 @@ async function pollViewers(cams, hooks) {
 
     if (newestViewerCam) {
       newestViewerCam.cancelStartupProbe();
-      if (!newestViewerCam.isRtspCapable()) {
-        for (const other of cams) {
-          if (
-              other !== newestViewerCam &&
-              !other.isRtspCapable() &&
-              other.getStationKey() === newestViewerCam.getStationKey()
-          ) {
-            other.clearViewerQueue('viewer switched to ' + newestViewerCam.name);
-            if (other.active && !other.isInMotion()) {
-              stopCam(
-                  other,
-                  'preempted by live view opened on ' + newestViewerCam.name,
-                  true,
-                  'viewer-preempt'
-              );
-            }
+      const switchNow = Date.now();
+      for (const other of cams) {
+        if (other.shouldYieldToNewStationViewer(newestViewerCam, switchNow)) {
+          other.clearViewerQueue('viewer switched to ' + newestViewerCam.name);
+          if (other.active) {
+            stopCam(
+                other,
+                'preempted by live view opened on ' + newestViewerCam.name,
+                true,
+                'viewer-preempt'
+            );
           }
         }
       }

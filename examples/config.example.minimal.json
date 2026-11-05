@@ -5,14 +5,16 @@
 	"frigate_api": "http://frigate:5000",
 	"cameras": [
 		{
-			"name": "shed",
-			"title": "Shed",
-			"serial": "T8162T0000000000"
+			"name": "garage",
+			"title": "Garage Camera",
+			"serial": "T8161T0000000000",
+			"mode": "rtsp"
 		},
 		{
-			"name": "backyard",
-			"title": "Backyard",
-			"serial": "T8162T1111111111"
+			"name": "front_doorbell",
+			"title": "Front Doorbell",
+			"serial": "T8214T1111111111",
+			"mode": "backfill"
 		}
 	]
 }

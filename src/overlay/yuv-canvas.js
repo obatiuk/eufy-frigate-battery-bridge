@@ -15,8 +15,6 @@ const FROSTED_BLUR_PASSES = 3;
 const FROSTED_LUMA_BLUR_RADIUS = 12;
 const FROSTED_CHROMA_BLUR_RADIUS = 6;
 const ROUNDED_BOX_BLUR_PAD_PX = 28;
-const DIM_LUMA_FACTOR = 0.55;
-const DIM_CHROMA_FACTOR = 0.65;
 const BLACK_BG_LUMA = 0x10;
 const SLATE_BG_LUMA = 0x22;
 const NEUTRAL_CHROMA = 0x80;
@@ -318,32 +316,23 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
 }
 
 /**
- * Prepares the base YUV420p background canvas once per renderCameraCards() cycle so it can be
+ * Prepares the base YUV420p sleeping screen canvas once per renderCameraCards() cycle so it can be
  * shared across the asleep, waking, and busy cards without repeating full-frame pixel loops.
  *
- * @param {{ theme: string, position: string, background: string, dimBackground?: boolean }} cardCfg - Resolved card config.
+ * @param {{ theme: string, position: string, sleepScreen: string }} cardCfg - Resolved card config.
  * @param {Uint8Array|null} bgFrame - Last captured YUV420p video frame for this camera.
  * @returns {{ baseCanvas: Uint8Array, hasBackground: boolean }}
  */
 function prepareBackgroundCanvas(cardCfg, bgFrame) {
   const baseCanvas = Buffer.allocUnsafe(FRAME);
   const hasBackground =
-      cardCfg.background === 'snapshot' && Buffer.isBuffer(bgFrame) && bgFrame.length === FRAME;
+      cardCfg.sleepScreen === 'snapshot' && Buffer.isBuffer(bgFrame) && bgFrame.length === FRAME;
 
   if (hasBackground) {
     bgFrame.copy(baseCanvas);
-    if (cardCfg.dimBackground) {
-      const lumaEnd = W * H;
-      for (let i = 0; i < lumaEnd; i++) {
-        baseCanvas[i] = Math.max(BLACK_BG_LUMA, ((baseCanvas[i] - BLACK_BG_LUMA) * DIM_LUMA_FACTOR + 16.5) | 0);
-      }
-      for (let i = lumaEnd; i < FRAME; i++) {
-        baseCanvas[i] = ((baseCanvas[i] - NEUTRAL_CHROMA) * DIM_CHROMA_FACTOR + 128.5) | 0;
-      }
-    }
   } else {
     baseCanvas.fill(NEUTRAL_CHROMA, W * H);
-    baseCanvas.fill(cardCfg.background === 'black' ? BLACK_BG_LUMA : SLATE_BG_LUMA, 0, W * H);
+    baseCanvas.fill(cardCfg.sleepScreen === 'black' ? BLACK_BG_LUMA : SLATE_BG_LUMA, 0, W * H);
   }
 
   return {baseCanvas, hasBackground};

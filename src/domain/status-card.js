@@ -31,16 +31,16 @@ const ICONS_BATTERY_WIDTH = 37;
 const ICONS_WIFI_WIDTH = 28;
 const ICONS_TEMP_WIDTH = 16;
 const ICONS_CLOCK_WIDTH = 20;
-const DEFAULT_CORNER_MIN_WIDTH_WITH_TEL = 540;
-const DEFAULT_CORNER_MIN_WIDTH_NO_TEL = 400;
-const DEFAULT_CORNER_HEIGHT_WITH_TEL = 88;
-const DEFAULT_CORNER_HEIGHT_NO_TEL = 48;
-const DEFAULT_CORNER_TEL_GAP = 18;
-const DEFAULT_CORNER_TEL_PAD_X = 44;
-const DEFAULT_CORNER_CARD_RADIUS = 22;
-const DEFAULT_CORNER_HEADER_LEFT_X = 42;
-const DEFAULT_CORNER_HEADER_CHAR_W = TEL_TEXT_CHAR_WIDTH;
-const DEFAULT_CORNER_HEADER_RIGHT_PAD = 24;
+const DETAILED_CORNER_MIN_WIDTH_WITH_TEL = 540;
+const DETAILED_CORNER_MIN_WIDTH_NO_TEL = 400;
+const DETAILED_CORNER_HEIGHT_WITH_TEL = 88;
+const DETAILED_CORNER_HEIGHT_NO_TEL = 48;
+const DETAILED_CORNER_TEL_GAP = 18;
+const DETAILED_CORNER_TEL_PAD_X = 44;
+const DETAILED_CORNER_CARD_RADIUS = 22;
+const DETAILED_CORNER_HEADER_LEFT_X = 42;
+const DETAILED_CORNER_HEADER_CHAR_W = TEL_TEXT_CHAR_WIDTH;
+const DETAILED_CORNER_HEADER_RIGHT_PAD = 24;
 const FRIGATE_MASK_SAFETY_PAD_PX = 6;
 
 /**
@@ -59,27 +59,27 @@ function computeIconsCardWidth(flags) {
 }
 
 /**
- * Computes the bounding dimensions { boxW, boxH, hasTelemetry, gap } for a corner default card.
+ * Computes the bounding dimensions { boxW, boxH, hasTelemetry, gap } for a corner detailed card.
  *
  * @param {string} headerText - Header text rendered on the top row.
  * @param {Array<Record<string, *>>} segments - Telemetry segments.
  * @returns {{ boxW: number, boxH: number, hasTelemetry: boolean, gap: number }}
  */
-function computeCornerDefaultCardDimensions(headerText, segments) {
+function computeCornerDetailedCardDimensions(headerText, segments) {
   const hasTelemetry = segments.length > 0;
-  const gap = DEFAULT_CORNER_TEL_GAP;
+  const gap = DETAILED_CORNER_TEL_GAP;
   const telW = hasTelemetry
       ? segments.reduce((sum, seg) => sum + seg.width, 0) +
         gap * Math.max(0, segments.length - 1) +
-        DEFAULT_CORNER_TEL_PAD_X
+        DETAILED_CORNER_TEL_PAD_X
       : 0;
   const headerW =
-      DEFAULT_CORNER_HEADER_LEFT_X +
-      headerText.length * DEFAULT_CORNER_HEADER_CHAR_W +
-      DEFAULT_CORNER_HEADER_RIGHT_PAD;
-  const minW = hasTelemetry ? DEFAULT_CORNER_MIN_WIDTH_WITH_TEL : DEFAULT_CORNER_MIN_WIDTH_NO_TEL;
+      DETAILED_CORNER_HEADER_LEFT_X +
+      headerText.length * DETAILED_CORNER_HEADER_CHAR_W +
+      DETAILED_CORNER_HEADER_RIGHT_PAD;
+  const minW = hasTelemetry ? DETAILED_CORNER_MIN_WIDTH_WITH_TEL : DETAILED_CORNER_MIN_WIDTH_NO_TEL;
   const boxW = Math.min(W - CARD_CORNER_MARGIN_PX * 2, Math.max(minW, telW, headerW));
-  const boxH = hasTelemetry ? DEFAULT_CORNER_HEIGHT_WITH_TEL : DEFAULT_CORNER_HEIGHT_NO_TEL;
+  const boxH = hasTelemetry ? DETAILED_CORNER_HEIGHT_WITH_TEL : DETAILED_CORNER_HEIGHT_NO_TEL;
   return {boxW, boxH, hasTelemetry, gap};
 }
 
@@ -124,8 +124,7 @@ class StatusCard {
     this.config = resolved;
     this.theme = resolved.theme;
     this.position = resolved.position;
-    this.background = resolved.background;
-    this.dimBackground = resolved.dimBackground;
+    this.sleepScreen = resolved.sleepScreen;
 
     this.autoFrigateMask = rawCamCfg.auto_frigate_mask ?? GLOBAL_AUTO_FRIGATE_MASK;
     this.showOnLive = rawCamCfg.card_show_on_live ?? GLOBAL_CARD_SHOW_ON_LIVE;
@@ -161,12 +160,12 @@ class StatusCard {
   }
 
   /**
-   * Returns true if the pre-rendered default corner live card buffer needs to be built.
+   * Returns true if the pre-rendered detailed corner live card buffer needs to be built.
    *
    * @returns {boolean}
    */
-  needsDefaultLiveCard() {
-    return Boolean(this.showOnLive && this.theme === 'default' && this.isCorner());
+  needsDetailedLiveCard() {
+    return Boolean(this.showOnLive && this.theme === 'detailed' && this.isCorner());
   }
 
   /**
@@ -249,7 +248,7 @@ class StatusCard {
         boxH = ICONS_CARD_HEIGHT;
         break;
       }
-      case 'default': {
+      case 'detailed': {
         const maxHeader = 'Asleep (Low Battery)  -  ' + displayTitle;
         const tc = telemetry.config;
         const st = this.liveTelState || evaluateTelemetryState('Asleep', {
@@ -263,7 +262,7 @@ class StatusCard {
           lastSeen: telemetry.lastSeen || '00:00',
         });
         const segments = tc.enabled ? buildTelemetrySegments(st) : [];
-        const dims = computeCornerDefaultCardDimensions(maxHeader, segments);
+        const dims = computeCornerDetailedCardDimensions(maxHeader, segments);
         boxW = dims.boxW;
         boxH = dims.boxH;
         break;
@@ -299,7 +298,7 @@ class StatusCard {
 }
 
 module.exports = {
-  DEFAULT_CORNER_CARD_RADIUS,
+  DETAILED_CORNER_CARD_RADIUS,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -311,6 +310,6 @@ module.exports = {
   ICONS_TEMP_WIDTH,
   StatusCard,
   computeIconsCardWidth,
-  computeCornerDefaultCardDimensions,
+  computeCornerDetailedCardDimensions,
   getCardBoxCoords,
 };

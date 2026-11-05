@@ -319,6 +319,7 @@ function startEncoder(cam) {
   });
 
   cam.attachEncoder(enc, spawnAt);
+  pushFrameToEncoder(cam, spawnAt);
 
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
   enc.stdin.on('error', () => {});

@@ -14,7 +14,6 @@ const {
   FRAME,
   COOLDOWN_MS,
   PREEMPT_EVENT_STREAMS,
-  BACKFILL_DOWNLOADS,
   INSTANT_EVENT_SNAPSHOT,
   MIN_CAMERA_PRIORITY,
   MAX_CAMERA_PRIORITY,
@@ -23,8 +22,8 @@ const {
   SHORT_KEYFRAME_BURST_MS,
   GLOBAL_PRESERVE_ASPECT,
   GLOBAL_STARTUP_SNAPSHOT,
-  GLOBAL_USE_RTSP,
   ACTIVE_HWACCEL,
+  resolveCameraTriggers,
   resolveCameraTimers,
 } = require('../config');
 const {log} = require('../logger');
@@ -37,13 +36,13 @@ const INITIAL_KEYFRAME_BURST_MS = 2000;
 /**
  * Determines whether a camera needs a brief startup snapshot probe on boot.
  *
- * @param {string} backgroundMode - Resolved card background ('snapshot', 'slate', 'black').
+ * @param {string} sleepScreen - Resolved sleep_screen mode ('snapshot', 'slate', 'black').
  * @param {boolean|string} startupMode - Configured startup_snapshot setting.
  * @param {Uint8Array|null} cachedFrame - Cached YUV420p frame loaded from disk, if any.
  * @returns {boolean}
  */
-function shouldProbeStartupSnapshot(backgroundMode, startupMode, cachedFrame) {
-  if (backgroundMode !== 'snapshot') {
+function shouldProbeStartupSnapshot(sleepScreen, startupMode, cachedFrame) {
+  if (sleepScreen !== 'snapshot') {
     return false;
   }
   if (startupMode === 'always') {
@@ -63,17 +62,21 @@ class Camera {
    */
   constructor(rawCamCfg, cachedSnapshot = {frame: null, lastSeen: ''}, renderCardsFn = null) {
     Object.assign(this, rawCamCfg);
+    this.name = String(rawCamCfg.name || rawCamCfg.serial || '').trim();
 
-    // 1. Composed Domain Models (StatusCard & Telemetry)
+    // 1. Identity, Priority & Routing Configuration
+    const startupMode = rawCamCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT;
+    this.timers = resolveCameraTimers(rawCamCfg);
+    this.triggers = resolveCameraTriggers(rawCamCfg);
+    this.mode = this.timers.mode;
+    this.alwaysBackfill = Boolean(this.timers.alwaysBackfill);
+    this.backfillDownloads = Boolean(this.timers.backfillDownloads);
+
+    // 2. Composed Domain Models (StatusCard & Telemetry)
     /** @type {StatusCard} */
     this.card = new StatusCard(rawCamCfg);
     /** @type {Telemetry} */
-    this.telemetry = new Telemetry(rawCamCfg, cachedSnapshot.lastSeen);
-
-    // 2. Identity, Priority & Routing Configuration
-    const startupMode = rawCamCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT;
-    this.timers = resolveCameraTimers(rawCamCfg);
-    this.alwaysBackfill = Boolean(this.timers.alwaysBackfill);
+    this.telemetry = new Telemetry(rawCamCfg, cachedSnapshot.lastSeen, this.timers);
     this.priority = clampNum(
         rawCamCfg.priority,
         MIN_CAMERA_PRIORITY,
@@ -82,16 +85,16 @@ class Camera {
     );
     this.eventPriority = 0;
     this.stationSerial = rawCamCfg.station_serial || '';
-    this.useRtsp = rawCamCfg.use_rtsp ?? (GLOBAL_USE_RTSP || Boolean(rawCamCfg.rtsp_url));
+    this.useRtsp = Boolean(this.timers.useRtsp);
     this.rtspUrl = rawCamCfg.rtsp_url || '';
-    this.rtspSupported = Boolean(rawCamCfg.rtsp_url || rawCamCfg.use_rtsp === true);
+    this.rtspSupported = Boolean(rawCamCfg.rtsp_url || this.mode === 'rtsp' || rawCamCfg.use_rtsp === true);
     this.rtspEnabledChecked = false;
     this.preserveAspect = rawCamCfg.preserve_aspect_ratio ?? GLOBAL_PRESERVE_ASPECT;
     this.useHwaccel = Boolean(ACTIVE_HWACCEL);
 
     // 3. Startup Snapshot & Backfill State
     this.needsStartupSnapshot = shouldProbeStartupSnapshot(
-        this.card.background,
+        this.card.sleepScreen,
         startupMode,
         cachedSnapshot.frame
     );
@@ -388,6 +391,26 @@ class Camera {
   }
 
   /**
+   * Returns true if a live viewer is allowed to wake this camera under its current
+   * battery and low_battery_wake_on_view state.
+   *
+   * @returns {boolean}
+   */
+  canWakeOnViewerInLowBattery() {
+    return !this.isLowBattery() || Boolean(this.telemetry.lowBatWakeOnView);
+  }
+
+  /**
+   * Returns true if the given Eufy event name is configured to trigger this camera.
+   *
+   * @param {string} evName - Raw Eufy event name.
+   * @returns {boolean}
+   */
+  shouldTriggerOnEvent(evName) {
+    return this.triggers.has(String(evName || '').toLowerCase());
+  }
+
+  /**
    * Returns the effective event hold duration in milliseconds for this camera, accounting
    * for per-camera hold_secs and Low-Battery Economy Mode.
    *
@@ -416,7 +439,7 @@ class Camera {
    */
   shouldBackfillOnlyOnEvent() {
     return Boolean(
-        BACKFILL_DOWNLOADS &&
+        this.backfillDownloads &&
         this.alwaysBackfill &&
         (!this.active || this.activeMode === 'download')
     );
@@ -810,7 +833,7 @@ class Camera {
   }
 
   /**
-   * Returns true if Eufy cleanly ended an active event livestream when let_eufy_decide_event_end is enabled.
+   * Returns true if Eufy cleanly ended an active event livestream when end_early is enabled.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} minCleanVideoMs - Minimum decoded video duration before honoring Eufy stop.
@@ -933,7 +956,12 @@ class Camera {
    * @returns {boolean}
    */
   shouldEnableRtspProperty(rtspStreamProp) {
-    if (this.useRtsp && this.rtspUrl && !this.rtspEnabledChecked && rtspStreamProp === false) {
+    if (
+        this.useRtsp &&
+        (this.rtspUrl || this.rtspSupported) &&
+        !this.rtspEnabledChecked &&
+        rtspStreamProp === false
+    ) {
       this.rtspEnabledChecked = true;
       return true;
     }
@@ -1506,8 +1534,8 @@ class Camera {
   }
 
   /**
-   * Updates stationSerial and auto-discovered rtspUrl from device properties, returning true
-   * if a new RTSP URL was discovered.
+   * Updates stationSerial and auto-discovered rtspUrl from device properties when useRtsp is enabled,
+   * returning true if a new RTSP URL was discovered.
    *
    * @param {*} stationSn - Unwrapped stationSerialNumber property.
    * @param {*} rtspUrlProp - Unwrapped rtspStreamUrl property.
@@ -1517,7 +1545,13 @@ class Camera {
     if (stationSn && typeof stationSn === 'string') {
       this.stationSerial = stationSn;
     }
-    if (rtspUrlProp && typeof rtspUrlProp === 'string' && !this.rtsp_url && this.rtspUrl !== rtspUrlProp) {
+    if (
+        this.useRtsp &&
+        rtspUrlProp &&
+        typeof rtspUrlProp === 'string' &&
+        !this.rtsp_url &&
+        this.rtspUrl !== rtspUrlProp
+    ) {
       this.rtspUrl = rtspUrlProp;
       this.rtspSupported = true;
       return true;
@@ -1793,6 +1827,44 @@ class Camera {
   }
 
   /**
+   * Returns true if this camera should yield its viewer queue (and stop if active without motion)
+   * when a human viewer opens newestViewerCam on the same station.
+   *
+   * @param {Camera|null|undefined} newestViewerCam - Camera newly opened by a human viewer.
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @returns {boolean}
+   */
+  shouldYieldToNewStationViewer(newestViewerCam, now = Date.now()) {
+    if (
+        !newestViewerCam ||
+        this === newestViewerCam ||
+        this.getStationKey() !== newestViewerCam.getStationKey() ||
+        this.isInMotion(now)
+    ) {
+      return false;
+    }
+    if (!this.hasWakingViewer()) {
+      return true;
+    }
+    return !newestViewerCam.isRtspCapable() && !this.isRtspCapable();
+  }
+
+  /**
+   * Returns true if an active RTSP session that dropped mid-stream should immediately re-wake
+   * (requires end_early=false, unexpired wantUntil, and either active motion or a connected viewer).
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @returns {boolean}
+   */
+  shouldRewakeRtspOnDrop(now = Date.now()) {
+    return Boolean(
+        !this.timers.letEufyDecideEnd &&
+        now < this.wantUntil() &&
+        (this.isInMotion(now) || this.hasWakingViewer())
+    );
+  }
+
+  /**
    * Prepares the camera state for an immediate mid-session RTSP re-wake and returns remaining hold seconds.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
@@ -1933,7 +2005,7 @@ class Camera {
 
   /**
    * Records that Eufy reported motion/activity cleared (state: false) and optionally shortens
-   * motionUntil when let_eufy_decide_event_end is enabled.
+   * motionUntil when end_early is enabled.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} settleMs - Post-clear settle duration in milliseconds.
@@ -1968,7 +2040,7 @@ class Camera {
    */
   queueEventBackfill(now, eventName, personName, reason, evPriority, recordingActive = true) {
     if (
-        !BACKFILL_DOWNLOADS ||
+        !this.backfillDownloads ||
         (!this.alwaysBackfill && (this.runtimeExtended || (this.active && this.gotVideo)))
     ) {
       return;

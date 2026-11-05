@@ -44,7 +44,6 @@ const {startHttpServer, stopHttpServer} = require('./services/http-server');
 const SIGUSR1_BACKFILL_DELAY_MS = 300;
 const SHUTDOWN_EXIT_DELAY_MS = 1500;
 const VIEWER_POLL_INTERVAL_MS = 750;
-const INITIAL_MASK_SYNC_DELAY_MS = 2500;
 
 let shuttingDown = false;
 const isShuttingDown = () => shuttingDown;
@@ -164,33 +163,22 @@ function registerSignalHandlers(cams) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function logStartupBanner(cams) {
-  const camNames = cams.map((cam) => cam.name).join(', ');
-  const alwaysBackfillCams = cams.filter((cam) => cam.alwaysBackfill).map((cam) => cam.name);
+  const camSummary = cams
+      .map((cam) => cam.name + '(' + cam.mode + ':' + Math.round(cam.timers.holdMs / 1000) + 's)')
+      .join(', ');
   const encoderDesc = config.ACTIVE_HWACCEL
       ? config.ACTIVE_HWACCEL + ' (' + config.HWACCEL_DEVICE + ')'
       : 'software (libx264)';
 
-  const summaryParts = [
-    'cameras=[' + camNames + ']',
+  const summary = [
+    'cameras=[' + camSummary + ']',
     'logLevel=' + config.ACTIVE_LOG_LEVEL_NAME,
     'cache=' + config.CACHE_DIR,
     'encoder=' + encoderDesc,
-    'useRtsp=' + config.GLOBAL_USE_RTSP,
-    'backfill=' + config.BACKFILL_DOWNLOADS,
-    'autoMask=' + config.GLOBAL_AUTO_FRIGATE_MASK,
-    'cardOnLive=' + config.GLOBAL_CARD_SHOW_ON_LIVE,
-    'letEufyDecideEnd=' + config.LET_EUFY_DECIDE_END,
-    'dimBg=' + config.GLOBAL_DIM_BACKGROUND,
-    'hold=' + config.HOLD_MS / 1000 + 's',
-    'earlySleep=' + config.EARLY_SLEEP_MS / 1000 + 's',
-    'viewerLinger=' + config.LINGER_MS / 1000 + 's',
-    'max=' + config.MAX_MS / 1000 + 's',
-  ];
-  if (alwaysBackfillCams.length > 0) {
-    summaryParts.push('alwaysBackfill=[' + alwaysBackfillCams.join(', ') + ']');
-  }
+    'audio=' + config.AUDIO,
+  ].join(', ');
 
-  log.info('bridge', 'eufy-frigate-battery-bridge starting: ' + summaryParts.join(', '));
+  log.info('bridge', 'eufy-frigate-battery-bridge starting: ' + summary);
 }
 
 /**
@@ -222,7 +210,6 @@ function startServices(cams) {
     isShuttingDown: () => shuttingDown,
   });
   connectWs();
-  setTimeout(() => void syncFrigateMotionMasks(cams, false, shuttingDown), INITIAL_MASK_SYNC_DELAY_MS);
 }
 
 /**

@@ -2,6 +2,9 @@
 .gitignore
 .idea/
 .opencode/
+.venv/
+node_modules/
+package-lock.json
 *.iml
 *.jsonc
 *.md

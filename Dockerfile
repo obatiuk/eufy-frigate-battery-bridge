@@ -2,7 +2,11 @@ FROM docker.io/library/node:22-alpine3.23 AS builder
 RUN apk add --no-cache font-inter \
     && cp "$(find /usr/share/fonts -iname '*Inter*Regular*' -o -iname '*InterVariable*' -o -iname '*.ttc' | head -n 1)" /tmp/Inter.ttf
 WORKDIR /app
-RUN npm install --omit=dev --no-audit --no-fund ws@8.18.3
+COPY package.json /app/package.json
+RUN npm install --omit=dev --no-package-lock --no-audit --no-fund
+COPY src/ /app/src/
+COPY test/ /app/test/
+RUN node --test --test-reporter=/app/test/reporter.js /app/test/*.test.js
 
 FROM docker.io/library/alpine:3.23
 

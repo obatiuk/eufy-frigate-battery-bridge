@@ -4,7 +4,7 @@
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
- * Status card rendering engine ('default', 'icons', 'minimal', 'none')
+ * Status card rendering engine ('detailed', 'icons', 'minimal', 'none')
  * and live-stream corner overlay compositing.
  */
 'use strict';
@@ -20,7 +20,6 @@ const {
   COLOR_GREY,
   SHORT_KEYFRAME_BURST_MS,
   MAX_FFMPEG_BUFFER_MULTIPLIER,
-  LOW_BAT_WAKE_ON_VIEW,
   resolveCardConfig,
 } = require('../config');
 const {log} = require('../logger');
@@ -31,7 +30,7 @@ const {
   buildTelemetrySegments,
 } = require('../domain/telemetry');
 const {
-  DEFAULT_CORNER_CARD_RADIUS,
+  DETAILED_CORNER_CARD_RADIUS,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -42,7 +41,7 @@ const {
   ICONS_WIFI_WIDTH,
   ICONS_TEMP_WIDTH,
   computeIconsCardWidth,
-  computeCornerDefaultCardDimensions,
+  computeCornerDetailedCardDimensions,
   getCardBoxCoords,
 } = require('../domain/status-card');
 const {
@@ -122,7 +121,7 @@ function drawLeftRewindTriangle(canvas, xApex, xBase, cy, halfH, rgb) {
 }
 
 /**
- * Draws an anti-aliased double left-pointing rewind icon (◀◀) centered at (cx, cy).
+ * Draws an anti-aliased double left-pointing rewind icon centered at (cx, cy).
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
  * @param {number} cx - Center X coordinate.
@@ -141,11 +140,11 @@ function drawRewindGlyph(canvas, cx, cy, scale, rgb) {
 }
 
 /**
- * Draws the status glyph for 'icons' and centered 'default' themes:
- *   - 'live': Filled Play triangle (▶, Red)
- *   - 'backfill': Filled Rewind double-triangle (◀◀, Red)
- *   - 'waking': Solid circle dot (●, Blue) matching minimal and corner default themes
- *   - 'asleep' / 'waiting' / 'low': Pause bars (⏸, Grey / Yellow / Purple)
+ * Draws the status glyph for 'icons' and centered 'detailed' themes:
+ *   - 'live': Filled Play triangle (Red)
+ *   - 'backfill': Filled Rewind double-triangle (Red)
+ *   - 'waking': Solid circle dot (Blue) matching minimal and corner detailed themes
+ *   - 'asleep' / 'waiting' / 'low': Pause bars (Grey / Yellow / Purple)
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
  * @param {number} cx - Center X coordinate.
@@ -268,7 +267,7 @@ function drawWifiArcsIcon(canvas, cx, bottomY, wifiBars, rgb) {
 
 /**
  * Draws the vector battery icon and curved Wi-Fi arc icon alongside their text labels
- * for the 'default' theme.
+ * for the 'detailed' theme.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
  * @param {Array<Record<string, *>>} segments - Telemetry segments from buildTelemetrySegments().
@@ -450,7 +449,7 @@ function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
 }
 
 /**
- * Composites the centered rounded translucent modal box ('default' theme at 'center' position),
+ * Composites the centered rounded translucent modal box ('detailed' theme at 'center' position),
  * the color-coded status glyph, and the baseline-aligned telemetry icons onto the canvas.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer (modified in place).
@@ -480,7 +479,7 @@ function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, 
 }
 
 /**
- * Draws the compact corner card for the 'default' theme when card_position is one of the
+ * Draws the compact corner card for the 'detailed' theme when card_position is one of the
  * four corners ('top-left', 'top-right', 'bottom-left', 'bottom-right').
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer (modified in place).
@@ -492,7 +491,7 @@ function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, 
  * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
  * @returns {string[]} Array of FFmpeg drawtext filter strings for the corner card.
  */
-function drawCornerDefaultCard(
+function drawCornerDetailedCard(
     canvas,
     position,
     headerText,
@@ -502,10 +501,10 @@ function drawCornerDefaultCard(
     buildDrawtext,
     blurBackdrop = true
 ) {
-  const {boxW, boxH, hasTelemetry, gap} = computeCornerDefaultCardDimensions(maxHeaderText, segments);
+  const {boxW, boxH, hasTelemetry, gap} = computeCornerDetailedCardDimensions(maxHeaderText, segments);
   const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
 
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, DEFAULT_CORNER_CARD_RADIUS, 0.58, 0.16, blurBackdrop);
+  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, DETAILED_CORNER_CARD_RADIUS, 0.58, 0.16, blurBackdrop);
   if (st.statusKind === 'backfill') {
     drawRewindGlyph(canvas, boxX + 26, boxY + 23, 0.95, st.statusRgb);
   } else {
@@ -521,7 +520,7 @@ function drawCornerDefaultCard(
 }
 
 /**
- * Locates the first available TrueType font file on disk for the 'default' text theme.
+ * Locates the first available TrueType font file on disk for the 'detailed' text theme.
  *
  * @returns {string|undefined}
  */
@@ -538,7 +537,7 @@ function findAvailableFontFile() {
 }
 
 /**
- * Renders a static YUV420p status frame according to card_theme ('default', 'icons', 'minimal',
+ * Renders a static YUV420p status frame according to card_theme ('detailed', 'icons', 'minimal',
  * or 'none') and card_position ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
  *
  * @param {string} titleText - Heading displayed on the card (e.g., "Asleep").
@@ -574,7 +573,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
 
   const font = findAvailableFontFile();
   if (!font) {
-    log.warn(camScope, 'no TrueType font found for default theme, falling back to vector icons card');
+    log.warn(camScope, 'no TrueType font found for detailed theme, falling back to vector icons card');
     drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
     return canvas;
   }
@@ -602,7 +601,7 @@ function card(titleText, line1, line2, status, preparedBg, hasBackground) {
     const camLabel = status && status.camTitle ? '  -  ' + status.camTitle : '';
     const maxHeaderText = 'Asleep (Low Battery)' + camLabel;
     drawtextList.push(
-        ...drawCornerDefaultCard(
+        ...drawCornerDetailedCard(
             canvas,
             cardCfg.position,
             titleText + camLabel,
@@ -688,10 +687,9 @@ function renderCameraCards(cam) {
   const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
 
   const asleepTitle = lowBat ? 'Asleep (Low Battery)' : 'Asleep';
-  const asleepLine2 =
-      lowBat && !LOW_BAT_WAKE_ON_VIEW
-          ? 'economy mode active, waking on motion events only'
-          : 'feed, open this camera to wake it, or wait for motion';
+  const asleepLine2 = !cam.canWakeOnViewerInLowBattery()
+      ? 'economy mode active, waking on motion events only'
+      : 'feed, open this camera to wake it, or wait for motion';
 
   cam.card.setRenderedFrames({
     asleep: card(
@@ -720,10 +718,10 @@ function renderCameraCards(cam) {
     ),
     liveTelState: evaluateTelemetryState('Live', status),
     backfillTelState: evaluateTelemetryState('Backfill', status),
-    liveCard: cam.card.needsDefaultLiveCard()
+    liveCard: cam.card.needsDetailedLiveCard()
         ? card('Live', '', '', status, baseCanvas, hasBackground)
         : null,
-    backfillCard: cam.card.needsDefaultLiveCard()
+    backfillCard: cam.card.needsDetailedLiveCard()
         ? card('Backfill', '', '', status, baseCanvas, hasBackground)
         : null,
   });
@@ -755,7 +753,7 @@ function renderLiveFrameWithCard(cam, rawFrame) {
     case 'icons':
       drawIconsOnlyCard(out, cam.card.position, st, true);
       return out;
-    case 'default': {
+    case 'detailed': {
       const activeCardBuf = isBackfill ? cam.card.backfillCard : cam.card.liveCard;
       if (Buffer.isBuffer(activeCardBuf)) {
         const bounds = cam.getCardBounds();
@@ -767,7 +765,7 @@ function renderLiveFrameWithCard(cam, rawFrame) {
               bounds.boxY,
               bounds.boxW,
               bounds.boxH,
-              DEFAULT_CORNER_CARD_RADIUS
+              DETAILED_CORNER_CARD_RADIUS
           );
         }
         return out;
