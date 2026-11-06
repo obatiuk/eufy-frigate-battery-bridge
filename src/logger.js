@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -16,6 +17,9 @@ const LOG_LEVELS = Object.freeze({
   error: 3,
 });
 
+const LOG_LEVEL_NAME_WIDTH = 5;
+
+/** @type {number} */
 let currentLogLevel = LOG_LEVELS.info;
 
 /**
@@ -78,27 +82,51 @@ function normalizeLevelName(rawLevel) {
 }
 
 /**
- * Resolves the log scope label from a camera object or scope string.
+ * Resolves the log scope label from a stateful domain object or scope string.
  *
- * @param {string|{name?: string}|null|undefined} scope - Camera instance or scope name.
+ * @param {string|{getScopeName?: () => string, getName?: () => string, name?: string, cameraName?: string, sessionState?: string, state?: string, decoderState?: string, evState?: string}|null|undefined} scope - Stateful domain instance or scope name.
  * @returns {string}
  */
 function resolveScopeName(scope) {
   if (!scope) {
     return 'bridge';
   }
-  if (typeof scope === 'object') {
-    return scope.name || 'bridge';
+  switch (typeof scope) {
+    case 'object':
+      if (typeof scope.getScopeName === 'function') {
+        return scope.getScopeName();
+      }
+      if (typeof scope.getName === 'function') {
+        return scope.getName() || 'bridge';
+      }
+      return scope.name || scope.cameraName || 'bridge';
+    default:
+      return String(scope);
   }
-  return String(scope);
+}
+
+/**
+ * Resolves the uppercase state badge prefix for log lines when scope is a stateful domain object
+ * (Camera with sessionState, BackfillJob with state, or sub-FSM scope with decoderState / evState).
+ *
+ * @param {string|{name?: string, cameraName?: string, sessionState?: string, state?: string, decoderState?: string, evState?: string}|null|undefined} scope - Stateful domain instance or scope name.
+ * @returns {string}
+ */
+function resolveStatePrefix(scope) {
+  if (!scope || typeof scope !== 'object') {
+    return '';
+  }
+  const rawState = scope.sessionState || scope.state || scope.decoderState || scope.evState || '';
+  return rawState ? '[' + String(rawState).toUpperCase() + '] ' : '';
 }
 
 /**
  * Formats a single structured log line for Grafana Alloy / Loki:
- *   YYYY-MM-DD HH:MM:SS [LEVEL] [camera_or_bridge] message
+ *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [bridge] message
+ *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [camera] [STATE] message
  *
  * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
- * @param {string|{name?: string}|null|undefined} scope - Camera state/config object or scope string.
+ * @param {string|{name?: string, sessionState?: string}|null|undefined} scope - Camera state/config object or scope string.
  * @param {Array<*>} args - Message segments.
  * @param {Date} [now=new Date()] - Timestamp to format.
  * @returns {string}
@@ -106,8 +134,10 @@ function resolveScopeName(scope) {
 function formatLogLine(level, scope, args, now = new Date()) {
   const normLevel = normalizeLevelName(level);
   const timestamp = formatLocalTimestamp(now);
+  const levelTag = `[${normLevel.toUpperCase().padEnd(LOG_LEVEL_NAME_WIDTH)}]`;
   const scopeName = resolveScopeName(scope);
-  return timestamp + ' [' + normLevel.toUpperCase() + '] [' + scopeName + '] ' + args.join(' ');
+  const statePrefix = resolveStatePrefix(scope);
+  return `${timestamp} - ${levelTag} - [${scopeName}] ${statePrefix}${args.join(' ')}`;
 }
 
 /**
@@ -152,7 +182,10 @@ function initLogger(rawLevel) {
 }
 
 module.exports = {
+  formatLocalTimestamp,
   formatLocalHm,
+  normalizeLevelName,
+  formatLogLine,
   log,
   initLogger,
 };

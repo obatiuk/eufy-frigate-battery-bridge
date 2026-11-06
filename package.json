@@ -13,5 +13,33 @@
   },
   "dependencies": {
     "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.10",
+    "@types/ws": "8.18.0",
+    "eslint": "9.39.5",
+    "knip": "5.85.0",
+    "prettier": "3.9.10",
+    "typescript": "5.8.2"
+  },
+  "knip": {
+    "entry": [
+      "test/*.js",
+      "scripts/*.js"
+    ],
+    "project": [
+      "src/**/*.js",
+      "test/**/*.js",
+      "scripts/**/*.js"
+    ],
+    "ignoreDependencies": [
+      "eslint",
+      "prettier"
+    ]
+  },
+  "prettier": {
+    "proseWrap": "preserve",
+    "printWidth": 120,
+    "tabWidth": 2
   }
 }

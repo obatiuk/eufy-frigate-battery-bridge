@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -17,10 +18,17 @@ const {
   INSTANT_EVENT_SNAPSHOT,
   KEYFRAME_BURST_MS,
   LIVE_FPS,
+  STREAM_MODES,
   sleep,
 } = require('../config');
 const {log} = require('../logger');
-const {pushFrameToEncoder} = require('../media/encoder');
+const {WAKE_KINDS} = require('../domain/camera');
+const {renderCameraCards} = require('../overlay/card-renderer');
+const {
+  OFFLINE_SNAPSHOT_SEED_MS,
+  pushFrameToEncoder,
+  seedOfflineCameraSnapshots,
+} = require('../media/encoder');
 const {notifyHA} = require('./ha-notifier');
 
 const FAST_LIVE_SNAP_DELAY_MS = 1000;
@@ -44,11 +52,27 @@ const REVIEW_LOOKUP_DELAY_MS = 1500;
 const ERROR_SNIPPET_MAX_CHARS = 200;
 const REVIEW_QUERY_LIMIT = 5;
 const ACTIVE_EVENTS_QUERY_LIMIT = 10;
+const INTERNAL_RECORDER_USER_AGENT_REGEX = /FFmpeg Frigate|^go2rtc/i;
 
 let isSyncingMasks = false;
 let frigateApiDown = false;
 let lastMaskCheckAt = Date.now();
 let isPollingViewers = false;
+
+/**
+ * Updates upstream service connectivity flags on all cameras and re-renders sleeping cards when changed.
+ *
+ * @param {Camera[]} cams - Array of Camera instances.
+ * @param {{ wsConnected?: boolean, frigateConnected?: boolean, go2rtcConnected?: boolean }} flags - Service health flags.
+ */
+function syncServiceHealthFlags(cams, flags) {
+  for (const cam of cams) {
+    if (cam.updateServiceHealth(flags)) {
+      renderCameraCards(cam);
+      pushFrameToEncoder(cam);
+    }
+  }
+}
 
 /**
  * Builds the Frigate PUT /api/config/set JSON body for updating a camera's eufy_bridge_card mask.
@@ -60,7 +84,7 @@ let isPollingViewers = false;
  * @returns {Record<string, *>}
  */
 function buildFrigateMaskPayload(cameraName, section, enabled, coordinates) {
-  return {
+  return Object.freeze({
     requires_restart: 0,
     update_topic: 'config/cameras/' + cameraName + '/' + section,
     config_data: {
@@ -78,7 +102,7 @@ function buildFrigateMaskPayload(cameraName, section, enabled, coordinates) {
         },
       },
     },
-  };
+  });
 }
 
 /**
@@ -89,17 +113,12 @@ function buildFrigateMaskPayload(cameraName, section, enabled, coordinates) {
  * @returns {boolean}
  */
 function isFrigateMaskIntact(maskEntry, expectedPoly) {
-  if (!maskEntry || typeof maskEntry !== 'object' || maskEntry.enabled === false) {
-    return false;
-  }
-  if (maskEntry.coordinates === expectedPoly) {
-    return true;
-  }
-  return (
-      Array.isArray(maskEntry.coordinates) &&
-      maskEntry.coordinates.length === 1 &&
-      maskEntry.coordinates[0] === expectedPoly
-  );
+  return Boolean(maskEntry && typeof maskEntry === 'object' && maskEntry.enabled !== false)
+      ? maskEntry.coordinates === expectedPoly ||
+          (Array.isArray(maskEntry.coordinates) &&
+            maskEntry.coordinates.length === 1 &&
+            maskEntry.coordinates[0] === expectedPoly)
+      : false;
 }
 
 /**
@@ -134,7 +153,7 @@ function computeRequiredSnapshotDelay(
     instantSnapshot = INSTANT_EVENT_SNAPSHOT,
     snapDelayMs = SNAP_DELAY_MS
 ) {
-  if (activeMode === 'download') {
+  if (activeMode === STREAM_MODES.DOWNLOAD) {
     return BACKFILL_SNAP_DELAY_MS;
   }
   return instantSnapshot ? Math.min(snapDelayMs, FAST_LIVE_SNAP_DELAY_MS) : snapDelayMs;
@@ -148,9 +167,11 @@ function computeRequiredSnapshotDelay(
  * @param {Camera} camCfg - Camera configuration object from Frigate /api/config.
  * @param {'motion'|'objects'} section - Frigate mask section ('motion' or 'objects').
  * @param {string} poly - Normalized polygon string, or '' to disable.
+ * @param {string} [frigateUrl=cfg.frigate_url] - Frigate base URL.
  * @returns {Promise<'verified'|'applied'|'disabled'|'none'|'failed'>}
  */
-async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
+async function syncSingleFrigateMaskSection(cam, camCfg, section, poly, frigateUrl = cfg.frigate_url) {
+  const camName = cam.getName();
   const sectionObj = camCfg && camCfg[section] ? camCfg[section] : null;
   const existingMasks = sectionObj ? sectionObj.mask : undefined;
   const isNamedDict =
@@ -160,12 +181,12 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
     if (isNamedDict && existingMasks.eufy_bridge_card && existingMasks.eufy_bridge_card.enabled) {
       try {
         const disablePayload = buildFrigateMaskPayload(
-            cam.name,
+            camName,
             section,
             false,
             existingMasks.eufy_bridge_card.coordinates
         );
-        const res = await fetch(cfg.frigate_api + '/api/config/set', {
+        const res = await fetch(frigateUrl + '/api/config/set', {
           method: 'PUT',
           headers: {'Content-Type': 'application/json'},
           signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
@@ -183,13 +204,13 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
   if (isNamedDict && isFrigateMaskIntact(existingMasks.eufy_bridge_card, poly)) {
     return 'verified';
   }
-  if (section === 'objects' && cam.card.lastSyncedMaskPoly === poly) {
+  if (cam.isMaskSectionAlreadySynced(section, poly)) {
     return 'verified';
   }
 
   try {
-    const enablePayload = buildFrigateMaskPayload(cam.name, section, true, poly);
-    const putRes = await fetch(cfg.frigate_api + '/api/config/set', {
+    const enablePayload = buildFrigateMaskPayload(camName, section, true, poly);
+    const putRes = await fetch(frigateUrl + '/api/config/set', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
@@ -201,9 +222,9 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
     }
 
     const legacyUrl =
-        cfg.frigate_api +
+        frigateUrl +
         '/api/config/set?cameras.' +
-        encodeURIComponent(cam.name) +
+        encodeURIComponent(camName) +
         '.' +
         section +
         '.mask=' +
@@ -243,40 +264,53 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly) {
  * @param {Camera[]} cams - Array of Camera instances.
  * @param {boolean} [forceResync=false] - Whether to clear cached polygons and re-verify all cameras.
  * @param {boolean} [shuttingDown=false] - Whether the bridge is shutting down.
+ * @param {string} [frigateUrl=cfg.frigate_url] - Frigate base URL.
  */
-async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = false) {
-  if (isSyncingMasks || shuttingDown || !cfg.frigate_api || !cams.some((c) => c.card.autoFrigateMask)) {
+async function syncFrigateMotionMasks(
+    cams,
+    forceResync = false,
+    shuttingDown = false,
+    frigateUrl = cfg.frigate_url
+) {
+  if (isSyncingMasks || shuttingDown || !frigateUrl || !cams.some((c) => c.hasAutoFrigateMask())) {
     return;
   }
   isSyncingMasks = true;
   lastMaskCheckAt = Date.now();
   try {
+    const wasFrigateApiDown = frigateApiDown;
+    const hadPriorMaskSync = cams.some((c) => Boolean(c.card.lastSyncedMaskPoly));
+    let anyMaskReapplied = false;
     if (forceResync) {
       for (const c of cams) {
-        c.card.resetMaskSync();
+        c.resetMaskSync();
       }
     }
     let frigateCfg = null;
     try {
-      const r = await fetch(cfg.frigate_api + '/api/config', {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
+      const r = await fetch(frigateUrl + '/api/config', {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
       if (!r.ok) {
         frigateApiDown = true;
+        syncServiceHealthFlags(cams, {frigateConnected: false});
         return;
       }
       frigateCfg = await r.json();
     } catch (err) {
       frigateApiDown = true;
+      syncServiceHealthFlags(cams, {frigateConnected: false});
       log.debug('bridge', 'could not fetch Frigate /api/config for auto_frigate_mask: ' + err.message);
       return;
     }
 
+    frigateApiDown = false;
+    syncServiceHealthFlags(cams, {frigateConnected: true});
     lastMaskCheckAt = Date.now();
     for (const cam of cams) {
-      if (!cam.card.autoFrigateMask) {
+      if (!cam.hasAutoFrigateMask()) {
         continue;
       }
       const poly = cam.computeMaskPolygon();
-      const camCfg = frigateCfg && frigateCfg.cameras ? frigateCfg.cameras[cam.name] : null;
+      const camCfg = frigateCfg && frigateCfg.cameras ? frigateCfg.cameras[cam.getName()] : null;
       if (!camCfg) {
         continue;
       }
@@ -285,23 +319,21 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
       const objMask = camCfg.objects && camCfg.objects.mask ? camCfg.objects.mask.eufy_bridge_card : null;
       const masksIntact =
           isFrigateMaskIntact(motMask, poly) &&
-          (isFrigateMaskIntact(objMask, poly) || cam.card.lastSyncedMaskPoly === poly);
+          (isFrigateMaskIntact(objMask, poly) || cam.isMaskSectionAlreadySynced('objects', poly));
 
-      if (cam.card.isMaskSynced(poly, masksIntact)) {
+      if (cam.isMaskSynced(poly, masksIntact)) {
         continue;
       }
 
-      const motionStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'motion', poly);
-      const objectStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'objects', poly);
+      const motionStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'motion', poly, frigateUrl);
+      const objectStatus = await syncSingleFrigateMaskSection(cam, camCfg, 'objects', poly, frigateUrl);
 
       if (!poly) {
         if (motionStatus === 'disabled' || objectStatus === 'disabled') {
           log.info(
               cam,
               'disabled Frigate motion & object masks eufy_bridge_card (card is ' +
-              cam.card.theme +
-              '/' +
-              cam.card.position +
+              cam.formatCardPlacementSummary('/') +
               ')'
           );
         }
@@ -309,21 +341,25 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
       }
 
       if (motionStatus !== 'failed' && objectStatus !== 'failed') {
-        cam.card.markMaskSynced(poly);
-        const actionVerb =
-            motionStatus === 'applied' || objectStatus === 'applied' ? 'auto-applied' : 'verified';
+        cam.markMaskSynced(poly);
+        const wasApplied = motionStatus === 'applied' || objectStatus === 'applied';
+        if (wasApplied) {
+          anyMaskReapplied = true;
+        }
+        const actionVerb = wasApplied ? 'auto-applied' : 'verified';
         log.info(
             cam,
             actionVerb +
             ' Frigate motion & object masks eufy_bridge_card (' +
-            cam.card.theme +
-            '@' +
-            cam.card.position +
+            cam.formatCardPlacementSummary('@') +
             ' -> ' +
             poly +
             ')'
         );
       }
+    }
+    if (wasFrigateApiDown || (hadPriorMaskSync && anyMaskReapplied)) {
+      seedOfflineCameraSnapshots(cams);
     }
   } finally {
     isSyncingMasks = false;
@@ -338,11 +374,15 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
  */
 function handleEncoderReconnectMaskSync(cams, isShuttingDownFn) {
   frigateApiDown = true;
-  setTimeout(() => {
+  syncServiceHealthFlags(cams, {frigateConnected: false});
+  const timer = setTimeout(() => {
     if (!isShuttingDownFn()) {
       void syncFrigateMotionMasks(cams, true, isShuttingDownFn());
     }
   }, ENCODER_RECONNECT_MASK_SYNC_DELAY_MS);
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
 }
 
 /**
@@ -368,7 +408,7 @@ function checkPeriodicMaskSync(cams, now, shuttingDown) {
  */
 async function lookupFrigateReviewId(cameraName, eventId) {
   try {
-    const reviewUrl = cfg.frigate_api + '/api/review?cameras=' + cameraName + '&limit=' + REVIEW_QUERY_LIMIT;
+    const reviewUrl = cfg.frigate_url + '/api/review?cameras=' + cameraName + '&limit=' + REVIEW_QUERY_LIMIT;
     const rvRes = await fetch(reviewUrl, {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
     const rv = rvRes.ok ? await rvRes.json() : null;
     if (!Array.isArray(rv)) {
@@ -391,31 +431,34 @@ async function lookupFrigateReviewId(cameraName, eventId) {
  * @param {string} [personName=''] - Optional recognized face name from HomeBase 3.
  */
 function frigateEvent(cam, ev, personName = '') {
-  if (!cfg.frigate_api) {
+  if (!cfg.frigate_url) {
     return;
   }
   const label = resolveFrigateEventLabel(ev);
 
   const evState = cam.tryUpgradeOrQueueFrigateEvent(label, personName, Date.now());
-  if (evState.status === 'upgraded') {
-    if (evState.upgradedLabel) {
-      log.debug(cam, 'upgraded pending Frigate event label ("motion" -> "' + label + '")');
-    }
-    if (evState.attachedPerson) {
-      log.debug(cam, 'attached recognized person "' + personName + '" to pending Frigate event');
-    }
-    return;
+  const evScope = cam.getEventLogScope();
+  switch (evState.status) {
+    case 'upgraded':
+      if (evState.upgradedLabel) {
+        log.debug(evScope, 'upgraded pending Frigate event label ("motion" -> "' + label + '")');
+      }
+      if (evState.attachedPerson) {
+        log.debug(evScope, 'attached recognized person "' + personName + '" to pending Frigate event');
+      }
+      return;
+    case 'cooldown':
+      return;
+    default:
+      break;
   }
-  if (evState.status === 'cooldown') {
-    return;
-  }
-  cam.evTimer = setTimeout(async () => {
-    cam.evTimer = null;
+  const timer = setTimeout(async () => {
+    cam.beginFrigateSnapshotWait();
     notifyHA(cam, {});
 
-    const requiredDelayMs = computeRequiredSnapshotDelay(cam.activeMode);
-    const showing = () =>
-        cam.isReadyForEventSnapshot(
+    const requiredDelayMs = computeRequiredSnapshotDelay(cam.getActiveMode());
+    const needsWait = () =>
+        cam.shouldWaitForEventSnapshot(
             Date.now(),
             requiredDelayMs,
             FRESH_LIVE_FRAME_MS,
@@ -426,14 +469,15 @@ function frigateEvent(cam, ev, personName = '') {
         MIN_SNAPSHOT_WAIT_LOOPS,
         Math.ceil((SNAP_DELAY_MS + SNAPSHOT_EXTRA_WAIT_MS) / SNAPSHOT_POLL_INTERVAL_MS)
     );
-    for (let i = 0; i < maxWaitLoops && cam.evLabel !== 'test' && !showing(); i++) {
+    for (let i = 0; i < maxWaitLoops && cam.isSessionActive() && needsWait(); i++) {
       await sleep(SNAPSHOT_POLL_INTERVAL_MS);
     }
 
-    const noVideo = cam.evLabel !== 'test' && !showing();
+    const noVideo = needsWait();
+    let injectedCleanSnapshot = false;
     if (cam.canInjectCleanEventSnapshot(noVideo)) {
-      cam.card.suppressLiveCard = true;
-      cam.triggerKeyframeBurst(Date.now(), KEYFRAME_BURST_MS);
+      cam.enableCleanSnapshotCardSuppression(Date.now(), KEYFRAME_BURST_MS);
+      injectedCleanSnapshot = true;
       pushFrameToEncoder(cam, Date.now());
       await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
     }
@@ -441,19 +485,21 @@ function frigateEvent(cam, ev, personName = '') {
         Date.now(),
         LIVE_FPS
     );
+    const camName = cam.getName();
 
     try {
-      const createUrl = cfg.frigate_api + '/api/events/' + cam.name + '/' + finalLabel + '/create';
+      const createUrl = cfg.frigate_url + '/api/events/' + camName + '/' + finalLabel + '/create';
+      const createBody = {
+        source_type: 'api',
+        duration: durationSecs,
+        include_recording: true,
+        ...(subLabel ? {sub_label: subLabel} : {}),
+      };
       const r = await fetch(createUrl, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS),
-        body: JSON.stringify({
-          source_type: 'api',
-          sub_label: subLabel,
-          duration: durationSecs,
-          include_recording: true,
-        }),
+        body: JSON.stringify(createBody),
       });
       if (!r.ok) {
         const errBody = (await r.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
@@ -462,6 +508,7 @@ function frigateEvent(cam, ev, personName = '') {
       }
       const resJson = await r.json();
       const eventId = resJson.event_id;
+      cam.recordCreatedFrigateEvent(eventId, Date.now());
       const personSuffix = finalPerson ? ' [person: ' + finalPerson + ']' : '';
       if (noVideo) {
         log.warn(
@@ -477,32 +524,42 @@ function frigateEvent(cam, ev, personName = '') {
       }
 
       await sleep(REVIEW_LOOKUP_DELAY_MS);
-      const reviewId = await lookupFrigateReviewId(cam.name, eventId);
+      const reviewId = await lookupFrigateReviewId(camName, eventId);
       notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
       log.error(cam, 'Frigate event failed: ' + err.message);
     } finally {
-      if (cam.card.suppressLiveCard) {
-        cam.card.suppressLiveCard = false;
+      if (injectedCleanSnapshot) {
+        cam.disableCleanSnapshotCardSuppression();
         pushFrameToEncoder(cam, Date.now());
       }
     }
   }, EVENT_DISPATCH_DELAY_MS);
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  cam.setFrigateEventTimer(timer);
 }
 
 /**
- * Checks whether Frigate currently has any active non-synthetic object detections in progress
- * for a camera, used to decide whether early sleep can safely put a motion-woken camera to sleep.
+ * Checks whether Frigate currently has any active or recently-active non-synthetic object
+ * detections for a camera, used to decide whether to extend the hold window or allow early sleep.
  *
  * @param {Camera} cam - Camera state object.
- * @returns {Promise<boolean>} True if Frigate has no active tracked object detections on this camera.
+ * @param {number} [clockNow] - Optional synthetic timestamp in milliseconds; uses Date.now() when omitted.
+ * @returns {Promise<boolean>} True if Frigate has no active or recent tracked object detections on this camera.
  */
-async function isFrigateCameraIdle(cam) {
-  if (!cfg.frigate_api) {
+async function isFrigateCameraIdle(cam, clockNow) {
+  if (!cfg.frigate_url) {
     return true;
   }
   try {
-    const url = cfg.frigate_api + '/api/events?cameras=' + cam.name + '&in_progress=1&limit=' + ACTIVE_EVENTS_QUERY_LIMIT;
+    const url =
+        cfg.frigate_url +
+        '/api/events?cameras=' +
+        cam.getName() +
+        '&limit=' +
+        ACTIVE_EVENTS_QUERY_LIMIT;
     const r = await fetch(url, {signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS)});
     if (!r.ok) {
       return false;
@@ -511,10 +568,8 @@ async function isFrigateCameraIdle(cam) {
     if (!Array.isArray(events)) {
       return false;
     }
-    const activeTracked = events.some(
-        (ev) => ev.sub_label !== 'eufy' && (!cam.evPerson || ev.sub_label !== cam.evPerson)
-    );
-    return !activeTracked;
+    const evalNow = clockNow === undefined ? Date.now() : clockNow;
+    return !cam.evaluateFrigateEventsActivity(events, evalNow);
   } catch (err) {
     return false;
   }
@@ -532,6 +587,9 @@ function classifyViewerAction(params) {
     camActive,
     alreadyViewing,
     isDashboardGrid,
+    blockedByOffline,
+    offlineReason,
+    blockedByBackfill,
     blockedByP2pMotion,
     activeMotionCamName,
     blockedByEco,
@@ -541,36 +599,47 @@ function classifyViewerAction(params) {
 
   const asked =
       !isDashboardGrid &&
+      !blockedByOffline &&
+      !blockedByBackfill &&
       (!camActive || alreadyViewing) &&
       !blockedByP2pMotion &&
       !blockedByEco &&
       (alreadyViewing || !inCooldown);
 
   if (asked) {
-    return {
+    return Object.freeze({
       asked: true,
       actionDesc: camActive ? 'extending active live view' : 'waking the camera',
-    };
+    });
   }
   if (isDashboardGrid) {
-    return {asked: false, actionDesc: 'ignored, multi-camera dashboard grid view'};
+    return Object.freeze({asked: false, actionDesc: 'ignored, multi-camera dashboard grid view'});
+  }
+  if (blockedByOffline) {
+    return Object.freeze({
+      asked: false,
+      actionDesc: 'ignored, camera is offline (' + (offlineReason || 'offline') + ')',
+    });
   }
   if (camActive) {
-    return {asked: false, actionDesc: 'joined while live, does not extend it'};
+    return Object.freeze({asked: false, actionDesc: 'joined while live, does not extend it'});
+  }
+  if (blockedByBackfill) {
+    return Object.freeze({asked: false, actionDesc: 'ignored, waiting for HomeBase clip backfill'});
   }
   if (blockedByP2pMotion) {
-    return {
+    return Object.freeze({
       asked: false,
       actionDesc: 'ignored, ' + activeMotionCamName + ' is active with P2P motion/event',
-    };
+    });
   }
   if (blockedByEco) {
-    return {
+    return Object.freeze({
       asked: false,
       actionDesc: 'ignored, camera is in low-battery economy mode (' + batteryPct + '%)',
-    };
+    });
   }
-  return {asked: false, actionDesc: 'ignored, camera just went to sleep (cooldown)'};
+  return Object.freeze({asked: false, actionDesc: 'ignored, camera just went to sleep (cooldown)'});
 }
 
 /**
@@ -587,14 +656,14 @@ async function pollViewers(cams, hooks) {
   isPollingViewers = true;
   try {
     const findStationMotionCam = (cam) =>
-        cams.find((c) => c.isInMotion() && !c.isRtspCapable() && c.getStationKey() === cam.getStationKey());
+        cams.find((c) => c.isHoldingStationP2pForMotion(cam.getStationKey()));
     const newConnections = [];
 
     let anyPollOk = false;
     let allPollsFailed = true;
     for (const cam of cams) {
       try {
-        const r = await fetch(cfg.go2rtc_api + '/api/streams?src=' + cam.name, {
+        const r = await fetch(cfg.go2rtc_url + '/api/streams?src=' + cam.getName(), {
           signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS),
         });
         if (!r.ok) {
@@ -603,15 +672,19 @@ async function pollViewers(cams, hooks) {
         allPollsFailed = false;
         anyPollOk = true;
         const d = await r.json();
-        const viewers = (d.consumers || []).filter(
-            (c) => !/FFmpeg Frigate|^go2rtc/i.test(c.user_agent || '')
-        );
+        const consumers = d.consumers || [];
         const now = Date.now();
+        if (cam.notifyEncoderConsumersObserved(consumers.length, OFFLINE_SNAPSHOT_SEED_MS, now)) {
+          pushFrameToEncoder(cam, now);
+        }
+        const viewers = consumers.filter(
+            (c) => !INTERNAL_RECORDER_USER_AGENT_REGEX.test(c.user_agent || '')
+        );
         const seen = new Set();
 
         for (const v of viewers) {
           seen.add(v.id);
-          if (cam.viewerIds.has(v.id)) {
+          if (cam.hasRegisteredViewer(v.id)) {
             continue;
           }
 
@@ -639,23 +712,47 @@ async function pollViewers(cams, hooks) {
     }
     if (allPollsFailed) {
       frigateApiDown = true;
-    } else if (anyPollOk && frigateApiDown) {
-      frigateApiDown = false;
-      log.info('bridge', 'Frigate API recovered after restart/outage, re-verifying motion & object masks');
-      setTimeout(() => {
-        if (!isShuttingDown()) {
-          void syncFrigateMotionMasks(cams, true, isShuttingDown());
-        }
-      }, FRIGATE_RECOVERY_MASK_SYNC_DELAY_MS);
+      syncServiceHealthFlags(cams, {go2rtcConnected: false});
+    } else if (anyPollOk) {
+      syncServiceHealthFlags(cams, {go2rtcConnected: true});
+      if (frigateApiDown) {
+        frigateApiDown = false;
+        syncServiceHealthFlags(cams, {frigateConnected: true});
+        log.info('bridge', 'Frigate API recovered after restart/outage, re-verifying motion & object masks');
+        seedOfflineCameraSnapshots(cams);
+        setTimeout(() => {
+          if (!isShuttingDown()) {
+            void syncFrigateMotionMasks(cams, true, isShuttingDown());
+          }
+        }, FRIGATE_RECOVERY_MASK_SYNC_DELAY_MS);
+      }
     }
 
-    const activeViewerCams = cams.filter((c) => c.viewers > 0);
+    const activeViewerCams = cams.filter((c) => c.hasConnectedViewers());
     const distinctNewCams = new Set(newConnections.map((x) => x.cam));
     const isDashboardGrid = distinctNewCams.size > 1 && activeViewerCams.length > 1;
     let newestViewerCam = null;
 
+    if (newConnections.length > 0) {
+      const pollNow = Date.now();
+      const offlineRefreshCams = cams.filter((c) => c.shouldRefreshOfflineOnView(pollNow));
+      if (offlineRefreshCams.length > 0) {
+        for (const offlineCam of offlineRefreshCams) {
+          log.info(
+              offlineCam,
+              'viewer activity detected while camera is offline (' +
+              (offlineCam.getOfflineReason() || 'offline') +
+              '), polling HomeBase for battery swap/recovery'
+          );
+        }
+        void fetchAllCameraTelemetry(true);
+      }
+    }
+
     for (const conn of newConnections) {
       const {cam, id, clientInfo, now} = conn;
+      const blockedByOffline = cam.isDeviceOffline();
+      const blockedByBackfill = cam.isViewerBlockedByBackfill();
       const blockedByEco = !cam.canWakeOnViewerInLowBattery();
       const activeP2pMotionCam = findStationMotionCam(cam);
       const blockedByP2pMotion = !cam.isRtspCapable() && Boolean(activeP2pMotionCam);
@@ -663,23 +760,22 @@ async function pollViewers(cams, hooks) {
       const inCooldown = cam.isInViewerCooldown(now);
 
       const {asked, actionDesc} = classifyViewerAction({
-        camActive: cam.active,
+        camActive: cam.isSessionActive(),
         alreadyViewing,
         isDashboardGrid,
+        blockedByOffline,
+        offlineReason: cam.getOfflineReason(),
+        blockedByBackfill,
         blockedByP2pMotion,
-        activeMotionCamName: activeP2pMotionCam ? activeP2pMotionCam.name : '',
+        activeMotionCamName: activeP2pMotionCam ? activeP2pMotionCam.getName() : '',
         blockedByEco,
-        batteryPct: cam.telemetry.battery,
+        batteryPct: cam.getBatteryPct(),
         inCooldown,
       });
 
-      cam.viewerIds.set(id, asked);
+      cam.setViewerWakingStatus(id, asked);
       if (asked) {
         newestViewerCam = cam;
-      }
-      if (!isDashboardGrid && blockedByEco && cam.telemetry.shouldRefreshLowBatteryOnView(now)) {
-        log.info(cam, 'viewer connected while in low-battery mode, polling HomeBase for battery swap');
-        void fetchAllCameraTelemetry(true);
       }
 
       log.info(cam, 'viewer connected (' + clientInfo + ') - ' + actionDesc);
@@ -688,13 +784,14 @@ async function pollViewers(cams, hooks) {
     if (newestViewerCam) {
       newestViewerCam.cancelStartupProbe();
       const switchNow = Date.now();
+      const targetCamName = newestViewerCam.getName();
       for (const other of cams) {
         if (other.shouldYieldToNewStationViewer(newestViewerCam, switchNow)) {
-          other.clearViewerQueue('viewer switched to ' + newestViewerCam.name);
-          if (other.active) {
+          other.clearViewerQueue('viewer switched to ' + targetCamName);
+          if (other.isSessionActive()) {
             stopCam(
                 other,
-                'preempted by live view opened on ' + newestViewerCam.name,
+                'preempted by live view opened on ' + targetCamName,
                 true,
                 'viewer-preempt'
             );
@@ -703,9 +800,8 @@ async function pollViewers(cams, hooks) {
       }
     }
     for (const cam of cams) {
-      if (cam.hasWakingViewer()) {
-        cam.isStartupProbe = false;
-        triggerCam(cam, 'live view opened', cam.getViewLingerMs(), 'view', 'viewer');
+      if (cam.promoteStartupProbeToViewerWake()) {
+        triggerCam(cam, 'live view opened', cam.getViewLingerMs(), WAKE_KINDS.VIEW, 'viewer');
       }
     }
   } finally {
@@ -715,7 +811,11 @@ async function pollViewers(cams, hooks) {
 
 module.exports = {
   BACKFILL_SNAP_DELAY_MS,
+  buildFrigateMaskPayload,
+  isFrigateMaskIntact,
+  resolveFrigateEventLabel,
   computeRequiredSnapshotDelay,
+  classifyViewerAction,
   syncFrigateMotionMasks,
   handleEncoderReconnectMaskSync,
   checkPeriodicMaskSync,

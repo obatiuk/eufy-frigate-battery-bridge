@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -9,18 +10,27 @@
  */
 'use strict';
 
-const {W, H, FRAME} = require('../config');
+const {W, H, FRAME, SLEEP_SCREENS} = require('../config');
 
 const FROSTED_BLUR_PASSES = 3;
 const FROSTED_LUMA_BLUR_RADIUS = 12;
 const FROSTED_CHROMA_BLUR_RADIUS = 6;
 const ROUNDED_BOX_BLUR_PAD_PX = 28;
+const HALF_PIXEL = 0.5;
+const DEFAULT_BORDER_OPACITY = 0.18;
+const RIM_WIDTH_PX = 1.25;
+const GLASS_TINT_R = 12;
+const GLASS_TINT_G = 12;
+const GLASS_TINT_B = 14;
+const MAX_CHANNEL_BYTE = 255;
 const BLACK_BG_LUMA = 0x10;
 const SLATE_BG_LUMA = 0x22;
 const NEUTRAL_CHROMA = 0x80;
 
-// Reusable scratch buffer for separable box-blur passes to avoid per-render heap allocations.
+// Reusable scratch buffers for separable box-blur passes, blurred sub-regions, and base backdrop canvas.
 let blurScratch = Buffer.allocUnsafe(0);
+let regionScratch = Buffer.allocUnsafe(0);
+const bgCanvasScratch = Buffer.allocUnsafe(FRAME);
 
 /**
  * Blends an RGB pixel with opacity alpha (0..1) into a raw YUV420p frame buffer at (x, y).
@@ -81,68 +91,6 @@ function fillYuvRect(yuvBuf, rx, ry, rw, rh, r, g, b, alpha) {
 }
 
 /**
- * Draws an anti-aliased filled circle onto a YUV420p frame buffer.
- *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Center X coordinate.
- * @param {number} cy - Center Y coordinate.
- * @param {number} radius - Circle radius in pixels.
- * @param {number[]} rgb - RGB color array [r, g, b].
- * @param {number} alpha - Opacity (0..1).
- */
-function drawYuvCircle(canvas, cx, cy, radius, rgb, alpha) {
-  const [r, g, b] = rgb;
-  const pad = Math.ceil(radius + 1);
-  const y0 = Math.max(0, Math.floor(cy - pad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + pad));
-  const x0 = Math.max(0, Math.floor(cx - pad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + pad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const cov = Math.min(1, Math.max(0, radius + 0.5 - Math.hypot(x - cx, y - cy)));
-      if (cov > 0) {
-        blendYuvPixel(canvas, x, y, r, g, b, alpha * cov);
-      }
-    }
-  }
-}
-
-
-/**
- * Draws an anti-aliased line segment between (x1, y1) and (x2, y2) onto a YUV420p buffer.
- *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} x1 - Start X coordinate.
- * @param {number} y1 - Start Y coordinate.
- * @param {number} x2 - End X coordinate.
- * @param {number} y2 - End Y coordinate.
- * @param {number} strokeHalf - Half of the line thickness in pixels.
- * @param {number[]} rgb - RGB color array [r, g, b].
- * @param {number} alpha - Opacity (0..1).
- */
-function drawYuvLine(canvas, x1, y1, x2, y2, strokeHalf, rgb, alpha) {
-  const [r, g, b] = rgb;
-  const minX = Math.max(0, Math.floor(Math.min(x1, x2) - strokeHalf - 1));
-  const maxX = Math.min(W - 1, Math.ceil(Math.max(x1, x2) + strokeHalf + 1));
-  const minY = Math.max(0, Math.floor(Math.min(y1, y2) - strokeHalf - 1));
-  const maxY = Math.min(H - 1, Math.ceil(Math.max(y1, y2) + strokeHalf + 1));
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  const lenSq = dx * dx + dy * dy || 1;
-
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      const t = Math.max(0, Math.min(1, ((x - x1) * dx + (y - y1) * dy) / lenSq));
-      const dist = Math.hypot(x - (x1 + t * dx), y - (y1 + t * dy));
-      const cov = Math.min(1, Math.max(0, strokeHalf + 0.5 - dist));
-      if (cov > 0) {
-        blendYuvPixel(canvas, x, y, r, g, b, alpha * cov);
-      }
-    }
-  }
-}
-
-/**
  * Performs a single horizontal + vertical sliding-window box blur pass on a planar Y, U, or V buffer.
  *
  * @param {Uint8Array} buf - Target YUV420p region buffer.
@@ -196,18 +144,22 @@ function boxBlurPlane(buf, offset, width, height, radius) {
  * @param {number} ry0 - Even-aligned top Y coordinate of the region.
  * @param {number} rw - Even-aligned width of the region.
  * @param {number} rh - Even-aligned height of the region.
- * @returns {{ buf: Uint8Array, lumaSize: number, chromaSize: number, cw: number }}
+ * @returns {{ buf: Uint8Array, buffer: ArrayBufferLike, lumaSize: number, chromaSize: number, cw: number }}
  */
 function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
   const cw = rw >> 1;
   const ch = rh >> 1;
   const lumaSize = rw * rh;
   const chromaSize = cw * ch;
-  const regionBuf = Buffer.allocUnsafe(lumaSize + chromaSize * 2);
+  const totalBytes = lumaSize + chromaSize * 2;
+  if (regionScratch.length < totalBytes) {
+    regionScratch = Buffer.allocUnsafe(totalBytes);
+  }
+  const regionBuf = regionScratch.subarray(0, totalBytes);
 
   for (let y = 0; y < rh; y++) {
     const srcOff = (ry0 + y) * W + rx0;
-    canvas.copy(regionBuf, y * rw, srcOff, srcOff + rw);
+    regionBuf.set(canvas.subarray(srcOff, srcOff + rw), y * rw);
   }
 
   const fullCw = W >> 1;
@@ -215,8 +167,8 @@ function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
   for (let cy = 0; cy < ch; cy++) {
     const srcU = W * H + ((ry0 >> 1) + cy) * fullCw + (rx0 >> 1);
     const srcV = srcU + fullChromaSize;
-    canvas.copy(regionBuf, lumaSize + cy * cw, srcU, srcU + cw);
-    canvas.copy(regionBuf, lumaSize + chromaSize + cy * cw, srcV, srcV + cw);
+    regionBuf.set(canvas.subarray(srcU, srcU + cw), lumaSize + cy * cw);
+    regionBuf.set(canvas.subarray(srcV, srcV + cw), lumaSize + chromaSize + cy * cw);
   }
 
   for (let pass = 0; pass < FROSTED_BLUR_PASSES; pass++) {
@@ -225,7 +177,7 @@ function extractBlurredRegion(canvas, rx0, ry0, rw, rh) {
     boxBlurPlane(regionBuf, lumaSize + chromaSize, cw, ch, FROSTED_CHROMA_BLUR_RADIUS);
   }
 
-  return {buf: regionBuf, lumaSize, chromaSize, cw};
+  return {buf: regionBuf, buffer: regionBuf.buffer, lumaSize, chromaSize, cw};
 }
 
 /**
@@ -269,10 +221,20 @@ function blendBlurredBackdropPixel(canvas, gx, gy, rx0, ry0, rw, blurred, cov) {
  * @param {number} boxH - Box height in pixels.
  * @param {number} radius - Corner radius in pixels.
  * @param {number} opacity - Dark glass tint opacity (0..1).
- * @param {number} [borderOpacity=0.16] - Subtle rim highlight opacity (0..1).
+ * @param {number} [borderOpacity=DEFAULT_BORDER_OPACITY] - Subtle rim highlight opacity (0..1).
  * @param {boolean} [blurBackdrop=true] - Whether to run a frosted-glass blur on the underlying pixels.
  */
-function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderOpacity = 0.16, blurBackdrop = true) {
+function drawRoundedBox(
+    canvas,
+    boxX,
+    boxY,
+    boxW,
+    boxH,
+    radius,
+    opacity,
+    borderOpacity = DEFAULT_BORDER_OPACITY,
+    blurBackdrop = true
+) {
   const pad = ROUNDED_BOX_BLUR_PAD_PX;
   const rx0 = Math.max(0, (boxX - pad) & ~1);
   const ry0 = Math.max(0, (boxY - pad) & ~1);
@@ -282,9 +244,14 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
   const rh = ry1 - ry0;
 
   const blurred = blurBackdrop ? extractBlurredRegion(canvas, rx0, ry0, rw, rh) : null;
-  const rSafe = Math.min(radius, Math.floor(boxW / 2), Math.floor(boxH / 2));
+  const hx = boxW / 2;
+  const hy = boxH / 2;
+  const rSafe = Math.min(radius, hx, hy);
+  const innerHalfW = hx - rSafe;
+  const innerHalfH = hy - rSafe;
 
   for (let py = 0; py < boxH; py++) {
+    const qy = Math.abs(py + HALF_PIXEL - hy) - innerHalfH;
     for (let px = 0; px < boxW; px++) {
       const gx = boxX + px;
       const gy = boxY + py;
@@ -292,10 +259,9 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
         continue;
       }
 
-      const dx = Math.max(rSafe - px, 0, px - (boxW - 1 - rSafe));
-      const dy = Math.max(rSafe - py, 0, py - (boxH - 1 - rSafe));
-      const dist = Math.hypot(dx, dy);
-      const cov = Math.min(1, Math.max(0, rSafe + 0.5 - dist));
+      const qx = Math.abs(px + HALF_PIXEL - hx) - innerHalfW;
+      const sdf = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - rSafe;
+      const cov = Math.min(1, Math.max(0, HALF_PIXEL - sdf));
       if (cov <= 0) {
         continue;
       }
@@ -304,11 +270,20 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
         blendBlurredBackdropPixel(canvas, gx, gy, rx0, ry0, rw, blurred, cov);
       }
 
-      blendYuvPixel(canvas, gx, gy, 12, 12, 14, opacity * cov);
+      blendYuvPixel(canvas, gx, gy, GLASS_TINT_R, GLASS_TINT_G, GLASS_TINT_B, opacity * cov);
       if (borderOpacity > 0) {
-        const borderCov = Math.min(1, Math.max(0, 1.1 - Math.abs(dist - (rSafe - 0.6))));
-        if (borderCov > 0) {
-          blendYuvPixel(canvas, gx, gy, 255, 255, 255, borderOpacity * borderCov * cov);
+        const innerCov = Math.min(1, Math.max(0, HALF_PIXEL - (sdf + RIM_WIDTH_PX)));
+        const rimCov = cov - innerCov;
+        if (rimCov > 0) {
+          blendYuvPixel(
+              canvas,
+              gx,
+              gy,
+              MAX_CHANNEL_BYTE,
+              MAX_CHANNEL_BYTE,
+              MAX_CHANNEL_BYTE,
+              borderOpacity * rimCov
+          );
         }
       }
     }
@@ -324,74 +299,122 @@ function drawRoundedBox(canvas, boxX, boxY, boxW, boxH, radius, opacity, borderO
  * @returns {{ baseCanvas: Uint8Array, hasBackground: boolean }}
  */
 function prepareBackgroundCanvas(cardCfg, bgFrame) {
-  const baseCanvas = Buffer.allocUnsafe(FRAME);
+  const baseCanvas = bgCanvasScratch;
   const hasBackground =
-      cardCfg.sleepScreen === 'snapshot' && Buffer.isBuffer(bgFrame) && bgFrame.length === FRAME;
+      cardCfg.sleepScreen === SLEEP_SCREENS.SNAPSHOT &&
+      Buffer.isBuffer(bgFrame) &&
+      bgFrame.length === FRAME;
 
   if (hasBackground) {
     bgFrame.copy(baseCanvas);
   } else {
     baseCanvas.fill(NEUTRAL_CHROMA, W * H);
-    baseCanvas.fill(cardCfg.sleepScreen === 'black' ? BLACK_BG_LUMA : SLATE_BG_LUMA, 0, W * H);
+    baseCanvas.fill(
+        cardCfg.sleepScreen === SLEEP_SCREENS.BLACK ? BLACK_BG_LUMA : SLATE_BG_LUMA,
+        0,
+        W * H
+    );
   }
 
   return {baseCanvas, hasBackground};
 }
 
-/**
- * Copies a rounded-rectangle sub-region (boxX, boxY, boxW, boxH) with corner radius from
- * srcYuv onto dstYuv, leaving pixels outside the rounded corners untouched and smoothly
- * alpha-blending the anti-aliased corner arc.
- *
- * @param {Uint8Array} srcYuv - Source YUV420p frame buffer.
- * @param {Uint8Array} dstYuv - Destination YUV420p frame buffer.
- * @param {number} boxX - Left X coordinate.
- * @param {number} boxY - Top Y coordinate.
- * @param {number} boxW - Width in pixels.
- * @param {number} boxH - Height in pixels.
- * @param {number} radius - Corner radius in pixels.
- */
-function copyRoundedYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH, radius) {
-  const rSafe = Math.min(radius, Math.floor(boxW / 2), Math.floor(boxH / 2));
-  const cw = W >> 1;
-  const cSize = cw * (H >> 1);
+const MONO_CHAR_ADVANCE_PX = 7;
+const MONO_GLYPH_W = 5;
+const MONO_GLYPH_H = 9;
 
-  for (let py = 0; py < boxH; py++) {
-    const gy = boxY + py;
-    if (gy < 0 || gy >= H) {
+/**
+ * Fixed-width 5x9 monospace bitmap glyph table for zero-subprocess diagnostic HUD text rendering.
+ *
+ * @type {Readonly<Record<string, ReadonlyArray<number>>>}
+ */
+const MONO_FONT_5X9 = Object.freeze({
+  '0': [0x0e, 0x11, 0x11, 0x13, 0x15, 0x19, 0x11, 0x11, 0x0e],
+  '1': [0x04, 0x0c, 0x14, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f],
+  '2': [0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x10, 0x11, 0x1f],
+  '3': [0x0e, 0x11, 0x01, 0x01, 0x06, 0x01, 0x01, 0x11, 0x0e],
+  '4': [0x02, 0x06, 0x0a, 0x12, 0x12, 0x1f, 0x02, 0x02, 0x02],
+  '5': [0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x01, 0x11, 0x0e],
+  '6': [0x06, 0x08, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x11, 0x0e],
+  '7': [0x1f, 0x11, 0x01, 0x02, 0x04, 0x04, 0x08, 0x08, 0x08],
+  '8': [0x0e, 0x11, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x11, 0x0e],
+  '9': [0x0e, 0x11, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x02, 0x0c],
+  A: [0x04, 0x0a, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11, 0x11],
+  B: [0x1e, 0x11, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x11, 0x1e],
+  C: [0x0e, 0x11, 0x10, 0x10, 0x10, 0x10, 0x10, 0x11, 0x0e],
+  D: [0x1c, 0x12, 0x11, 0x11, 0x11, 0x11, 0x11, 0x12, 0x1c],
+  E: [0x1f, 0x10, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10, 0x1f],
+  F: [0x1f, 0x10, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10, 0x10],
+  G: [0x0e, 0x11, 0x10, 0x10, 0x17, 0x11, 0x11, 0x11, 0x0f],
+  H: [0x11, 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11, 0x11],
+  I: [0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e],
+  J: [0x07, 0x02, 0x02, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0c],
+  K: [0x11, 0x12, 0x14, 0x18, 0x18, 0x14, 0x12, 0x11, 0x11],
+  L: [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
+  M: [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11, 0x11, 0x11],
+  N: [0x11, 0x19, 0x19, 0x15, 0x15, 0x13, 0x13, 0x11, 0x11],
+  O: [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+  P: [0x1e, 0x11, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10, 0x10],
+  Q: [0x0e, 0x11, 0x11, 0x11, 0x11, 0x15, 0x13, 0x0e, 0x01],
+  R: [0x1e, 0x11, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11, 0x11],
+  S: [0x0e, 0x11, 0x10, 0x08, 0x06, 0x01, 0x01, 0x11, 0x0e],
+  T: [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+  U: [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+  V: [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x0a, 0x04],
+  W: [0x11, 0x11, 0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11],
+  X: [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x0a, 0x11, 0x11],
+  Y: [0x11, 0x11, 0x0a, 0x0a, 0x04, 0x04, 0x04, 0x04, 0x04],
+  Z: [0x1f, 0x01, 0x02, 0x04, 0x04, 0x08, 0x10, 0x10, 0x1f],
+  ':': [0x00, 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00, 0x00],
+  '/': [0x01, 0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10, 0x10],
+  '-': [0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00],
+  '+': [0x00, 0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00, 0x00],
+  '>': [0x00, 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10, 0x00],
+  _: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f],
+  '.': [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c],
+  '%': [0x19, 0x19, 0x02, 0x04, 0x04, 0x08, 0x13, 0x13, 0x00],
+  '*': [0x00, 0x04, 0x15, 0x0e, 0x1f, 0x0e, 0x15, 0x04, 0x00],
+  '|': [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+  '#': [0x0a, 0x0a, 0x1f, 0x0a, 0x0a, 0x0a, 0x1f, 0x0a, 0x0a],
+});
+
+/**
+ * Renders fixed-width monospace text directly onto a YUV420p canvas using a 5x9 bitmap font
+ * with a 1px dark luma shadow so small white characters remain razor-sharp over blurred video.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {number} x - Left X coordinate of the first character cell.
+ * @param {number} y - Top Y coordinate of the text row.
+ * @param {string} text - Text string to render.
+ * @param {readonly [number, number, number]} [rgb=[250, 250, 255]] - Foreground [R, G, B] color.
+ */
+function drawMonospaceText(canvas, x, y, text, rgb = [250, 250, 255]) {
+  const [r, g, b] = rgb;
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const ch = text[i];
+    if (ch === ' ') {
       continue;
     }
-    const dy = Math.max(rSafe - py, 0, py - (boxH - 1 - rSafe));
-    const rowOff = gy * W;
-
-    for (let px = 0; px < boxW; px++) {
-      const gx = boxX + px;
-      if (gx < 0 || gx >= W) {
+    const glyph = MONO_FONT_5X9[ch] || MONO_FONT_5X9[ch.toUpperCase()];
+    if (!glyph) {
+      continue;
+    }
+    const cx = x + i * MONO_CHAR_ADVANCE_PX;
+    if (cx + MONO_GLYPH_W >= W) {
+      break;
+    }
+    for (let row = 0; row < MONO_GLYPH_H; row++) {
+      const bits = glyph[row];
+      if (!bits) {
         continue;
       }
-      const dx = Math.max(rSafe - px, 0, px - (boxW - 1 - rSafe));
-      const cov =
-          dx === 0 && dy === 0 ? 1 : Math.min(1, Math.max(0, rSafe + 0.5 - Math.hypot(dx, dy)));
-      if (cov <= 0) {
-        continue;
-      }
-
-      const yIdx = rowOff + gx;
-      if (cov >= 1) {
-        dstYuv[yIdx] = srcYuv[yIdx];
-      } else {
-        dstYuv[yIdx] = (dstYuv[yIdx] * (1 - cov) + srcYuv[yIdx] * cov + 0.5) | 0;
-      }
-
-      if ((gx & 1) === 0 && (gy & 1) === 0) {
-        const uIdx = W * H + (gy >> 1) * cw + (gx >> 1);
-        const vIdx = uIdx + cSize;
-        if (cov >= 1) {
-          dstYuv[uIdx] = srcYuv[uIdx];
-          dstYuv[vIdx] = srcYuv[vIdx];
-        } else {
-          dstYuv[uIdx] = (dstYuv[uIdx] * (1 - cov) + srcYuv[uIdx] * cov + 0.5) | 0;
-          dstYuv[vIdx] = (dstYuv[vIdx] * (1 - cov) + srcYuv[vIdx] * cov + 0.5) | 0;
+      const gy = y + row;
+      for (let col = 0; col < MONO_GLYPH_W; col++) {
+        if ((bits & (1 << (MONO_GLYPH_W - 1 - col))) !== 0) {
+          const gx = cx + col;
+          blendYuvPixel(canvas, gx + 1, gy + 1, 8, 8, 10, 0.85);
+          blendYuvPixel(canvas, gx, gy, r, g, b, 1);
         }
       }
     }
@@ -401,9 +424,8 @@ function copyRoundedYuvRegion(srcYuv, dstYuv, boxX, boxY, boxW, boxH, radius) {
 module.exports = {
   blendYuvPixel,
   fillYuvRect,
-  drawYuvCircle,
-  drawYuvLine,
+  extractBlurredRegion,
   drawRoundedBox,
   prepareBackgroundCanvas,
-  copyRoundedYuvRegion,
+  drawMonospaceText,
 };

@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -14,34 +15,71 @@ const {
   W,
   H,
   FRAME,
+  CARD_THEMES,
+  CARD_POSITIONS,
+  CARD_STATUS_TITLES,
   GLOBAL_AUTO_FRIGATE_MASK,
   GLOBAL_CARD_SHOW_ON_LIVE,
   resolveCardConfig,
 } = require('../config');
-const {TEL_TEXT_CHAR_WIDTH, evaluateTelemetryState, buildTelemetrySegments} = require('./telemetry');
+const {
+  POWER_LABELS,
+  WIFI_SIGNAL_LEVELS,
+  TEL_TEXT_CHAR_WIDTH,
+  evaluateTelemetryState,
+  buildTelemetrySegments,
+} = require('./telemetry');
 
 const CARD_CORNER_MARGIN_PX = 24;
-const MINIMAL_CARD_WIDTH = 92;
-const MINIMAL_CARD_HEIGHT = 36;
+const BOUNDS_PLACEHOLDER_BATTERY_PCT = 100;
+const BOUNDS_PLACEHOLDER_RSSI_DBM = -60;
+const BOUNDS_PLACEHOLDER_TEMP_C = 25;
+const BOUNDS_PLACEHOLDER_LAST_SEEN = '00:00';
+const MASK_NORMALIZED_COORD_DECIMALS = 3;
+const MINIMAL_CARD_WIDTH = 110;
+const MINIMAL_CARD_HEIGHT = 44;
 const ICONS_CARD_HEIGHT = 44;
 const ICONS_CARD_PAD_X = 16;
 const ICONS_CARD_ITEM_GAP = 16;
-const ICONS_STATUS_WIDTH = 20;
-const ICONS_BATTERY_WIDTH = 37;
-const ICONS_WIFI_WIDTH = 28;
-const ICONS_TEMP_WIDTH = 16;
-const ICONS_CLOCK_WIDTH = 20;
+const ICONS_STATUS_WIDTH = 22;
+const ICONS_BATTERY_WIDTH = 38;
+const ICONS_WIFI_WIDTH = 30;
+const ICONS_TEMP_WIDTH = 18;
+const ICONS_CLOCK_WIDTH = 22;
 const DETAILED_CORNER_MIN_WIDTH_WITH_TEL = 540;
 const DETAILED_CORNER_MIN_WIDTH_NO_TEL = 400;
 const DETAILED_CORNER_HEIGHT_WITH_TEL = 88;
 const DETAILED_CORNER_HEIGHT_NO_TEL = 48;
 const DETAILED_CORNER_TEL_GAP = 18;
 const DETAILED_CORNER_TEL_PAD_X = 44;
-const DETAILED_CORNER_CARD_RADIUS = 22;
-const DETAILED_CORNER_HEADER_LEFT_X = 42;
+const CARD_CORNER_RADIUS = 22;
+const DETAILED_CORNER_HEADER_LEFT_X = 45;
 const DETAILED_CORNER_HEADER_CHAR_W = TEL_TEXT_CHAR_WIDTH;
 const DETAILED_CORNER_HEADER_RIGHT_PAD = 24;
+const DEBUG_CARD_MAX_WIDTH = 832;
+const DEBUG_CARD_HEIGHT = 76;
+const DEBUG_CARD_MARGIN_X = 16;
+const DEBUG_CARD_MARGIN_Y = 12;
 const FRIGATE_MASK_SAFETY_PAD_PX = 6;
+
+/**
+ * Computes the bottom-anchored bounding box { boxX, boxY, boxW, boxH } for the diagnostic
+ * "debug" HUD theme, strictly capped at <= 2/3 of the frame width.
+ *
+ * @param {string} position - Normalized card_position string.
+ * @returns {Readonly<{ boxX: number, boxY: number, boxW: number, boxH: number }>}
+ */
+function computeDebugCardBounds(position) {
+  const maxTwoThirds = Math.floor((W * 2) / 3) & ~1;
+  const boxW = Math.min(DEBUG_CARD_MAX_WIDTH, Math.max(240, maxTwoThirds));
+  const boxH = DEBUG_CARD_HEIGHT;
+  const boxY = Math.max(0, H - boxH - DEBUG_CARD_MARGIN_Y);
+  const isRight = position === CARD_POSITIONS.BOTTOM_RIGHT || position === CARD_POSITIONS.TOP_RIGHT;
+  const boxX = isRight
+      ? Math.max(0, (W - boxW - DEBUG_CARD_MARGIN_X) & ~1)
+      : DEBUG_CARD_MARGIN_X;
+  return Object.freeze({boxX, boxY, boxW, boxH});
+}
 
 /**
  * Computes the total width in pixels for the icons-only capsule card given visible icon flags.
@@ -78,9 +116,10 @@ function computeCornerDetailedCardDimensions(headerText, segments) {
       headerText.length * DETAILED_CORNER_HEADER_CHAR_W +
       DETAILED_CORNER_HEADER_RIGHT_PAD;
   const minW = hasTelemetry ? DETAILED_CORNER_MIN_WIDTH_WITH_TEL : DETAILED_CORNER_MIN_WIDTH_NO_TEL;
-  const boxW = Math.min(W - CARD_CORNER_MARGIN_PX * 2, Math.max(minW, telW, headerW));
+  const rawW = Math.max(minW, telW, headerW);
+  const boxW = Math.min(W - CARD_CORNER_MARGIN_PX * 2, (rawW + 1) & ~1);
   const boxH = hasTelemetry ? DETAILED_CORNER_HEIGHT_WITH_TEL : DETAILED_CORNER_HEIGHT_NO_TEL;
-  return {boxW, boxH, hasTelemetry, gap};
+  return Object.freeze({boxW, boxH, hasTelemetry, gap});
 }
 
 /**
@@ -90,25 +129,25 @@ function computeCornerDetailedCardDimensions(headerText, segments) {
  * @param {string} position - Normalized position string.
  * @param {number} boxW - Card width in pixels.
  * @param {number} boxH - Card height in pixels.
- * @returns {{ boxX: number, boxY: number }}
+ * @returns {Readonly<{ boxX: number, boxY: number }>}
  */
 function getCardBoxCoords(position, boxW, boxH) {
   const margin = CARD_CORNER_MARGIN_PX;
   switch (position) {
-    case 'top-left':
-      return {boxX: margin, boxY: margin};
-    case 'top-right':
-      return {boxX: W - boxW - margin, boxY: margin};
-    case 'bottom-left':
-      return {boxX: margin, boxY: H - boxH - margin};
-    case 'bottom-right':
-      return {boxX: W - boxW - margin, boxY: H - boxH - margin};
-    case 'center':
+    case CARD_POSITIONS.TOP_LEFT:
+      return Object.freeze({boxX: margin, boxY: margin});
+    case CARD_POSITIONS.TOP_RIGHT:
+      return Object.freeze({boxX: W - boxW - margin, boxY: margin});
+    case CARD_POSITIONS.BOTTOM_LEFT:
+      return Object.freeze({boxX: margin, boxY: H - boxH - margin});
+    case CARD_POSITIONS.BOTTOM_RIGHT:
+      return Object.freeze({boxX: W - boxW - margin, boxY: H - boxH - margin});
+    case CARD_POSITIONS.CENTER:
     default:
-      return {
-        boxX: Math.round((W - boxW) / 2),
-        boxY: Math.round((H - boxH) / 2),
-      };
+      return Object.freeze({
+        boxX: Math.round((W - boxW) / 2) & ~1,
+        boxY: Math.round((H - boxH) / 2) & ~1,
+      });
   }
 }
 
@@ -126,30 +165,34 @@ class StatusCard {
     this.position = resolved.position;
     this.sleepScreen = resolved.sleepScreen;
 
-    this.autoFrigateMask = rawCamCfg.auto_frigate_mask ?? GLOBAL_AUTO_FRIGATE_MASK;
-    this.showOnLive = rawCamCfg.card_show_on_live ?? GLOBAL_CARD_SHOW_ON_LIVE;
+    this.autoFrigateMask = rawCamCfg.autoFrigateMask ?? rawCamCfg.auto_frigate_mask ?? GLOBAL_AUTO_FRIGATE_MASK;
+    this.showOnLive = rawCamCfg.cardShowOnLive ?? rawCamCfg.card_show_on_live ?? GLOBAL_CARD_SHOW_ON_LIVE;
     this.lastSyncedMaskPoly = '';
     this.suppressLiveCard = false;
 
     this.liveTelState = null;
     this.backfillTelState = null;
-    this.liveCard = null;
-    this.backfillCard = null;
     this.liveOverlayBufs = [Buffer.allocUnsafe(FRAME), Buffer.allocUnsafe(FRAME)];
     this.liveOverlayIdx = 0;
     this.liveOverlayBuf = this.liveOverlayBufs[0];
-    this.asleep = null;
-    this.waking = null;
-    this.busy = null;
+    /** @type {Uint8Array} */
+    this.asleep = Buffer.allocUnsafe(FRAME);
+    /** @type {Uint8Array} */
+    this.waking = Buffer.allocUnsafe(FRAME);
+    /** @type {Uint8Array} */
+    this.busy = Buffer.allocUnsafe(FRAME);
   }
 
   /**
-   * Returns true if the card uses a visible theme placed in one of the four corners.
+   * Returns true if the card uses a visible theme placed in one of the four corners (or the bottom debug HUD).
    *
    * @returns {boolean}
    */
   isCorner() {
-    return this.theme !== 'none' && this.position !== 'center';
+    return (
+      this.theme === CARD_THEMES.DEBUG ||
+      (this.theme !== CARD_THEMES.NONE && this.position !== CARD_POSITIONS.CENTER)
+    );
   }
 
   /**
@@ -159,15 +202,6 @@ class StatusCard {
    */
   shouldOverlayOnLive() {
     return Boolean(this.showOnLive && !this.suppressLiveCard && this.isCorner());
-  }
-
-  /**
-   * Returns true if the pre-rendered detailed corner live card buffer needs to be built.
-   *
-   * @returns {boolean}
-   */
-  needsDetailedLiveCard() {
-    return Boolean(this.showOnLive && this.theme === 'detailed' && this.isCorner());
   }
 
   /**
@@ -200,7 +234,7 @@ class StatusCard {
   /**
    * Stores the pre-rendered YUV420p status card buffers and live/backfill telemetry visual states.
    *
-   * @param {{ asleep: Uint8Array, waking: Uint8Array, busy: Uint8Array, liveTelState: Record<string, *>, backfillTelState: Record<string, *>, liveCard: Uint8Array|null, backfillCard: Uint8Array|null }} rendered - Rendered card buffers.
+   * @param {{ asleep: Uint8Array, waking: Uint8Array, busy: Uint8Array, liveTelState: Record<string, *>, backfillTelState: Record<string, *> }} rendered - Rendered card buffers.
    */
   setRenderedFrames(rendered) {
     this.asleep = rendered.asleep;
@@ -208,8 +242,6 @@ class StatusCard {
     this.busy = rendered.busy;
     this.liveTelState = rendered.liveTelState;
     this.backfillTelState = rendered.backfillTelState;
-    this.liveCard = rendered.liveCard;
-    this.backfillCard = rendered.backfillCard;
   }
 
   /**
@@ -222,7 +254,7 @@ class StatusCard {
   prepareLiveOverlayBuffer(rawFrame) {
     this.liveOverlayIdx = (this.liveOverlayIdx + 1) & 1;
     const targetBuf = this.liveOverlayBufs[this.liveOverlayIdx];
-    rawFrame.copy(targetBuf);
+    targetBuf.set(rawFrame);
     this.liveOverlayBuf = targetBuf;
     return targetBuf;
   }
@@ -243,7 +275,9 @@ class StatusCard {
     let boxH = MINIMAL_CARD_HEIGHT;
 
     switch (this.theme) {
-      case 'icons': {
+      case CARD_THEMES.DEBUG:
+        return computeDebugCardBounds(this.position);
+      case CARD_THEMES.ICONS: {
         const tc = telemetry.config;
         boxW = computeIconsCardWidth({
           showBat: Boolean(tc.enabled && tc.battery),
@@ -254,32 +288,34 @@ class StatusCard {
         boxH = ICONS_CARD_HEIGHT;
         break;
       }
-      case 'detailed': {
-        const maxHeader = 'Asleep (Low Battery)  -  ' + displayTitle;
+      case CARD_THEMES.DETAILED: {
+        const maxHeader = CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY + '  -  ' + displayTitle;
         const tc = telemetry.config;
-        const st = this.liveTelState || evaluateTelemetryState('Asleep', {
-          telCfg: tc,
-          battery: telemetry.battery ?? 100,
-          charging: telemetry.charging,
-          powerLabel: telemetry.powerLabel || 'Charging',
-          wifi: telemetry.wifi ?? 4,
-          rssi: telemetry.rssi ?? -60,
-          temp: telemetry.temp ?? 25,
-          lastSeen: telemetry.lastSeen || '00:00',
-        });
+        const st =
+            this.liveTelState ||
+            evaluateTelemetryState(CARD_STATUS_TITLES.ASLEEP, {
+              telCfg: tc,
+              battery: telemetry.battery ?? BOUNDS_PLACEHOLDER_BATTERY_PCT,
+              charging: telemetry.charging,
+              powerLabel: telemetry.powerLabel || POWER_LABELS.CHARGING,
+              wifi: telemetry.wifi ?? WIFI_SIGNAL_LEVELS.FULL,
+              rssi: telemetry.rssi ?? BOUNDS_PLACEHOLDER_RSSI_DBM,
+              temp: telemetry.temp ?? BOUNDS_PLACEHOLDER_TEMP_C,
+              lastSeen: telemetry.lastSeen || BOUNDS_PLACEHOLDER_LAST_SEEN,
+            });
         const segments = tc.enabled ? buildTelemetrySegments(st) : [];
         const dims = computeCornerDetailedCardDimensions(maxHeader, segments);
         boxW = dims.boxW;
         boxH = dims.boxH;
         break;
       }
-      case 'minimal':
+      case CARD_THEMES.MINIMAL:
       default:
         break;
     }
 
     const {boxX, boxY} = getCardBoxCoords(this.position, boxW, boxH);
-    return {boxX, boxY, boxW, boxH};
+    return Object.freeze({boxX, boxY, boxW, boxH});
   }
 
   /**
@@ -295,16 +331,16 @@ class StatusCard {
       return '';
     }
     const pad = FRIGATE_MASK_SAFETY_PAD_PX;
-    const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(3);
-    const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(3);
-    const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(3);
-    const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(3);
+    const x0 = Math.max(0, (bounds.boxX - pad) / W).toFixed(MASK_NORMALIZED_COORD_DECIMALS);
+    const y0 = Math.max(0, (bounds.boxY - pad) / H).toFixed(MASK_NORMALIZED_COORD_DECIMALS);
+    const x1 = Math.min(1, (bounds.boxX + bounds.boxW + pad) / W).toFixed(MASK_NORMALIZED_COORD_DECIMALS);
+    const y1 = Math.min(1, (bounds.boxY + bounds.boxH + pad) / H).toFixed(MASK_NORMALIZED_COORD_DECIMALS);
     return x0 + ',' + y0 + ',' + x0 + ',' + y1 + ',' + x1 + ',' + y1 + ',' + x1 + ',' + y0;
   }
 }
 
 module.exports = {
-  DETAILED_CORNER_CARD_RADIUS,
+  CARD_CORNER_RADIUS,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -317,5 +353,6 @@ module.exports = {
   StatusCard,
   computeIconsCardWidth,
   computeCornerDetailedCardDimensions,
+  computeDebugCardBounds,
   getCardBoxCoords,
 };

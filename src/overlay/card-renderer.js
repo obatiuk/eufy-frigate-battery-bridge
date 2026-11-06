@@ -1,36 +1,41 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
- * Status card rendering engine ('detailed', 'icons', 'minimal', 'none')
- * and live-stream corner overlay compositing.
+ * Status card rendering engine ('detailed', 'icons', 'minimal', 'debug', 'none')
+ * and live-stream corner overlay compositing using pre-baked proportional UI glyphs
+ * and Eufy Security standard icon alpha sprites.
  */
 'use strict';
 
-const fs = require('fs');
-const {spawnSync} = require('child_process');
 const {
-  cfg,
   clampNum,
   W,
-  H,
   FRAME,
-  COLOR_GREY,
   SHORT_KEYFRAME_BURST_MS,
-  MAX_FFMPEG_BUFFER_MULTIPLIER,
+  CARD_THEMES,
+  CARD_POSITIONS,
+  CARD_STATUS_TITLES,
+  CAMERA_MODES,
+  FRAME_STAGE_MARKERS,
   resolveCardConfig,
 } = require('../config');
-const {log} = require('../logger');
 const {
+  POWER_LABELS,
   TEL_BAT_LABEL_OFFSET_X,
   TEL_WIFI_LABEL_OFFSET_X,
+  TEL_TEMP_LABEL_OFFSET_X,
+  TEL_SEEN_LABEL_OFFSET_X,
+  STATUS_KINDS,
+  TELEMETRY_SEGMENT_TYPES,
   evaluateTelemetryState,
   buildTelemetrySegments,
 } = require('../domain/telemetry');
 const {
-  DETAILED_CORNER_CARD_RADIUS,
+  CARD_CORNER_RADIUS,
   MINIMAL_CARD_WIDTH,
   MINIMAL_CARD_HEIGHT,
   ICONS_CARD_HEIGHT,
@@ -42,735 +47,996 @@ const {
   ICONS_TEMP_WIDTH,
   computeIconsCardWidth,
   computeCornerDetailedCardDimensions,
+  computeDebugCardBounds,
   getCardBoxCoords,
 } = require('../domain/status-card');
 const {
-  blendYuvPixel,
   fillYuvRect,
-  drawYuvCircle,
-  drawYuvLine,
   drawRoundedBox,
   prepareBackgroundCanvas,
-  copyRoundedYuvRegion,
+  drawMonospaceText,
 } = require('./yuv-canvas');
+const {
+  UI_FONT_SIZES,
+  EUFY_ICON_SPRITES,
+  measureUiText,
+  drawUiText,
+  blitAlphaSprite,
+  getClockHandsMask,
+} = require('./ui-glyphs');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
 
 const CENTER_MODAL_WIDTH = 820;
 const CENTER_MODAL_HEIGHT_WITH_TEL = 336;
 const CENTER_MODAL_HEIGHT_NO_TEL = 268;
-const MINIMAL_DOT_OUTER_RADIUS = 6.8;
-const MINIMAL_BULLSEYE_GAP_RADIUS = 4.3;
-const MINIMAL_BULLSEYE_KERNEL_RADIUS = 3.4;
+const CENTER_MODAL_ICON_CY = 114;
+const CENTER_MODAL_TITLE_Y = 30;
+const CENTER_MODAL_LINE1_Y = 168;
+const CENTER_MODAL_LINE2_Y = 204;
+const CENTER_MODAL_DIVIDER_PAD_X = 44;
+const CENTER_MODAL_DIVIDER_Y = 254;
+const CENTER_MODAL_TEL_GAP = 28;
+const CENTER_MODAL_TEL_Y = 278;
+
+const CARD_BG_OPACITY = 0.64;
+const CARD_BORDER_OPACITY = 0.18;
+const DIVIDER_OPACITY = 0.16;
+const STATUS_GLYPH_OPACITY = 1;
+
+const BAT_SHELL_OPACITY = 0.98;
+const BAT_FILL_OPACITY = 0.98;
+const BAT_FILL_X = 4;
+const BAT_FILL_Y = 4;
+const BAT_FILL_MAX_W = 26;
+const BAT_FILL_MIN_W = 3;
+const BAT_FILL_H = 10;
+const BAT_PCT_MAX = 100;
+const BAT_BADGE_OFFSET_X = 8;
+const BADGE_HALO_OPACITY = 0.92;
+const BADGE_FG_OPACITY = 0.98;
+
+const WIFI_LIT_OPACITY = 1;
+const WIFI_UNLIT_OPACITY = 0.34;
+
+const THERM_BODY_OPACITY = 0.98;
+const THERM_BORE_OPACITY = 0.92;
+const THERM_MERCURY_OPACITY = 1;
+const THERM_MAX_C = 50;
+const THERM_DEFAULT_C = 22;
+const THERM_MERCURY_MAX_H = 10;
+const THERM_MERCURY_X = 5;
+const THERM_MERCURY_W = 3;
+const THERM_BULB_JOIN_Y = 14;
+
+const CLOCK_SIZE_PX = 22;
+const CLOCK_DIAL_OPACITY = 0.98;
+const CLOCK_HANDS_OPACITY = 1;
+
+const MINIMAL_DOT_TOP_OFFSET = 13;
+const MINIMAL_STATUS_OFFSET_X = 16;
+const MINIMAL_BAT_OFFSET_X = 46;
+const MINIMAL_WIFI_OFFSET_X = 76;
+const MINIMAL_FG_OPACITY = 1;
+
+const ICONS_CY_OFFSET = 22;
+const ICONS_STATUS_HALF_W = 11;
+const ICONS_BAT_TOP_OFFSET = 9;
+const ICONS_WIFI_TOP_OFFSET = 11;
+const ICONS_THERM_TOP_OFFSET = 11;
+const ICONS_CLOCK_TOP_OFFSET = 11;
+
+const DETAILED_STATUS_CX_OFFSET = 26;
+const DETAILED_STATUS_CY_OFFSET = 23;
+const DETAILED_HEADER_X_OFFSET = 45;
+const DETAILED_HEADER_Y_OFFSET = 15;
+const DETAILED_DIVIDER_PAD_X = 20;
+const DETAILED_DIVIDER_Y_OFFSET = 44;
+const DETAILED_TEL_X_OFFSET = 22;
+const DETAILED_TEL_Y_OFFSET = 54;
+const TEL_BAT_ICON_Y_OFFSET = -2;
+const TEL_WIFI_ICON_Y_OFFSET = -4;
+const TEL_THERM_ICON_Y_OFFSET = -4;
+const TEL_CLOCK_ICON_Y_OFFSET = -4;
+
+const BLOCK_B_STEM_W = 3;
+const BLOCK_B_H = 14;
+const BLOCK_B_BAR_W = 9;
+const BLOCK_B_BAR_H = 3;
+const BLOCK_B_MID_Y = 6;
+const BLOCK_B_BOT_Y = 11;
+const BLOCK_B_R_X = 8;
+const BLOCK_B_LOBE_H = 4;
+const BLOCK_B_BOT_LOBE_Y = 8;
+
+const STAGE_BOX_X = 8;
+const STAGE_BOX_HALF_Y = 10;
+const STAGE_BOX_W = 26;
+const STAGE_BOX_H = 20;
+const STAGE_TOP_OFFSET = 7;
+const STAGE_F_X = 10;
+const STAGE_F_MID_W = 7;
+const STAGE_FB_B_X = 21;
+const STAGE_SINGLE_X = 16;
+const STAGE_L_W = 10;
+const STAGE_S_X = 15;
+const STAGE_S_W = 12;
+const STAGE_S_R_X = 9;
+const STAGE_S_STEP = 3;
+
+const NORMAL_TEMP_HEX = '0xd4d4d8';
+const WHITE_RGB = Object.freeze([255, 255, 255]);
+const MODAL_BODY_RGB = Object.freeze([228, 228, 231]);
+const ZINC_TEXT_RGB = Object.freeze([212, 212, 216]);
+const MUTED_SEEN_RGB = Object.freeze([161, 161, 170]);
+const UNLIT_WIFI_RGB = Object.freeze([113, 113, 122]);
+const DARK_GLASS_RGB = Object.freeze([24, 24, 28]);
+const BADGE_HALO_RGB = Object.freeze([18, 18, 22]);
+const BADGE_FG_RGB = Object.freeze([250, 250, 252]);
+const CLOCK_DIAL_RGB = Object.freeze([228, 228, 231]);
+
+const DEBUG_STAGE_YELLOW_RGB = Object.freeze([234, 179, 8]);
+const DEBUG_STAGE_RED_RGB = Object.freeze([239, 68, 68]);
+const DEBUG_STAGE_DARK_TEXT_RGB = Object.freeze([15, 15, 20]);
+const DEBUG_STAGE_LIGHT_TEXT_RGB = Object.freeze([255, 255, 255]);
+const DEBUG_STAGE_BOX_OPACITY = 0.96;
+const DEBUG_STAGE_SNAPSHOT_BOX_OPACITY = 0.92;
+const DEBUG_STAGE_GLYPH_OPACITY = 0.98;
+const DEBUG_HUD_BG_OPACITY = 0.74;
+const DEBUG_HUD_MAX_SESSION_DISPLAY = 99;
+const DEBUG_HUD_SESSION_PAD_LEN = 2;
+const DEBUG_HUD_MODE_TAG_LEN = 4;
+const DEBUG_HUD_LEFT_COL_OFFSET_X = 12;
+const DEBUG_HUD_STAGE_SQUARE_OFFSET_X = 4;
+const DEBUG_HUD_STAGE_SQUARE_CENTER_Y = 19;
+const DEBUG_HUD_MODE_ROW_INDEX = 2;
+const DEBUG_HUD_SESSION_ROW_INDEX = 3;
+const DEBUG_HUD_TEXT_LEFT_OFFSET_X = 52;
+const DEBUG_HUD_TEXT_TOP_OFFSET_Y = 9;
+const DEBUG_HUD_LINE_STEP_Y = 15;
+const DEFAULT_LIVE_OVERLAY_MAX_AGE_MS = 2000;
+
+/** @type {Readonly<Record<string, string>>} */
+const DEBUG_HUD_MODE_TAGS = Object.freeze({
+  [CAMERA_MODES.AUTO]: 'AUTO',
+  [CAMERA_MODES.RTSP]: 'RTSP',
+  [CAMERA_MODES.P2P]: 'P2P ',
+  [CAMERA_MODES.BACKFILL]: 'BF  ',
+  [CAMERA_MODES.CUSTOM]: 'CUST',
+});
 
 /**
- * Draws an anti-aliased filled right-pointing play triangle centered at (cx, cy).
+ * Resolves which Eufy Power Manager badge ('solar', 'plugged', 'bolt', or 'none') to overlay on the battery icon.
  *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Center X coordinate.
- * @param {number} cy - Center Y coordinate.
- * @param {number} scale - Size multiplier (1.0 = 20x20 icon, 3.0 = 60x60 modal icon).
- * @param {number[]} rgb - RGB color array [r, g, b].
+ * @param {string} powerLabel - Parsed power source label ('Solar', 'Plugged', 'Charging', or '').
+ * @param {boolean} showBadge - Whether power-source iconography is active for this battery state.
+ * @returns {'solar'|'plugged'|'bolt'|'none'}
  */
-function drawFilledPlayTriangle(canvas, cx, cy, scale, rgb) {
-  const [r, g, b] = rgb;
-  const xLeft = Math.round(cx - 4.8 * scale);
-  const xRight = Math.round(cx + 6.2 * scale);
-  const halfH = 6.6 * scale;
-  const width = Math.max(1, xRight - xLeft);
-
-  for (let x = xLeft; x <= xRight; x++) {
-    const progress = (x - xLeft) / width;
-    const span = halfH * (1 - progress);
-    const yMin = Math.floor(cy - span - 1);
-    const yMax = Math.ceil(cy + span + 1);
-    for (let y = yMin; y <= yMax; y++) {
-      const cov = Math.min(1, Math.max(0, span + 0.5 - Math.abs(y - cy)));
-      if (cov > 0) {
-        blendYuvPixel(canvas, x, y, r, g, b, 0.96 * cov);
-      }
-    }
+function resolvePowerBadgeKind(powerLabel, showBadge) {
+  if (!showBadge) {
+    return 'none';
   }
-}
-
-/**
- * Draws a single anti-aliased filled left-pointing triangle between xApex (left) and xBase (right).
- *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} xApex - Left apex X coordinate.
- * @param {number} xBase - Right base X coordinate.
- * @param {number} cy - Vertical center Y coordinate.
- * @param {number} halfH - Half-height of the triangle base in pixels.
- * @param {number[]} rgb - RGB color array [r, g, b].
- */
-function drawLeftRewindTriangle(canvas, xApex, xBase, cy, halfH, rgb) {
-  const [r, g, b] = rgb;
-  const width = Math.max(1, xBase - xApex);
-  for (let x = xApex; x <= xBase; x++) {
-    const progress = (x - xApex) / width;
-    const span = halfH * progress;
-    const yMin = Math.floor(cy - span - 1);
-    const yMax = Math.ceil(cy + span + 1);
-    for (let y = yMin; y <= yMax; y++) {
-      const cov = Math.min(1, Math.max(0, span + 0.5 - Math.abs(y - cy)));
-      if (cov > 0) {
-        blendYuvPixel(canvas, x, y, r, g, b, 0.96 * cov);
-      }
-    }
+  if (powerLabel === POWER_LABELS.SOLAR) {
+    return 'solar';
   }
+  if (powerLabel === POWER_LABELS.PLUGGED) {
+    return 'plugged';
+  }
+  return 'bolt';
 }
 
 /**
- * Draws an anti-aliased double left-pointing rewind icon centered at (cx, cy).
+ * Draws the pre-baked Eufy status glyph sprite ('live', 'backfill', 'waking', 'disconnected', 'standby').
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Center X coordinate.
- * @param {number} cy - Center Y coordinate.
- * @param {number} scale - Size multiplier (1.0 = 20x20 icon, 3.0 = 60x60 modal icon).
- * @param {number[]} rgb - RGB color array [r, g, b].
- */
-function drawRewindGlyph(canvas, cx, cy, scale, rgb) {
-  const halfH = 5.8 * scale;
-  const leftApex = Math.round(cx - 7.4 * scale);
-  const leftBase = Math.round(cx - 0.2 * scale);
-  const rightApex = Math.round(cx - 0.6 * scale);
-  const rightBase = Math.round(cx + 6.8 * scale);
-  drawLeftRewindTriangle(canvas, leftApex, leftBase, cy, halfH, rgb);
-  drawLeftRewindTriangle(canvas, rightApex, rightBase, cy, halfH, rgb);
-}
-
-/**
- * Draws the status glyph for 'icons' and centered 'detailed' themes:
- *   - 'live': Filled Play triangle (Red)
- *   - 'backfill': Filled Rewind double-triangle (Red)
- *   - 'waking': Solid circle dot (Blue) matching minimal and corner detailed themes
- *   - 'asleep' / 'waiting' / 'low': Pause bars (Grey / Yellow / Purple)
- *
- * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Center X coordinate.
- * @param {number} cy - Center Y coordinate.
- * @param {number} scale - Size multiplier (1.0 = 20x20 icon, 3.0 = 60x60 modal icon).
+ * @param {{ cx: number, cy: number, modal?: boolean }} pos - Center coordinates and modal size flag.
  * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
  */
-function drawStatusGlyph(canvas, cx, cy, scale, st) {
+function drawStatusGlyph(canvas, pos, st) {
+  const spriteSet = pos.modal ? EUFY_ICON_SPRITES.statusModal : EUFY_ICON_SPRITES.statusSmall;
+  let sprite = spriteSet.standby;
   switch (st.statusKind) {
-    case 'live':
-      drawFilledPlayTriangle(canvas, cx, cy, scale, st.statusRgb);
-      return;
-    case 'backfill':
-      drawRewindGlyph(canvas, cx, cy, scale, st.statusRgb);
-      return;
-    case 'waking':
-      drawYuvCircle(canvas, cx, cy, 5.6 * scale, st.statusRgb, 0.96);
-      return;
+    case STATUS_KINDS.LIVE:
+      sprite = spriteSet.live;
+      break;
+    case STATUS_KINDS.BACKFILL:
+      sprite = spriteSet.backfill;
+      break;
+    case STATUS_KINDS.WAKING:
+      sprite = spriteSet.waking;
+      break;
+    case STATUS_KINDS.DISCONNECTED:
+      sprite = spriteSet.disconnected;
+      break;
     default:
       break;
   }
-
-  const barW = Math.max(3, Math.round(3.4 * scale));
-  const barH = Math.round(12.0 * scale);
-  const gapHalf = Math.max(2, Math.round(2.2 * scale));
-  const topY = cy - barH / 2;
-
-  fillYuvRect(
+  blitAlphaSprite(
       canvas,
-      cx - gapHalf - barW,
-      topY,
-      barW,
-      barH,
-      st.statusRgb[0],
-      st.statusRgb[1],
-      st.statusRgb[2],
-      0.95
-  );
-  fillYuvRect(
-      canvas,
-      cx + gapHalf,
-      topY,
-      barW,
-      barH,
-      st.statusRgb[0],
-      st.statusRgb[1],
-      st.statusRgb[2],
-      0.95
+      {x: pos.cx - sprite.width / 2, y: pos.cy - sprite.height / 2, sprite},
+      {rgb: st.statusRgb, opacity: STATUS_GLYPH_OPACITY, shadow: true}
   );
 }
 
 /**
- * Draws a 37x16 vector battery icon with a proportional inner charge bar
- * and optional charging bolt.
+ * Draws the 38x18 Eufy rounded battery icon, proportional charge fill bar, and optional
+ * Eufy Power Manager badge (Solar sun, AC Plug, or USB-C Lightning Bolt).
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} bx - Left X coordinate of the battery shell.
- * @param {number} batY - Top Y coordinate of the battery shell.
- * @param {number} batPct - Battery percentage (0..100).
- * @param {number[]} shellRgb - RGB color array [r, g, b] for the shell outline.
- * @param {number[]} fillRgb - RGB color array [r, g, b] for the inner charge bar.
- * @param {boolean} showBolt - Whether to draw a charging bolt across the center of the battery.
+ * @param {{ x: number, y: number }} pos - Top-left coordinates of the battery shell.
+ * @param {{ batPct: number, rgb: readonly number[], badgeKind: 'solar'|'plugged'|'bolt'|'none' }} opts - Battery visual state.
  */
-function drawBatteryIcon(canvas, bx, batY, batPct, shellRgb, fillRgb, showBolt) {
-  const [sr, sg, sb] = shellRgb;
-  const [fr, fg, fb] = fillRgb;
-  fillYuvRect(canvas, bx, batY, 34, 2, sr, sg, sb, 0.92);
-  fillYuvRect(canvas, bx, batY + 14, 34, 2, sr, sg, sb, 0.92);
-  fillYuvRect(canvas, bx, batY + 2, 2, 12, sr, sg, sb, 0.92);
-  fillYuvRect(canvas, bx + 32, batY + 2, 2, 12, sr, sg, sb, 0.92);
-  fillYuvRect(canvas, bx + 34, batY + 5, 3, 6, sr, sg, sb, 0.92);
-  const fillW = Math.max(3, Math.round((26 * batPct) / 100));
-  fillYuvRect(canvas, bx + 4, batY + 4, fillW, 8, fr, fg, fb, 0.95);
-  if (showBolt) {
-    drawYuvLine(canvas, bx + 18, batY + 3, bx + 14, batY + 8, 1.1, [20, 20, 24], 0.95);
-    drawYuvLine(canvas, bx + 14, batY + 8, bx + 19, batY + 8, 1.1, [20, 20, 24], 0.95);
-    drawYuvLine(canvas, bx + 19, batY + 8, bx + 15, batY + 13, 1.1, [20, 20, 24], 0.95);
+function drawBatteryIcon(canvas, pos, opts) {
+  blitAlphaSprite(
+      canvas,
+      {x: pos.x, y: pos.y, sprite: EUFY_ICON_SPRITES.batteryShell},
+      {rgb: opts.rgb, opacity: BAT_SHELL_OPACITY, shadow: true}
+  );
+  if (opts.batPct > 0) {
+    const fillW = Math.max(BAT_FILL_MIN_W, Math.round((BAT_FILL_MAX_W * opts.batPct) / BAT_PCT_MAX));
+    const [fr, fg, fb] = opts.rgb;
+    fillYuvRect(canvas, pos.x + BAT_FILL_X, pos.y + BAT_FILL_Y, fillW, BAT_FILL_H, fr, fg, fb, BAT_FILL_OPACITY);
+  }
+  if (opts.badgeKind !== 'none') {
+    const badge = EUFY_ICON_SPRITES.powerBadges[opts.badgeKind];
+    const badgeX = pos.x + BAT_BADGE_OFFSET_X;
+    blitAlphaSprite(
+        canvas,
+        {x: badgeX, y: pos.y, sprite: badge.haloSprite},
+        {rgb: BADGE_HALO_RGB, opacity: BADGE_HALO_OPACITY}
+    );
+    blitAlphaSprite(
+        canvas,
+        {x: badgeX, y: pos.y, sprite: badge.fgSprite},
+        {rgb: BADGE_FG_RGB, opacity: BADGE_FG_OPACITY}
+    );
   }
 }
 
 /**
- * Draws a curved Wi-Fi signal icon (base dot + 3 concentric upper-sector wave arcs)
- * colored by RSSI/signal quality.
+ * Draws the pre-baked 4-tier Eufy rounded-cap Wi-Fi signal fan colored by RSSI/signal quality.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cx - Horizontal center X coordinate of the Wi-Fi fan.
- * @param {number} bottomY - Vertical Y coordinate of the bottom apex dot.
- * @param {number} wifiBars - Number of lit signal levels (0..4).
- * @param {number[]} rgb - Active signal RGB color array [r, g, b].
+ * @param {{ x: number, y: number }} pos - Top-left coordinates of the 30x22 Wi-Fi icon slot.
+ * @param {{ wifiBars: number, rgb: readonly number[] }} opts - Signal bar tier (0..4) and active RGB color.
  */
-function drawWifiArcsIcon(canvas, cx, bottomY, wifiBars, rgb) {
-  const dotLit = wifiBars >= 1;
-  const unlitRgb = [113, 113, 122];
-  drawYuvCircle(canvas, cx, bottomY, 2.1, dotLit ? rgb : unlitRgb, dotLit ? 0.96 : 0.45);
-
-  const radii = [5.4, 9.2, 13.0];
-  const strokeHalf = 1.25;
-  for (let i = 0; i < 3; i++) {
-    const rad = radii[i];
-    const lit = wifiBars >= i + 2;
-    const [r, g, b] = lit ? rgb : unlitRgb;
-    const alpha = lit ? 0.95 : 0.42;
-    const pad = Math.ceil(rad + strokeHalf + 1);
-    for (let y = Math.floor(bottomY - pad); y <= Math.ceil(bottomY + 1); y++) {
-      for (let x = Math.floor(cx - pad); x <= Math.ceil(cx + pad); x++) {
-        const dx = x - cx;
-        const dy = y - bottomY;
-        const angle = Math.atan2(dy, dx);
-        if (angle >= -2.38 && angle <= -0.76) {
-          const d = Math.hypot(dx, dy);
-          const cov = Math.min(1, Math.max(0, strokeHalf + 0.5 - Math.abs(d - rad)));
-          if (cov > 0) {
-            blendYuvPixel(canvas, x, y, r, g, b, alpha * cov);
-          }
+function drawWifiArcsIcon(canvas, pos, opts) {
+  const tiers = EUFY_ICON_SPRITES.wifiTiers;
+  for (let i = 0; i < tiers.length; i++) {
+    const lit = opts.wifiBars >= i + 1;
+    blitAlphaSprite(
+        canvas,
+        {x: pos.x, y: pos.y, sprite: tiers[i]},
+        {
+          rgb: lit ? opts.rgb : UNLIT_WIFI_RGB,
+          opacity: lit ? WIFI_LIT_OPACITY : WIFI_UNLIT_OPACITY,
+          shadow: lit,
         }
-      }
-    }
+    );
   }
 }
 
 /**
- * Draws the vector battery icon and curved Wi-Fi arc icon alongside their text labels
- * for the 'detailed' theme.
+ * Draws the pre-baked 18x22 Eufy thermometer icon with graduation ticks and proportional mercury bar.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {Array<Record<string, *>>} segments - Telemetry segments from buildTelemetrySegments().
- * @param {number} startX - Left X coordinate where the telemetry row begins.
- * @param {number} textY - Top Y coordinate for 20px drawtext strings.
- * @param {number} gap - Horizontal pixel gap between segments.
- * @param {Function} buildDrawtext - Helper that formats a drawtext filter string.
- * @returns {string[]} Array of FFmpeg drawtext filter strings.
+ * @param {{ x: number, y: number }} pos - Top-left coordinates of the 18x22 thermometer slot.
+ * @param {Record<string, *>} st - Evaluated telemetry state or temperature segment.
  */
-function drawTelemetryRow(canvas, segments, startX, textY, gap, buildDrawtext) {
-  const filters = [];
-  const textBaselineY = textY + 14;
-  let cursorX = startX;
+function drawThermometerIcon(canvas, pos, st) {
+  blitAlphaSprite(
+      canvas,
+      {x: pos.x, y: pos.y, sprite: EUFY_ICON_SPRITES.thermometer.bodySprite},
+      {rgb: st.tempRgb, opacity: THERM_BODY_OPACITY, shadow: true}
+  );
+  blitAlphaSprite(
+      canvas,
+      {x: pos.x, y: pos.y, sprite: EUFY_ICON_SPRITES.thermometer.boreSprite},
+      {rgb: DARK_GLASS_RGB, opacity: THERM_BORE_OPACITY}
+  );
+  if (st.hasTemp) {
+    const clampedTemp = clampNum(st.tempNum, 0, THERM_MAX_C, THERM_DEFAULT_C);
+    const mercuryH = Math.max(2, Math.round((clampedTemp / THERM_MAX_C) * THERM_MERCURY_MAX_H));
+    const [tr, tg, tb] = st.tempRgb;
+    fillYuvRect(
+        canvas,
+        pos.x + THERM_MERCURY_X,
+        pos.y + THERM_BULB_JOIN_Y - mercuryH,
+        THERM_MERCURY_W,
+        mercuryH + 2,
+        tr,
+        tg,
+        tb,
+        THERM_MERCURY_OPACITY
+    );
+  }
+}
+
+/**
+ * Draws the pre-baked 22x22 Eufy hollow-ring clock dial and cached HH:MM hands mask.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {{ x: number, y: number }} pos - Top-left coordinates of the 22x22 clock slot.
+ * @param {string} seenVal - Formatted 'HH:MM' timestamp.
+ */
+function drawAnalogClockIcon(canvas, pos, seenVal) {
+  blitAlphaSprite(
+      canvas,
+      {x: pos.x, y: pos.y, sprite: EUFY_ICON_SPRITES.clockDial},
+      {rgb: CLOCK_DIAL_RGB, opacity: CLOCK_DIAL_OPACITY, shadow: true}
+  );
+  const handsSprite = {
+    width: CLOCK_SIZE_PX,
+    height: CLOCK_SIZE_PX,
+    mask: getClockHandsMask(seenVal),
+  };
+  blitAlphaSprite(
+      canvas,
+      {x: pos.x, y: pos.y, sprite: handsSprite},
+      {rgb: BADGE_FG_RGB, opacity: CLOCK_HANDS_OPACITY, shadow: true}
+  );
+}
+
+/**
+ * Measures the rendered pixel width (icon + proportional label) of a single telemetry segment.
+ *
+ * @param {Record<string, *>} seg - Telemetry segment from buildTelemetrySegments().
+ * @returns {number}
+ */
+function measureTelemetrySegmentWidth(seg) {
+  const textW = measureUiText(seg.label, UI_FONT_SIZES.SM);
+  switch (seg.type) {
+    case TELEMETRY_SEGMENT_TYPES.BATTERY:
+      return TEL_BAT_LABEL_OFFSET_X + textW;
+    case TELEMETRY_SEGMENT_TYPES.WIFI:
+      return TEL_WIFI_LABEL_OFFSET_X + textW;
+    case TELEMETRY_SEGMENT_TYPES.TEMPERATURE:
+      return TEL_TEMP_LABEL_OFFSET_X + textW;
+    case TELEMETRY_SEGMENT_TYPES.LAST_SEEN:
+      return TEL_SEEN_LABEL_OFFSET_X + textW;
+    default:
+      return textW;
+  }
+}
+
+/**
+ * Draws the Eufy telemetry icons alongside their proportional anti-aliased text labels
+ * for the 'detailed' theme without spawning FFmpeg.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {{ startX: number, textY: number, gap: number }} layout - Row start coordinates and segment gap.
+ * @param {Array<Record<string, *>>} segments - Telemetry segments from buildTelemetrySegments().
+ */
+function drawTelemetryRow(canvas, layout, segments) {
+  let cursorX = layout.startX;
+  const {textY, gap} = layout;
 
   for (const seg of segments) {
     switch (seg.type) {
-      case 'bat':
-        drawBatteryIcon(canvas, cursorX, textY - 1, seg.batPct, seg.batRgb, seg.batRgb, Boolean(seg.showBolt));
-        filters.push(buildDrawtext(seg.label, seg.batHex, 20, String(cursorX + TEL_BAT_LABEL_OFFSET_X), textY));
+      case TELEMETRY_SEGMENT_TYPES.BATTERY: {
+        const badgeKind = resolvePowerBadgeKind(seg.powerLabel, Boolean(seg.showBolt));
+        drawBatteryIcon(
+            canvas,
+            {x: cursorX, y: textY + TEL_BAT_ICON_Y_OFFSET},
+            {batPct: seg.batPct, rgb: seg.batRgb, badgeKind}
+        );
+        drawUiText(canvas, {
+          x: cursorX + TEL_BAT_LABEL_OFFSET_X,
+          y: textY,
+          text: seg.label,
+          fontSize: UI_FONT_SIZES.SM,
+          rgb: seg.batRgb,
+        });
         break;
-      case 'wifi':
-        drawWifiArcsIcon(canvas, cursorX + 16, textBaselineY - 1, seg.wifiBars, seg.wifiRgb);
-        filters.push(buildDrawtext(seg.label, '0xd4d4d8', 20, String(cursorX + TEL_WIFI_LABEL_OFFSET_X), textY));
+      }
+      case TELEMETRY_SEGMENT_TYPES.WIFI:
+        drawWifiArcsIcon(
+            canvas,
+            {x: cursorX, y: textY + TEL_WIFI_ICON_Y_OFFSET},
+            {wifiBars: seg.wifiBars, rgb: seg.wifiRgb}
+        );
+        drawUiText(canvas, {
+          x: cursorX + TEL_WIFI_LABEL_OFFSET_X,
+          y: textY,
+          text: seg.label,
+          fontSize: UI_FONT_SIZES.SM,
+          rgb: ZINC_TEXT_RGB,
+        });
         break;
-      case 'temp':
-        filters.push(buildDrawtext(seg.label, seg.tempHex, 20, String(cursorX), textY));
+      case TELEMETRY_SEGMENT_TYPES.TEMPERATURE: {
+        drawThermometerIcon(canvas, {x: cursorX, y: textY + TEL_THERM_ICON_Y_OFFSET}, seg);
+        const tempTextRgb = seg.tempHex === NORMAL_TEMP_HEX ? ZINC_TEXT_RGB : seg.tempRgb;
+        drawUiText(canvas, {
+          x: cursorX + TEL_TEMP_LABEL_OFFSET_X,
+          y: textY,
+          text: seg.label,
+          fontSize: UI_FONT_SIZES.SM,
+          rgb: tempTextRgb,
+        });
         break;
-      case 'seen':
-        filters.push(buildDrawtext(seg.label, '0xa1a1aa', 20, String(cursorX), textY));
+      }
+      case TELEMETRY_SEGMENT_TYPES.LAST_SEEN:
+        drawAnalogClockIcon(canvas, {x: cursorX, y: textY + TEL_CLOCK_ICON_Y_OFFSET}, seg.seenVal);
+        drawUiText(canvas, {
+          x: cursorX + TEL_SEEN_LABEL_OFFSET_X,
+          y: textY,
+          text: seg.label,
+          fontSize: UI_FONT_SIZES.SM,
+          rgb: MUTED_SEEN_RGB,
+        });
         break;
       default:
         break;
     }
-    cursorX += seg.width + gap;
+    cursorX += measureTelemetrySegmentWidth(seg) + gap;
   }
-
-  return filters;
 }
 
 /**
- * Renders the 'minimal' three-dot theme with graduated status dots inside a capsule.
+ * Draws a bold 11x14 block letter 'B' at (bx, top) using the given RGB color.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {string} position - Placement ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
- * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
- * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
+ * @param {{ x: number, top: number }} pos - Left and top coordinates of the 'B' glyph.
+ * @param {readonly number[]} rgb - RGB color array [r, g, b].
  */
-function drawMinimalDotsCard(canvas, position, st, blurBackdrop = true) {
-  const boxW = MINIMAL_CARD_WIDTH;
-  const boxH = MINIMAL_CARD_HEIGHT;
-  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
-
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 18, 0.42, 0.16, blurBackdrop);
-
-  const cy = boxY + 18;
-  const statusCx = boxX + 22;
-  drawYuvCircle(canvas, statusCx, cy, MINIMAL_DOT_OUTER_RADIUS, st.statusRgb, 0.96);
-  if (st.statusKind === 'backfill') {
-    drawYuvCircle(canvas, statusCx, cy, MINIMAL_BULLSEYE_GAP_RADIUS, [20, 20, 24], 0.96);
-    drawYuvCircle(canvas, statusCx, cy, MINIMAL_BULLSEYE_KERNEL_RADIUS, COLOR_GREY, 0.98);
-  }
-  drawYuvCircle(canvas, boxX + 46, cy, 6.0, st.batRgb, 0.96);
-  drawYuvCircle(canvas, boxX + 70, cy, 5.2, st.wifiRgb, 0.96);
+function drawBlockLetterB(canvas, pos, rgb) {
+  const [r, g, b] = rgb;
+  fillYuvRect(canvas, pos.x, pos.top, BLOCK_B_STEM_W, BLOCK_B_H, r, g, b, DEBUG_STAGE_GLYPH_OPACITY);
+  fillYuvRect(canvas, pos.x, pos.top, BLOCK_B_BAR_W, BLOCK_B_BAR_H, r, g, b, DEBUG_STAGE_GLYPH_OPACITY);
+  fillYuvRect(canvas, pos.x, pos.top + BLOCK_B_MID_Y, BLOCK_B_BAR_W, 2, r, g, b, DEBUG_STAGE_GLYPH_OPACITY);
+  fillYuvRect(canvas, pos.x, pos.top + BLOCK_B_BOT_Y, BLOCK_B_BAR_W, BLOCK_B_BAR_H, r, g, b, DEBUG_STAGE_GLYPH_OPACITY);
+  fillYuvRect(canvas, pos.x + BLOCK_B_R_X, pos.top + 2, BLOCK_B_STEM_W, BLOCK_B_LOBE_H, r, g, b, DEBUG_STAGE_GLYPH_OPACITY);
+  fillYuvRect(
+      canvas,
+      pos.x + BLOCK_B_R_X,
+      pos.top + BLOCK_B_BOT_LOBE_Y,
+      BLOCK_B_STEM_W,
+      BLOCK_B_LOBE_H,
+      r,
+      g,
+      b,
+      DEBUG_STAGE_GLYPH_OPACITY
+  );
 }
 
 /**
- * Draws a 16x20 vector thermometer icon with tick marks and proportional mercury bar.
+ * Draws the colored status square and crisp block-letter frame marker ('S', 'FB', 'B', or 'L')
+ * inside the left status slot of the 'debug' HUD card.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cursorX - Left X coordinate.
- * @param {number} cy - Vertical center Y coordinate.
+ * @param {{ boxX: number, cy: number, marker: string }} slot - Left X, vertical center Y, and frame stage marker.
  * @param {Record<string, *>} st - Evaluated telemetry state.
  */
-function drawThermometerIcon(canvas, cursorX, cy, st) {
-  const thermCx = cursorX + 6;
-  const bulbCy = cy + 5;
-  const stemTop = cy - 9;
-  const [tr, tg, tb] = st.tempRgb;
-
-  fillYuvRect(canvas, thermCx - 3, stemTop, 6, 12, tr, tg, tb, 0.85);
-  fillYuvRect(canvas, thermCx - 1, stemTop + 2, 2, 10, 24, 24, 28, 0.9);
-  fillYuvRect(canvas, thermCx + 5, stemTop + 2, 3, 1, tr, tg, tb, 0.8);
-  fillYuvRect(canvas, thermCx + 5, stemTop + 5, 3, 1, tr, tg, tb, 0.8);
-  fillYuvRect(canvas, thermCx + 5, stemTop + 8, 3, 1, tr, tg, tb, 0.8);
-  drawYuvCircle(canvas, thermCx, bulbCy, 4.8, st.tempRgb, 0.92);
-  drawYuvCircle(canvas, thermCx, bulbCy, 3.2, st.tempRgb, 0.98);
-
-  const clampedTemp = clampNum(st.tempNum, 0, 50, 22);
-  const mercuryH = Math.max(2, Math.round((clampedTemp / 50) * 10));
-  fillYuvRect(canvas, thermCx - 1, bulbCy - 2 - mercuryH, 2, mercuryH + 2, tr, tg, tb, 0.95);
+function drawDebugStageSquare(canvas, slot, st) {
+  const {boxX, cy, marker} = slot;
+  const top = cy - STAGE_TOP_OFFSET;
+  const [yr, yg, yb] = DEBUG_STAGE_YELLOW_RGB;
+  const [rr, rg, rb] = DEBUG_STAGE_RED_RGB;
+  const [dr, dg, db] = DEBUG_STAGE_DARK_TEXT_RGB;
+  const [lr, lg, lb] = DEBUG_STAGE_LIGHT_TEXT_RGB;
+  switch (marker) {
+    case FRAME_STAGE_MARKERS.FIRST_BACKFILL: {
+      fillYuvRect(canvas, boxX + STAGE_BOX_X, cy - STAGE_BOX_HALF_Y, STAGE_BOX_W, STAGE_BOX_H, yr, yg, yb, DEBUG_STAGE_BOX_OPACITY);
+      const fx = boxX + STAGE_F_X;
+      fillYuvRect(canvas, fx, top, BLOCK_B_STEM_W, BLOCK_B_H, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, fx, top, BLOCK_B_BAR_W, BLOCK_B_BAR_H, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, fx, top + BLOCK_B_MID_Y, STAGE_F_MID_W, BLOCK_B_BAR_H, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      drawBlockLetterB(canvas, {x: boxX + STAGE_FB_B_X, top}, DEBUG_STAGE_DARK_TEXT_RGB);
+      return;
+    }
+    case FRAME_STAGE_MARKERS.BACKFILL:
+      fillYuvRect(canvas, boxX + STAGE_BOX_X, cy - STAGE_BOX_HALF_Y, STAGE_BOX_W, STAGE_BOX_H, rr, rg, rb, DEBUG_STAGE_BOX_OPACITY);
+      drawBlockLetterB(canvas, {x: boxX + STAGE_SINGLE_X, top}, DEBUG_STAGE_LIGHT_TEXT_RGB);
+      return;
+    case FRAME_STAGE_MARKERS.LIVE: {
+      fillYuvRect(canvas, boxX + STAGE_BOX_X, cy - STAGE_BOX_HALF_Y, STAGE_BOX_W, STAGE_BOX_H, rr, rg, rb, DEBUG_STAGE_BOX_OPACITY);
+      const lx = boxX + STAGE_SINGLE_X;
+      fillYuvRect(canvas, lx, top, BLOCK_B_STEM_W, BLOCK_B_H, lr, lg, lb, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, lx, top + BLOCK_B_BOT_Y, STAGE_L_W, BLOCK_B_BAR_H, lr, lg, lb, DEBUG_STAGE_GLYPH_OPACITY);
+      return;
+    }
+    case FRAME_STAGE_MARKERS.SNAPSHOT:
+    default: {
+      const [sr, sg, sb] = st.statusRgb;
+      fillYuvRect(
+          canvas,
+          boxX + STAGE_BOX_X,
+          cy - STAGE_BOX_HALF_Y,
+          STAGE_BOX_W,
+          STAGE_BOX_H,
+          sr,
+          sg,
+          sb,
+          DEBUG_STAGE_SNAPSHOT_BOX_OPACITY
+      );
+      const sx = boxX + STAGE_S_X;
+      fillYuvRect(canvas, sx, top, STAGE_S_W, BLOCK_B_BAR_H, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, sx, top + STAGE_S_STEP, BLOCK_B_STEM_W, STAGE_S_STEP, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, sx, top + BLOCK_B_MID_Y, STAGE_S_W, 2, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, sx + STAGE_S_R_X, top + BLOCK_B_BOT_LOBE_Y, BLOCK_B_STEM_W, STAGE_S_STEP, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      fillYuvRect(canvas, sx, top + BLOCK_B_BOT_Y, STAGE_S_W, BLOCK_B_BAR_H, dr, dg, db, DEBUG_STAGE_GLYPH_OPACITY);
+      return;
+    }
+  }
 }
 
 /**
- * Draws a 20x20 filled analog clock icon with hands positioned to the HH:MM lastSeen time.
+ * Renders the shared frosted-glass rounded card surface (22px corner radius, 64% dark glass tint,
+ * and uniform 1.25px anti-aliased frosted rim) used identically by all non-HUD themes.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {number} cursorX - Left X coordinate.
- * @param {number} cy - Vertical center Y coordinate.
- * @param {string} seenVal - Formatted 'HH:MM' string.
+ * @param {{ boxX: number, boxY: number, boxW: number, boxH: number }} bounds - Even-aligned card bounds.
+ * @param {boolean} blurBackdrop - Whether to blur the live/snapshot backdrop underneath the box.
  */
-function drawAnalogClockIcon(canvas, cursorX, cy, seenVal) {
-  const clockCx = cursorX + 10;
-  drawYuvCircle(canvas, clockCx, cy, 8.5, [244, 244, 245], 0.95);
-
-  const match = /^(\d{1,2}):(\d{2})/.exec(String(seenVal || ''));
-  const hours = match ? Number(match[1]) % 12 : 4;
-  const mins = match ? Number(match[2]) % 60 : 20;
-  const hourAngle = ((hours + mins / 60) / 12) * Math.PI * 2 - Math.PI / 2;
-  const minAngle = (mins / 60) * Math.PI * 2 - Math.PI / 2;
-
-  drawYuvLine(
+function drawCardSurface(canvas, bounds, blurBackdrop) {
+  drawRoundedBox(
       canvas,
-      clockCx,
-      cy,
-      clockCx + Math.cos(hourAngle) * 4.4,
-      cy + Math.sin(hourAngle) * 4.4,
-      1.2,
-      [24, 24, 27],
-      0.95
-  );
-  drawYuvLine(
-      canvas,
-      clockCx,
-      cy,
-      clockCx + Math.cos(minAngle) * 6.2,
-      cy + Math.sin(minAngle) * 6.2,
-      1.0,
-      [24, 24, 27],
-      0.95
+      bounds.boxX,
+      bounds.boxY,
+      bounds.boxW,
+      bounds.boxH,
+      CARD_CORNER_RADIUS,
+      CARD_BG_OPACITY,
+      CARD_BORDER_OPACITY,
+      blurBackdrop
   );
 }
 
 /**
- * Renders the 'icons' theme: converts all enabled status and telemetry items into crisp
- * vector icons inside a full-radius capsule with zero text and no FFmpeg subprocess.
+ * Renders the 'minimal' theme inside a 110x44 frosted-glass capsule using three 18x18 halo-free
+ * shadowed circles (Status solid circle or hollow ring for Backfill, Battery, and Wi-Fi) and zero icons.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer.
- * @param {string} position - Placement ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
+ * @param {{ position: string, blurBackdrop?: boolean }} opts - Placement and backdrop blur flag.
  * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
- * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
  */
-function drawIconsOnlyCard(canvas, position, st, blurBackdrop = true) {
+function drawMinimalDotsCard(canvas, opts, st) {
+  const blurBackdrop = opts.blurBackdrop !== false;
+  const {boxX, boxY} = getCardBoxCoords(opts.position, MINIMAL_CARD_WIDTH, MINIMAL_CARD_HEIGHT);
+
+  drawCardSurface(canvas, {boxX, boxY, boxW: MINIMAL_CARD_WIDTH, boxH: MINIMAL_CARD_HEIGHT}, blurBackdrop);
+
+  const minSprites = EUFY_ICON_SPRITES.minimal;
+  const statusSprite = st.statusKind === STATUS_KINDS.BACKFILL ? minSprites.dotRing : minSprites.dotFg;
+  const dotY = boxY + MINIMAL_DOT_TOP_OFFSET;
+  blitAlphaSprite(
+      canvas,
+      {x: boxX + MINIMAL_STATUS_OFFSET_X, y: dotY, sprite: statusSprite},
+      {rgb: st.statusRgb, opacity: MINIMAL_FG_OPACITY, shadow: true}
+  );
+  blitAlphaSprite(
+      canvas,
+      {x: boxX + MINIMAL_BAT_OFFSET_X, y: dotY, sprite: minSprites.dotFg},
+      {rgb: st.batRgb, opacity: MINIMAL_FG_OPACITY, shadow: true}
+  );
+  blitAlphaSprite(
+      canvas,
+      {x: boxX + MINIMAL_WIFI_OFFSET_X, y: dotY, sprite: minSprites.dotFg},
+      {rgb: st.wifiRgb, opacity: MINIMAL_FG_OPACITY, shadow: true}
+  );
+}
+
+/**
+ * Renders the diagnostic 'debug' bottom HUD with a sharp blurred backdrop,
+ * colored frame-stage square ('S', 'FB', 'B', 'L'), and 4 fixed-width monospace rows.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {{ position: string, blurBackdrop?: boolean, cam?: Camera|null, frameMarker?: string, now?: number }} hud - HUD options.
+ * @param {Record<string, *>} st - Evaluated telemetry state.
+ */
+function drawDebugHudCard(canvas, hud, st) {
+  const blurBackdrop = hud.blurBackdrop !== false;
+  const cam = hud.cam || null;
+  const frameMarker = hud.frameMarker || FRAME_STAGE_MARKERS.SNAPSHOT;
+  const now = hud.now === undefined ? Date.now() : hud.now;
+  const {boxX, boxY, boxW, boxH} = computeDebugCardBounds(hud.position);
+  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 0, DEBUG_HUD_BG_OPACITY, 0, blurBackdrop);
+
+  drawDebugStageSquare(
+      canvas,
+      {
+        boxX: boxX + DEBUG_HUD_STAGE_SQUARE_OFFSET_X,
+        cy: boxY + DEBUG_HUD_STAGE_SQUARE_CENTER_Y,
+        marker: frameMarker,
+      },
+      st
+  );
+  const modeKey = cam && cam.mode ? String(cam.mode).toLowerCase() : CAMERA_MODES.AUTO;
+  const modeTag =
+      DEBUG_HUD_MODE_TAGS[modeKey] ||
+      String(modeKey).toUpperCase().slice(0, DEBUG_HUD_MODE_TAG_LEN).padEnd(DEBUG_HUD_MODE_TAG_LEN, ' ');
+  const sessNum = Math.max(
+      0,
+      Math.min(DEBUG_HUD_MAX_SESSION_DISPLAY, Number(cam && cam.sessionId ? cam.sessionId : 0))
+  );
+  const sessTag = '#' + String(sessNum).padStart(DEBUG_HUD_SESSION_PAD_LEN, '0') + ' ';
+  const leftColX = boxX + DEBUG_HUD_LEFT_COL_OFFSET_X;
+  drawMonospaceText(
+      canvas,
+      leftColX,
+      boxY + DEBUG_HUD_TEXT_TOP_OFFSET_Y + DEBUG_HUD_MODE_ROW_INDEX * DEBUG_HUD_LINE_STEP_Y,
+      modeTag
+  );
+  drawMonospaceText(
+      canvas,
+      leftColX,
+      boxY + DEBUG_HUD_TEXT_TOP_OFFSET_Y + DEBUG_HUD_SESSION_ROW_INDEX * DEBUG_HUD_LINE_STEP_Y,
+      sessTag
+  );
+
+  if (cam && typeof cam.buildDebugHudLines === 'function') {
+    const lines = cam.buildDebugHudLines(now);
+    const textX = boxX + DEBUG_HUD_TEXT_LEFT_OFFSET_X;
+    for (let i = 0; i < lines.length; i++) {
+      drawMonospaceText(
+          canvas,
+          textX,
+          boxY + DEBUG_HUD_TEXT_TOP_OFFSET_Y + i * DEBUG_HUD_LINE_STEP_Y,
+          lines[i]
+      );
+    }
+  }
+}
+
+/**
+ * Renders the 'icons' theme using pre-baked Eufy Security standard UI icon sprites
+ * inside a full-radius frosted-glass capsule with zero text and zero FFmpeg subprocesses.
+ *
+ * @param {Uint8Array} canvas - Target YUV420p frame buffer.
+ * @param {{ position: string, blurBackdrop?: boolean }} opts - Placement and backdrop blur flag.
+ * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
+ */
+function drawIconsOnlyCard(canvas, opts, st) {
+  const blurBackdrop = opts.blurBackdrop !== false;
   const {telCfg} = st;
-  const showBat = telCfg.enabled && telCfg.battery && st.hasBat;
-  const showWifi = telCfg.enabled && telCfg.wifi && (st.hasWifi || st.hasRssi);
-  const showTemp = telCfg.enabled && telCfg.temperature && st.hasTemp;
-  const showClock = telCfg.enabled && telCfg.lastSeen && Boolean(st.seenVal);
+  const showBat = Boolean(telCfg.enabled && telCfg.battery);
+  const showWifi = Boolean(telCfg.enabled && telCfg.wifi);
+  const showTemp = Boolean(telCfg.enabled && telCfg.temperature);
+  const showClock = Boolean(telCfg.enabled && telCfg.lastSeen && st.seenVal);
 
   const boxW = computeIconsCardWidth({showBat, showWifi, showTemp, showClock});
   const boxH = ICONS_CARD_HEIGHT;
-  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
-  const cy = boxY + 22;
+  const {boxX, boxY} = getCardBoxCoords(opts.position, boxW, boxH);
+  const cy = boxY + ICONS_CY_OFFSET;
 
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 22, 0.44, 0.16, blurBackdrop);
+  drawCardSurface(canvas, {boxX, boxY, boxW, boxH}, blurBackdrop);
 
   let cursorX = boxX + ICONS_CARD_PAD_X;
-  drawStatusGlyph(canvas, cursorX + 10, cy, 1.0, st);
+  drawStatusGlyph(canvas, {cx: cursorX + ICONS_STATUS_HALF_W, cy, modal: false}, st);
   cursorX += ICONS_STATUS_WIDTH + ICONS_CARD_ITEM_GAP;
 
   if (showBat) {
-    const showBolt = Boolean(telCfg.powerSource && (st.charging || st.powerLabel));
-    drawBatteryIcon(canvas, cursorX, cy - 8, st.batPct, st.batRgb, st.batRgb, showBolt);
+    const showBadge = Boolean(telCfg.powerSource && (st.charging || st.powerLabel));
+    const badgeKind = resolvePowerBadgeKind(st.powerLabel, showBadge);
+    drawBatteryIcon(
+        canvas,
+        {x: cursorX, y: cy - ICONS_BAT_TOP_OFFSET},
+        {batPct: st.batPct, rgb: st.batRgb, badgeKind}
+    );
     cursorX += ICONS_BATTERY_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showWifi) {
-    drawWifiArcsIcon(canvas, cursorX + 14, cy + 7, st.wifiBars, st.wifiRgb);
+    drawWifiArcsIcon(canvas, {x: cursorX, y: cy - ICONS_WIFI_TOP_OFFSET}, {wifiBars: st.wifiBars, rgb: st.wifiRgb});
     cursorX += ICONS_WIFI_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showTemp) {
-    drawThermometerIcon(canvas, cursorX, cy, st);
+    drawThermometerIcon(canvas, {x: cursorX, y: cy - ICONS_THERM_TOP_OFFSET}, st);
     cursorX += ICONS_TEMP_WIDTH + ICONS_CARD_ITEM_GAP;
   }
 
   if (showClock) {
-    drawAnalogClockIcon(canvas, cursorX, cy, st.seenVal);
+    drawAnalogClockIcon(canvas, {x: cursorX, y: cy - ICONS_CLOCK_TOP_OFFSET}, st.seenVal);
   }
 }
 
 /**
- * Composites the centered rounded translucent modal box ('detailed' theme at 'center' position),
- * the color-coded status glyph, and the baseline-aligned telemetry icons onto the canvas.
+ * Composites the centered rounded translucent modal ('detailed' theme at 'center' position),
+ * 60x60 Eufy status sprite, proportional anti-aliased copy, and baseline-aligned telemetry row.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer (modified in place).
- * @param {number} boxX - Left coordinate of the centered modal box.
- * @param {number} boxY - Top coordinate of the centered modal box.
- * @param {number} boxW - Width of the centered modal box.
- * @param {number} boxH - Height of the centered modal box.
+ * @param {{ titleText: string, line1: string, line2: string, segments: Array<Record<string, *>>, blurBackdrop: boolean }} modal - Modal content.
  * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
- * @param {Array<Record<string, *>>} segments - Telemetry segments from buildTelemetrySegments().
- * @param {Function} buildDrawtext - Helper that formats a drawtext filter string.
- * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
- * @returns {string[]} Array of FFmpeg drawtext filter strings for the telemetry row.
  */
-function drawFrigateModalGraphics(canvas, boxX, boxY, boxW, boxH, st, segments, buildDrawtext, blurBackdrop = true) {
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, 26, 0.56, 0.16, blurBackdrop);
-  drawStatusGlyph(canvas, W / 2, boxY + 114, 3.0, st);
+function drawCenteredDetailedModal(canvas, modal, st) {
+  const {segments, blurBackdrop} = modal;
+  const boxW = CENTER_MODAL_WIDTH;
+  const boxH = segments.length > 0 ? CENTER_MODAL_HEIGHT_WITH_TEL : CENTER_MODAL_HEIGHT_NO_TEL;
+  const {boxX, boxY} = getCardBoxCoords(CARD_POSITIONS.CENTER, boxW, boxH);
 
-  if (!segments.length) {
-    return [];
+  drawCardSurface(canvas, {boxX, boxY, boxW, boxH}, blurBackdrop);
+  drawStatusGlyph(canvas, {cx: W / 2, cy: boxY + CENTER_MODAL_ICON_CY, modal: true}, st);
+
+  drawUiText(canvas, {
+    x: W / 2,
+    y: boxY + CENTER_MODAL_TITLE_Y,
+    text: modal.titleText,
+    fontSize: UI_FONT_SIZES.LG,
+    rgb: WHITE_RGB,
+    centered: true,
+  });
+  drawUiText(canvas, {
+    x: W / 2,
+    y: boxY + CENTER_MODAL_LINE1_Y,
+    text: modal.line1,
+    fontSize: UI_FONT_SIZES.MD,
+    rgb: MODAL_BODY_RGB,
+    centered: true,
+  });
+  drawUiText(canvas, {
+    x: W / 2,
+    y: boxY + CENTER_MODAL_LINE2_Y,
+    text: modal.line2,
+    fontSize: UI_FONT_SIZES.MD,
+    rgb: MODAL_BODY_RGB,
+    centered: true,
+  });
+
+  if (segments.length > 0) {
+    fillYuvRect(
+        canvas,
+        boxX + CENTER_MODAL_DIVIDER_PAD_X,
+        boxY + CENTER_MODAL_DIVIDER_Y,
+        boxW - CENTER_MODAL_DIVIDER_PAD_X * 2,
+        1,
+        WHITE_RGB[0],
+        WHITE_RGB[1],
+        WHITE_RGB[2],
+        DIVIDER_OPACITY
+    );
+    const totalW =
+      segments.reduce((sum, seg) => sum + measureTelemetrySegmentWidth(seg), 0) +
+      CENTER_MODAL_TEL_GAP * Math.max(0, segments.length - 1);
+    const startX = Math.round(W / 2 - totalW / 2);
+    drawTelemetryRow(canvas, {startX, textY: boxY + CENTER_MODAL_TEL_Y, gap: CENTER_MODAL_TEL_GAP}, segments);
   }
-
-  fillYuvRect(canvas, boxX + 44, boxY + 254, boxW - 88, 1, 255, 255, 255, 0.16);
-  const gap = 32;
-  const totalW = segments.reduce((sum, s) => sum + s.width, 0) + gap * Math.max(0, segments.length - 1);
-  const startX = Math.round(W / 2 - totalW / 2);
-  return drawTelemetryRow(canvas, segments, startX, boxY + 278, gap, buildDrawtext);
 }
 
 /**
- * Draws the compact corner card for the 'detailed' theme when card_position is one of the
- * four corners ('top-left', 'top-right', 'bottom-left', 'bottom-right').
+ * Draws the compact corner card for the 'detailed' theme using frosted-glass live/snapshot blur,
+ * pre-baked Eufy status/telemetry sprites, and proportional anti-aliased UI glyphs.
  *
  * @param {Uint8Array} canvas - Target YUV420p frame buffer (modified in place).
- * @param {string} position - Corner name ('top-left', 'top-right', 'bottom-left', 'bottom-right').
- * @param {string} headerText - Status and camera title shown on the top line of the card.
- * @param {number[]} dotRgb - RGB color array [r, g, b] for the status indicator dot.
- * @param {Array<Record<string, *>>} segments - Telemetry segments from buildTelemetrySegments().
- * @param {Function} buildDrawtext - Helper that formats a drawtext filter string.
- * @param {boolean} [blurBackdrop=true] - Whether to blur the underlying snapshot pixels.
- * @returns {string[]} Array of FFmpeg drawtext filter strings for the corner card.
+ * @param {{ position: string, headerText: string, maxHeaderText: string, segments: Array<Record<string, *>>, blurBackdrop: boolean }} corner - Corner layout.
+ * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
  */
-function drawCornerDetailedCard(
-    canvas,
-    position,
-    headerText,
-    maxHeaderText,
-    st,
-    segments,
-    buildDrawtext,
-    blurBackdrop = true
-) {
-  const {boxW, boxH, hasTelemetry, gap} = computeCornerDetailedCardDimensions(maxHeaderText, segments);
-  const {boxX, boxY} = getCardBoxCoords(position, boxW, boxH);
+function drawCornerDetailedCard(canvas, corner, st) {
+  const {boxW, boxH, hasTelemetry, gap} = computeCornerDetailedCardDimensions(
+      corner.maxHeaderText,
+      corner.segments
+  );
+  const {boxX, boxY} = getCardBoxCoords(corner.position, boxW, boxH);
 
-  drawRoundedBox(canvas, boxX, boxY, boxW, boxH, DETAILED_CORNER_CARD_RADIUS, 0.58, 0.16, blurBackdrop);
-  if (st.statusKind === 'backfill') {
-    drawRewindGlyph(canvas, boxX + 26, boxY + 23, 0.95, st.statusRgb);
-  } else {
-    drawYuvCircle(canvas, boxX + 26, boxY + 23, 5.6, st.statusRgb, 0.96);
-  }
+  drawCardSurface(canvas, {boxX, boxY, boxW, boxH}, corner.blurBackdrop);
+  drawStatusGlyph(
+      canvas,
+      {cx: boxX + DETAILED_STATUS_CX_OFFSET, cy: boxY + DETAILED_STATUS_CY_OFFSET, modal: false},
+      st
+  );
+  drawUiText(canvas, {
+    x: boxX + DETAILED_HEADER_X_OFFSET,
+    y: boxY + DETAILED_HEADER_Y_OFFSET,
+    text: corner.headerText,
+    fontSize: UI_FONT_SIZES.SM,
+    rgb: WHITE_RGB,
+  });
 
-  const filters = [buildDrawtext(headerText, '0xffffff', 20, String(boxX + 42), boxY + 15)];
   if (hasTelemetry) {
-    fillYuvRect(canvas, boxX + 20, boxY + 44, boxW - 40, 1, 255, 255, 255, 0.16);
-    filters.push(...drawTelemetryRow(canvas, segments, boxX + 22, boxY + 54, gap, buildDrawtext));
+    fillYuvRect(
+        canvas,
+        boxX + DETAILED_DIVIDER_PAD_X,
+        boxY + DETAILED_DIVIDER_Y_OFFSET,
+        boxW - DETAILED_DIVIDER_PAD_X * 2,
+        1,
+        WHITE_RGB[0],
+        WHITE_RGB[1],
+        WHITE_RGB[2],
+        DIVIDER_OPACITY
+    );
+    drawTelemetryRow(
+        canvas,
+        {startX: boxX + DETAILED_TEL_X_OFFSET, textY: boxY + DETAILED_TEL_Y_OFFSET, gap},
+        corner.segments
+    );
   }
-  return filters;
-}
-
-/**
- * Locates the first available TrueType font file on disk for the 'detailed' text theme.
- *
- * @returns {string|undefined}
- */
-function findAvailableFontFile() {
-  const candidates = [
-    cfg.font_file,
-    process.env.FONT_FILE,
-    '/usr/share/fonts/Inter.ttf',
-    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
-    '/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf',
-  ].filter(Boolean);
-
-  return candidates.find((filePath) => fs.existsSync(filePath));
 }
 
 /**
  * Renders a static YUV420p status frame according to card_theme ('detailed', 'icons', 'minimal',
- * or 'none') and card_position ('center', 'top-left', 'top-right', 'bottom-left', 'bottom-right').
+ * 'debug', or 'none') and card_position, mutating targetBuf in-place when provided.
  *
- * @param {string} titleText - Heading displayed on the card (e.g., "Asleep").
- * @param {string} line1 - First line of descriptive text below the circular icon.
- * @param {string} line2 - Second line of descriptive text.
- * @param {Record<string, *>|null} status - Camera telemetry and config flags.
- * @param {Uint8Array} preparedBg - Pre-dimmed YUV420p background frame from prepareBackgroundCanvas().
- * @param {boolean} hasBackground - Whether preparedBg contains a camera snapshot.
+ * @param {{ titleText: string, line1: string, line2: string }} copy - Card title and modal body strings.
+ * @param {{ status: Record<string, *>|null, preparedBg: Uint8Array, hasBackground: boolean, targetBuf?: Uint8Array|null }} renderCtx - Background and buffer context.
  * @returns {Uint8Array} Raw YUV420p frame buffer of length FRAME.
  */
-function card(titleText, line1, line2, status, preparedBg, hasBackground) {
-  const camScope = (status && status.camName) || 'bridge';
+function renderSingleStatusCard(copy, renderCtx) {
+  const {status, preparedBg, hasBackground} = renderCtx;
   const cardCfg = (status && status.cardCfg) || resolveCardConfig({});
-  const canvas = Buffer.allocUnsafe(FRAME);
-  preparedBg.copy(canvas);
+  const canvas =
+      Buffer.isBuffer(renderCtx.targetBuf) && renderCtx.targetBuf.length === FRAME
+          ? renderCtx.targetBuf
+          : Buffer.allocUnsafe(FRAME);
+  canvas.set(preparedBg);
 
-  if (cardCfg.theme === 'none') {
+  if (cardCfg.theme === CARD_THEMES.NONE) {
     return canvas;
   }
 
-  const st = evaluateTelemetryState(titleText, status);
+  const st = evaluateTelemetryState(copy.titleText, status);
 
   switch (cardCfg.theme) {
-    case 'minimal':
-      drawMinimalDotsCard(canvas, cardCfg.position, st, hasBackground);
+    case CARD_THEMES.DEBUG:
+      drawDebugHudCard(
+          canvas,
+          {
+            position: cardCfg.position,
+            blurBackdrop: hasBackground,
+            cam: status && status.cam ? status.cam : null,
+            frameMarker: FRAME_STAGE_MARKERS.SNAPSHOT,
+          },
+          st
+      );
       return canvas;
-    case 'icons':
-      drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
+    case CARD_THEMES.MINIMAL:
+      drawMinimalDotsCard(canvas, {position: cardCfg.position, blurBackdrop: hasBackground}, st);
+      return canvas;
+    case CARD_THEMES.ICONS:
+      drawIconsOnlyCard(canvas, {position: cardCfg.position, blurBackdrop: hasBackground}, st);
       return canvas;
     default:
       break;
   }
 
-  const font = findAvailableFontFile();
-  if (!font) {
-    log.warn(camScope, 'no TrueType font found for detailed theme, falling back to vector icons card');
-    drawIconsOnlyCard(canvas, cardCfg.position, st, hasBackground);
+  const segments = buildTelemetrySegments(st);
+  if (cardCfg.position !== CARD_POSITIONS.CENTER) {
+    const camLabel = status && status.camTitle ? '  -  ' + status.camTitle : '';
+    const maxHeaderText = CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY + camLabel;
+    drawCornerDetailedCard(
+        canvas,
+        {
+          position: cardCfg.position,
+          headerText: copy.titleText + camLabel,
+          maxHeaderText,
+          segments,
+          blurBackdrop: hasBackground,
+        },
+        st
+    );
     return canvas;
   }
 
-  const esc = (t) => String(t).replace(/[\\']/g, ' ').replace(/:/g, '\\:');
-  const buildDrawtext = (text, color, size, xExpr, yVal) =>
-      'drawtext=fontfile=' +
-      font +
-      ':expansion=none:text=\'' +
-      esc(text) +
-      '\':fontcolor=' +
-      color +
-      ':fontsize=' +
-      size +
-      ':x=' +
-      xExpr +
-      ':y=' +
-      yVal;
-
-  const segments = buildTelemetrySegments(st);
-  const hasTelemetry = segments.length > 0;
-  const drawtextList = ['format=yuv420p'];
-
-  if (cardCfg.position !== 'center') {
-    const camLabel = status && status.camTitle ? '  -  ' + status.camTitle : '';
-    const maxHeaderText = 'Asleep (Low Battery)' + camLabel;
-    drawtextList.push(
-        ...drawCornerDetailedCard(
-            canvas,
-            cardCfg.position,
-            titleText + camLabel,
-            maxHeaderText,
-            st,
-            segments,
-            buildDrawtext,
-            hasBackground
-        )
-    );
-  } else {
-    const boxW = CENTER_MODAL_WIDTH;
-    const boxH = hasTelemetry ? CENTER_MODAL_HEIGHT_WITH_TEL : CENTER_MODAL_HEIGHT_NO_TEL;
-    const {boxX, boxY} = getCardBoxCoords('center', boxW, boxH);
-    const modalTelFilters = drawFrigateModalGraphics(
-        canvas,
-        boxX,
-        boxY,
-        boxW,
-        boxH,
-        st,
+  drawCenteredDetailedModal(
+      canvas,
+      {
+        titleText: copy.titleText,
+        line1: copy.line1,
+        line2: copy.line2,
         segments,
-        buildDrawtext,
-        hasBackground
-    );
-    drawtextList.push(
-        buildDrawtext(titleText, '0xffffff', 36, '(w-text_w)/2', boxY + 30),
-        buildDrawtext(line1, '0xe4e4e7', 24, '(w-text_w)/2', boxY + 168),
-        buildDrawtext(line2, '0xe4e4e7', 24, '(w-text_w)/2', boxY + 204),
-        ...modalTelFilters
-    );
-  }
-
-  const r = spawnSync(
-      'ffmpeg',
-      [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-f',
-        'rawvideo',
-        '-pix_fmt',
-        'yuv420p',
-        '-s',
-        W + 'x' + H,
-        '-i',
-        'pipe:0',
-        '-vf',
-        drawtextList.join(','),
-        '-frames:v',
-        '1',
-        '-f',
-        'rawvideo',
-        'pipe:1',
-      ],
-      {input: canvas, maxBuffer: FRAME * MAX_FFMPEG_BUFFER_MULTIPLIER}
-  );
-
-  if (r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME) {
-    return r.stdout;
-  }
-
-  log.warn(
-      camScope,
-      'could not render text card (' +
-      titleText +
-      '), using plain backdrop: ' +
-      String(r.stderr || '').trim().split('\n').pop()
+        blurBackdrop: hasBackground,
+      },
+      st
   );
   return canvas;
 }
 
 /**
- * Renders the asleep, waking, busy, and live-corner status cards for a camera using its
- * Telemetry and StatusCard domain models and a single shared background buffer.
+ * Renders the asleep, waking, and busy status cards for a camera using its Telemetry
+ * and StatusCard domain models and a single shared background buffer.
  *
  * @param {Camera} cam - Camera domain instance.
  */
 function renderCameraCards(cam) {
-  const title = cam.getDisplayTitle();
-  const lowBat = cam.isLowBattery();
-  const status = cam.telemetry.toStatusSnapshot(cam.name, title, cam.card.config);
-  const {baseCanvas, hasBackground} = prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
+  const ctx = cam.prepareCardRenderContext();
+  const {baseCanvas, hasBackground} = prepareBackgroundCanvas(ctx.cardConfig, ctx.lastFrame);
 
-  const asleepTitle = lowBat ? 'Asleep (Low Battery)' : 'Asleep';
-  const asleepLine2 = !cam.canWakeOnViewerInLowBattery()
-      ? 'economy mode active, waking on motion events only'
-      : 'feed, open this camera to wake it, or wait for motion';
-
-  cam.card.setRenderedFrames({
-    asleep: card(
-        asleepTitle,
-        'No active stream on the ' + title + ' detect',
-        asleepLine2,
-        status,
-      baseCanvas,
-      hasBackground
-    ),
-    waking: card(
-        'Waking Up...',
-        'Connecting to ' + title + ' P2P livestream,',
-        'live video starts in a few seconds',
-        status,
-        baseCanvas,
-        hasBackground
-    ),
-    busy: card(
-        'Waiting',
-        'Another camera is currently live on the HomeBase,',
-        'only one battery camera can stream at a time',
-        status,
-        baseCanvas,
-        hasBackground
-    ),
-    liveTelState: evaluateTelemetryState('Live', status),
-    backfillTelState: evaluateTelemetryState('Backfill', status),
-    liveCard: cam.card.needsDetailedLiveCard()
-        ? card('Live', '', '', status, baseCanvas, hasBackground)
-        : null,
-    backfillCard: cam.card.needsDetailedLiveCard()
-        ? card('Backfill', '', '', status, baseCanvas, hasBackground)
-        : null,
-  });
-  cam.triggerKeyframeBurst(Date.now(), SHORT_KEYFRAME_BURST_MS);
+  cam.commitRenderedCards(
+      {
+        asleep: renderSingleStatusCard(
+            {
+              titleText: ctx.asleepTitle,
+              line1: 'No active stream on the ' + ctx.title + ' detect',
+              line2: ctx.asleepLine2,
+            },
+            {status: ctx.status, preparedBg: baseCanvas, hasBackground, targetBuf: ctx.asleepBuf}
+        ),
+        waking: renderSingleStatusCard(
+            {
+              titleText: CARD_STATUS_TITLES.WAKING_UP,
+              line1: 'Connecting to ' + ctx.title + ' P2P livestream,',
+              line2: 'live video starts in a few seconds',
+            },
+            {status: ctx.status, preparedBg: baseCanvas, hasBackground, targetBuf: ctx.wakingBuf}
+        ),
+        busy: renderSingleStatusCard(
+            {
+              titleText: CARD_STATUS_TITLES.WAITING,
+              line1: 'Another camera is currently live on the HomeBase,',
+              line2: 'only one battery camera can stream at a time',
+            },
+            {status: ctx.status, preparedBg: baseCanvas, hasBackground, targetBuf: ctx.busyBuf}
+        ),
+        liveTelState: evaluateTelemetryState(CARD_STATUS_TITLES.LIVE, ctx.status),
+        backfillTelState: evaluateTelemetryState(CARD_STATUS_TITLES.BACKFILL, ctx.status),
+      },
+      Date.now(),
+      SHORT_KEYFRAME_BURST_MS
+  );
 }
 
 /**
- * Composites the camera's corner status card onto a copy of a live video frame when
- * card_show_on_live is enabled, leaving the original raw frame (and cam.lastFrame) untouched.
+ * Composites the camera's corner status card (or bottom diagnostic HUD) onto a copy of a frame
+ * when card_show_on_live is enabled, leaving the original raw frame (and cam.lastFrame) untouched.
  *
  * @param {Camera} cam - Camera domain instance.
- * @param {Uint8Array} rawFrame - Clean decoded YUV420p video frame.
+ * @param {Uint8Array} rawFrame - Source YUV420p frame buffer.
+ * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  * @returns {Uint8Array} YUV420p frame buffer with corner overlay applied (or rawFrame if disabled).
  */
-function renderLiveFrameWithCard(cam, rawFrame) {
-  if (!cam.card.shouldOverlayOnLive()) {
+function renderLiveFrameWithCard(cam, rawFrame, now = Date.now()) {
+  if (!cam.shouldOverlayCardOnLive() && !cam.hasDynamicDebugCard()) {
     return rawFrame;
   }
-  const out = cam.card.prepareLiveOverlayBuffer(rawFrame);
-  const isBackfill = cam.isBackfillPlayback();
-  const st = isBackfill
-      ? cam.card.backfillTelState || cam.telemetry.evaluateVisualState('Backfill')
-      : cam.card.liveTelState || cam.telemetry.evaluateVisualState('Live');
+  if (cam.card.theme === CARD_THEMES.DEBUG) {
+    const isLive = cam.isStreamingLive(now, DEFAULT_LIVE_OVERLAY_MAX_AGE_MS);
+    const {baseCanvas, hasBackground} = isLive
+        ? {baseCanvas: rawFrame, hasBackground: true}
+        : prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
+    const out = cam.card.prepareLiveOverlayBuffer(baseCanvas);
+    const titleForState = isLive
+        ? cam.isBackfillPlayback()
+            ? CARD_STATUS_TITLES.BACKFILL
+            : CARD_STATUS_TITLES.LIVE
+        : cam.active && !cam.isBackfillPlayback()
+            ? CARD_STATUS_TITLES.WAKING_UP
+            : cam.isWaitingForSlotOrBackfill(now)
+                ? CARD_STATUS_TITLES.WAITING
+                : cam.hasServiceDisruption()
+                    ? CARD_STATUS_TITLES.DISCONNECTED
+                    : cam.isLowBattery()
+                        ? CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY
+                        : CARD_STATUS_TITLES.ASLEEP;
+    const st = cam.telemetry.evaluateVisualState(titleForState);
+    const stageMarker =
+        isLive || cam.gotVideo ? cam.getFrameMarker() : FRAME_STAGE_MARKERS.SNAPSHOT;
+    drawDebugHudCard(
+        out,
+        {
+          position: cam.card.position,
+          blurBackdrop: hasBackground,
+          cam,
+          frameMarker: stageMarker,
+          now,
+        },
+        st
+    );
+    return out;
+  }
 
-  switch (cam.card.theme) {
-    case 'minimal':
-      drawMinimalDotsCard(out, cam.card.position, st, true);
+  const {out, theme, position, camTitle, statusTitle, st} =
+      cam.prepareLiveCardOverlay(rawFrame);
+
+  switch (theme) {
+    case CARD_THEMES.MINIMAL:
+      drawMinimalDotsCard(out, {position, blurBackdrop: true}, st);
       return out;
-    case 'icons':
-      drawIconsOnlyCard(out, cam.card.position, st, true);
+    case CARD_THEMES.ICONS:
+      drawIconsOnlyCard(out, {position, blurBackdrop: true}, st);
       return out;
-    case 'detailed': {
-      const activeCardBuf = isBackfill ? cam.card.backfillCard : cam.card.liveCard;
-      if (Buffer.isBuffer(activeCardBuf)) {
-        const bounds = cam.getCardBounds();
-        if (bounds) {
-          copyRoundedYuvRegion(
-              activeCardBuf,
-              out,
-              bounds.boxX,
-              bounds.boxY,
-              bounds.boxW,
-              bounds.boxH,
-              DETAILED_CORNER_CARD_RADIUS
-          );
-        }
-        return out;
-      }
-      return rawFrame;
+    case CARD_THEMES.DETAILED: {
+      const camLabel = camTitle ? '  -  ' + camTitle : '';
+      drawCornerDetailedCard(
+          out,
+          {
+            position,
+            headerText: statusTitle + camLabel,
+            maxHeaderText: CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY + camLabel,
+            segments: buildTelemetrySegments(st),
+            blurBackdrop: true,
+          },
+          st
+      );
+      return out;
     }
     default:
       return rawFrame;

@@ -1,0 +1,19 @@
+{
+	"$schema": "https://raw.githubusercontent.com/obatiuk/eufy-frigate-battery-bridge/main/deploy/config.schema.json",
+	"eufy_security_ws_url": "ws://eufy-security-ws:3000",
+	"frigate_url": "http://frigate:5000",
+	"cameras": [
+		{
+			"name": "garage",
+			"title": "Garage Camera",
+			"serial": "SN0000000001",
+			"mode": "rtsp"
+		},
+		{
+			"name": "front_doorbell",
+			"title": "Front Doorbell",
+			"serial": "SN0000000002",
+			"mode": "backfill"
+		}
+	]
+}

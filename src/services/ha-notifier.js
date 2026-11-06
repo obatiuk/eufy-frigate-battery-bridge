@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -21,13 +22,14 @@ const HA_WEBHOOK_TIMEOUT_MS = 5000;
  *
  * @param {Camera} cam - Camera domain instance.
  * @param {Record<string, *>} [extra={}] - Additional JSON fields to include in the webhook body.
+ * @param {string} [webhookUrl=cfg.ha_webhook_url] - Home Assistant webhook URL.
  */
-function notifyHA(cam, extra = {}) {
-  if (!cfg.ha_webhook) {
+function notifyHA(cam, extra = {}, webhookUrl = cfg.ha_webhook_url) {
+  if (!webhookUrl) {
     return;
   }
   const payload = cam.toHaWebhookPayload(extra);
-  fetch(cfg.ha_webhook, {
+  fetch(webhookUrl, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     signal: AbortSignal.timeout(HA_WEBHOOK_TIMEOUT_MS),

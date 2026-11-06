@@ -1,17 +1,17 @@
 FROM docker.io/library/node:22-alpine3.23 AS builder
-RUN apk add --no-cache font-inter \
-    && cp "$(find /usr/share/fonts -iname '*Inter*Regular*' -o -iname '*InterVariable*' -o -iname '*.ttc' | head -n 1)" /tmp/Inter.ttf
+LABEL org.opencontainers.image.source="https://github.com/obatiuk/eufy-frigate-battery-bridge"
 WORKDIR /app
 COPY package.json /app/package.json
 RUN npm install --omit=dev --no-package-lock --no-audit --no-fund
 COPY src/ /app/src/
 COPY test/ /app/test/
+COPY deploy/ /app/deploy/
 RUN node --test --test-reporter=/app/test/reporter.js /app/test/*.test.js
 
 FROM docker.io/library/alpine:3.23
+LABEL org.opencontainers.image.source="https://github.com/obatiuk/eufy-frigate-battery-bridge"
 
-ENV NODE_ENV=production \
-    FONT_FILE=/usr/share/fonts/Inter.ttf
+ENV NODE_ENV=production
 
 RUN apk add --no-cache \
       nodejs \
@@ -25,9 +25,15 @@ RUN apk add --no-cache \
     && mkdir -p /config/cache \
     && chown -R node:node /config
 
-COPY --from=builder /tmp/Inter.ttf /usr/share/fonts/Inter.ttf
 COPY --from=builder /app/node_modules /app/node_modules
+COPY package.json /app/package.json
 COPY src/ /app/
+
+ARG BUILD_VERSION=latest
+ARG GIT_COMMIT=dev
+RUN printf '%s (%s)\n' "${BUILD_VERSION}" "${GIT_COMMIT}" > /app/.version
+ENV BRIDGE_VERSION=${BUILD_VERSION} \
+    BRIDGE_COMMIT=${GIT_COMMIT}
 
 WORKDIR /app
 USER node

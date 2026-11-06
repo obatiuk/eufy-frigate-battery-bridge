@@ -1,10 +1,9 @@
 .idea/
-.opencode/
 .venv/
 node_modules/
 package-lock.json
 *.iml
-*.jsonc
-conversations/
+*.log
 config.json
+deploy/config.json
 cache/

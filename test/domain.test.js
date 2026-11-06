@@ -12,15 +12,56 @@ const assert = require('node:assert/strict');
 process.env.LOG_LEVEL = 'error';
 process.env.CACHE_DIR = '/tmp';
 
-const {FRAME} = require('../src/config');
+const {
+  FRAME,
+  PROCESS_SIGNALS,
+  CARD_THEMES,
+  CARD_POSITIONS,
+  CARD_STATUS_TITLES,
+  STREAM_MODES,
+  FRAME_STAGE_MARKERS,
+  COLOR_RED,
+  COLOR_GREY,
+  COLOR_GREEN,
+  COLOR_BLUE,
+  COLOR_YELLOW,
+  COLOR_PURPLE,
+} = require('../src/config');
+const {initLogger} = require('../src/logger');
 const {
   DOWNLOAD_EVENT_DURATION_MARGIN_SECS,
+  SESSION_STATES,
+  ALLOWED_SESSION_TRANSITIONS,
+  canTransitionSession,
+  FRIGATE_EVENT_STATES,
+  DECODER_STATES,
+  WAKE_KINDS,
+  WakeRequest,
   Camera,
 } = require('../src/domain/camera');
 const {
+  STATUS_KINDS,
+  TELEMETRY_SEGMENT_TYPES,
+  POWER_LABELS,
+  EUFY_DEVICE_STATES,
+  EUFY_CHARGING_STATUS,
+  EUFY_POWER_SOURCES,
+  WIFI_SIGNAL_LEVELS,
+  Telemetry,
+  unwrapProperty,
+  evaluateTelemetryState,
+  buildTelemetrySegments,
+} = require('../src/domain/telemetry');
+const {
   BackfillJob,
+  BACKFILL_STATES,
+  ALLOWED_BACKFILL_TRANSITIONS,
+  canTransitionBackfill,
+  extractDatabaseRecordCandidate,
+  DEFAULT_BACKFILL_MAX_AGE_MS,
   BACKFILL_POST_CLEAR_SETTLE_MS,
   BACKFILL_RECORDING_WAIT_CAP_MS,
+  BACKFILL_MAX_QUERY_ATTEMPTS,
 } = require('../src/domain/backfill-job');
 const {prepareBackgroundCanvas} = require('../src/overlay/yuv-canvas');
 const {renderCameraCards, renderLiveFrameWithCard} = require('../src/overlay/card-renderer');
@@ -74,7 +115,7 @@ describe('Camera & Telemetry Domain Models', () => {
       serial: 'T8161T0000000000',
       mode: 'rtsp',
       station_serial: 'T8030T0000000000',
-      rtsp_url: 'rtsp://192.168.1.50/live0',
+      homebase_rtsp_url: 'rtsp://192.168.1.50/live0',
     });
     const doorbellCam = new Camera({
       serial: 'T8214T2222222222',
@@ -108,10 +149,11 @@ describe('Camera & Telemetry Domain Models', () => {
     );
   });
 
-  it('enables rtspStream=true on startup in "rtsp" mode and ignores rtspStreamUrl in "p2p"/"backfill" modes', () => {
+  it('enables rtspStream=true on startup in "rtsp" and RTSP-capable "backfill" modes, and ignores rtspStreamUrl in "p2p" mode', () => {
     const rtspCam = new Camera({serial: 'T8161T0000000000', mode: 'rtsp'});
     const p2pCam = new Camera({serial: 'T8161T1111111111', mode: 'p2p'});
-    const backfillCam = new Camera({serial: 'T8214T2222222222', mode: 'backfill'});
+    const backfillRtspCam = new Camera({serial: 'T8161T3333333333', mode: 'backfill'});
+    const backfillDoorbell = new Camera({serial: 'T8214T2222222222', mode: 'backfill'});
 
     assert.equal(rtspCam.shouldEnableRtspProperty(false), true);
     assert.equal(rtspCam.shouldEnableRtspProperty(false), false, 'Only checks rtspStream once per session');
@@ -123,9 +165,81 @@ describe('Camera & Telemetry Domain Models', () => {
     assert.equal(p2pCam.isRtspCapable(), false);
     assert.equal(p2pCam.stationSerial, 'T8030T0000000000');
 
-    assert.equal(backfillCam.shouldEnableRtspProperty(false), false);
-    assert.equal(backfillCam.updateDiscoveredRtspConfig('T8030T0000000000', 'rtsp://192.168.1.50/live2'), false);
-    assert.equal(backfillCam.isRtspCapable(), false);
+    assert.equal(backfillRtspCam.shouldEnableRtspProperty(false), true);
+    assert.equal(
+      backfillRtspCam.isRtspCapable(),
+      true,
+      'RTSP-capable camera in backfill mode must be RTSP-capable immediately when rtspStream boolean is present even before rtspStreamUrl is populated'
+    );
+    backfillRtspCam.viewUntil = Date.now() + 20000;
+    assert.equal(
+      backfillRtspCam.wantsRtspWake(Date.now()),
+      true,
+      'Opening Live View on an RTSP-capable backfill camera must wake via RTSP, never P2P'
+    );
+    backfillRtspCam.viewUntil = 0;
+    assert.equal(backfillRtspCam.updateDiscoveredRtspConfig('T8030T0000000000', 'rtsp://192.168.1.50/live2'), true);
+    assert.equal(backfillRtspCam.isRtspCapable(), true);
+    assert.equal(backfillRtspCam.shouldBackfillOnlyOnEvent(), true);
+
+    assert.equal(backfillDoorbell.shouldEnableRtspProperty(undefined), false);
+    assert.equal(backfillDoorbell.updateDiscoveredRtspConfig('T8030T0000000000', ''), false);
+    assert.equal(backfillDoorbell.isRtspCapable(), false);
+
+    // Regression: cameras in "backfill" mode never adopt external RTSP wakes or trigger-paired P2P wakes,
+    // but can piggyback on standalone P2P wakes when no trigger/backfill is active (AT-01, AT-02, AT-05)
+    const checkNow = Date.now() + 60000;
+    assert.equal(backfillRtspCam.adoptExternalRtspWake(checkNow, 3000), false);
+    assert.equal(backfillRtspCam.canAdoptExternalWake(checkNow, 3000), true);
+    assert.equal(backfillDoorbell.canAdoptExternalWake(checkNow, 3000), true);
+    backfillRtspCam.queueEventBackfill(checkNow, 'motion detected', '', 'motion detected', 50, true);
+    backfillDoorbell.queueEventBackfill(checkNow, 'rings', '', 'rings', 100, true);
+    assert.equal(backfillRtspCam.canAdoptExternalWake(checkNow, 3000), false);
+    assert.equal(backfillDoorbell.canAdoptExternalWake(checkNow, 3000), false);
+    backfillRtspCam.clearPendingBackfill();
+    backfillDoorbell.clearPendingBackfill();
+    assert.equal(rtspCam.canAdoptExternalWake(checkNow, 3000), true);
+    assert.equal(p2pCam.canAdoptExternalWake(checkNow, 3000), true);
+
+    // Regression: RTSP-capable camera in "backfill" mode emitting "rtsp livestream started" while IDLE recording to HomeBase must not stop RTSP or disable rtspStream
+    assert.deepEqual(backfillRtspCam.evaluateUnexpectedRtspStart(), {
+      shouldStopRtsp: false,
+      shouldDisableRtspProp: false,
+      shouldRestartP2p: false,
+    });
+    assert.equal(backfillRtspCam.isRtspCapable(), true);
+  });
+
+  it('auto-detects RTSP vs P2P in "auto" mode and defaults omitted title to Eufy device name', () => {
+    const autoRtspCam = new Camera({serial: 'T8161T0000000000', name: 'garage'});
+    const autoP2pCam = new Camera({serial: 'T8214T2222222222'});
+    const explicitTitleCam = new Camera({
+      serial: 'T8161T1111111111',
+      name: 'driveway',
+      title: 'Front Driveway Custom',
+    });
+
+    assert.equal(autoRtspCam.mode, 'auto');
+    assert.equal(autoRtspCam.isRtspCapable(), false, 'Before rtspStreamUrl discovery, "auto" uses P2P');
+    assert.equal(autoRtspCam.backfillDownloads, true);
+    assert.equal(
+      autoRtspCam.updateDiscoveredRtspConfig('T8030T0000000000', 'rtsp://192.168.1.50/live0'),
+      true
+    );
+    assert.equal(autoRtspCam.isRtspCapable(), true, 'Uses HomeBase RTSP once rtspStreamUrl is discovered');
+
+    assert.equal(autoP2pCam.updateDiscoveredRtspConfig('T8030T0000000000', ''), false);
+    assert.equal(autoP2pCam.isRtspCapable(), false, 'Falls back to P2P when camera does not expose rtspStreamUrl');
+    assert.equal(autoP2pCam.stationSerial, 'T8030T0000000000');
+
+    // Omitted title defaults to camera name before telemetry load, then Eufy device name after telemetry load
+    assert.equal(autoRtspCam.getDisplayTitle(), 'garage');
+    autoRtspCam.telemetry.applyProperties({name: {value: 'Garage S350'}});
+    assert.equal(autoRtspCam.getDisplayTitle(), 'Garage S350');
+
+    // Explicit title in config.json always takes precedence over Eufy device name
+    explicitTitleCam.telemetry.applyProperties({name: {value: 'Eufy App Name'}});
+    assert.equal(explicitTitleCam.getDisplayTitle(), 'Front Driveway Custom');
   });
 
   it('preserves and upgrades pendingBackfill across companion events until 5s of live video is decoded', () => {
@@ -156,33 +270,27 @@ describe('Camera & Telemetry Domain Models', () => {
       'identity person detected (Alice)',
       60000,
       'eufy-event',
-      300,
-      3000,
-      5000,
-      3000
+      300
     );
     assert.ok(p2pCam.pendingBackfill instanceof BackfillJob);
     assert.equal(p2pCam.pendingBackfill.event, 'identity person detected');
     assert.equal(p2pCam.pendingBackfill.personName, 'Alice');
 
-    // Once >= 5s of live video is decoded, subsequent extension clears pendingBackfill
+    // Once >= 20% of hold_secs (12s for a 60s hold) of live video is decoded, subsequent extension clears pendingBackfill (AT-15)
     p2pCam.gotVideo = true;
     p2pCam.firstFrameAt = t0 + 1000;
     p2pCam.firstVideoAt = t0 + 1000;
     p2pCam.applyMotionTrigger(
-      t0 + 7000,
+      t0 + 14000,
       'person detected',
       60000,
       'eufy-event',
-      200,
-      3000,
-      5000,
-      3000
+      200
     );
     assert.equal(p2pCam.pendingBackfill, null);
   });
 
-  it('honors per-camera trigger_events, backfill_downloads, low_battery_threshold, and low_battery_wake_on_view', () => {
+  it('honors per-camera trigger_events, backfill_enabled, low_battery_threshold, and low_battery_wake_on_view', () => {
     const doorbellCam = new Camera({
       serial: 'T8214T2222222222',
       mode: 'backfill',
@@ -193,7 +301,7 @@ describe('Camera & Telemetry Domain Models', () => {
     const standaloneCam = new Camera({
       serial: 'T8134STANDALONE1',
       mode: 'p2p',
-      backfill_downloads: false,
+      backfill_enabled: false,
       low_battery_threshold: 0,
       low_battery_wake_on_view: true,
     });
@@ -203,7 +311,7 @@ describe('Camera & Telemetry Domain Models', () => {
     assert.equal(doorbellCam.shouldTriggerOnEvent('motion detected'), false);
     assert.equal(standaloneCam.shouldTriggerOnEvent('motion detected'), true);
 
-    // Per-camera backfill_downloads=false prevents queuing BackfillJob on standalone camera
+    // Per-camera backfill_enabled=false prevents queuing BackfillJob on standalone camera
     standaloneCam.queueEventBackfill(10000, 'motion detected', '', 'motion detected', 10, true);
     assert.equal(standaloneCam.pendingBackfill, null);
 
@@ -222,13 +330,13 @@ describe('Camera & Telemetry Domain Models', () => {
       serial: 'T8161T0000000000',
       station_serial: 'T8030T9999999999',
       mode: 'rtsp',
-      rtsp_url: 'rtsp://10.0.0.1/live0',
+      homebase_rtsp_url: 'rtsp://10.0.0.1/live0',
     });
     const cam2 = new Camera({
       serial: 'T8161T1111111111',
       station_serial: 'T8030T9999999999',
       mode: 'rtsp',
-      rtsp_url: 'rtsp://10.0.0.1/live1',
+      homebase_rtsp_url: 'rtsp://10.0.0.1/live1',
     });
     const doorbell = new Camera({
       serial: 'T8214T2222222222',
@@ -265,15 +373,25 @@ describe('Camera & Telemetry Domain Models', () => {
     cam1.motionUntil = 0;
     doorbell.beginSession('p2p', t0, false);
     doorbell.viewUntil = t0 + 20000;
+    const p2pCam3 = new Camera({
+      serial: 'T8214T3333333333',
+      station_serial: 'T8030T9999999999',
+      mode: 'p2p',
+    });
     assert.equal(
       cam1.shouldYieldToNewStationViewer(cam2, t0 + 15000),
-      true,
-      'Lingering RTSP camera with 0 viewers on same station must yield when user opens cam2'
+      false,
+      'RTSP Live View camera on same station must stay open in parallel when user opens another camera (AT-14)'
     );
     assert.equal(
       doorbell.shouldYieldToNewStationViewer(cam2, t0 + 15000),
+      false,
+      'P2P Live View camera must not stop when user opens an RTSP camera on the same station (AT-14)'
+    );
+    assert.equal(
+      doorbell.shouldYieldToNewStationViewer(p2pCam3, t0 + 15000),
       true,
-      'Lingering P2P camera with 0 viewers on same station must yield when user opens cam2'
+      'P2P Live View camera on same station must yield when user opens another P2P camera (AT-14)'
     );
 
     cam1.motionUntil = t0 + 60000;
@@ -291,9 +409,11 @@ describe('StatusCard Domain Model & Frigate Polygon Masks', () => {
     const detailedCam = new Camera({serial: 'T8161T1111111111', card_theme: 'detailed', card_position: 'bottom-right'});
     const centerCam = new Camera({serial: 'T8161T2222222222', card_theme: 'detailed', card_position: 'center'});
 
-    assert.equal(iconsCam.card.needsDetailedLiveCard(), false);
-    assert.equal(detailedCam.card.needsDetailedLiveCard(), true);
-    assert.equal(centerCam.card.needsDetailedLiveCard(), false);
+    assert.equal(iconsCam.card.shouldOverlayOnLive(), true);
+    assert.equal(detailedCam.card.shouldOverlayOnLive(), true);
+    assert.equal(centerCam.card.shouldOverlayOnLive(), false);
+    assert.equal('liveCard' in detailedCam.card, false);
+    assert.equal('backfillCard' in detailedCam.card, false);
 
     const iconsPoly = iconsCam.computeMaskPolygon();
     assert.match(iconsPoly, /^0\.\d{3},0\.\d{3},0\.\d{3},0\.\d{3},0\.\d{3},0\.\d{3},0\.\d{3},0\.\d{3}$/);
@@ -365,6 +485,458 @@ describe('StatusCard Domain Model & Frigate Polygon Masks', () => {
 
     const liveNone = renderLiveFrameWithCard(noneCam, rawFrame);
     assert.equal(liveNone, rawFrame, '"none" theme must return rawFrame directly');
+  });
+
+  it('honors startup_snapshot (true, false, "always") and card_show_on_live (true vs false, Live vs Backfill indicator)', () => {
+    const cachedFrame = Buffer.alloc(FRAME, 0x55);
+
+    const startupTrueNoCache = new Camera(
+      {serial: 'T8161T0000000000', startup_snapshot: true, sleep_screen: 'snapshot'},
+      {frame: null, lastSeen: ''}
+    );
+    const startupTrueWithCache = new Camera(
+      {serial: 'T8161T0000000000', startup_snapshot: true, sleep_screen: 'snapshot'},
+      {frame: cachedFrame, lastSeen: '12:00'}
+    );
+    const startupFalseNoCache = new Camera(
+      {serial: 'T8161T1111111111', startup_snapshot: false, sleep_screen: 'snapshot'},
+      {frame: null, lastSeen: ''}
+    );
+    const startupAlwaysWithCache = new Camera(
+      {serial: 'T8214T2222222222', startup_snapshot: 'always', sleep_screen: 'snapshot'},
+      {frame: cachedFrame, lastSeen: '12:00'}
+    );
+
+    assert.equal(startupTrueNoCache.needsStartupSnapshot, true);
+    assert.equal(startupTrueWithCache.needsStartupSnapshot, false);
+    assert.equal(startupFalseNoCache.needsStartupSnapshot, false);
+    assert.equal(startupAlwaysWithCache.needsStartupSnapshot, true);
+
+    const hideLiveCardCam = new Camera(
+      {serial: 'T8161T0000000000', card_theme: 'icons', card_position: 'bottom-left', card_show_on_live: false},
+      {frame: cachedFrame, lastSeen: '12:00'},
+      renderCameraCards
+    );
+    assert.equal(hideLiveCardCam.card.shouldOverlayOnLive(), false);
+
+    const showLiveCardCam = new Camera(
+      {serial: 'T8214T2222222222', card_theme: 'icons', card_position: 'bottom-left', card_show_on_live: true},
+      {frame: cachedFrame, lastSeen: '12:00'},
+      renderCameraCards
+    );
+    assert.equal(showLiveCardCam.card.shouldOverlayOnLive(), true);
+
+    // Live stream (activeMode='p2p') vs Backfill playback (activeMode='download') render distinct status glyphs
+    showLiveCardCam.active = true;
+    showLiveCardCam.activeMode = 'p2p';
+    const liveOverlayBuf = Buffer.from(renderLiveFrameWithCard(showLiveCardCam, cachedFrame));
+    showLiveCardCam.activeMode = 'download';
+    const backfillOverlayBuf = Buffer.from(renderLiveFrameWithCard(showLiveCardCam, cachedFrame));
+    assert.equal(
+      liveOverlayBuf.equals(backfillOverlayBuf),
+      false,
+      'Backfill playback must render the rewind glyph instead of the live play triangle'
+    );
+
+    // Minimal theme renders 3 circles only (solid circle for Live vs circle ring for Backfill) inside a 110x44 capsule
+    const minimalMarkerCam = new Camera(
+      {serial: 'T8214T2222222222', card_theme: 'minimal', card_position: 'bottom-left', card_show_on_live: true},
+      {frame: cachedFrame, lastSeen: '12:00'},
+      renderCameraCards
+    );
+    const minimalBounds = minimalMarkerCam.getCardBounds();
+    assert.deepEqual(minimalBounds, {boxX: 24, boxY: 652, boxW: 110, boxH: 44});
+    const maskPolyBefore = minimalMarkerCam.computeMaskPolygon();
+    assert.equal(minimalMarkerCam.getFrameMarker(), 'S');
+    minimalMarkerCam.active = true;
+    minimalMarkerCam.activeMode = 'download';
+    minimalMarkerCam.downloadPlayedFrames = 1;
+    assert.equal(minimalMarkerCam.getFrameMarker(), 'FB');
+    minimalMarkerCam.downloadPlayedFrames = 2;
+    assert.equal(minimalMarkerCam.getFrameMarker(), 'B');
+    const bMinimalBuf = Buffer.from(renderLiveFrameWithCard(minimalMarkerCam, cachedFrame));
+    minimalMarkerCam.activeMode = 'p2p';
+    assert.equal(minimalMarkerCam.getFrameMarker(), 'L');
+    const lMinimalBuf = Buffer.from(renderLiveFrameWithCard(minimalMarkerCam, cachedFrame));
+    assert.equal(bMinimalBuf.equals(lMinimalBuf), false, 'Minimal card must distinguish Backfill from Live frames');
+    assert.equal(minimalMarkerCam.computeMaskPolygon(), maskPolyBefore, 'Minimal card Frigate mask bounds must remain unchanged');
+
+    // Debug theme renders distinct S, FB, B, and L frame stage markers in its status square
+    const debugMarkerCam = new Camera(
+      {serial: 'T8214T2222222222', card_theme: 'debug', card_position: 'bottom-left', card_show_on_live: true},
+      {frame: cachedFrame, lastSeen: '12:00'},
+      renderCameraCards
+    );
+    debugMarkerCam.active = true;
+    debugMarkerCam.activeMode = 'download';
+    debugMarkerCam.firstFrameAt = 1000;
+    debugMarkerCam.gotVideo = true;
+    debugMarkerCam.downloadPlayedFrames = 1;
+    const fbDebugBuf = Buffer.from(renderLiveFrameWithCard(debugMarkerCam, cachedFrame, 1500));
+    debugMarkerCam.downloadPlayedFrames = 2;
+    const bDebugBuf = Buffer.from(renderLiveFrameWithCard(debugMarkerCam, cachedFrame, 1500));
+    debugMarkerCam.activeMode = 'p2p';
+    const lDebugBuf = Buffer.from(renderLiveFrameWithCard(debugMarkerCam, cachedFrame, 1500));
+    assert.equal(fbDebugBuf.equals(bDebugBuf), false, 'Debug HUD must distinguish FB (First Backfill frame) from B (Backfill frames)');
+    assert.equal(bDebugBuf.equals(lDebugBuf), false, 'Debug HUD must distinguish B (Backfill frames) from L (Live frames)');
+  });
+
+  it('renders proportional anti-aliased UI glyphs and pre-baked Eufy icon sprites without Inter.ttf or FFmpeg', () => {
+    // Verify proportional UI glyph metrics/blitting, Eufy standard icon sprites, and zero-FFmpeg detailed card rendering
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const {
+      UI_FONT_SIZES,
+      EUFY_ICON_SPRITES,
+      measureUiText,
+      drawUiText,
+      getClockHandsMask,
+    } = require('../src/overlay/ui-glyphs');
+
+    assert.ok(measureUiText('iiii', UI_FONT_SIZES.SM) > 0);
+    assert.ok(
+      measureUiText('iiii', UI_FONT_SIZES.SM) < measureUiText('WWWW', UI_FONT_SIZES.SM),
+      'Proportional glyph atlas must advance narrow letters less than wide letters'
+    );
+    assert.ok(
+      measureUiText('Asleep', UI_FONT_SIZES.SM) < measureUiText('Asleep', UI_FONT_SIZES.MD) &&
+        measureUiText('Asleep', UI_FONT_SIZES.MD) < measureUiText('Asleep', UI_FONT_SIZES.LG),
+      'Glyph atlas must scale across 20px, 24px, and 36px sizes'
+    );
+    assert.ok(measureUiText('23°C', UI_FONT_SIZES.SM) > measureUiText('23C', UI_FONT_SIZES.SM));
+
+    const testCanvas = Buffer.alloc(FRAME, 0x10);
+    testCanvas.fill(0x80, 1280 * 720);
+    drawUiText(testCanvas, {
+      x: 40,
+      y: 40,
+      text: 'Asleep (Low Battery) - 23°C',
+      fontSize: UI_FONT_SIZES.SM,
+      rgb: [255, 255, 255],
+    });
+    let intermediatePixels = 0;
+    let brightPixels = 0;
+    for (let y = 36; y < 70; y++) {
+      for (let x = 38; x < 360; x++) {
+        const luma = testCanvas[y * 1280 + x];
+        if (luma > 0x20 && luma < 0xd0) intermediatePixels++;
+        if (luma >= 0xd0) brightPixels++;
+      }
+    }
+    assert.ok(brightPixels > 20, 'Proportional glyph renderer must draw bright foreground strokes');
+    assert.ok(intermediatePixels > 20, 'Proportional glyph renderer must produce anti-aliased edge coverage');
+
+    assert.equal(EUFY_ICON_SPRITES.wifiTiers.length, 4);
+    assert.ok(EUFY_ICON_SPRITES.powerBadges.solar.fg instanceof Uint8Array);
+    assert.ok(EUFY_ICON_SPRITES.powerBadges.plugged.fg instanceof Uint8Array);
+    assert.ok(EUFY_ICON_SPRITES.powerBadges.bolt.fg instanceof Uint8Array);
+    assert.equal(
+      Buffer.from(EUFY_ICON_SPRITES.powerBadges.solar.fg).equals(
+        Buffer.from(EUFY_ICON_SPRITES.powerBadges.bolt.fg)
+      ),
+      false,
+      'Solar badge sprite must differ from USB charging bolt sprite'
+    );
+    assert.equal(
+      Buffer.from(EUFY_ICON_SPRITES.statusSmall.disconnected.mask).equals(
+        Buffer.from(EUFY_ICON_SPRITES.statusSmall.standby.mask)
+      ),
+      false,
+      'Disconnected status sprite must have a distinct silhouette from Standby/Asleep'
+    );
+    const handsA = getClockHandsMask('09:15');
+    const handsB = getClockHandsMask('03:45');
+    assert.equal(handsA, getClockHandsMask('09:15'), 'Clock hands mask must be cached for identical HH:MM');
+    assert.equal(Buffer.from(handsA).equals(Buffer.from(handsB)), false);
+
+    // Verify "detailed" corner and centered cards render without FONT_FILE and blur live video directly
+    const prevFontEnv = process.env.FONT_FILE;
+    process.env.FONT_FILE = '/nonexistent/Inter.ttf';
+    try {
+      const darkSnap = Buffer.alloc(FRAME, 0x20);
+      darkSnap.fill(0x80, 1280 * 720);
+      const cornerDetailed = new Camera(
+        {
+          serial: 'T8161T3333333333',
+          title: 'Front Patio',
+          card_theme: 'detailed',
+          card_position: 'bottom-left',
+          card_show_on_live: true,
+        },
+        {frame: darkSnap, lastSeen: '14:30'},
+        renderCameraCards
+      );
+      cornerDetailed.applyTelemetryProperties({
+        battery: 88,
+        chargingStatus: 4,
+        wifiRssi: -61,
+        temperature: 23,
+      });
+      renderCameraCards(cornerDetailed);
+
+      const centerDetailed = new Camera(
+        {
+          serial: 'T8161T4444444444',
+          title: 'Backyard',
+          card_theme: 'detailed',
+          card_position: 'center',
+        },
+        {frame: darkSnap, lastSeen: '14:30'},
+        renderCameraCards
+      );
+      centerDetailed.applyTelemetryProperties({
+        battery: 42,
+        chargingStatus: 2,
+        wifiRssi: -74,
+        temperature: 18,
+      });
+      renderCameraCards(centerDetailed);
+      assert.equal(centerDetailed.card.asleep.equals(darkSnap), false);
+
+      cornerDetailed.active = true;
+      cornerDetailed.activeMode = 'p2p';
+      const brightLiveFrame = Buffer.alloc(FRAME, 0xc8);
+      brightLiveFrame.fill(0x80, 1280 * 720);
+      const liveOverDark = Buffer.from(renderLiveFrameWithCard(cornerDetailed, darkSnap));
+      const liveOverBright = Buffer.from(renderLiveFrameWithCard(cornerDetailed, brightLiveFrame));
+      const bounds = cornerDetailed.getCardBounds();
+      assert.ok(bounds);
+      const sampleIdx = (bounds.boxY + 12) * 1280 + (bounds.boxX + bounds.boxW - 16);
+      assert.notEqual(
+        liveOverDark[sampleIdx],
+        liveOverBright[sampleIdx],
+        'Detailed live overlay must blur the real live frame backdrop instead of copying a stale sleeping snapshot'
+      );
+
+      cornerDetailed.activeMode = 'download';
+      const bfOverDark = Buffer.from(renderLiveFrameWithCard(cornerDetailed, darkSnap));
+      assert.equal(liveOverDark.equals(bfOverDark), false);
+    } finally {
+      if (prevFontEnv === undefined) {
+        delete process.env.FONT_FILE;
+      } else {
+        process.env.FONT_FILE = prevFontEnv;
+      }
+    }
+
+    // Verify Eufy power badges (Solar vs Plugged vs Charging) render distinct pixels on "icons" theme
+    const snap = Buffer.alloc(FRAME, 0x30);
+    snap.fill(0x80, 1280 * 720);
+    const makeIconsCardForCharging = (chargingStatus) => {
+      const c = new Camera(
+        {serial: 'T8161T5555555555', card_theme: 'icons', card_position: 'top-left'},
+        {frame: snap, lastSeen: '10:20'}
+      );
+      c.applyTelemetryProperties({battery: 80, chargingStatus, wifiRssi: -60, temperature: 22});
+      renderCameraCards(c);
+      return Buffer.from(c.card.asleep);
+    };
+    const usbChargingBuf = makeIconsCardForCharging(1);
+    const pluggedBuf = makeIconsCardForCharging(3);
+    const solarBuf = makeIconsCardForCharging(4);
+    assert.equal(usbChargingBuf.equals(solarBuf), false, 'Eufy Solar icon must differ from USB Charging bolt');
+    assert.equal(usbChargingBuf.equals(pluggedBuf), false, 'Eufy Plugged icon must differ from USB Charging bolt');
+    assert.equal(solarBuf.equals(pluggedBuf), false, 'Eufy Solar icon must differ from Plugged icon');
+
+    const rendererSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'overlay', 'card-renderer.js'), 'utf8');
+    assert.equal(rendererSrc.includes('spawnSync'), false, 'card-renderer.js must not spawn FFmpeg');
+    assert.equal(rendererSrc.includes('Inter.ttf'), false, 'card-renderer.js must not reference Inter.ttf');
+    assert.equal(rendererSrc.includes('FONT_FILE'), false, 'card-renderer.js must not read FONT_FILE');
+
+    const dockerfilePath = path.join(__dirname, '..', 'deploy', 'Dockerfile');
+    if (fs.existsSync(dockerfilePath)) {
+      const dockerfileText = fs.readFileSync(dockerfilePath, 'utf8');
+      assert.equal(dockerfileText.includes('font-inter'), false, 'Dockerfile must not install font-inter');
+      assert.equal(dockerfileText.includes('Inter.ttf'), false, 'Dockerfile must not copy Inter.ttf');
+      assert.equal(dockerfileText.includes('FONT_FILE'), false, 'Dockerfile must not define FONT_FILE');
+    }
+  });
+
+  it('renders "minimal" with circles only (never icons) and shares identical frosted-glass background design across all non-HUD themes', () => {
+    // Verify minimal uses 3 pure circles (dotFg + dotRing, never icons/halos), bolder shadowed icons on icons/detailed, and identical card background surface across all non-HUD themes
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const {EUFY_ICON_SPRITES, blitAlphaSprite} = require('../src/overlay/ui-glyphs');
+    assert.ok(EUFY_ICON_SPRITES.minimal, 'EUFY_ICON_SPRITES.minimal must provide pre-baked minimal circle sprites');
+    assert.equal('pillFg' in EUFY_ICON_SPRITES.minimal, false, 'Minimal theme must not define stadium pills');
+    assert.equal('pillHalo' in EUFY_ICON_SPRITES.minimal, false, 'Minimal theme must not define dark pillHalo rings');
+    assert.equal('dotHalo' in EUFY_ICON_SPRITES.minimal, false, 'Minimal theme must not define dark dotHalo rings');
+    assert.equal(EUFY_ICON_SPRITES.minimal.dotFg.width, 18);
+    assert.equal(EUFY_ICON_SPRITES.minimal.dotFg.height, 18);
+    assert.equal(EUFY_ICON_SPRITES.minimal.dotRing.width, 18);
+    assert.equal(EUFY_ICON_SPRITES.minimal.dotRing.height, 18);
+
+    const rendererSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'overlay', 'card-renderer.js'), 'utf8');
+    const minimalFnMatch = /function drawMinimalDotsCard[\s\S]*?\n\}/.exec(rendererSrc);
+    assert.ok(minimalFnMatch, 'drawMinimalDotsCard must exist');
+    assert.equal(
+      minimalFnMatch[0].includes('drawStatusGlyph'),
+      false,
+      'drawMinimalDotsCard must never render icons via drawStatusGlyph'
+    );
+
+    // Verify bolder prominent icon slot dimensions across icons and detailed themes
+    assert.equal(EUFY_ICON_SPRITES.statusSmall.standby.width, 22);
+    assert.equal(EUFY_ICON_SPRITES.statusSmall.standby.height, 22);
+    assert.equal(EUFY_ICON_SPRITES.batteryShell.width, 38);
+    assert.equal(EUFY_ICON_SPRITES.batteryShell.height, 18);
+    assert.equal(EUFY_ICON_SPRITES.wifiTiers[0].width, 30);
+    assert.equal(EUFY_ICON_SPRITES.wifiTiers[0].height, 22);
+    assert.equal(EUFY_ICON_SPRITES.thermometer.bodySprite.width, 18);
+    assert.equal(EUFY_ICON_SPRITES.thermometer.bodySprite.height, 22);
+    assert.equal(EUFY_ICON_SPRITES.clockDial.width, 22);
+    assert.equal(EUFY_ICON_SPRITES.clockDial.height, 22);
+
+    // Verify blitAlphaSprite directional 1px drop-shadow darkens (+1, +1) without a dark top-left halo
+    const shadowCanvas = Buffer.alloc(FRAME, 0xb0);
+    shadowCanvas.fill(0x80, 1280 * 720);
+    blitAlphaSprite(
+      shadowCanvas,
+      {x: 100, y: 100, sprite: EUFY_ICON_SPRITES.minimal.dotFg},
+      {rgb: [255, 255, 255], opacity: 1, shadow: true}
+    );
+    assert.equal(shadowCanvas[99 * 1280 + 109], 0xb0, 'Top edge outside sprite must have no dark halo');
+    assert.equal(shadowCanvas[109 * 1280 + 99], 0xb0, 'Left edge outside sprite must have no dark halo');
+    assert.ok(
+      shadowCanvas[110 * 1280 + 118] < 0xa8,
+      'Bottom-right (+1, +1) edge must receive subtle directional luma drop-shadow'
+    );
+
+    const brightSkyFrame = Buffer.alloc(FRAME, 0xe2);
+    brightSkyFrame.fill(0x80, 1280 * 720);
+    const minCam = new Camera(
+      {serial: 'SN0000000066', card_theme: 'minimal', card_position: 'bottom-left', card_show_on_live: true},
+      {frame: brightSkyFrame, lastSeen: '13:45'},
+      renderCameraCards
+    );
+    const iconsCam = new Camera(
+      {serial: 'SN0000000067', card_theme: 'icons', card_position: 'bottom-left', card_show_on_live: true},
+      {frame: brightSkyFrame, lastSeen: '13:45'},
+      renderCameraCards
+    );
+    const detailedCam = new Camera(
+      {
+        serial: 'SN0000000068',
+        title: 'Garden',
+        card_theme: 'detailed',
+        card_position: 'bottom-left',
+        card_show_on_live: true,
+      },
+      {frame: brightSkyFrame, lastSeen: '13:45'},
+      renderCameraCards
+    );
+    const centerModalCam = new Camera(
+      {
+        serial: 'SN0000000069',
+        title: 'Porch',
+        card_theme: 'detailed',
+        card_position: 'center',
+      },
+      {frame: brightSkyFrame, lastSeen: '13:45'},
+      renderCameraCards
+    );
+    for (const c of [minCam, iconsCam, detailedCam, centerModalCam]) {
+      c.applyTelemetryProperties({battery: 85, chargingStatus: 0, wifiRssi: -60, temperature: 21});
+      renderCameraCards(c);
+    }
+
+    const minBounds = minCam.getCardBounds();
+    const iconsBounds = iconsCam.getCardBounds();
+    const detailedBounds = detailedCam.getCardBounds();
+    const modalBounds = {boxX: 230, boxY: 192, boxW: 820, boxH: 336};
+    assert.deepEqual(minBounds, {boxX: 24, boxY: 652, boxW: 110, boxH: 44});
+    assert.equal(iconsBounds.boxH, 44, 'Minimal and icons capsules must share identical 44px height');
+    assert.equal(iconsBounds.boxY, minBounds.boxY, 'Minimal and icons capsules must align on exact Y coordinate');
+
+    // Verify all 3 slots in minimal (Status x=16, Battery x=46, Wi-Fi x=76) render identical circles when all 3 are Green
+    const cy = minBounds.boxY + 22;
+    for (let row = 0; row < 19; row++) {
+      for (let col = 0; col < 19; col++) {
+        const y = minBounds.boxY + 13 + row;
+        const p1 = minCam.card.asleep[y * 1280 + (minBounds.boxX + 16 + col)];
+        const p2 = minCam.card.asleep[y * 1280 + (minBounds.boxX + 46 + col)];
+        const p3 = minCam.card.asleep[y * 1280 + (minBounds.boxX + 76 + col)];
+        assert.equal(p1, p2, 'Minimal Status dot and Battery dot must render identical circles');
+        assert.equal(p2, p3, 'Minimal Battery dot and Wi-Fi dot must render identical circles');
+      }
+    }
+
+    // Verify minimal gap symmetry and zero dark halo circle around dots
+    const minGlassLuma = minCam.card.asleep[cy * 1280 + (minBounds.boxX + 40)];
+    const gap2Luma = minCam.card.asleep[cy * 1280 + (minBounds.boxX + 70)];
+    assert.equal(minGlassLuma, gap2Luma, 'Both 12px inter-circle gaps in minimal must have identical glass luma');
+    const leftOfBatDotLuma = minCam.card.asleep[cy * 1280 + (minBounds.boxX + 45)];
+    assert.equal(leftOfBatDotLuma, minGlassLuma, 'Minimal dots must have no dark halo ring outside their circle');
+
+    // Verify minimal Live renders a solid red circle while Backfill renders a symmetric red circle ring (no icons)
+    minCam.active = true;
+    minCam.activeMode = 'p2p';
+    const minLive = Buffer.from(renderLiveFrameWithCard(minCam, brightSkyFrame));
+    minCam.activeMode = 'download';
+    const minBackfill = Buffer.from(renderLiveFrameWithCard(minCam, brightSkyFrame));
+    assert.equal(minLive.equals(minBackfill), false, 'Minimal must distinguish Live circle from Backfill circle ring');
+
+    const statusCx = minBounds.boxX + 25;
+    assert.equal(
+      minBackfill[cy * 1280 + statusCx],
+      minGlassLuma,
+      'Backfill circle ring center must show clean frosted glass without any black fill or icon'
+    );
+    const ringTop = minBackfill[(cy - 7) * 1280 + statusCx];
+    const ringBottom = minBackfill[(cy + 7) * 1280 + statusCx];
+    const ringLeft = minBackfill[cy * 1280 + (statusCx - 7)];
+    const ringRight = minBackfill[cy * 1280 + (statusCx + 7)];
+    assert.ok(Math.abs(ringTop - ringBottom) <= 1 && Math.abs(ringLeft - ringRight) <= 1 && Math.abs(ringTop - ringLeft) <= 1,
+      'Backfill indicator in minimal must have 4-way circular ring symmetry (never a directional icon)'
+    );
+
+    // Verify identical background surface design (blur, 22px corner radius, 64% glass tint, 1px rim, YUV chroma) across ALL non-HUD themes
+    const darkScene = Buffer.alloc(FRAME, 0x20);
+    darkScene.fill(0x74, 1280 * 720, 1280 * 720 + 640 * 360);
+    darkScene.fill(0x8c, 1280 * 720 + 640 * 360);
+    for (const c of [minCam, iconsCam, detailedCam, centerModalCam]) {
+      c.active = false;
+      c.activeMode = '';
+      c.lastFrame = darkScene;
+      renderCameraCards(c);
+    }
+
+    const iconsGlassLuma = iconsCam.card.asleep[cy * 1280 + (iconsBounds.boxX + 46)];
+    const detailedGlassLuma = detailedCam.card.asleep[(detailedBounds.boxY + 22) * 1280 + (detailedBounds.boxX + detailedBounds.boxW - 16)];
+    const modalGlassLuma = centerModalCam.card.asleep[(modalBounds.boxY + 22) * 1280 + (modalBounds.boxX + 40)];
+    const minDarkGlass = minCam.card.asleep[cy * 1280 + (minBounds.boxX + 40)];
+    assert.equal(minDarkGlass, iconsGlassLuma, 'Minimal and icons must share identical frosted-glass interior luma');
+    assert.equal(minDarkGlass, detailedGlassLuma, 'Minimal and detailed corner must share identical frosted-glass interior luma');
+    assert.equal(minDarkGlass, modalGlassLuma, 'Minimal and detailed center modal must share identical frosted-glass interior luma');
+
+    // Byte-for-byte 10x10 top-left rounded corner (Y luma + U/V chroma) equality across minimal, icons, detailed corner, and detailed center modal
+    const assertIdenticalCornerSurface = (bufA, boundsA, bufB, boundsB, label) => {
+      for (let py = 0; py < 10; py++) {
+        for (let px = 0; px < 10; px++) {
+          const yA = bufA[(boundsA.boxY + py) * 1280 + (boundsA.boxX + px)];
+          const yB = bufB[(boundsB.boxY + py) * 1280 + (boundsB.boxX + px)];
+          assert.equal(yA, yB, 'Top-left 22px corner & 1px rim luma must match exactly for ' + label);
+          if ((px & 1) === 0 && (py & 1) === 0) {
+            const cOffA = ((boundsA.boxY + py) >> 1) * 640 + ((boundsA.boxX + px) >> 1);
+            const cOffB = ((boundsB.boxY + py) >> 1) * 640 + ((boundsB.boxX + px) >> 1);
+            assert.equal(bufA[1280 * 720 + cOffA], bufB[1280 * 720 + cOffB], 'Corner U chroma must match for ' + label);
+            assert.equal(
+              bufA[1280 * 720 + 640 * 360 + cOffA],
+              bufB[1280 * 720 + 640 * 360 + cOffB],
+              'Corner V chroma must match for ' + label
+            );
+          }
+        }
+      }
+    };
+    assertIdenticalCornerSurface(minCam.card.asleep, minBounds, iconsCam.card.asleep, iconsBounds, 'minimal vs icons');
+    assertIdenticalCornerSurface(minCam.card.asleep, minBounds, detailedCam.card.asleep, detailedBounds, 'minimal vs detailed corner');
+    assertIdenticalCornerSurface(minCam.card.asleep, minBounds, centerModalCam.card.asleep, modalBounds, 'minimal vs detailed modal');
+
+    const minTopRim = minCam.card.asleep[minBounds.boxY * 1280 + (minBounds.boxX + 55)];
+    const minLeftCapRim = minCam.card.asleep[cy * 1280 + minBounds.boxX];
+    assert.ok(minTopRim - minDarkGlass >= 25, 'All cards must show a crisp subtle 1px frosted rim');
+    assert.ok(Math.abs(minLeftCapRim - minTopRim) <= 6, 'Curved capsule caps must preserve rim brightness');
   });
 });
 
@@ -476,6 +1048,9 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
       clipMs: t0 + 1000,
     };
     assert.equal(doorbellCam.tryMatchBackfillCandidate(clip1), true);
+    const matchLog = doorbellCam.formatBackfillClipMatchLog(clip1);
+    assert.ok(matchLog.includes('preRoll=-1.0s'));
+    assert.ok(matchLog.includes('sensorSpan=22.0s'));
     doorbellCam.beginBackfillDownload(doorbellCam.backfillClip, false, t0 + 27000);
 
     // Burst-downloaded audio chunks are preserved up to maxDownloadBytes instead of being capped at 1s
@@ -483,7 +1058,7 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
     doorbellCam.appendAudioChunk(Buffer.alloc(32000), 32000, 32000 * 120);
     assert.equal(doorbellCam.pcmLen, 64000);
 
-    // Frame 0 committed -> advances to Frame 1 on the very next 15 fps tick once encoded (zero still-frame hold)
+    // Frame 0 committed -> immediately ready to advance to Frame 1 on the next 15 fps tick (62ms) without freezing
     const dummyFrame1 = Buffer.alloc(FRAME, 0x30);
     const dummyFrame2 = Buffer.alloc(FRAME, 0x50);
     const tFirstFrame = t0 + 27100;
@@ -494,13 +1069,13 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
     assert.equal(doorbellCam.canAdvanceDownloadFrame(tFirstFrame + 100, 62), false, 'Must not overwrite un-encoded Frame 0');
 
     doorbellCam.markFrameEncoded(dummyFrame1, tFirstFrame);
+    const silenceBuf = Buffer.alloc(3200, 0);
     const tNextTick = tFirstFrame + 62;
     assert.equal(
       doorbellCam.canAdvanceDownloadFrame(tNextTick, 62),
       true,
-      'Must advance immediately to Frame 1 on the next 15 fps tick without holding still frames'
+      'Advances to Frame 1 on the very next 15 fps tick (62ms) after Frame 0 is encoded'
     );
-    const silenceBuf = Buffer.alloc(3200, 0);
     assert.notEqual(doorbellCam.consumeAudioChunk(3200, silenceBuf), silenceBuf);
     doorbellCam.consumeNextDownloadFrame(tNextTick, 62, '17:10');
     doorbellCam.markFrameEncoded(dummyFrame2, tNextTick + 10);
@@ -524,20 +1099,39 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
       'Completes once minPlaybackMs (4.5s) and postPlaybackHoldMs (2.5s) have elapsed'
     );
 
-    // Scales Frigate event duration with DOWNLOAD_EVENT_DURATION_MARGIN_SECS (8s) for backfill downloads
+    // Scales Frigate event duration with DOWNLOAD_EVENT_DURATION_MARGIN_SECS (6s) for backfill downloads
+    // and only populates subLabel when a recognized face name is present (null otherwise)
     doorbellCam.downloadFrames = new Array(600);
-    doorbellCam.tryUpgradeOrQueueFrigateEvent('person', 'Alice', tNextTick + 500);
-    const filed = doorbellCam.completeFrigateEventFiling(tNextTick + 1000, 15);
-    assert.equal(filed.durationSecs, 41 + DOWNLOAD_EVENT_DURATION_MARGIN_SECS);
+    doorbellCam.tryUpgradeOrQueueFrigateEvent('person', '', tNextTick + 500);
+    const filedNoFace = doorbellCam.completeFrigateEventFiling(tNextTick + 1000, 15);
+    assert.equal(filedNoFace.subLabel, null);
+    assert.equal(filedNoFace.durationSecs, 41 + DOWNLOAD_EVENT_DURATION_MARGIN_SECS);
+
+    doorbellCam.evUntil = 0;
+    doorbellCam.tryUpgradeOrQueueFrigateEvent('person', 'Alice', tNextTick + 1100);
+    const filedWithFace = doorbellCam.completeFrigateEventFiling(tNextTick + 1200, 15);
+    assert.equal(filedWithFace.subLabel, 'Alice');
     doorbellCam.downloadFrames = [];
 
     // Ending session promotes activeBackfillJob to a follow-up query because activity spanned 21s past clip1
     doorbellCam.endSession(tNextTick + 3000);
     assert.ok(doorbellCam.pendingBackfill instanceof BackfillJob);
     assert.equal(doorbellCam.pendingBackfill.followUpQueried, true);
+
+    // A short 10s event whose clip filename starts 5s earlier (pre-roll) must not schedule a false follow-up query
+    const shortJob = new BackfillJob({
+      at: t0,
+      lastActivityAt: t0,
+      clearedAt: t0 + 10000,
+    });
+    assert.equal(
+      shortJob.needsFollowUpClipQuery(t0 - 5000),
+      false,
+      'Pre-roll clip timestamp (5s before trigger) must not inflate post-trigger activity span'
+    );
   });
 
-  it('streams backfill clips from Frame 0 at 15 fps without encoding old snapshots, freezing still frames, or filing Frigate events before pipeline transit', () => {
+  it('streams backfill clips from Frame 0 at 15 fps without starving encoder pipe during handshake or freezing Frame 0', () => {
     const oldSnapshot = Buffer.alloc(FRAME, 0x11);
     const doorbellCam = new Camera(
       {
@@ -600,13 +1194,13 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
       false,
       'Must NOT treat previous session lastFrame as live video before Frame 0 is decoded'
     );
-    pushFrameToEncoder(doorbellCam, tWake + 100);
     pushFrameToEncoder(doorbellCam, tWake + 250);
     assert.equal(
       writtenFrames.length,
-      0,
-      'Encoder stdin must remain completely quiet during backfill handshake before Frame 0 is decoded so zero old snapshot frames queue ahead of Frame 0'
+      1,
+      'Encoder stdin continues normal idle card pacing during backfill handshake instead of starving pipe:0'
     );
+    writtenFrames.length = 0;
 
     const requiredDelayMs = computeRequiredSnapshotDelay('download');
     assert.equal(
@@ -634,31 +1228,2376 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
 
     assert.equal(writtenFrames.length, 1);
     assert.equal(doorbellCam.lastSent, frame0, 'lastSent must track raw Frame 0');
-    assert.equal(writtenFrames[0][0], 0x80, 'First encoded frame of backfill must be Frame 0, never oldSnapshot or card.asleep');
+    assert.equal(writtenFrames[0][0], 0x80, 'First encoded frame of backfill must be Frame 0');
+    assert.equal(doorbellCam.getFrameMarker(), 'FB');
+    assert.equal(doorbellCam.downloadFrames.length, 2, 'Frame 1 and Frame 2 are buffered behind Frame 0');
+    assert.equal(doorbellCam.downloadDecodedFrames, 3, 'Tracks Frame 0 + Frame 1 + Frame 2 as 3 decoded frames');
+    assert.equal(doorbellCam.downloadPlayedFrames, 1, 'Tracks Frame 0 as 1 played frame');
+    assert.equal(doorbellCam.downloadVideoPackets, 1, 'Tracks incoming P2P video packet count during download');
+    assert.equal(doorbellCam.backfillPlaybackStartedAt, tFrame0);
 
-    // Phase 3: Continuous 15 fps advancement (Frame 0 -> Frame 1 -> Frame 2 with zero still-frame freeze)
+    // Phase 3: Next 15 fps tick (tFrame0 + 62ms) immediately advances to Frame 1 (B) without any frozen warmup hold
     const tTick1 = tFrame0 + 62;
     pushFrameToEncoder(doorbellCam, tTick1);
     assert.equal(writtenFrames.length, 2);
     assert.equal(doorbellCam.lastSent, frame1);
-    assert.equal(writtenFrames[1][0], 0x81, 'Tick 1 (62ms) must advance immediately to Frame 1 without freezing Frame 0');
+    assert.equal(writtenFrames[1][0], 0x81, 'Next 15 fps tick immediately advances to Frame 1');
+    assert.equal(doorbellCam.downloadPlayedFrames, 2);
+    assert.equal(doorbellCam.getFrameMarker(), 'B');
+
+    const transferLog = doorbellCam.formatBackfillTransferCompleteLog(1, 15);
+    assert.ok(transferLog.includes('packets=1'));
+    assert.ok(transferLog.includes('decodedFrames=3'));
+    assert.ok(transferLog.includes('playedFrames=2'));
+    assert.ok(transferLog.includes('estClipDuration=0.2s'));
 
     const tTick2 = tTick1 + 62;
     pushFrameToEncoder(doorbellCam, tTick2);
     assert.equal(writtenFrames.length, 3);
     assert.equal(doorbellCam.lastSent, frame2);
-    assert.equal(writtenFrames[2][0], 0x82, 'Tick 2 (124ms) must advance immediately to Frame 2');
+    assert.equal(writtenFrames[2][0], 0x82, 'Subsequent 15 fps tick advances to Frame 2');
+    assert.equal(doorbellCam.downloadPlayedFrames, 3);
 
     // Phase 4: Frigate event waits for pipeline transit (BACKFILL_SNAP_DELAY_MS) after firstFrameAt
     assert.equal(
       doorbellCam.isReadyForEventSnapshot(tFrame0 + 200, requiredDelayMs, 1500, 5000),
       false,
-      'Must wait while Frame 0 is still in flight through h264_vaapi -> go2rtc -> Frigate'
+      'Must wait while initial frames are still in flight through h264_vaapi -> go2rtc -> Frigate'
     );
     assert.equal(
       doorbellCam.isReadyForEventSnapshot(tFrame0 + BACKFILL_SNAP_DELAY_MS, requiredDelayMs, 1500, 5000),
       true,
-      'Becomes ready to create Frigate event once Frame 0 has reached Frigate'
+      'Becomes ready to create Frigate event once initial frames have reached Frigate'
+    );
+
+    // Phase 5: Backfill SLEEP summary includes clipStart, clipDuration, decodedFrames, playedFrames, playbackSpan, and postHold
+    const sleepResult = doorbellCam.terminateSession(tTick2 + 2500, 'backfill clip completed', false, 'bridge-backfill');
+    assert.ok(sleepResult.sleepMsg.includes('clipDuration=0.2s'));
+    assert.ok(sleepResult.sleepMsg.includes('decodedFrames=3'));
+    assert.ok(sleepResult.sleepMsg.includes('playedFrames=3'));
+    assert.ok(sleepResult.sleepMsg.includes('playbackSpan=0.1s'));
+    assert.ok(sleepResult.sleepMsg.includes('postHold=2.5s'));
+  });
+
+  it('extracts database record candidates from explicit storage_path or synthesized crop_local_path and enforces time window and expiry', () => {
+    assert.equal(extractDatabaseRecordCandidate(null), null);
+    assert.equal(extractDatabaseRecordCandidate({device_sn: 'T8214T2222222222'}), null);
+
+    const directCandidate = extractDatabaseRecordCandidate({
+      device_sn: 'T8214T2222222222',
+      storage_path: '/media/mmcblk0p1/video/20261105200709.zxvideo',
+      video_type: 1,
+      cipher_id: 7,
+      start_time: '2026-11-05T20:07:09Z',
+    });
+    assert.ok(directCandidate);
+    assert.equal(directCandidate.devSn, 'T8214T2222222222');
+    assert.equal(directCandidate.storagePath, '/media/mmcblk0p1/video/20261105200709.zxvideo');
+    assert.equal(directCandidate.cipherId, 7);
+    assert.equal(directCandidate.clipMs, Date.parse('2026-11-05T20:07:09Z'));
+
+    const cropCandidate = extractDatabaseRecordCandidate({
+      serialNumber: 'T8214T2222222222',
+      crop_local_path: '/zx/hdd_data0/Camera02/202611/20261105200709/pic20261105200709.jpg',
+      cipherId: 0,
+      create_time: '2026-11-05T20:07:09Z',
+    });
+    assert.ok(cropCandidate);
+    assert.equal(cropCandidate.storagePath, '/zx/hdd_data0/Camera02/202611/20261105200709/20261105200709.zxvideo');
+    assert.equal(cropCandidate.clipMs, Date.parse('2026-11-05T20:07:09Z'));
+
+    const tTrigger = 1793927229000;
+    const job = new BackfillJob({
+      at: tTrigger,
+      event: 'person detected',
+      personName: 'Alice',
+      reason: 'person detected (Alice)',
+      priority: 200,
+    });
+    const downloadedPaths = new Set();
+
+    assert.equal(
+      job.matchesCandidate(
+        {
+          devSn: 'T8214T2222222222',
+          storagePath: '/path/pre_roll.zxvideo',
+          clipMs: tTrigger - 40000,
+        },
+        downloadedPaths
+      ),
+      true,
+      'Matches clip within 45s pre-roll window before trigger'
+    );
+    assert.equal(
+      job.matchesCandidate(
+        {
+          devSn: 'T8214T2222222222',
+          storagePath: '/path/too_old.zxvideo',
+          clipMs: tTrigger - 46000,
+        },
+        downloadedPaths
+      ),
+      false,
+      'Rejects clip older than 45s before trigger'
+    );
+    assert.equal(
+      job.matchesCandidate(
+        {
+          devSn: 'T8214T2222222222',
+          storagePath: '/path/too_late.zxvideo',
+          clipMs: tTrigger + 185000,
+        },
+        downloadedPaths
+      ),
+      false,
+      'Rejects clip more than 180s after latest trigger'
+    );
+
+    for (let i = 1; i <= BACKFILL_MAX_QUERY_ATTEMPTS; i++) {
+      assert.equal(job.consumeQueryAttempt(), true);
+    }
+    assert.equal(BACKFILL_MAX_QUERY_ATTEMPTS, 10, 'Allows 10 query attempts (~40s after sensor clear) so 30s hardware clips finish recording');
+    assert.equal(job.consumeQueryAttempt(), false, 'Returns false when max query attempts are exhausted');
+    assert.equal(job.isExpired(tTrigger + DEFAULT_BACKFILL_MAX_AGE_MS - 1), false);
+    assert.equal(job.isExpired(tTrigger + DEFAULT_BACKFILL_MAX_AGE_MS + 1), true);
+  });
+});
+
+describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
+  it('evaluates 6-color semantic state across status, battery, charging, Wi-Fi RSSI, and temperature', () => {
+    assert.equal(unwrapProperty({value: 85}), 85);
+    assert.equal(unwrapProperty(42), 42);
+    assert.equal(unwrapProperty(null), null);
+
+    const lowBatState = evaluateTelemetryState('Asleep (Low Battery)', {
+      telCfg: {enabled: true, battery: true, powerSource: true, wifi: true, rssi: true, temperature: true, lastSeen: true},
+      battery: 15,
+      charging: false,
+      economyMode: true,
+      lowBatThreshold: 20,
+      wifi: 1,
+      rssi: -82,
+      temp: 52,
+      lastSeen: '19:45',
+    });
+    assert.equal(lowBatState.statusKind, 'low');
+    assert.equal(lowBatState.batHex, '0xe879f9');
+    assert.equal(lowBatState.wifiBars, 1);
+    assert.equal(lowBatState.tempHex, '0xe879f9');
+
+    const chargingState = evaluateTelemetryState('Waking Up...', {
+      telCfg: {enabled: true, battery: true, powerSource: true, wifi: true, rssi: true, temperature: true, lastSeen: true},
+      battery: 55,
+      charging: true,
+      powerLabel: 'Charging',
+      economyMode: false,
+      lowBatThreshold: 20,
+      wifi: 4,
+      rssi: -55,
+      temp: 24,
+      lastSeen: '19:45',
+    });
+    assert.equal(chargingState.statusKind, 'waking');
+    assert.equal(chargingState.batHex, '0x38bdf8');
+    assert.equal(chargingState.wifiBars, 4);
+    assert.equal(chargingState.tempHex, '0xd4d4d8');
+
+    const liveState = evaluateTelemetryState('Live', {
+      telCfg: {enabled: true, battery: true, powerSource: true, wifi: true, rssi: true, temperature: true, lastSeen: true},
+      battery: 90,
+      charging: false,
+      powerLabel: 'Plugged',
+      economyMode: false,
+      lowBatThreshold: 20,
+      wifi: 2,
+      rssi: -72,
+      temp: 0,
+      lastSeen: '19:45',
+    });
+    assert.equal(liveState.statusKind, 'live');
+    assert.equal(liveState.batHex, '0x4ade80');
+    assert.equal(liveState.wifiBars, 3);
+    assert.equal(liveState.tempHex, '0x38bdf8');
+
+    const segs = buildTelemetrySegments(liveState);
+    assert.equal(segs.length, 4);
+    assert.equal(segs[0].type, 'bat');
+    assert.equal(segs[0].label, '90% Plugged');
+    assert.equal(segs[1].type, 'wifi');
+    assert.equal(segs[1].label, '-72 dBm');
+    assert.equal(segs[2].type, 'temp');
+    assert.equal(segs[2].label, '0°C');
+    assert.equal(segs[3].type, 'seen');
+    assert.equal(segs[3].label, 'Last live 19:45');
+  });
+
+  it('matches all README "What the Status Colors Mean" tiers across Status, Battery, Wi-Fi, and Temperature', () => {
+    const allEnabled = {
+      enabled: true,
+      battery: true,
+      powerSource: true,
+      wifi: true,
+      rssi: true,
+      temperature: true,
+      lastSeen: true,
+    };
+
+    // 1. Status colors: Red (Live / Backfill), Green (Asleep sleep-ready), Grey (Disconnected), Blue (Waking Up...), Yellow (Waiting), Purple (Asleep Low Battery)
+    assert.deepEqual(evaluateTelemetryState('Live', {telCfg: allEnabled}).statusRgb, COLOR_RED);
+    assert.equal(evaluateTelemetryState('Live', {telCfg: allEnabled}).statusKind, 'live');
+    assert.deepEqual(evaluateTelemetryState('Backfill', {telCfg: allEnabled}).statusRgb, COLOR_RED);
+    assert.equal(evaluateTelemetryState('Backfill', {telCfg: allEnabled}).statusKind, 'backfill');
+    assert.deepEqual(evaluateTelemetryState('Asleep', {telCfg: allEnabled}).statusRgb, COLOR_GREEN);
+    assert.equal(evaluateTelemetryState('Asleep', {telCfg: allEnabled}).statusKind, 'asleep');
+    assert.deepEqual(evaluateTelemetryState('Disconnected', {telCfg: allEnabled}).statusRgb, COLOR_GREY);
+    assert.equal(evaluateTelemetryState('Disconnected', {telCfg: allEnabled}).statusKind, 'disconnected');
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, serviceDisrupted: true}).statusRgb,
+      COLOR_GREY
+    );
+    assert.equal(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, serviceDisrupted: true}).statusKind,
+      'disconnected'
+    );
+    assert.deepEqual(evaluateTelemetryState('Waking Up...', {telCfg: allEnabled}).statusRgb, COLOR_BLUE);
+    assert.equal(evaluateTelemetryState('Waking Up...', {telCfg: allEnabled}).statusKind, 'waking');
+    assert.deepEqual(evaluateTelemetryState('Waiting', {telCfg: allEnabled}).statusRgb, COLOR_YELLOW);
+    assert.equal(evaluateTelemetryState('Waiting', {telCfg: allEnabled}).statusKind, 'waiting');
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep (Low Battery)', {telCfg: allEnabled, economyMode: true}).statusRgb,
+      COLOR_PURPLE
+    );
+    assert.equal(
+      evaluateTelemetryState('Asleep (Low Battery)', {telCfg: allEnabled, economyMode: true}).statusKind,
+      'low'
+    );
+
+    // 2. Battery colors: Green (50-100%), Blue (Charging / Solar), Yellow (21-49%), Purple (<=20% Low)
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: 50, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_GREEN
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: 100, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_GREEN
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {
+        telCfg: allEnabled,
+        battery: 40,
+        charging: true,
+        powerLabel: 'Solar',
+        lowBatThreshold: 20,
+      }).batRgb,
+      COLOR_BLUE
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: 49, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_YELLOW
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: 21, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_YELLOW
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: 20, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_PURPLE
+    );
+    assert.deepEqual(
+      evaluateTelemetryState('Asleep', {telCfg: allEnabled, battery: null, charging: false, lowBatThreshold: 20}).batRgb,
+      COLOR_GREY
+    );
+
+    // 3. Wi-Fi colors & bars: Green (Strong 4 bars >= -65 dBm), Blue (Good 3 bars -66..-72 dBm),
+    // Yellow (Fair 2 bars -73..-80 dBm), Purple (Weak 1 bar <= -81 dBm), Grey (Not available)
+    const wifiStrong = evaluateTelemetryState('Asleep', {telCfg: allEnabled, rssi: -65});
+    assert.equal(wifiStrong.wifiBars, 4);
+    assert.deepEqual(wifiStrong.wifiRgb, COLOR_GREEN);
+
+    const wifiGood = evaluateTelemetryState('Asleep', {telCfg: allEnabled, rssi: -70});
+    assert.equal(wifiGood.wifiBars, 3);
+    assert.deepEqual(wifiGood.wifiRgb, COLOR_BLUE);
+
+    const wifiFair = evaluateTelemetryState('Asleep', {telCfg: allEnabled, rssi: -78});
+    assert.equal(wifiFair.wifiBars, 2);
+    assert.deepEqual(wifiFair.wifiRgb, COLOR_YELLOW);
+
+    const wifiWeak = evaluateTelemetryState('Asleep', {telCfg: allEnabled, rssi: -81});
+    assert.equal(wifiWeak.wifiBars, 1);
+    assert.deepEqual(wifiWeak.wifiRgb, COLOR_PURPLE);
+
+    const wifiMissing = evaluateTelemetryState('Asleep', {telCfg: allEnabled, wifi: null, rssi: null});
+    assert.equal(wifiMissing.wifiBars, 0);
+    assert.deepEqual(wifiMissing.wifiRgb, COLOR_GREY);
+
+    // 4. Temperature colors: Green (Normal 6-35°C), Blue (Cold <=5°C), Yellow (Warm 36-44°C), Purple (Hot >=45°C), Grey (Not available)
+    const tempNormal = evaluateTelemetryState('Asleep', {telCfg: allEnabled, temp: 22});
+    assert.deepEqual(tempNormal.tempRgb, COLOR_GREEN);
+
+    const tempCold = evaluateTelemetryState('Asleep', {telCfg: allEnabled, temp: 5});
+    assert.deepEqual(tempCold.tempRgb, COLOR_BLUE);
+
+    const tempWarm = evaluateTelemetryState('Asleep', {telCfg: allEnabled, temp: 36});
+    assert.deepEqual(tempWarm.tempRgb, COLOR_YELLOW);
+
+    const tempHot = evaluateTelemetryState('Asleep', {telCfg: allEnabled, temp: 45});
+    assert.deepEqual(tempHot.tempRgb, COLOR_PURPLE);
+
+    const tempMissing = evaluateTelemetryState('Asleep', {telCfg: allEnabled, temp: null});
+    assert.deepEqual(tempMissing.tempRgb, COLOR_GREY);
+  });
+
+  it('distinguishes major battery/charging state changes from minor telemetry updates and evaluates quality/refresh rules', () => {
+    const tel = new Telemetry({
+      mode: 'custom',
+      low_battery_threshold: 20,
+      enforce_streaming_quality: 3,
+      sync_power: true,
+      power_working_mode: 2,
+      recording_clip_length: 60,
+      recording_end_early: false,
+      recording_retrigger_interval: 5,
+    });
+
+    const initial = tel.applyProperties({
+      name: {value: 'FrontCam'},
+      model: {value: 'T8161'},
+      softwareVersion: {value: '3.1.4'},
+      battery: {value: 50},
+      chargingStatus: {value: 2},
+      wifiSignalLevel: {value: 3},
+      wifiRssi: {value: -68},
+      batteryTemperature: {value: 25},
+    });
+    assert.equal(initial.hadInitialTelemetry, false);
+    assert.equal(initial.nowLowBat, false);
+    assert.ok(tel.formatLoadedLog(initial.model, initial.swVer, initial.nowLowBat).includes('T8161'));
+
+    // Minor 2% drop does not trigger stateChanged (card rebuild), only minorTelemetryChanged
+    const minor = tel.applyProperties({battery: 48, wifiRssi: -69});
+    assert.equal(minor.hadInitialTelemetry, true);
+    assert.equal(minor.stateChanged, false);
+    assert.equal(minor.minorTelemetryChanged, true);
+    assert.ok(tel.formatUpdateLog().includes('battery=48%'));
+
+    // >= 10% jump (e.g. battery swap from 48% to 95%) triggers stateChanged
+    const swapped = tel.applyProperties({battery: 95});
+    assert.equal(swapped.stateChanged, true);
+    assert.ok(tel.formatStateChangeLog(swapped.prevBattery, swapped.nowLowBat).includes('48% -> 95%'));
+
+    assert.deepEqual(
+      tel.evaluateQualityChange({videoStreamingQuality: {value: 1}}, 'T8161T0000000000'),
+      {shouldUpdate: true, currentQuality: 1, targetQuality: 3}
+    );
+    assert.deepEqual(
+      tel.evaluateQualityChange({videoStreamingQuality: {value: 3}}, 'T8161T0000000000'),
+      {shouldUpdate: false, currentQuality: 0, targetQuality: 7},
+      'Only checks streaming quality once per session'
+    );
+
+    // Offline viewer refresh cooldown (300s / 5m)
+    tel.applyProperties({battery: 15, chargingStatus: 2});
+    assert.equal(tel.isLowBattery(), true);
+    assert.equal(tel.shouldRefreshLowBatteryOnView(400000), true);
+    assert.equal(tel.shouldRefreshLowBatteryOnView(500000), false, 'Respects 300s poll cooldown');
+    assert.equal(tel.shouldRefreshLowBatteryOnView(705000), true);
+  });
+});
+
+describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', () => {
+  it('compares wanting cameras by priority and preempts lower-priority P2P sessions', () => {
+    const lowCam = new Camera({serial: 'T8161T0000000000', priority: 10});
+    const highCam = new Camera({serial: 'T8214T2222222222', priority: 100});
+
+    const t0 = Date.now();
+    lowCam.beginSession('p2p', t0, false);
+    lowCam.motionUntil = t0 + 60000;
+    lowCam.lastMotionAt = t0;
+
+    highCam.beginSession('p2p', t0, false);
+    highCam.motionUntil = t0 + 60000;
+    highCam.lastMotionAt = t0 + 500;
+
+    assert.equal(highCam.canPreempt(lowCam, t0 + 1000, 12000), true);
+    assert.equal(lowCam.canPreempt(highCam, t0 + 1000, 12000), false);
+    assert.equal(highCam.resolvePreemptInitiator(lowCam, t0 + 1000), 'bridge-arbitrator/higher-priority-event');
+
+    lowCam.motionUntil = 0;
+    assert.equal(highCam.resolvePreemptInitiator(lowCam, t0 + 1000), 'bridge-arbitrator/motion-over-viewer');
+
+    highCam.motionUntil = 0;
+    highCam.viewUntil = t0 + 20000;
+    assert.equal(highCam.resolvePreemptInitiator(lowCam, t0 + 1000), 'bridge-arbitrator/newer-viewer');
+
+    // Compare wanting order: motion beats viewer; higher effective priority beats lower priority
+    lowCam.active = false;
+    lowCam.activeMode = '';
+    lowCam.motionUntil = t0 + 60000;
+    highCam.motionUntil = t0 + 60000;
+    const sorted = [lowCam, highCam].sort((a, b) => Camera.compareWanting(a, b));
+    assert.equal(sorted[0], highCam);
+  });
+
+  it('evaluates active hold extensions near expiry, early sleep on motion cleared, and Eufy clean-end detection', () => {
+    const cam = new Camera({serial: 'T8161T0000000000', mode: 'p2p', hold_secs: 60, stream_max_secs: 120});
+    const t0 = 100000;
+    cam.beginSession('p2p', t0, false);
+    cam.gotVideo = true;
+    cam.firstFrameAt = t0 + 1000;
+    cam.firstVideoAt = t0 + 1000;
+    cam.motionUntil = t0 + 60000;
+
+    // Not near expiry yet (30s remaining > 4s window) -> no poll needed
+    assert.deepEqual(cam.shouldPollFrigateForHoldOrBackfill(t0 + 30000, 4000, 2000, 2000), {
+      shouldPoll: false,
+      needsTimeoutExtendCheck: false,
+    });
+
+    // Within 4s of expiry -> polls and extends by holdMs / 2 (30s)
+    assert.deepEqual(cam.shouldPollFrigateForHoldOrBackfill(t0 + 58000, 4000, 2000, 2000), {
+      shouldPoll: true,
+      needsTimeoutExtendCheck: true,
+    });
+    const ext = cam.extendActiveHold(t0 + 58000, 5000, true);
+    assert.equal(ext.extendMs, 30000);
+    assert.equal(cam.motionUntil, t0 + 90000);
+
+    // Early sleep when letEufyDecideEnd=true and motion clears after first video
+    const earlyCam = new Camera({
+      serial: 'T8161T1111111111',
+      mode: 'custom',
+      end_early: true,
+      idle_timeout_secs: 10,
+      hold_secs: 60,
+    });
+    earlyCam.beginSession('p2p', t0, false);
+    earlyCam.gotVideo = true;
+    earlyCam.eventActive = true;
+    earlyCam.firstVideoAt = t0 + 1000;
+    earlyCam.lastMotionAt = t0 + 1000;
+    earlyCam.motionUntil = t0 + 60000;
+
+    assert.equal(earlyCam.recordMotionCleared(t0 + 8000, 5000, 10000), 5);
+    assert.equal(earlyCam.checkEarlySleepDue(t0 + 9000, 3000, 4000).due, false);
+    assert.deepEqual(earlyCam.checkEarlySleepDue(t0 + 12500, 3000, 4000), {
+      due: true,
+      clearedByEufy: true,
+    });
+
+    // Clean Eufy livestream stop detection vs premature interruption
+    assert.equal(earlyCam.didEufyEndEventCleanly(t0 + 10000, 8000), true);
+    assert.equal(cam.didEufyEndEventCleanly(t0 + 10000, 8000), false, 'letEufyDecideEnd=false requires full hold');
+  });
+
+  it('evaluates RTSP and P2P watchdog health, unsolicited video filtering, and HTTP/HA payload formatting', () => {
+    const rtspCam = new Camera({
+      serial: 'T8161T0000000000',
+      title: 'Driveway',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://10.0.0.1/live0',
+    });
+    const t0 = 200000;
+    rtspCam.beginSession('rtsp', t0, false);
+    rtspCam.motionUntil = t0 + 60000;
+
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 2000, t0, 1200, 6000, 3500, 3, 15000, 6000).action,
+      'none'
+    );
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 4000, t0, 1200, 6000, 3500, 3, 15000, 6000).action,
+      'retry',
+      'Retries start_rtsp_livestream after retryMs when no video has arrived'
+    );
+
+    rtspCam.markRtspFrameReceived(t0 + 4500);
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 6000, t0 + 4500, 1200, 6000, 3500, 3, 15000, 6000).action,
+      'none'
+    );
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 8200, t0 + 4500).action,
+      'none',
+      'Default midStallMs (5000ms) must tolerate a 3.7s Wi-Fi retransmission pause without tearing down RTSP'
+    );
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 9800, t0 + 4500).action,
+      'dropped',
+      'Default midStallMs (5000ms) must report dropped once RTSP frames stop for > 5s'
+    );
+    assert.equal(
+      rtspCam.evaluateRtspHealth(t0 + 12000, t0 + 4500, 1200, 6000, 3500, 3, 15000, 6000).action,
+      'dropped',
+      'Reports dropped if RTSP frames stop for > midStallMs'
+    );
+
+    const slowWakeCam = new Camera({
+      serial: 'T8161T0000000001',
+      title: 'Slow Wake',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://10.0.0.1/live1',
+    });
+    slowWakeCam.beginSession('rtsp', t0, false);
+    slowWakeCam.motionUntil = t0 + 60000;
+    assert.equal(
+      slowWakeCam.evaluateRtspHealth(t0 + 8500, t0).action,
+      'none',
+      'Default RTSP retry interval must outlast an observed 7-8.5s HomeBase RTSP cold wake so a retry does not restart a wake in progress'
+    );
+    assert.equal(slowWakeCam.evaluateRtspHealth(t0 + 10500, t0).action, 'retry');
+
+    // Unsolicited P2P video filtering when camera recently slept vs past delayMs
+    rtspCam.endSession(t0 + 19000);
+    assert.equal(
+      rtspCam.shouldStopUnsolicitedVideo(t0 + 20000, 3000).shouldStop,
+      false,
+      'Within 3s post-stop window, ignores trailing packets without sending redundant stop_livestream'
+    );
+    assert.equal(
+      rtspCam.shouldStopUnsolicitedVideo(t0 + 25000, 3000).shouldStop,
+      true,
+      'Past 3s post-stop window, triggers stop_livestream for unsolicited video'
+    );
+
+    // Adopt external P2P wake and verify P2P watchdog health states
+    const p2pCam = new Camera({serial: 'T8161T1111111111', title: 'Backyard', mode: 'p2p'});
+    assert.equal(p2pCam.adoptExternalP2pWake(t0, 5000), true);
+    assert.equal(p2pCam.active, true);
+    assert.equal(p2pCam.activeMode, 'p2p');
+    assert.equal(p2pCam.wakeInitiator, 'eufy-ws');
+    assert.equal(p2pCam.evaluateP2pHealth(t0 + 7000, t0, 6000, 8000, 3).action, 'retry');
+
+    // Coalesce HTTP /api/wake bursts and verify API + HA webhook payloads
+    p2pCam.apiWakeScheduledAt = t0 + 2500;
+    assert.equal(p2pCam.coalesceApiWake(30000, 'ha-automation', true, t0 + 1000), 1500);
+    const apiResp = p2pCam.toApiWakeResponse('scheduled', 30000, 1500);
+    assert.equal(apiResp.camera, 'T8161T1111111111');
+    assert.equal(apiResp.status, 'scheduled');
+    assert.equal(apiResp.hold_secs, 30);
+
+    p2pCam.evLabel = 'person';
+    p2pCam.evPerson = 'Alice';
+    const haPayload = p2pCam.toHaWebhookPayload({event_id: 'evt-123'});
+    assert.equal(haPayload.camera, 'T8161T1111111111');
+    assert.equal(haPayload.person, 'Alice');
+    assert.equal(haPayload.event_id, 'evt-123');
+  });
+
+  it('transitions Camera.sessionState deterministically across RTSP, P2P, and Backfill FSM lifecycle states', () => {
+    assert.ok(SESSION_STATES);
+    const rtspCam = new Camera({
+      serial: 'T8161T0000000000',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://10.0.0.1/live0',
+    });
+    const p2pCam = new Camera({serial: 'T8161T1111111111', mode: 'p2p'});
+    const backfillCam = new Camera({serial: 'T8214T2222222222', mode: 'backfill'});
+
+    const t0 = 500000;
+    // 1. RTSP lifecycle: IDLE -> WAKING_RTSP -> STREAMING_LIVE -> WAKING_RTSP (rewake) -> STREAMING_LIVE -> IDLE
+    assert.equal(rtspCam.sessionState, SESSION_STATES.IDLE);
+    rtspCam.beginSession('rtsp', t0, false);
+    assert.equal(rtspCam.sessionState, SESSION_STATES.WAKING_RTSP);
+    rtspCam.markRtspFrameReceived(t0 + 1000);
+    assert.equal(rtspCam.sessionState, SESSION_STATES.STREAMING_LIVE);
+    rtspCam.beginRtspRewake(t0 + 5000, 10000);
+    assert.equal(rtspCam.sessionState, SESSION_STATES.WAKING_RTSP);
+    rtspCam.markRtspFrameReceived(t0 + 6000);
+    assert.equal(rtspCam.sessionState, SESSION_STATES.STREAMING_LIVE);
+    rtspCam.endSession(t0 + 10000);
+    assert.equal(rtspCam.sessionState, SESSION_STATES.IDLE);
+
+    // 2. P2P lifecycle: IDLE -> WAKING_P2P -> STREAMING_LIVE -> COOLDOWN -> IDLE
+    assert.equal(p2pCam.sessionState, SESSION_STATES.IDLE);
+    assert.equal(p2pCam.transitionTo(SESSION_STATES.WAKING_P2P, t0), SESSION_STATES.WAKING_P2P);
+    p2pCam.beginSession('p2p', t0, false);
+    assert.equal(p2pCam.sessionState, SESSION_STATES.WAKING_P2P);
+    const p2pFrame = Buffer.alloc(FRAME, 0x44);
+    p2pCam.markP2pVideoPacketReceived(t0 + 700);
+    p2pCam.recordDecodedFrame(p2pFrame, p2pFrame, t0 + 800, '12:00', 5000);
+    assert.equal(p2pCam.sessionState, SESSION_STATES.STREAMING_LIVE);
+    p2pCam.endSession(t0 + 10000, true, false, 'p2p');
+    assert.equal(p2pCam.sessionState, SESSION_STATES.COOLDOWN);
+    assert.equal(p2pCam.isInViewerCooldown(t0 + 10500), true);
+
+    // Regression #18: isInViewerCooldown bypassed when hardware triggers active
+    p2pCam.activeTriggerEvents.add('motion');
+    p2pCam.lastMotionAt = t0 + 12000;
+    p2pCam.motionUntil = t0 + 12000 + 20000;
+    p2pCam.motionClearedAt = 0;
+    assert.equal(p2pCam.hasActiveHardwareTriggers(), true);
+    assert.equal(p2pCam.isInViewerCooldown(t0 + 12000), false);
+
+    // Regression #18: hasActiveHardwareTriggers returns false after motion clears
+    p2pCam.motionClearedAt = t0 + 35000;
+    assert.equal(p2pCam.hasActiveHardwareTriggers(), false);
+
+    assert.equal(p2pCam.getSessionState(t0 + 30000), SESSION_STATES.IDLE);
+    assert.equal(p2pCam.sessionState, SESSION_STATES.IDLE);
+
+    // 3. Backfill lifecycle: IDLE -> HANDSHAKING_BACKFILL -> PLAYING_BACKFILL -> DRAINING_BACKFILL_TAIL -> IDLE
+    assert.equal(backfillCam.sessionState, SESSION_STATES.IDLE);
+    backfillCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/hdd_data0/Camera02/202611/20261105200709/20261105200709.zxvideo',
+        cipherId: 0,
+        clipMs: t0 - 30000,
+        event: 'person detected',
+        personName: '',
+        reason: 'person detected',
+      },
+      false,
+      t0
+    );
+    assert.equal(backfillCam.sessionState, SESSION_STATES.HANDSHAKING_BACKFILL);
+
+    const bfFrame0 = Buffer.alloc(FRAME, 0x55);
+    backfillCam.recordDecodedFrame(bfFrame0, bfFrame0, t0 + 300, '12:01', 5000);
+    assert.equal(backfillCam.sessionState, SESSION_STATES.PLAYING_BACKFILL);
+
+    backfillCam.markDownloadFinished(t0 + 4000);
+    assert.equal(backfillCam.sessionState, SESSION_STATES.DRAINING_BACKFILL_TAIL);
+
+    backfillCam.endSession(t0 + 30000);
+    assert.equal(backfillCam.sessionState, SESSION_STATES.IDLE);
+  });
+
+  it('logs every camera session FSM transition exactly once with structured from -> to and reason context', () => {
+    const rtspCam = new Camera({serial: 'T8161T0000000000', name: 'front_yard', mode: 'rtsp'});
+    const p2pCam = new Camera({serial: 'T8161T1111111111', name: 'back_yard', mode: 'p2p'});
+    const backfillCam = new Camera({serial: 'T8214T2222222222', name: 'doorbell', mode: 'backfill'});
+    const t0 = 200000;
+
+    const loggedLines = [];
+    const origConsoleLog = console.log;
+    initLogger('debug');
+    console.log = (line) => loggedLines.push(line);
+
+    try {
+      // 1. RTSP transitions including mid-session re-wake and cooldown expiry
+      rtspCam.beginSession('rtsp', t0, false);
+      rtspCam.markRtspFrameReceived(t0 + 1000);
+      // Second RTSP frame in same state must not emit a duplicate transition log
+      rtspCam.markRtspFrameReceived(t0 + 1066);
+      rtspCam.beginRtspRewake(t0 + 5000, 10000);
+      rtspCam.markRtspFrameReceived(t0 + 6000);
+      rtspCam.endSession(t0 + 10000, true, false, 'rtsp');
+      rtspCam.getSessionState(t0 + 30000);
+
+      // 2. P2P transitions including viewer preemption
+      p2pCam.beginSession('p2p', t0, false);
+      const frame = Buffer.alloc(FRAME, 0x33);
+      p2pCam.recordDecodedFrame(frame, frame, t0 + 500, '12:00', 5000);
+      // Second P2P frame in same state must not emit a duplicate transition log
+      p2pCam.recordDecodedFrame(frame, frame, t0 + 566, '12:00', 5000);
+      p2pCam.endSession(t0 + 2000, true, true, 'p2p');
+
+      // 3. Backfill download transitions
+      backfillCam.beginBackfillDownload(
+        {
+          storagePath: '/zx/hdd_data0/Camera02/202611/20261105200709/20261105200709.zxvideo',
+          cipherId: 0,
+          clipMs: t0 - 30000,
+          event: 'person detected',
+          personName: '',
+          reason: 'person detected',
+        },
+        false,
+        t0
+      );
+      backfillCam.recordDecodedFrame(frame, frame, t0 + 300, '12:01', 5000);
+      // Second backfill frame in same state must not emit a duplicate transition log
+      backfillCam.recordDecodedFrame(frame, frame, t0 + 366, '12:01', 5000);
+      backfillCam.markDownloadFinished(t0 + 4000);
+      backfillCam.endSession(t0 + 30000, true, false, 'download');
+    } finally {
+      console.log = origConsoleLog;
+      initLogger('error');
+    }
+
+    const transitionLogs = loggedLines
+      .filter((line) => line.includes('session state:'))
+      .map((line) => line.replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - \[DEBUG\] - /, ''));
+
+    assert.deepEqual(transitionLogs, [
+      '[front_yard] [WAKING_RTSP] session state: idle -> waking_rtsp (session start: rtsp)',
+      '[front_yard] [STREAMING_LIVE] session state: waking_rtsp -> streaming_live (first rtsp frame received)',
+      '[front_yard] [WAKING_RTSP] session state: streaming_live -> waking_rtsp (rtsp stream dropped, re-waking)',
+      '[front_yard] [STREAMING_LIVE] session state: waking_rtsp -> streaming_live (rtsp re-wake frame received)',
+      '[front_yard] [COOLDOWN] session state: streaming_live -> cooldown (live session ended, entering cooldown)',
+      '[front_yard] [IDLE] session state: cooldown -> idle (cooldown elapsed)',
+      '[back_yard] [WAKING_P2P] session state: idle -> waking_p2p (session start: p2p)',
+      '[back_yard] [STREAMING_LIVE] session state: waking_p2p -> streaming_live (first live frame decoded)',
+      '[back_yard] [IDLE] session state: streaming_live -> idle (preempted by viewer)',
+      '[doorbell] [HANDSHAKING_BACKFILL] session state: idle -> handshaking_backfill (session start: backfill download)',
+      '[doorbell] [PLAYING_BACKFILL] session state: handshaking_backfill -> playing_backfill (first backfill frame decoded)',
+      '[doorbell] [DRAINING_BACKFILL_TAIL] session state: playing_backfill -> draining_backfill_tail (download transfer finished)',
+      '[doorbell] [IDLE] session state: draining_backfill_tail -> idle (backfill session ended)',
+    ]);
+  });
+
+  it('enforces strict FSM transition validation across Session, BackfillJob, FrigateEvent, and Decoder state machines, plus WakeRequest builder', () => {
+    // 1. Session FSM transition table validation
+    assert.ok(Object.isFrozen(SESSION_STATES));
+    assert.ok(Object.isFrozen(ALLOWED_SESSION_TRANSITIONS));
+    assert.equal(canTransitionSession(SESSION_STATES.IDLE, SESSION_STATES.WAKING_P2P), true);
+    assert.equal(canTransitionSession(SESSION_STATES.IDLE, SESSION_STATES.PLAYING_BACKFILL), false);
+    assert.equal(canTransitionSession(SESSION_STATES.IDLE, SESSION_STATES.DRAINING_BACKFILL_TAIL), false);
+
+    const cam = new Camera({serial: 'T8161T0000000000', mode: 'p2p', hold_secs: 60});
+    assert.equal(
+      cam.transitionTo(SESSION_STATES.PLAYING_BACKFILL, 1000, 'illegal jump'),
+      SESSION_STATES.IDLE,
+      'Must reject illegal transition from IDLE directly to PLAYING_BACKFILL'
+    );
+
+    // 2. BackfillJob strict FSM transitions: RECORDING -> SETTLING -> RECORDING -> SETTLING -> READY_TO_QUERY -> MATCHED -> DOWNLOADING -> COMPLETED | EXPIRED
+    assert.ok(Object.isFrozen(BACKFILL_STATES));
+    assert.ok(Object.isFrozen(ALLOWED_BACKFILL_TRANSITIONS));
+    assert.equal(canTransitionBackfill(BACKFILL_STATES.RECORDING, BACKFILL_STATES.SETTLING), true);
+    assert.equal(canTransitionBackfill(BACKFILL_STATES.RECORDING, BACKFILL_STATES.DOWNLOADING), false);
+
+    const t0 = 100000;
+    const job = new BackfillJob({
+      at: t0,
+      event: 'motion detected',
+      personName: '',
+      reason: 'motion detected',
+      priority: 100,
+    });
+    assert.equal(job.state, BACKFILL_STATES.RECORDING);
+    job.markRecordingCleared('motion detected', t0 + 10000);
+    assert.equal(job.state, BACKFILL_STATES.SETTLING);
+
+    // Companion event re-activates recording
+    job.upgradeEvent({
+      at: t0 + 11000,
+      event: 'person detected',
+      personName: 'Alice',
+      reason: 'person detected (Alice)',
+      priority: 250,
+    });
+    assert.equal(job.state, BACKFILL_STATES.RECORDING);
+    job.markRecordingCleared('person detected', t0 + 20000);
+    assert.equal(job.state, BACKFILL_STATES.SETTLING);
+
+    // Settle window elapses -> READY_TO_QUERY
+    assert.equal(job.isReadyToQuery(t0 + 20000 + BACKFILL_POST_CLEAR_SETTLE_MS, 65000), true);
+    assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY);
+
+    const candidate = {
+      devSn: 'T8161T0000000000',
+      storagePath: '/zx/clip1.zxvideo',
+      cipherId: 0,
+      clipMs: t0 + 1000,
+    };
+    assert.equal(job.enqueueMatchedCandidate(candidate, new Set()), true);
+    assert.equal(job.state, BACKFILL_STATES.MATCHED);
+
+    const nextClip = job.shiftNextClipForDownload();
+    assert.ok(nextClip);
+    assert.equal(job.state, BACKFILL_STATES.DOWNLOADING);
+
+    // Follow-up query transitions DOWNLOADING -> READY_TO_QUERY
+    assert.equal(job.prepareFollowUpQuery(t0 + 25000), true);
+    assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY);
+    assert.equal(job.isExpired(t0 + 25000 + DEFAULT_BACKFILL_MAX_AGE_MS + 1000), true);
+    assert.equal(job.state, BACKFILL_STATES.EXPIRED);
+
+    // 3. Frigate Event Lifecycle FSM: IDLE -> QUEUED -> WAITING_SNAPSHOT -> COOLDOWN -> IDLE
+    assert.ok(Object.isFrozen(FRIGATE_EVENT_STATES));
+    assert.equal(cam.getFrigateEventState(t0), FRIGATE_EVENT_STATES.IDLE);
+    assert.equal(cam.tryUpgradeOrQueueFrigateEvent('motion detected', '', t0).status, 'queued');
+    assert.equal(cam.getFrigateEventState(t0), FRIGATE_EVENT_STATES.QUEUED);
+    assert.equal(cam.beginFrigateSnapshotWait(), true);
+    assert.equal(cam.getFrigateEventState(t0 + 600), FRIGATE_EVENT_STATES.WAITING_SNAPSHOT);
+    cam.completeFrigateEventFiling(t0 + 2000, 15);
+    assert.equal(cam.getFrigateEventState(t0 + 2500), FRIGATE_EVENT_STATES.COOLDOWN);
+    assert.equal(cam.getFrigateEventState(t0 + 120000), FRIGATE_EVENT_STATES.IDLE);
+
+    // 4. Decoder Backpressure FSM: DETACHED -> HANDSHAKING -> DECODING -> PAUSED_BACKPRESSURE -> FLUSHING_EOF -> DETACHED
+    assert.ok(Object.isFrozen(DECODER_STATES));
+    assert.equal(cam.decoderState, DECODER_STATES.DETACHED);
+    cam.attachDecoder({stdin: {writable: true, write() {}, end() {}}, stdout: {pause() {}, resume() {}}});
+    assert.equal(cam.decoderState, DECODER_STATES.HANDSHAKING);
+    cam.markDecoderDecoding();
+    assert.equal(cam.decoderState, DECODER_STATES.DECODING);
+    cam.pauseDecoderStdout();
+    assert.equal(cam.decoderState, DECODER_STATES.PAUSED_BACKPRESSURE);
+    cam.resumeDecoderStdout();
+    assert.equal(cam.decoderState, DECODER_STATES.DECODING);
+    cam.markDecoderInputEnded();
+    assert.equal(cam.decoderState, DECODER_STATES.FLUSHING_EOF);
+    cam.detachDecoder();
+    assert.equal(cam.decoderState, DECODER_STATES.DETACHED);
+
+    // 5. Immutable WakeRequest Builder & default health policy methods
+    const req = WakeRequest.motion('person detected (Alice)', 45000)
+      .withInitiator('eufy-ws/event')
+      .withPriority(250)
+      .withCreateEvent(true)
+      .build();
+    assert.ok(Object.isFrozen(req));
+    assert.equal(req.kind, 'motion');
+    assert.equal(req.reason, 'person detected (Alice)');
+    assert.equal(req.durationMs, 45000);
+    assert.equal(req.initiator, 'eufy-ws/event');
+    assert.equal(req.priority, 250);
+
+    const applied = cam.applyWakeRequest(req, t0, [cam]);
+    assert.equal(applied.accepted, true);
+    assert.equal(cam.motionUntil, t0 + 45000);
+    assert.equal(cam.wakeInitiator, 'eufy-ws/event');
+
+    cam.beginSession('p2p', t0, false);
+    // Default thresholds on evaluateP2pHealth & shouldPollFrigateForHoldOrBackfill work without magic numbers
+    assert.equal(cam.evaluateP2pHealth(t0 + 1000, t0).action, 'none');
+    assert.equal(cam.shouldPollFrigateForHoldOrBackfill(t0 + 1000).shouldPoll, false);
+
+    // 6. State transition logging for BackfillJob, FrigateEvent, and Decoder state machines
+    const loggedLines = [];
+    const origConsoleLog = console.log;
+    initLogger('debug');
+    console.log = (line) => loggedLines.push(line);
+    try {
+      const logCam = new Camera({serial: 'T8214T2222222222', name: 'doorbell', mode: 'backfill'});
+      logCam.queueEventBackfill(t0, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+      logCam.recordMotionCleared(t0 + 5000, 5000, 10000, 'person detected');
+      logCam.canQueryBackfill(t0 + 10000, 8000, 12000);
+      logCam.tryMatchBackfillCandidate({
+        devSn: 'T8214T2222222222',
+        storagePath: '/zx/clip_log.zxvideo',
+        cipherId: 0,
+        clipMs: t0 + 1000,
+      });
+      logCam.beginBackfillDownload(logCam.backfillClip, false, t0 + 11000);
+
+      logCam.tryUpgradeOrQueueFrigateEvent('person', 'Alice', t0);
+      logCam.beginFrigateSnapshotWait();
+      logCam.completeFrigateEventFiling(t0 + 2000, 15);
+      logCam.getFrigateEventState(t0 + 120000);
+
+      logCam.attachDecoder({stdin: {writable: true, write() {}, end() {}}, stdout: {pause() {}, resume() {}}});
+      logCam.markDecoderDecoding();
+      logCam.pauseDecoderStdout();
+      logCam.resumeDecoderStdout();
+      logCam.markDecoderInputEnded();
+      logCam.detachDecoder();
+    } finally {
+      console.log = origConsoleLog;
+      initLogger('error');
+    }
+
+    const strippedLogs = loggedLines.map((line) =>
+      line.replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - \[DEBUG\] - /, '')
+    );
+    assert.deepEqual(
+      strippedLogs.filter((l) => l.includes('backfill state:')),
+      [
+        '[doorbell] [SETTLING] backfill state: recording -> settling (all triggers cleared)',
+        '[doorbell] [READY_TO_QUERY] backfill state: settling -> ready_to_query (settle window elapsed)',
+        '[doorbell] [MATCHED] backfill state: ready_to_query -> matched (candidate clip matched)',
+        '[doorbell] [DOWNLOADING] backfill state: matched -> downloading (clip dequeued for download)',
+      ]
+    );
+    assert.deepEqual(
+      strippedLogs.filter((l) => l.includes('frigate event state:')),
+      [
+        '[doorbell] [QUEUED] frigate event state: idle -> queued (event queued)',
+        '[doorbell] [WAITING_SNAPSHOT] frigate event state: queued -> waiting_snapshot (dispatch timer fired)',
+        '[doorbell] [COOLDOWN] frigate event state: waiting_snapshot -> cooldown (event filed)',
+        '[doorbell] [IDLE] frigate event state: cooldown -> idle (cooldown elapsed)',
+      ]
+    );
+    assert.deepEqual(
+      strippedLogs.filter((l) => l.includes('decoder state:')),
+      [
+        '[doorbell] [HANDSHAKING] decoder state: detached -> handshaking (decoder attached)',
+        '[doorbell] [DECODING] decoder state: handshaking -> decoding (first frame decoded)',
+        '[doorbell] [PAUSED_BACKPRESSURE] decoder state: decoding -> paused_backpressure (high watermark reached)',
+        '[doorbell] [DECODING] decoder state: paused_backpressure -> decoding (low watermark resumed)',
+        '[doorbell] [FLUSHING_EOF] decoder state: decoding -> flushing_eof (input pipe ended)',
+        '[doorbell] [DETACHED] decoder state: flushing_eof -> detached (decoder detached)',
+      ]
+    );
+  });
+
+  it('provides named domain predicates, filters, and comparators on Camera', () => {
+    const t0 = 1710000000000;
+    const rtspCam = new Camera({
+      serial: 'T8161T0000000000',
+      name: 'driveway',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://127.0.0.1:8554/driveway',
+      station_serial: 'T8030P0000000000',
+    });
+    const p2pCam = new Camera({
+      serial: 'T8214T2222222222',
+      name: 'doorbell',
+      mode: 'p2p',
+      idle_timeout_secs: 15,
+      station_serial: 'T8030P0000000000',
+    });
+    const allCams = [rtspCam, p2pCam];
+
+    // 1. RTSP wake, session, and decoder predicates
+    assert.equal(rtspCam.isActiveRtspSession(), false);
+    assert.equal(rtspCam.canStartRtspStream(), false);
+    assert.equal(rtspCam.wantsWake(t0), false);
+    assert.equal(rtspCam.wantsRtspWake(t0), false);
+
+    rtspCam.motionUntil = t0 + 60000;
+    assert.equal(rtspCam.wantsWake(t0), true);
+    assert.equal(rtspCam.wantsRtspWake(t0), true);
+    assert.equal(p2pCam.wantsRtspWake(t0), false);
+    assert.deepEqual(
+      allCams.filter((c) => c.wantsRtspWake(t0)).map((c) => c.name),
+      ['driveway']
+    );
+
+    rtspCam.eventActive = true;
+    rtspCam.beginSession('rtsp', t0, true);
+    assert.equal(rtspCam.isActiveRtspSession(), true);
+    assert.equal(rtspCam.isActiveLiveSession(), true);
+    assert.equal(rtspCam.canStartRtspStream(), true);
+    assert.equal(rtspCam.shouldFileInitialRtspEvent(), true);
+    assert.equal(rtspCam.canSpawnRtspDecoder(rtspCam.sessionId), true);
+    assert.equal(rtspCam.isEstablishedRtspStream(), false);
+
+    rtspCam.markRtspFrameReceived(t0 + 1000);
+    assert.equal(rtspCam.isEstablishedRtspStream(), true);
+    assert.equal(rtspCam.hasExpiredLiveHold(t0 + 30000), false);
+    assert.equal(rtspCam.hasExpiredLiveHold(t0 + 60000), true);
+
+    // 2. Station P2P slot and early-sleep predicates
+    assert.equal(p2pCam.belongsToStationP2pSlot('T8030P0000000000'), true);
+    assert.equal(rtspCam.belongsToStationP2pSlot('T8030P0000000000'), false);
+    p2pCam.motionUntil = t0 + 60000;
+    p2pCam.lastMotionAt = t0;
+    assert.equal(p2pCam.isHoldingStationP2pForMotion('T8030P0000000000', t0), true);
+
+    p2pCam.beginSession('p2p', t0, true);
+    p2pCam.gotVideo = true;
+    assert.equal(p2pCam.isMotionOnlyActiveSession(t0 + 5000), true);
+    assert.equal(p2pCam.canSleepEarlyOnIdle(t0 + 5000, 10000), false);
+    assert.equal(p2pCam.canSleepEarlyOnIdle(t0 + 15000, 10000), true);
+    assert.equal(p2pCam.isMidStreamRetrigger(t0 + 6000, 5000), true);
+
+    // 3. Backfill download/query filters, station resolution, and comparators
+    p2pCam.endSession(t0 + 16000, false, false, 'p2p');
+    p2pCam.queueEventBackfill(t0, 'person detected', 'Alice', 'person detected (Alice)', 200, false);
+    assert.equal(p2pCam.getBackfillPriority(), p2pCam.priority + 200);
+    assert.equal(Camera.compareBackfillPriority(rtspCam, p2pCam) > 0, true);
+    assert.equal(Camera.compareRtspFirst(rtspCam, p2pCam) < 0, true);
+    assert.equal(p2pCam.resolveHomeBaseStationSerial(allCams), 'T8030P0000000000');
+    assert.equal(p2pCam.isOnStation('T8030P0000000000'), true);
+    assert.equal(p2pCam.isOnStation('OTHER_STATION'), false);
+    assert.equal(
+      p2pCam.canQueryBackfillNow(allCams, t0 + 25000, 8000, 12000, 5000),
+      true
+    );
+
+    p2pCam.tryMatchBackfillCandidate({
+      devSn: 'T8214T2222222222',
+      storagePath: '/zx/clip1.zxvideo',
+      cipherId: 0,
+      clipMs: t0 + 1000,
+    });
+    assert.equal(p2pCam.canStartBackfillDownloadNow(allCams, t0 + 25000, 5000), true);
+
+    // 4. Viewer, Frigate event, API wake duration, and startup summary helpers
+    assert.equal(p2pCam.hasConnectedViewers(), false);
+    p2pCam.viewers = 2;
+    assert.equal(p2pCam.hasConnectedViewers(), true);
+    p2pCam.evPerson = 'Alice';
+    assert.equal(p2pCam.isNonSyntheticFrigateEvent({sub_label: 'eufy'}), false);
+    assert.equal(p2pCam.isNonSyntheticFrigateEvent({sub_label: 'Alice'}), false);
+    assert.equal(p2pCam.isNonSyntheticFrigateEvent({data: {type: 'api'}, sub_label: null}), false);
+    assert.equal(
+      p2pCam.isNonSyntheticFrigateEvent({data: {type: 'object'}, sub_label: 'Alice'}),
+      true,
+      'Real Frigate detector object (data.type === "object") must extend hold even if sub_label matches evPerson'
+    );
+    assert.equal(p2pCam.isNonSyntheticFrigateEvent({sub_label: null}), true);
+    assert.equal(p2pCam.resolveApiWakeDurationSecs(undefined, 5), 60);
+    assert.equal(p2pCam.resolveApiWakeDurationSecs(2, 5), 5);
+    assert.equal(p2pCam.shouldClearQueueForSigUsr1Test(), true);
+    assert.equal(p2pCam.formatStartupSummary(), 'doorbell(p2p:60s)');
+
+    // 5. Fast continuation across timeout boundary when hardware triggers remain active or split clips are queued
+    rtspCam.beginSession('rtsp', t0, true);
+    rtspCam.gotVideo = true;
+    rtspCam.lastMotionAt = t0;
+    rtspCam.motionUntil = t0 + 60000;
+    rtspCam.activeTriggerEvents.add('motion detected');
+    assert.equal(rtspCam.hasActiveHardwareTriggers(), true);
+    assert.equal(
+      rtspCam.shouldRewakeRtspOnDrop(t0 + 60000),
+      true,
+      'Must re-wake RTSP at 60s clip boundary when Eufy hardware trigger has not cleared yet'
+    );
+    rtspCam.recordMotionCleared(t0 + 60000, 5000, 10000, 'motion detected');
+    assert.equal(rtspCam.hasActiveHardwareTriggers(), false);
+
+    // Once motion has cleared and the full 60s hold_secs has elapsed since lastMotionAt, a hardware RTSP clip stop sleeps cleanly;
+    // however, if the camera cuts off RTSP at t=40s (before the 60s hold_secs has elapsed), it MUST re-wake to finish the 60s hold!
+    rtspCam.firstVideoAt = t0 + 2000;
+    rtspCam.motionUntil = t0 + 60000;
+    rtspCam.recordMotionCleared(t0 + 10000, 5000, 10000, 'motion detected');
+    assert.equal(
+      rtspCam.shouldRewakeRtspOnDrop(t0 + 40000),
+      true,
+      'Must re-wake RTSP when hardware closes stream at 40s (20s before 60s hold_secs expires) even if PIR cleared at 10s'
+    );
+    rtspCam.recordMotionCleared(t0 + 60000, 5000, 10000, 'motion detected');
+    rtspCam.motionUntil = t0 + 90000;
+    assert.equal(
+      rtspCam.shouldRewakeRtspOnDrop(t0 + 66000),
+      false,
+      'Must not force RTSP re-wake once full 60s hold_secs has elapsed since lastMotionAt and no Frigate object is active'
+    );
+    assert.equal(
+      rtspCam.evaluateFrigateEventsActivity(
+        [{id: 'obj-1', label: 'person', data: {type: 'object'}, end_time: (t0 + 60000) / 1000}],
+        t0 + 66000
+      ),
+      true,
+      'Recently finished Frigate object track (6s ago) must count as active object activity when remaining tail is short'
+    );
+    assert.equal(
+      rtspCam.shouldRewakeRtspOnDrop(t0 + 66000),
+      true,
+      'Must re-wake RTSP at 66s when Frigate recently detected a person at 60s'
+    );
+
+    // Mid-stream Eufy events in the second half of hold_secs guarantee at least a full hold_secs window from now,
+    // and extending motionUntil past evUntil re-queues Frigate event creation so recordings are never cut off early
+    const extendCam = new Camera({serial: 'T8161T0000000000', mode: 'rtsp', hold_secs: 60});
+    extendCam.applyMotionTrigger(t0, 'motion detected', 60000, 'eufy-event', 10);
+    extendCam.beginSession('rtsp', t0, true);
+    extendCam.gotVideo = true;
+    extendCam.firstVideoAt = t0 + 1000;
+    extendCam.firstFrameAt = t0 + 1000;
+    assert.equal(extendCam.tryUpgradeOrQueueFrigateEvent('motion', '', t0 + 1000).status, 'queued');
+    extendCam.beginFrigateSnapshotWait();
+    const initialFiling = extendCam.completeFrigateEventFiling(t0 + 2000, 15);
+    assert.equal(initialFiling.durationSecs, 60);
+    extendCam.recordCreatedFrigateEvent('synth-evt-1');
+    assert.equal(
+      extendCam.evaluateFrigateEventsActivity([{id: 'synth-evt-1', label: 'motion', end_time: null}], t0 + 10000),
+      false,
+      'Bridge must ignore its own synthetic Frigate event ID when checking for detector object activity'
+    );
+
+    // Mid-stream trigger in first half (t=20s) extends by +30s (to t=90s); companion trigger 100ms later does not double-add +30s
+    extendCam.applyMotionTrigger(t0 + 20000, 'motion detected', 60000, 'eufy-event', 10);
+    assert.equal(extendCam.motionUntil, t0 + 90000);
+    extendCam.applyMotionTrigger(t0 + 20100, 'person detected', 60000, 'eufy-event', 200);
+    assert.equal(extendCam.motionUntil, t0 + 90000, 'Companion event 100ms later must not double-add halfMs');
+
+    // Because motionUntil (t+90s) now exceeds evUntil (t+62s) + 5s (and label upgraded motion -> person),
+    // tryUpgradeOrQueueFrigateEvent during COOLDOWN re-queues the Frigate event for the remaining hold duration
+    assert.equal(extendCam.shouldExtendFrigateEvent(t0 + 20100, 15), true);
+    assert.equal(
+      extendCam.tryUpgradeOrQueueFrigateEvent('person', 'Alice', t0 + 20100).status,
+      'queued',
+      'Must re-queue Frigate event during cooldown when hold extends beyond evUntil or label/person upgrades'
+    );
+    extendCam.beginFrigateSnapshotWait();
+    const extendedFiling = extendCam.completeFrigateEventFiling(t0 + 21000, 15);
+    assert.equal(
+      extendedFiling.durationSecs,
+      69,
+      'Extended Frigate event duration must cover the full remaining 69s of motionUntil'
+    );
+
+    // Mid-stream trigger in second half (t=85s, 5s before t=90s timeout) grants a full 60s hold from t=85s (to t=145s)
+    extendCam.applyMotionTrigger(t0 + 85000, 'person detected', 60000, 'eufy-event', 200);
+    assert.equal(
+      extendCam.motionUntil,
+      t0 + 145000,
+      'Mid-stream event near timeout must guarantee a full 60s hold window from the new event timestamp'
+    );
+
+    // Mid-session RTSP re-wake refreshes stale waking card snapshot when lastFrame was updated during live streaming
+    let cardRenderCount = 0;
+    const snapCam = new Camera(
+      {serial: 'T8161T0000000000', mode: 'rtsp', homebase_rtsp_url: 'rtsp://127.0.0.1:8554/driveway'},
+      {frame: Buffer.alloc(1382400, 0x10), lastSeen: '19:09'},
+      (c) => {
+        cardRenderCount++;
+        c.commitRenderedCards({
+          asleep: c.card.asleep,
+          waking: c.card.waking,
+          busy: c.card.busy,
+          liveTelState: {},
+          backfillTelState: {},
+          liveCard: null,
+          backfillCard: null,
+        });
+      }
+    );
+    assert.equal(cardRenderCount, 1);
+    snapCam.beginSession('rtsp', t0, true);
+    const liveBuf = Buffer.alloc(1382400, 0x55);
+    snapCam.recordDecodedFrame(liveBuf, liveBuf, t0 + 2000, '19:10');
+    snapCam.beginRtspRewake(t0 + 40000, 20000);
+    snapCam.selectEncoderFrame(t0 + 43000, 2000);
+    assert.equal(
+      cardRenderCount >= 2,
+      true,
+      'Must re-render status cards with latest live frame before displaying waking card on mid-session re-wake'
+    );
+
+    // Natural timer expiration enforces the 3s post-sleep guard and in-flight stop guard so trailing packets/events from our own closing P2P session never self-adopt as an external wake
+    p2pCam.beginSession('p2p', t0, true);
+    p2pCam.gotVideo = true;
+    p2pCam.terminateSession(t0 + 60000, 'hold/view timer expired', false, 'bridge-timer');
+    assert.equal(
+      p2pCam.canAdoptExternalWake(t0 + 60500, 3000),
+      false,
+      'Natural timer expiration must enforce the 3s post-sleep guard against trailing packets/events'
+    );
+    assert.equal(
+      p2pCam.canAdoptExternalWake(t0 + 64000, 3000),
+      false,
+      'Must block external wake adoption while P2P stop_livestream is still in flight'
+    );
+    assert.equal(
+      p2pCam.evaluateExternalLivestreamStop(t0 + 60200, 3000).action,
+      'inactive',
+      'Bridge-initiated stop_livestream completion must return inactive while stoppingP2p is active'
+    );
+    p2pCam.clearP2pStopInFlight();
+    assert.equal(
+      p2pCam.canAdoptExternalWake(t0 + 64000, 3000),
+      true,
+      'Must allow external wake adoption once P2P stop has settled and 3s guard has elapsed'
+    );
+
+    // Default experimental track_stuck_spotlight=false leaves spotlight untouched even past 130s
+    const defaultUntrackedCam = new Camera({
+      serial: 'T8161T9999999997',
+      name: 'garage_default_light',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://192.168.1.50/live4',
+      station_serial: 'T8030P0000000000',
+    });
+    assert.equal(defaultUntrackedCam.hasStuckSpotlightTracking(), false);
+    defaultUntrackedCam.applyTelemetryProperties({light: true, battery: 80, wifiRssi: -72}, false, t0);
+    defaultUntrackedCam.sleptAt = t0 + 1000;
+    assert.equal(defaultUntrackedCam.shouldTurnOffStuckIdleLight(t0 + 200000), false);
+    for (let i = 1; i <= 4; i++) {
+      assert.equal(defaultUntrackedCam.recordIdleRssiChange(t0 + 200000 + i * 2000), false);
+    }
+
+    // Idle wedged P2P radio & stuck spotlight detection when track_stuck_spotlight=true:
+    // - Never triggers on startup before any session has run (sleptAt=0, lastStoppedAt=0) when spotlight is off
+    // - Triggers recordIdleRssiChange when light=true is stuck on while idle or >15s after a completed session
+    const freshStartupCam = new Camera({
+      serial: 'T8161T9999999999',
+      name: 'garage_backfill',
+      mode: 'backfill',
+      track_stuck_spotlight: true,
+      station_serial: 'T8030P0000000000',
+    });
+    assert.equal(freshStartupCam.hasStuckSpotlightTracking(), true);
+    for (let i = 0; i < 5; i++) {
+      assert.equal(
+        freshStartupCam.recordIdleRssiChange(t0 + i * 2000),
+        false,
+        'Must not trigger wedged-radio stop on startup before any bridge session has run when light is off'
+      );
+    }
+
+    // If spotlight turns on and gets stuck while idle, recordIdleRssiChange and shouldTurnOffStuckIdleLight detect it
+    freshStartupCam.applyTelemetryProperties({light: true, battery: 80, wifiRssi: -72}, false);
+    assert.equal(freshStartupCam.telemetry.isLightOn(), true);
+    assert.equal(freshStartupCam.recordIdleRssiChange(t0 + 20000), false);
+    assert.equal(freshStartupCam.recordIdleRssiChange(t0 + 22000), false);
+    assert.equal(freshStartupCam.recordIdleRssiChange(t0 + 24000), false);
+    assert.equal(
+      freshStartupCam.recordIdleRssiChange(t0 + 26000),
+      true,
+      '4th idle wifiRssi change while spotlight is stuck on must trigger idle drain recovery'
+    );
+    assert.equal(freshStartupCam.shouldTurnOffStuckIdleLight(Date.now() + 1000), false, 'Grace must outlast a hardware clip');
+    assert.equal(freshStartupCam.shouldTurnOffStuckIdleLight(Date.now() + 200000), true);
+    assert.equal(freshStartupCam.telemetry.isLightOn(), false);
+
+    // Regression: recordIdleRssiChange must not treat a freshly lit spotlight (<=130s) or pending BackfillJob as stuck
+    const freshLightRtspCam = new Camera({
+      serial: 'T8161T9999999998',
+      name: 'patio_rtsp',
+      mode: 'rtsp',
+      track_stuck_spotlight: true,
+      homebase_rtsp_url: 'rtsp://192.168.1.50/live3',
+      station_serial: 'T8030P0000000000',
+    });
+    const tClip = 500000;
+    freshLightRtspCam.applyTelemetryProperties({light: true, battery: 85}, false, tClip);
+    for (let i = 1; i <= 4; i++) {
+      assert.equal(
+        freshLightRtspCam.recordIdleRssiChange(tClip + i * 2000),
+        false,
+        'Freshly lit spotlight within 130s grace must not trigger wedged-radio stop during hardware clip'
+      );
+    }
+    freshLightRtspCam.queueEventBackfill(tClip, 'motion detected', '', 'motion detected', 10, true);
+    freshLightRtspCam.activeTriggerEvents.clear();
+    for (let i = 1; i <= 4; i++) {
+      assert.equal(
+        freshLightRtspCam.recordIdleRssiChange(tClip + 140000 + i * 2000),
+        false,
+        'Active recording BackfillJob must block idle RSSI wedged-radio stop even after 130s'
+      );
+    }
+    freshLightRtspCam.clearPendingBackfill();
+    assert.equal(freshLightRtspCam.recordIdleRssiChange(tClip + 150000), false);
+    assert.equal(freshLightRtspCam.recordIdleRssiChange(tClip + 152000), false);
+    assert.equal(freshLightRtspCam.recordIdleRssiChange(tClip + 154000), false);
+    assert.equal(
+      freshLightRtspCam.recordIdleRssiChange(tClip + 156000),
+      true,
+      'Spotlight stuck past 130s grace with no pending BackfillJob must trigger idle drain recovery'
+    );
+
+    const idleBase = t0 + 90000;
+    assert.equal(p2pCam.recordIdleRssiChange(idleBase + 1000), false);
+    assert.equal(p2pCam.recordIdleRssiChange(idleBase + 3000), false);
+    assert.equal(p2pCam.recordIdleRssiChange(idleBase + 15000), false);
+    assert.equal(
+      p2pCam.recordIdleRssiChange(idleBase + 17000),
+      true,
+      '4th wifiRssi change within 60s after a completed session must trigger wedged-radio force-stop once'
+    );
+    assert.equal(
+      p2pCam.recordIdleRssiChange(idleBase + 25000),
+      false,
+      'Must respect cooldown after triggering wedged-radio force-stop'
+    );
+    for (let i = 0; i < 5; i++) {
+      assert.equal(
+        p2pCam.recordIdleRssiChange(idleBase + 120000 + i * 2000),
+        false,
+        'Must not re-trigger wedged-radio force-stop in an infinite loop while no new session has run'
+      );
+    }
+
+    // Transient wakeTimedOutOffline clears on normal standby properties even when battery is <= low_battery_threshold (20%)
+    p2pCam.telemetry.markWakeTimedOut();
+    assert.equal(p2pCam.isDeviceOffline(), true);
+    p2pCam.applyTelemetryProperties({state: 0, battery: 15, wifiRssi: -25}, false);
+    assert.equal(
+      p2pCam.isDeviceOffline(),
+      false,
+      'Healthy standby telemetry (state=0, battery=15%, rssi=-25) must clear transient wakeTimedOutOffline even below 20% low battery threshold'
+    );
+
+    // Split backfill clips skip the 2.5s post-playback hold when another clip is already queued in backfillClipQueue
+    p2pCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/clip1.zxvideo',
+        cipherId: 0,
+        clipMs: t0,
+        event: 'person detected',
+        personName: 'Alice',
+        reason: 'person detected (Alice)',
+      },
+      false,
+      t0
+    );
+    p2pCam.gotVideo = true;
+    p2pCam.lastVideoAt = t0 + 5000;
+    p2pCam.markDownloadFinished(t0 + 5000);
+    p2pCam.backfillClipQueue = [
+      {
+        storagePath: '/zx/clip2.zxvideo',
+        cipherId: 0,
+        clipMs: t0 + 30000,
+        event: 'person detected',
+        personName: 'Alice',
+        reason: 'person detected (Alice)',
+      },
+    ];
+    assert.equal(
+      p2pCam.isDownloadComplete(t0 + 6100, 3000, 2500, 4500),
+      true,
+      'Must complete clip 1 immediately after decoder flush (without 2.5s postPlaybackHoldMs) when clip 2 is queued'
+    );
+
+    // Back-to-back doorbell clips: while Clip 1 is draining in RAM (downloadFinished=true), a newly settled
+    // pendingBackfill job can query HomeBase in the background, skips the 2.5s postPlaybackHoldMs, and keeps
+    // isStreamingLive() === true across the brief Clip 2 handshake so the stream never flashes the Asleep (S) card
+    p2pCam.backfillClipQueue = [];
+    p2pCam.backfillClip = null;
+    p2pCam.lastBackfillQueryAt = 0;
+    const tNewTrigger = t0 + 5200;
+    p2pCam.queueEventBackfill(tNewTrigger, 'person detected', '', 'person detected', 200, true);
+    p2pCam.recordMotionCleared(tNewTrigger + 9000, 5000, 10000, 'person detected');
+    assert.equal(p2pCam.pendingBackfill.recordingActive, false);
+    assert.equal(p2pCam.activeBackfillJob.recordingActive, false);
+    assert.equal(
+      p2pCam.canQueryBackfillNow([p2pCam], tNewTrigger + 13500, 8000, 12000, 5000),
+      true,
+      'Must allow background HomeBase database query for Clip 2 while Clip 1 is draining buffered frames in RAM'
+    );
+    assert.equal(
+      p2pCam.isDownloadComplete(t0 + 6100, 3000, 2500, 4500),
+      true,
+      'Must skip 2.5s postPlaybackHoldMs when a new pendingBackfill job is waiting'
+    );
+    p2pCam.frame = Buffer.alloc(1382400, 0x44);
+    p2pCam.terminateSession(tNewTrigger + 14000, 'post-event clip download stream completed', false, 'eufy/download-finished');
+    p2pCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/clip2.zxvideo',
+        cipherId: 0,
+        clipMs: tNewTrigger,
+        event: 'person detected',
+        personName: '',
+        reason: 'person detected',
+      },
+      false,
+      tNewTrigger + 14010
+    );
+    assert.equal(
+      p2pCam.isStreamingLive(tNewTrigger + 14100, 2000),
+      true,
+      'Back-to-back continuation clip must hold Clip 1 final frame as live video during Clip 2 handshake instead of flashing Asleep card'
+    );
+    assert.equal(
+      p2pCam.getFrameMarker(),
+      FRAME_STAGE_MARKERS.BACKFILL,
+      'Back-to-back continuation clip must keep BACKFILL (B) marker during handshake instead of flashing SNAPSHOT (S) or FIRST_BACKFILL (FB)'
+    );
+
+    // Mid-session RTSP re-wake and Frigate event expiry polling:
+    // 1. shouldPollFrigateForHoldOrBackfill must trigger when evUntil is within checkWindowMs (12s) even if beginRtspRewake pushed motionUntil out to 20s
+    // 2. isReadyForEventSnapshot must return true immediately for mid-session event extensions (evDispatchedAt > 0) even while rtspRewaking has no fresh frame
+    // 3. hasRecentRtspStartAttempt detects start_rtsp_livestream calls within 2s to prevent duplicate wake resets
+    extendCam.motionUntil = t0 + 95000;
+    extendCam.evUntil = t0 + 81000;
+    extendCam.evDispatchedAt = t0 + 21000;
+    extendCam.lastExtendCheckAt = 0;
+    assert.deepEqual(
+      extendCam.shouldPollFrigateForHoldOrBackfill(t0 + 75000, 12000, 5000, 4000),
+      {shouldPoll: true, needsTimeoutExtendCheck: true},
+      'Must poll Frigate and extend evUntil when evUntil is within 12s even if motionUntil is 20s away'
+    );
+    extendCam.frameAt = t0 + 70000;
+    extendCam.lastFrame = Buffer.alloc(1382400, 0x66);
+    extendCam.beginRtspRewake(t0 + 75000, 20000);
+    assert.equal(extendCam.hasRecentRtspStartAttempt(t0 + 76000, 2000), true);
+    assert.equal(extendCam.hasRecentRtspStartAttempt(t0 + 78000, 2000), false);
+    assert.equal(
+      extendCam.isReadyForEventSnapshot(t0 + 76000, 1500, 1500, 5000),
+      true,
+      'Mid-session Frigate event extension must not block waiting for a fresh frame when gotVideo and lastFrame are already established'
+    );
+  });
+
+  it('encapsulates Law-of-Demeter accessors, mutators, and immutable value objects across domain models', () => {
+    const t0 = 1710000000000;
+    const cam = new Camera({
+      serial: 'T8161T0000000000',
+      name: 'driveway',
+      title: 'Driveway Cam',
+      mode: 'rtsp',
+      homebase_rtsp_url: 'rtsp://user:secret@192.168.1.50:8554/live0',
+      station_serial: 'T8030P0000000000',
+    });
+
+    // 1. Basic encapsulated accessors & immutable summaries
+    assert.equal(cam.getName(), 'driveway');
+    assert.equal(cam.getSerial(), 'T8161T0000000000');
+    assert.equal(cam.getRtspUrl(), 'rtsp://user:secret@192.168.1.50:8554/live0');
+    assert.equal(cam.getMaskedRtspUrl(), 'rtsp://***@192.168.1.50:8554/live0');
+    assert.equal(cam.isSessionActive(), false);
+    const avail = cam.toAvailableCameraSummary();
+    assert.equal(Object.isFrozen(avail), true);
+    assert.deepEqual(avail, {
+      name: 'driveway',
+      serial: 'T8161T0000000000',
+      title: 'Driveway Cam',
+    });
+
+    // 2. Telemetry delegation without reaching into cam.telemetry.*
+    assert.equal(cam.hasBatteryReading(), false);
+    const telResult = cam.applyTelemetryProperties(
+      {battery: 85, chargingStatus: 2, wifiRssi: -62, batteryTemperature: 21},
+      false
+    );
+    assert.equal(Object.isFrozen(telResult), true);
+    assert.equal(telResult.shouldRebuildCard, true);
+    assert.equal(telResult.logLevel, 'info');
+    assert.equal(cam.hasBatteryReading(), true);
+    assert.equal(cam.getBatteryPct(), 85);
+
+    // 3. StatusCard mask & overlay delegation without reaching into cam.card.*
+    assert.equal(cam.hasAutoFrigateMask(), true);
+    assert.equal(cam.formatCardPlacementSummary('@'), 'icons@bottom-left');
+    const poly = cam.computeMaskPolygon();
+    cam.markMaskSynced(poly);
+    assert.equal(cam.isMaskSectionAlreadySynced('objects', poly), true);
+    cam.resetMaskSync();
+    assert.equal(cam.isMaskSectionAlreadySynced('objects', poly), false);
+
+    // 4. Session wake & stop encapsulation
+    cam.motionUntil = t0 + 60000;
+    cam.lastMotionAt = t0;
+    const rtspWakeLog = cam.beginRtspWakeSession(t0);
+    assert.equal(cam.isSessionActive(), true);
+    assert.match(rtspWakeLog, /WAKE \[RTSP\]/);
+    assert.equal(cam.isFirstWakeAttempt(), true);
+    const sessId = cam.markRtspAttemptStart(t0 + 500);
+    assert.equal(sessId, cam.getSessionId());
+
+    const quietSecs = cam.markEarlySleep(t0 + 12000);
+    assert.equal(quietSecs, 12);
+    assert.equal(cam.handleStationDisconnected('station_disconnected'), true);
+    assert.equal(cam.motionUntil, 0);
+
+    // 5. External livestream stop evaluation
+    cam.endSession(t0 + 13000, false, false, 'rtsp');
+    cam.motionUntil = t0 + 60000;
+    const p2pWake = cam.beginP2pWakeSession(t0 + 14000, 'T8030P0000000000');
+    assert.equal(Object.isFrozen(p2pWake), true);
+    assert.equal(p2pWake.shouldFileEvent, true);
+    const extStop = cam.evaluateExternalLivestreamStop(t0 + 20000, 3000);
+    assert.equal(Object.isFrozen(extStop), true);
+    assert.equal(extStop.action, 'interrupted');
+  });
+
+  it('evaluates single-expression boolean predicates for decoder exit logging, station backfill blocking, viewer yielding, and download completion', () => {
+    const t0 = 1710000000000;
+    const cam = new Camera({
+      serial: 'T8214T2222222222',
+      name: 'doorbell',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000000',
+    });
+    const otherCam = new Camera({
+      serial: 'T8161T0000000000',
+      name: 'driveway',
+      mode: 'p2p',
+      station_serial: 'T8030P0000000000',
+    });
+
+    // 1. shouldLogUnexpectedDecoderExit ternary predicate
+    assert.equal(cam.shouldLogUnexpectedDecoderExit(999, 1), false, 'Returns false when sessionId is not current');
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/clip1.zxvideo',
+        cipherId: 0,
+        clipMs: t0 - 10000,
+        event: 'motion detected',
+        personName: '',
+        reason: 'motion detected',
+      },
+      false,
+      t0
+    );
+    const activeSid = cam.getSessionId();
+    assert.equal(
+      cam.shouldLogUnexpectedDecoderExit(activeSid, 0),
+      true,
+      'Returns true if backfill decoder exits with 0 before downloadFinished is marked'
+    );
+    assert.equal(
+      cam.shouldLogUnexpectedDecoderExit(activeSid, 1),
+      true,
+      'Returns true if backfill decoder exits with non-zero code'
+    );
+    cam.markDownloadFinished(t0 + 2000);
+    assert.equal(
+      cam.shouldLogUnexpectedDecoderExit(activeSid, 0),
+      false,
+      'Returns false on clean exitCode=0 after backfill downloadFinished'
+    );
+    assert.equal(
+      cam.shouldLogUnexpectedDecoderExit(activeSid, 1),
+      true,
+      'Returns true on non-zero exitCode even after downloadFinished'
+    );
+
+    // 2. isBlockingStationBackfill & isStationIdleForBackfill predicates
+    assert.equal(
+      cam.isBlockingStationBackfill('T8030P0000000000', t0 + 3000, 5000, false),
+      true,
+      'Active P2P/download session blocks station backfill'
+    );
+    assert.equal(
+      cam.isBlockingStationBackfill('OTHER_STATION', t0 + 3000, 5000, false),
+      false,
+      'Different station never blocks'
+    );
+    cam.endSession(t0 + 3000, true, false, 'download');
+    otherCam.sleptAt = t0 + 3000;
+    assert.equal(
+      otherCam.isBlockingStationBackfill('T8030P0000000000', t0 + 5000, 5000, false),
+      true,
+      'Post-sleep cooldown blocks normal backfill'
+    );
+    assert.equal(
+      otherCam.isBlockingStationBackfill('T8030P0000000000', t0 + 5000, 5000, true),
+      false,
+      'Urgent SIGUSR1 test bypasses post-sleep delay'
+    );
+    assert.equal(
+      otherCam.isBlockingStationBackfill('T8030P0000000000', t0 + 9000, 5000, false),
+      false,
+      'Station becomes idle once delayMs has elapsed'
+    );
+
+    // 3. shouldYieldToNewStationViewer & canAdoptExternalWake ternary predicates
+    otherCam.viewUntil = t0 + 20000;
+    assert.equal(otherCam.shouldYieldToNewStationViewer(cam, t0 + 10000), true);
+    otherCam.setViewerWakingStatus('v1', true);
+    assert.equal(
+      otherCam.shouldYieldToNewStationViewer(cam, t0 + 10000),
+      true,
+      'P2P viewer yields when another P2P camera on the same station opens a viewer'
+    );
+    assert.equal(otherCam.canAdoptExternalWake(t0 + 4000, 3000), false, 'Inside guardMs');
+    assert.equal(otherCam.canAdoptExternalWake(t0 + 7000, 3000), true, 'Outside guardMs');
+  });
+
+  it('uses semantically distinct domain constants for telemetry visual status kinds, segment types, power labels, wake kinds, and process signals', () => {
+    assert.equal(Object.isFrozen(STATUS_KINDS), true);
+    assert.deepEqual(STATUS_KINDS, {
+      LIVE: 'live',
+      BACKFILL: 'backfill',
+      WAKING: 'waking',
+      WAITING: 'waiting',
+      LOW_BATTERY: 'low',
+      DISCONNECTED: 'disconnected',
+      ASLEEP: 'asleep',
+    });
+
+    assert.equal(Object.isFrozen(TELEMETRY_SEGMENT_TYPES), true);
+    assert.deepEqual(TELEMETRY_SEGMENT_TYPES, {
+      BATTERY: 'bat',
+      WIFI: 'wifi',
+      TEMPERATURE: 'temp',
+      LAST_SEEN: 'seen',
+    });
+
+    assert.equal(Object.isFrozen(POWER_LABELS), true);
+    assert.deepEqual(POWER_LABELS, {
+      CHARGING: 'Charging',
+      PLUGGED: 'Plugged',
+      SOLAR: 'Solar',
+    });
+
+    assert.equal(Object.isFrozen(WAKE_KINDS), true);
+    assert.deepEqual(WAKE_KINDS, {
+      MOTION: 'motion',
+      VIEW: 'view',
+    });
+
+    assert.equal(Object.isFrozen(EUFY_CHARGING_STATUS), true);
+    assert.deepEqual(EUFY_CHARGING_STATUS, {
+      CHARGING: 1,
+      UNPLUGGED: 2,
+      PLUGGED: 3,
+      SOLAR: 4,
+    });
+
+    assert.equal(Object.isFrozen(EUFY_POWER_SOURCES), true);
+    assert.deepEqual(EUFY_POWER_SOURCES, {
+      BATTERY: 0,
+      SOLAR: 1,
+    });
+
+    assert.equal(Object.isFrozen(WIFI_SIGNAL_LEVELS), true);
+    assert.deepEqual(WIFI_SIGNAL_LEVELS, {
+      NONE: 0,
+      WEAK: 1,
+      FAIR: 2,
+      GOOD: 3,
+      FULL: 4,
+    });
+
+    // Verify Telemetry visual states use CARD_STATUS_TITLES input and produce STATUS_KINDS output without mixing meanings
+    const cam = new Camera({
+      serial: 'T8161T0000000000',
+      name: 'driveway',
+      card_theme: CARD_THEMES.ICONS,
+      card_position: CARD_POSITIONS.BOTTOM_LEFT,
+    });
+    cam.applyTelemetryProperties(
+      {battery: 90, chargingStatus: 1, wifiRssi: -58, batteryTemperature: 22},
+      false
+    );
+    const liveVisual = cam.telemetry.evaluateVisualState(CARD_STATUS_TITLES.LIVE);
+    const backfillVisual = cam.telemetry.evaluateVisualState(CARD_STATUS_TITLES.BACKFILL);
+    const asleepVisual = cam.telemetry.evaluateVisualState(CARD_STATUS_TITLES.ASLEEP);
+    assert.equal(liveVisual.statusKind, STATUS_KINDS.LIVE);
+    assert.equal(backfillVisual.statusKind, STATUS_KINDS.BACKFILL);
+    assert.equal(asleepVisual.statusKind, STATUS_KINDS.ASLEEP);
+    assert.equal(asleepVisual.powerText, POWER_LABELS.CHARGING);
+
+    const segments = buildTelemetrySegments(
+      cam.telemetry.toStatusSnapshot('driveway', 'Driveway', cam.card.config),
+      asleepVisual
+    );
+    assert.equal(segments[0].type, TELEMETRY_SEGMENT_TYPES.BATTERY);
+    assert.equal(segments[1].type, TELEMETRY_SEGMENT_TYPES.WIFI);
+    assert.equal(segments[2].type, TELEMETRY_SEGMENT_TYPES.TEMPERATURE);
+
+    // Verify WakeRequest uses WAKE_KINDS and Camera encoder process control uses PROCESS_SIGNALS
+    const motionReq = WakeRequest.motion('person detected', 60000).build();
+    const viewReq = WakeRequest.view('live view', 20000).build();
+    assert.equal(motionReq.kind, WAKE_KINDS.MOTION);
+    assert.equal(viewReq.kind, WAKE_KINDS.VIEW);
+
+    const signalsSent = [];
+    cam.attachEncoder({
+      kill(sig) {
+        signalsSent.push(sig);
+      },
+    });
+    cam.stopEncoderProcess();
+    cam.killWedgedEncoder();
+    assert.deepEqual(signalsSent, [PROCESS_SIGNALS.SIGTERM, PROCESS_SIGNALS.SIGKILL]);
+
+    // Verify STREAM_MODES vs CARD_STATUS_TITLES vs STATUS_KINDS are never conflated
+    assert.notEqual(STREAM_MODES.DOWNLOAD, CARD_STATUS_TITLES.BACKFILL);
+    assert.notEqual(STREAM_MODES.DOWNLOAD, STATUS_KINDS.BACKFILL);
+    assert.notEqual(CARD_STATUS_TITLES.BACKFILL, STATUS_KINDS.BACKFILL);
+  });
+
+  it('rebuilds the status card when Wi-Fi signal bar tier changes after initial battery load, while ignoring minor RSSI jitter within the same bar tier', () => {
+    const doorbell = new Camera({
+      serial: 'T8214T2222222222',
+      title: 'Front Doorbell',
+      mode: 'backfill',
+      card_theme: CARD_THEMES.MINIMAL,
+    });
+
+    // 1. Initial battery property arrives before wifiRssi
+    const firstOutcome = doorbell.applyTelemetryProperties({battery: 9}, false);
+    assert.equal(firstOutcome.shouldRebuildCard, true);
+    assert.equal(doorbell.telemetry.wifi, null);
+
+    // 2. Subsequent wifiRssi property arrives (-26 dBm -> wifi=4 bars): must rebuild card so 3rd dot turns Green
+    const wifiLoadedOutcome = doorbell.applyTelemetryProperties({wifiRssi: -26}, false);
+    assert.equal(doorbell.telemetry.wifi, 4);
+    assert.equal(
+      wifiLoadedOutcome.shouldRebuildCard,
+      true,
+      'Must rebuild card when Wi-Fi bars transition from null to 4'
+    );
+
+    // 3. Minor 1 dBm RSSI fluctuation within the same 4-bar tier (-26 -> -27 dBm) must not rebuild card
+    const jitterOutcome = doorbell.applyTelemetryProperties({wifiRssi: -27}, false);
+    assert.equal(doorbell.telemetry.wifi, 4);
+    assert.equal(jitterOutcome.shouldRebuildCard, false);
+
+    // 4. Signal drop across bar tiers (-27 -> -76 dBm, 4 -> 2 bars) must rebuild card
+    const tierChangeOutcome = doorbell.applyTelemetryProperties({wifiRssi: -76}, false);
+    assert.equal(doorbell.telemetry.wifi, 2);
+    assert.equal(tierChangeOutcome.shouldRebuildCard, true);
+
+    // 5. Subsequent batteryTemperature property arriving (null -> 21°C) must rebuild card so Grey thermometer turns Green
+    const tempLoadedOutcome = doorbell.applyTelemetryProperties({batteryTemperature: 21}, false);
+    assert.equal(doorbell.telemetry.temp, 21);
+    assert.equal(tempLoadedOutcome.shouldRebuildCard, true);
+  });
+
+  it('detects offline/dead camera states (Eufy DeviceState, 0% depleted battery, and non-event wake timeouts), pauses encoder, and evaluates offline snapshot seeding eligibility', () => {
+    assert.equal(Object.isFrozen(EUFY_DEVICE_STATES), true);
+    assert.deepEqual(EUFY_DEVICE_STATES, {
+      OFFLINE: 0,
+      ONLINE: 1,
+      MANUALLY_DISABLED: 2,
+      OFFLINE_LOWBAT: 3,
+      REMOVE_AND_READD: 4,
+      RESET_AND_READD: 5,
+    });
+
+    const doorbell = new Camera(
+      {
+        serial: 'T8214T2222222222',
+        name: 'doorbell',
+        title: 'Front Doorbell',
+        mode: 'backfill',
+        sleep_screen: 'snapshot',
+      },
+      {frame: Buffer.alloc(FRAME, 0x30), lastSeen: '10:00'}
+    );
+    const noSnapCam = new Camera(
+      {serial: 'T8161T0000000000', sleep_screen: 'snapshot'},
+      {frame: null, lastSeen: ''}
+    );
+    const blackScreenCam = new Camera(
+      {serial: 'T8161T1111111111', sleep_screen: 'black'},
+      {frame: Buffer.alloc(FRAME, 0x30), lastSeen: '10:00'}
+    );
+
+    assert.equal(doorbell.hasOfflineSnapshotToSeed(), true);
+    assert.equal(
+      noSnapCam.hasOfflineSnapshotToSeed(),
+      false,
+      'Must not seed when no cached snapshot is available'
+    );
+    assert.equal(
+      blackScreenCam.hasOfflineSnapshotToSeed(),
+      false,
+      'Must not seed when sleep_screen is not "snapshot"'
+    );
+
+    assert.equal(doorbell.isDeviceOffline(), false);
+    assert.equal(doorbell.getOfflineReason(), '');
+
+    // 1. Depleted battery (0% while unplugged) marks camera offline and blocks wakes/startup probes
+    const depletedOutcome = doorbell.applyTelemetryProperties(
+      {battery: 0, chargingStatus: 2},
+      false
+    );
+    assert.equal(depletedOutcome.hadInitialTelemetry, false);
+    assert.equal(depletedOutcome.isOffline, true);
+    assert.equal(depletedOutcome.offlineChanged, true);
+    assert.equal(doorbell.isDeviceOffline(), true);
+    assert.equal(doorbell.getOfflineReason(), 'battery depleted (0%)');
+
+    const now = 50000;
+    doorbell.viewUntil = now + 20000;
+    doorbell.needsStartupSnapshot = true;
+    assert.equal(doorbell.wantsWake(now), false, 'Offline camera must not request wake');
+    assert.equal(
+      doorbell.canStartStartupProbe([doorbell], now),
+      false,
+      'Offline camera must not start startup snapshot probe'
+    );
+
+    // 2. Plugging camera in to charge clears 0% depleted battery offline state
+    const chargingOutcome = doorbell.applyTelemetryProperties({chargingStatus: 1}, false);
+    assert.equal(chargingOutcome.hadInitialTelemetry, true);
+    assert.equal(chargingOutcome.isOffline, false);
+    assert.equal(chargingOutcome.offlineChanged, true);
+    assert.equal(doorbell.isDeviceOffline(), false);
+    assert.equal(doorbell.getOfflineReason(), '');
+
+    // 3. Explicit Eufy DeviceState OFFLINE_LOWBAT (3) vs deep-sleep standby OFFLINE (0)
+    doorbell.applyTelemetryProperties(
+      {state: EUFY_DEVICE_STATES.OFFLINE_LOWBAT, chargingStatus: 2, battery: 5},
+      false
+    );
+    assert.equal(doorbell.isDeviceOffline(), true);
+    assert.equal(doorbell.getOfflineReason(), 'offline (low battery)');
+
+    // Healthy battery camera (e.g. T8161 at 100% battery and -72 dBm RSSI) reporting state=0 in deep standby must NOT be marked offline
+    doorbell.applyTelemetryProperties(
+      {state: EUFY_DEVICE_STATES.OFFLINE, battery: 100, wifiRssi: -72, wifiSignalLevel: 3},
+      false
+    );
+    assert.equal(
+      doorbell.isDeviceOffline(),
+      false,
+      'Battery camera in deep standby (state=0 with healthy battery and Wi-Fi RSSI) must not be marked offline'
+    );
+    assert.equal(doorbell.getOfflineReason(), '');
+
+    // state=0 with dead link (rssi <= -95 dBm) or critical battery (<= 5%) is genuinely offline
+    doorbell.applyTelemetryProperties(
+      {state: EUFY_DEVICE_STATES.OFFLINE, battery: 45, wifiRssi: -100, wifiSignalLevel: 0},
+      false
+    );
+    assert.equal(doorbell.isDeviceOffline(), true);
+    assert.equal(doorbell.getOfflineReason(), 'device offline');
+
+    doorbell.applyTelemetryProperties({state: EUFY_DEVICE_STATES.ONLINE, wifiRssi: -68}, false);
+    assert.equal(doorbell.isDeviceOffline(), false);
+    assert.equal(doorbell.getOfflineReason(), '');
+
+    // 4. Non-event wake timeout without video marks camera unreachable/offline, whereas event wake timeout does not
+    doorbell.eventActive = false;
+    doorbell.beginSession(STREAM_MODES.P2P, now, false);
+    doorbell.terminateSession(
+      now + 15000,
+      'no initial video for 15s after 3 start attempts',
+      false,
+      'error/watchdog-timeout'
+    );
+    assert.equal(doorbell.isDeviceOffline(), true);
+    assert.equal(doorbell.getOfflineReason(), 'unreachable (wake timed out)');
+
+    doorbell.markDeviceOnline();
+    assert.equal(doorbell.isDeviceOffline(), false);
+
+    doorbell.eventActive = true;
+    doorbell.beginSession(STREAM_MODES.P2P, now + 20000, false);
+    doorbell.terminateSession(
+      now + 35000,
+      'no initial video for 15s after 3 start attempts',
+      false,
+      'error/watchdog-timeout'
+    );
+    assert.equal(
+      doorbell.isDeviceOffline(),
+      false,
+      'Motion-triggered wake timeout must not mark camera offline because hardware is awake recording for backfill'
+    );
+
+    // 5. Encoder pause/resume lifecycle for Frigate "device offline" display
+    const signals = [];
+    doorbell.attachEncoder({
+      kill(sig) {
+        signals.push(sig);
+      },
+    });
+    doorbell.applyTelemetryProperties({state: EUFY_DEVICE_STATES.OFFLINE_LOWBAT}, false);
+    assert.equal(doorbell.pauseEncoderForOffline(), true);
+    assert.deepEqual(signals, [PROCESS_SIGNALS.SIGKILL]);
+    assert.equal(doorbell.hasEncoderProcess(), false);
+    assert.equal(doorbell.shouldResumeOfflineEncoder(), false);
+
+    doorbell.applyTelemetryProperties({state: EUFY_DEVICE_STATES.ONLINE, battery: 60}, false);
+    assert.equal(doorbell.shouldResumeOfflineEncoder(), true);
+    doorbell.clearEncoderOfflinePause();
+    assert.equal(doorbell.shouldResumeOfflineEncoder(), false);
+
+    // 6. Battery swap recovery when device.get_properties still carries stale state=3 (OFFLINE_LOWBAT) or state=0 + dead RSSI
+    doorbell.applyTelemetryProperties(
+      {
+        state: EUFY_DEVICE_STATES.OFFLINE_LOWBAT,
+        battery: 2,
+        chargingStatus: 2,
+        wifiRssi: -100,
+        wifiSignalLevel: 1,
+      },
+      false
+    );
+    assert.equal(doorbell.isDeviceOffline(), true);
+    doorbell.applyTelemetryProperties({battery: 1}, false);
+    assert.equal(
+      doorbell.isDeviceOffline(),
+      true,
+      'A 2% -> 1% property changed event without state must not clear OFFLINE_LOWBAT while still in low battery'
+    );
+    assert.equal(doorbell.shouldRefreshOfflineOnView(400000), true);
+    assert.equal(
+      doorbell.shouldRefreshOfflineOnView(500000),
+      false,
+      'Respects 5m (300s) refresh cooldown while offline so MSE reconnects do not spam driver.poll_refresh'
+    );
+
+    const swappedWithStaleState3 = doorbell.applyTelemetryProperties(
+      {
+        state: EUFY_DEVICE_STATES.OFFLINE_LOWBAT,
+        battery: 100,
+        chargingStatus: 2,
+        wifiRssi: -100,
+        wifiSignalLevel: 1,
+      },
+      false
+    );
+    assert.equal(
+      doorbell.isDeviceOffline(),
+      false,
+      'Must clear stale OFFLINE_LOWBAT (state=3) when battery is swapped to 100% even if state=3 is present in device.get_properties'
+    );
+    assert.equal(swappedWithStaleState3.offlineChanged, true);
+    assert.equal(swappedWithStaleState3.stateChanged, true);
+    assert.equal(swappedWithStaleState3.shouldRebuildCard, true);
+    assert.equal(doorbell.shouldRefreshOfflineOnView(800000), false);
+
+    // 7. Consumer (re-)connection triggers an immediate 15 fps keyframe burst so Frigate attaches without waiting for 1 fps GOP
+    const tAttach = 300000;
+    doorbell.attachEncoder({stdin: {writable: true, write() {}}, kill() {}}, tAttach);
+    assert.equal(doorbell.isInKeyframeBurst(tAttach + 5000), false);
+    assert.equal(doorbell.notifyEncoderConsumersObserved(1, 6000, tAttach + 5000), true);
+    assert.equal(doorbell.isInKeyframeBurst(tAttach + 5500), true);
+    assert.equal(
+      doorbell.notifyEncoderConsumersObserved(1, 6000, tAttach + 6000),
+      false,
+      'Does not re-trigger burst while consumer remains connected'
+    );
+    assert.equal(doorbell.notifyEncoderConsumersObserved(0, 6000, tAttach + 9000), false);
+    assert.equal(
+      doorbell.notifyEncoderConsumersObserved(1, 6000, tAttach + 10000),
+      true,
+      'Re-triggers keyframe burst when go2rtc consumer disconnects and reconnects'
+    );
+
+    // 8. Deduplicates simultaneous property changed + native trigger start/clear pairs within 1s burst
+    const tBurst = 900000;
+    assert.equal(doorbell.isDuplicateTriggerEvent('person detected', true, '', tBurst), false);
+    doorbell.queueEventBackfill(tBurst, 'person detected', '', 'person detected', 200, true);
+    assert.equal(
+      doorbell.isDuplicateTriggerEvent('person detected', true, '', tBurst + 5),
+      true,
+      'Duplicate person detected start within 1s burst must be coalesced'
+    );
+    assert.equal(
+      doorbell.isDuplicateTriggerEvent('person detected', true, 'Alice', tBurst + 10),
+      false,
+      'Must allow companion face name upgrade on the same trigger event'
+    );
+    assert.equal(doorbell.isDuplicateTriggerEvent('person detected', false, '', tBurst + 10000), false);
+    doorbell.recordMotionCleared(tBurst + 10000, 5000, 10000, 'person detected');
+    assert.equal(
+      doorbell.isDuplicateTriggerEvent('person detected', false, '', tBurst + 10005),
+      true,
+      'Duplicate person detected clear within 1s burst must be coalesced'
+    );
+
+    // 9. terminateSession reports hadDownloadFinished so stop() skips redundant device.cancel_download after normal completion
+    doorbell.beginBackfillDownload(
+      {
+        storagePath: '/zx/clip_done.zxvideo',
+        cipherId: 0,
+        cipher_id: 0,
+        clipMs: tBurst - 10000,
+        event: 'person detected',
+        personName: '',
+        reason: 'person detected',
+      },
+      false,
+      tBurst + 20000
+    );
+    doorbell.markDownloadFinished(tBurst + 25000);
+    const termDone = doorbell.terminateSession(tBurst + 55000, 'post-event clip download stream completed', false, 'eufy/download-finished');
+    assert.equal(termDone.hadDownloadFinished, true);
+
+    // 10. P2P viewer linger disconnect, mid-session starting guard, and lastStartAt refresh in backfill mode
+    const garageCam = new Camera({serial: 'T8161T1111111111', name: 'garage', mode: 'backfill'});
+    const tView = 1000000;
+    garageCam.applyViewTrigger(tView, 'live view opened', 20000, 'viewer');
+    garageCam.beginSession('p2p', tView, true);
+    garageCam.markP2pVideoPacketReceived(tView + 4000);
+    garageCam.recordDecodedFrame(Buffer.alloc(FRAME, 0x20), Buffer.alloc(FRAME, 0x20), tView + 4000, '22:22');
+    const liveOverlaySpec = garageCam.prepareLiveCardOverlay(Buffer.alloc(FRAME, 0x20));
+    assert.equal('frameMarker' in liveOverlaySpec, false);
+
+    // When all viewers disconnect (viewerIds empty) and stream stops during post-viewer linger, end cleanly ('expired') instead of re-waking
+    assert.equal(garageCam.hasWakingViewer(), false);
+    assert.equal(
+      garageCam.evaluateExternalLivestreamStop(tView + 12000, 3000).action,
+      'expired',
+      'Must not re-request P2P livestream during post-viewer linger after all viewers disconnected'
+    );
+    assert.equal(
+      garageCam.evaluateP2pHealth(tView + 12000, tView + 4000).action,
+      'expired',
+      'Watchdog must expire viewer-only P2P stream cleanly when camera stops sending video after viewer disconnected'
+    );
+
+    // While an active viewer is connected, markP2pStreamReady updates lastStartAt and starting=true suppresses self-stop events
+    garageCam.registerNewViewer('v1', tView + 5000);
+    garageCam.setViewerWakingStatus('v1', true);
+    garageCam.beginP2pStartAttempt();
+    assert.equal(
+      garageCam.evaluateExternalLivestreamStop(tView + 13000, 3000).action,
+      'inactive',
+      'Must ignore livestream stopped events while startLivestream (starting=true) is restarting the stream'
+    );
+    garageCam.markP2pStreamReady(tView + 14000);
+    garageCam.finishP2pStartAttempt(garageCam.getSessionId());
+    assert.equal(
+      garageCam.isMidStreamRetrigger(tView + 15000, 5000),
+      false,
+      'markP2pStreamReady must refresh lastStartAt so watchdog retries do not trigger false +15s mid-stream hold extensions'
+    );
+    const termP2p = garageCam.terminateSession(tView + 16000, 'viewer closed', false, 'eufy/camera');
+    assert.equal(termP2p.hadUnexpectedRtsp, false);
+    assert.deepEqual(
+      garageCam.evaluateQualityChange({videoStreamingQuality: {value: 10}}),
+      {shouldUpdate: true, currentQuality: 10, targetQuality: 7},
+      'evaluateQualityChange must clamp High/Ultra/4K (>7) streaming quality down to Medium (7) to prevent 4K bandwidth stalls over weak Wi-Fi'
+    );
+
+    // 11. Back-to-back backfill during DRAINING_BACKFILL_TAIL: needsLatestInfoBackfillQuery returns true whenever pendingBackfill has no matched clip
+    const backToBackCam = new Camera({serial: 'T8161T4444444444', name: 'garage_b2b', mode: 'backfill'});
+    const tClip1 = 2000000;
+    backToBackCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/clip1.zxvideo',
+        cipherId: 0,
+        clipMs: tClip1 - 15000,
+        event: 'person detected',
+        personName: '',
+        reason: 'person detected',
+      },
+      false,
+      tClip1
+    );
+    const tailFrame = Buffer.alloc(FRAME, 0x33);
+    backToBackCam.recordDecodedFrame(tailFrame, tailFrame, tClip1 + 500, '20:40', 5000);
+    backToBackCam.markDownloadFinished(tClip1 + 3000);
+    assert.equal(backToBackCam.sessionState, SESSION_STATES.DRAINING_BACKFILL_TAIL);
+    assert.equal(backToBackCam.needsLatestInfoBackfillQuery(), false);
+    backToBackCam.queueEventBackfill(tClip1 + 4000, 'person detected', '', 'person detected', 250, true);
+    backToBackCam.recordMotionCleared(tClip1 + 14000, 4000, 30000, 'person detected');
+    assert.equal(
+      backToBackCam.needsLatestInfoBackfillQuery(),
+      true,
+      'Must query station.database_query_latest_info even while Clip 1 is in DRAINING_BACKFILL_TAIL so Clip 2 is matched before Clip 1 finishes'
+    );
+    backToBackCam.tryMatchBackfillCandidate({
+      devSn: 'T8161T4444444444',
+      storagePath: '/zx/clip2.zxvideo',
+      cipherId: 0,
+      clipMs: tClip1 + 4500,
+    });
+    assert.equal(
+      backToBackCam.needsLatestInfoBackfillQuery(),
+      false,
+      'Once Clip 2 is matched into backfillClip, needsLatestInfoBackfillQuery returns false'
+    );
+
+    // 12. Diagnostic bottom HUD theme (card_theme: "debug")
+    const debugCam = new Camera(
+      {
+        serial: 'T8161T5555555555',
+        name: 'debug_cam',
+        mode: 'backfill',
+        card_theme: 'debug',
+        card_position: 'center',
+      },
+      {frame: Buffer.alloc(FRAME, 0x22), lastSeen: '20:45'},
+      renderCameraCards
+    );
+    assert.equal(debugCam.card.theme, CARD_THEMES.DEBUG);
+    assert.equal(debugCam.hasDynamicDebugCard(), true);
+    const bounds = debugCam.getCardBounds();
+    assert.ok(bounds);
+    assert.ok(bounds.boxW <= Math.floor((1280 * 2) / 3), 'Debug HUD width must be <= 2/3 of frame width');
+    assert.equal(bounds.boxY, 720 - bounds.boxH - 12, 'Debug HUD must be anchored at the bottom of the frame');
+    assert.ok(debugCam.computeMaskPolygon().includes(','), 'Debug HUD must generate a Frigate motion/object mask polygon');
+
+    debugCam.applyTelemetryProperties(
+      {
+        state: 1,
+        battery: 83,
+        chargingStatus: 2,
+        wifiSignalLevel: 4,
+        wifiRssi: -71,
+        batteryTemperature: 21,
+        light: true,
+        rtspStream: false,
+        powerWorkingMode: 2,
+        recordingClipLength: 30,
+        recordingEndClipMotionStops: true,
+        videoStreamingQuality: 7,
+      },
+      false
+    );
+    const idleLines = debugCam.buildDebugHudLines(tClip1 + 5000);
+    assert.equal(idleLines.length, 4);
+    assert.ok(idleLines[0].includes('ST:IDLE -> IDLE'));
+    assert.ok(idleLines[1].includes('LIGHT:ON '));
+    assert.ok(idleLines[1].includes('HW:M2/030s/EE:Y/Q7/RTSP:N'));
+
+    // Verify BACKFILL_STATES.RECORDING and BACKFILL_STATES.SETTLING map to ACTIVE and WAIT_Q in the Debug HUD
+    debugCam.queueEventBackfill(tClip1 + 6000, 'person detected', 'Alice', 'person detected', 200, true);
+    const recLines = debugCam.buildDebugHudLines(tClip1 + 6500);
+    assert.ok(recLines[0].includes('BF:ACTIVE '), 'BACKFILL_STATES.RECORDING must render as BF:ACTIVE in Debug HUD');
+    debugCam.recordMotionCleared(tClip1 + 7000, 4000, 30000, 'person detected');
+    const settleLines = debugCam.buildDebugHudLines(tClip1 + 7500);
+    assert.ok(settleLines[0].includes('BF:WAIT_Q '), 'BACKFILL_STATES.SETTLING must render as BF:WAIT_Q in Debug HUD');
+
+    // Transition to streaming backfill and verify fixed column layout does not shift horizontally
+    debugCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/debug_clip.zxvideo',
+        cipherId: 0,
+        clipMs: tClip1,
+        event: 'person detected',
+        personName: 'Alice',
+        reason: 'person detected',
+      },
+      false,
+      tClip1 + 10000
+    );
+    const liveFrame = Buffer.alloc(FRAME, 0x55);
+    debugCam.recordDecodedFrame(liveFrame, liveFrame, tClip1 + 10500, '20:46', 5000);
+    assert.equal(
+      debugCam.getFrameMarker(),
+      FRAME_STAGE_MARKERS.FIRST_BACKFILL,
+      'First decoded backfill frame must return FRAME_STAGE_MARKERS.FIRST_BACKFILL (FB)'
+    );
+    debugCam.markFrameEncoded(liveFrame, tClip1 + 10500);
+    debugCam.markFrameEncoded(liveFrame, tClip1 + 10566);
+    debugCam.applyTelemetryProperties({light: false, battery: 100}, false);
+    const activeLines = debugCam.buildDebugHudLines(tClip1 + 11000);
+    assert.equal(activeLines.length, 4);
+    assert.ok(activeLines[0].includes('BF:PLAYING'), 'BACKFILL_STATES.PLAYING must render as BF:PLAYING in Debug HUD');
+    assert.equal(activeLines[0].length, idleLines[0].length, 'Row 1 must have fixed character width');
+    assert.equal(activeLines[1].length, idleLines[1].length, 'Row 2 must have fixed character width');
+    assert.equal(activeLines[2].length, idleLines[2].length, 'Row 3 must have fixed character width');
+    assert.equal(activeLines[3].length, idleLines[3].length, 'Row 4 must have fixed character width');
+    assert.equal(activeLines[0].indexOf('| DEC:'), idleLines[0].indexOf('| DEC:'));
+    assert.equal(activeLines[0].indexOf('| BF:'), idleLines[0].indexOf('| BF:'));
+    assert.equal(activeLines[0].indexOf('| FPS:'), idleLines[0].indexOf('| FPS:'));
+    assert.equal(activeLines[0].indexOf('| WS:'), idleLines[0].indexOf('| WS:'));
+    assert.equal(activeLines[0].indexOf('| DROP:'), idleLines[0].indexOf('| DROP:'));
+    assert.equal(activeLines[1].indexOf('| BAT:'), idleLines[1].indexOf('| BAT:'));
+    assert.equal(activeLines[1].indexOf('| WIFI:'), idleLines[1].indexOf('| WIFI:'));
+    assert.equal(activeLines[1].indexOf('| HW:'), idleLines[1].indexOf('| HW:'));
+    assert.equal(activeLines[2].indexOf('| HOLD:'), idleLines[2].indexOf('| HOLD:'));
+    assert.equal(activeLines[2].indexOf('| TRIG:'), idleLines[2].indexOf('| TRIG:'));
+    assert.equal(activeLines[3].indexOf('| BFQ:'), idleLines[3].indexOf('| BFQ:'));
+    assert.equal(activeLines[3].indexOf('| CLIP:'), idleLines[3].indexOf('| CLIP:'));
+    assert.equal(activeLines[3].indexOf('| INIT:'), idleLines[3].indexOf('| INIT:'));
+    // Verify vertical column alignment across all 4 HUD rows (with 2-column spans for ST, EV, WIFI, and BFQ)
+    assert.ok(activeLines[0].includes('ST:BF_HSHK -> BF_PLAY'));
+    assert.ok(activeLines[0].includes('WS:OK HB:OK FRG:OK RTC:OK'));
+    assert.ok(activeLines[2].includes('  Q:00/00'));
+    assert.equal(activeLines[0].indexOf('s | DEC:'), activeLines[0].indexOf('| DEC:') - 2);
+    assert.equal(activeLines[1].indexOf('| BAT:'), activeLines[2].indexOf('| HOLD:'));
+    assert.equal(activeLines[0].indexOf('| DEC:'), activeLines[1].indexOf('| WIFI:'));
+    assert.equal(activeLines[0].indexOf('| DEC:'), activeLines[2].indexOf('| IDLE:'));
+    assert.equal(activeLines[0].indexOf('| DEC:'), activeLines[3].indexOf('| BFQ:'));
+    assert.equal(activeLines[0].indexOf('| BF:'), activeLines[2].indexOf('| VID:'));
+    assert.equal(activeLines[0].indexOf('| FPS:'), activeLines[1].indexOf('| TMP:'));
+    assert.equal(activeLines[0].indexOf('| FPS:'), activeLines[2].indexOf('| VW:'));
+    assert.equal(activeLines[0].indexOf('| FPS:'), activeLines[3].indexOf('| CONT:'));
+    assert.equal(activeLines[0].indexOf('| WS:'), activeLines[1].indexOf('| HW:'));
+    assert.equal(activeLines[0].indexOf('| WS:'), activeLines[2].indexOf('| TRIG:'));
+    assert.equal(activeLines[0].indexOf('| WS:'), activeLines[3].indexOf('| CLIP:'));
+    assert.equal(activeLines[0].indexOf('| DROP:'), activeLines[1].indexOf('| SEEN:'));
+    assert.equal(activeLines[0].indexOf('| DROP:'), activeLines[2].indexOf('| STOP:'));
+    assert.equal(activeLines[0].indexOf('| DROP:'), activeLines[3].indexOf('| INIT:'));
+    assert.ok(activeLines[1].includes('LIGHT:OFF'));
+
+    // Service disruption switches WS/HB/FRG/RTC from OK to DN and marks hasServiceDisruption() true
+    assert.equal(debugCam.hasServiceDisruption(), false);
+    assert.equal(debugCam.updateServiceHealth({wsConnected: false, frigateConnected: false, go2rtcConnected: false}), true);
+    assert.equal(debugCam.hasServiceDisruption(), true);
+    const downLines = debugCam.buildDebugHudLines(tClip1 + 11000);
+    assert.ok(downLines[0].includes('WS:DN HB:OK FRG:DN RTC:DN'));
+    assert.equal(downLines[0].length, activeLines[0].length);
+    debugCam.updateServiceHealth({wsConnected: true, frigateConnected: true, go2rtcConnected: true});
+    assert.equal(debugCam.hasServiceDisruption(), false);
+
+    const overlaidLive = renderLiveFrameWithCard(debugCam, liveFrame, tClip1 + 11000);
+    assert.notEqual(overlaidLive, liveFrame, 'Debug HUD must composite onto live frames via scratch buffer');
+
+    // Verify getFrameMarker() returns FRAME_STAGE_MARKERS.SNAPSHOT ('S') while idle, and shouldEnableRtspProperty recovers rtspStream=false on backfill RTSP cameras
+    const rtspBackfillCam = new Camera({
+      serial: 'T8161T6666666666',
+      name: 'garage_rtsp_bf',
+      mode: 'backfill',
+    });
+    assert.equal(rtspBackfillCam.shouldBackfillOnlyOnApiWake(), false);
+    assert.equal(rtspBackfillCam.isViewerBlockedByBackfill(), false);
+    assert.equal(rtspBackfillCam.isWaitingForBackfill(tClip1), false);
+    assert.equal(rtspBackfillCam.isWaitingForSlotOrBackfill(tClip1), false);
+    rtspBackfillCam.queueEventBackfill(tClip1, 'motion detected', '', 'motion detected', 10, true);
+    assert.equal(rtspBackfillCam.shouldBackfillOnlyOnApiWake(), true);
+    assert.equal(rtspBackfillCam.isViewerBlockedByBackfill(), true);
+    assert.equal(rtspBackfillCam.isWaitingForBackfill(tClip1), true);
+    assert.equal(rtspBackfillCam.isWaitingForSlotOrBackfill(tClip1), true);
+    rtspBackfillCam.clearPendingBackfill();
+    rtspBackfillCam.activeTriggerEvents.clear();
+    assert.equal(
+      rtspBackfillCam.getFrameMarker(),
+      FRAME_STAGE_MARKERS.SNAPSHOT,
+      'Frame marker must be FRAME_STAGE_MARKERS.SNAPSHOT (S) while camera is idle'
+    );
+    assert.equal(
+      rtspBackfillCam.shouldEnableRtspProperty(false),
+      true,
+      'RTSP-capable camera in backfill mode must re-enable rtspStream=true when eufy-security-ws reports rtspStream=false'
+    );
+    rtspBackfillCam.beginSession('rtsp', tClip1 + 12000, true);
+    assert.equal(
+      rtspBackfillCam.gotVideo,
+      false,
+      'gotVideo remains false while waking before first video frame arrives'
+    );
+    rtspBackfillCam.markRtspFrameReceived(tClip1 + 13000);
+    assert.equal(
+      rtspBackfillCam.getFrameMarker(),
+      FRAME_STAGE_MARKERS.LIVE,
+      'Frame marker is FRAME_STAGE_MARKERS.LIVE (L) once RTSP video frame arrives'
+    );
+
+    // Doorbell (T8214) in backfill mode must never enable RTSP, must recover from unexpected RTSP start during P2P wake, and must not be marked offline on watchdog timeout when device telemetry/events arrived in session
+    const doorbellBf = new Camera({
+      serial: 'T8214T5555555555',
+      name: 'doorbell_bf',
+      mode: 'backfill',
+    });
+    assert.equal(doorbellBf.isDoorbell(), true);
+    assert.equal(doorbellBf.isRtspCapable(), false);
+    assert.equal(doorbellBf.shouldEnableRtspProperty(false), false);
+    assert.equal(doorbellBf.shouldDisableRtspProperty(true), true);
+
+    doorbellBf.beginSession('p2p', tClip1 + 14000, true);
+    doorbellBf.markDeviceHeardInSession();
+    assert.deepEqual(doorbellBf.evaluateUnexpectedRtspStart(), {
+      shouldStopRtsp: true,
+      shouldDisableRtspProp: true,
+      shouldRestartP2p: true,
+    });
+    // Regression: subsequent 'rtsp livestream started' in the same session must be ignored to prevent restart loops
+    assert.deepEqual(doorbellBf.evaluateUnexpectedRtspStart(), {
+      shouldStopRtsp: false,
+      shouldDisableRtspProp: false,
+      shouldRestartP2p: false,
+    });
+    const termHeard = doorbellBf.terminateSession(
+      tClip1 + 45000,
+      'camera stopped sending video after 3 retries',
+      false,
+      'error/watchdog-timeout'
+    );
+    assert.equal(termHeard.hadUnexpectedRtsp, true);
+
+    // Regression: spurious 'rtsp livestream started' after P2P video has already arrived (gotVideo=true) must be ignored
+    doorbellBf.beginSession('p2p', tClip1 + 46000, true);
+    doorbellBf.markP2pVideoPacketReceived(tClip1 + 47000);
+    assert.deepEqual(
+      doorbellBf.evaluateUnexpectedRtspStart(),
+      {
+        shouldStopRtsp: false,
+        shouldDisableRtspProp: false,
+        shouldRestartP2p: false,
+      },
+      'Spurious rtsp livestream started on a doorbell already receiving P2P video must not stop RTSP or set rtspStream=false'
+    );
+    doorbellBf.endSession(tClip1 + 48000, true, false, 'p2p');
+    assert.equal(
+      doorbellBf.isDeviceOffline(),
+      false,
+      'Online camera that sent telemetry or stream events during session must not be marked offline on watchdog timeout'
+    );
+
+    // Unresponsive camera that sent zero events during session is still marked offline on watchdog timeout
+    doorbellBf.beginSession('p2p', tClip1 + 50000, true);
+    doorbellBf.terminateSession(
+      tClip1 + 80000,
+      'camera stopped sending video after 3 retries',
+      false,
+      'error/watchdog-timeout'
+    );
+    assert.equal(doorbellBf.isDeviceOffline(), true);
+  });
+
+  it(
+    'closes the end-of-hold Frigate poll blind spot, clears expired event cooldowns, and skips no-op hold extensions',
+    () => {
+    // Regression: (1) expired evUntil from a prior session triggered premature Frigate hold checks in the next
+    // session, (2) the 4s Frigate poll cooldown blinded the final <4s of a hold window so active objects were missed
+    // at hold expiry, and (3) extendActiveHold reported fake extensions or switched motion holds to viewer holds.
+    const t0 = 1794513000000;
+    const rtspCam = new Camera({
+      serial: 'T8161T0000000091',
+      name: 'storage_room',
+      mode: 'rtsp',
+    });
+
+    // 1. Session 1 files a Frigate event (evUntil = t0 + 62000), then ends after video.
+    rtspCam.motionUntil = t0 + 60000;
+    rtspCam.lastMotionAt = t0;
+    rtspCam.eventActive = true;
+    rtspCam.beginSession('rtsp', t0, true);
+    rtspCam.gotVideo = true;
+    rtspCam.tryUpgradeOrQueueFrigateEvent('motion', '', t0 + 2000);
+    rtspCam.beginFrigateSnapshotWait();
+    rtspCam.completeFrigateEventFiling(t0 + 2000, 15);
+    assert.equal(rtspCam.evUntil, t0 + 62000);
+    rtspCam.endSession(t0 + 60000, true, false, 'rtsp');
+
+    // Session 2 starts 30s later (t2 = t0 + 90000) after Session 1's evUntil has elapsed.
+    const t2 = t0 + 90000;
+    assert.equal(rtspCam.getFrigateEventState(t2), 'idle');
+    assert.equal(
+      rtspCam.evUntil,
+      0,
+      'Advancing Frigate event state from COOLDOWN to IDLE must reset expired evUntil to 0'
+    );
+
+    rtspCam.motionUntil = t2 + 60000;
+    rtspCam.lastMotionAt = t2;
+    rtspCam.eventActive = true;
+    rtspCam.beginSession('rtsp', t2, true);
+    rtspCam.gotVideo = true;
+    rtspCam.tryUpgradeOrQueueFrigateEvent('motion', '', t2);
+    assert.deepEqual(
+      rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 3000, 12000, 5000, 4000),
+      {shouldPoll: false, needsTimeoutExtendCheck: false},
+      'New session with 57s hold remaining and pending initial event must not poll Frigate early from a stale evUntil'
+    );
+
+    // 2. Final <4s of hold window: polled at t2 + 57000 (3s left), must bypass 4s cooldown once at t2 + 60000 expiry.
+    rtspCam.beginFrigateSnapshotWait();
+    rtspCam.completeFrigateEventFiling(t2 + 3000, 15);
+    assert.deepEqual(
+      rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 57000, 12000, 5000, 4000),
+      {shouldPoll: true, needsTimeoutExtendCheck: true}
+    );
+    assert.deepEqual(
+      rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 58500, 12000, 5000, 4000),
+      {shouldPoll: false, needsTimeoutExtendCheck: false},
+      'Mid-window poll 1.5s later remains throttled while hold has not expired yet'
+    );
+    assert.deepEqual(
+      rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 60000, 12000, 5000, 4000),
+      {shouldPoll: true, needsTimeoutExtendCheck: true},
+      'Hold expiry at t2 + 60000 must run one final Frigate check even if polled 3s earlier (<4s cooldown)'
+    );
+    const afterExpiryPoll = rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 60500, 12000, 5000, 4000);
+    assert.deepEqual(
+      afterExpiryPoll,
+      {shouldPoll: false, needsTimeoutExtendCheck: false},
+      'Once the final expiry check ran for holdUntil, it must not re-poll in a loop when holdUntil did not increase'
+    );
+    assert.equal(Object.isFrozen(afterExpiryPoll), true);
+
+    rtspCam.setExtendCheckInFlight(true);
+    assert.equal(rtspCam.isExtendCheckInFlight(), true);
+    rtspCam.lastExtendCheckAt = 0;
+    assert.deepEqual(
+      rtspCam.shouldPollFrigateForHoldOrBackfill(t2 + 60000, 12000, 5000, 4000),
+      {shouldPoll: false, needsTimeoutExtendCheck: false},
+      'Overlapping Frigate extend checks must be suppressed while extendCheckInFlight is true'
+    );
+    rtspCam.setExtendCheckInFlight(false);
+
+    // 3. Extending at/just after motionUntil expiry on a motion session must extend motionUntil, not viewUntil.
+    const expiryExt = rtspCam.extendActiveHold(t2 + 60050);
+    assert.equal(Object.isFrozen(expiryExt), true);
+    assert.deepEqual(expiryExt, {extended: true, extendMs: 30000, holdSecs: 30});
+    assert.equal(rtspCam.motionUntil, t2 + 90050);
+    assert.equal(
+      rtspCam.viewUntil,
+      0,
+      'Expiry-tick hold extension on a motion session must keep extending motionUntil rather than setting viewUntil'
+    );
+
+    // 4. Backfill camera (30s base hold) woken for 60s via /api/wake with 54s left must report extended=false.
+    const backfillCam = new Camera({
+      serial: 'T8161T0000000092',
+      name: 'garage_cam',
+      mode: 'backfill',
+    });
+    backfillCam.motionUntil = t0 + 60000;
+    backfillCam.lastMotionAt = t0;
+    backfillCam.eventActive = true;
+    backfillCam.beginSession('rtsp', t0, true);
+    backfillCam.queueEventBackfill(t0, 'person detected', '', 'person detected', 100, false);
+
+    const noopExt = backfillCam.extendActiveHold(t0 + 6000);
+    assert.equal(Object.isFrozen(noopExt), true);
+    assert.deepEqual(
+      noopExt,
+      {extended: false, extendMs: 0, holdSecs: 54},
+      'extendActiveHold must report extended=false and extendMs=0 when wantUntil already exceeds nextUntil'
+    );
+    assert.equal(backfillCam.runtimeExtended, false);
+    assert.equal(
+      backfillCam.hasPendingBackfill(),
+      true,
+      'No-op hold extension must not clear safety-net pendingBackfill'
     );
   });
 });
+
+
+
+

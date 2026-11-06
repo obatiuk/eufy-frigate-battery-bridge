@@ -27,7 +27,11 @@ module.exports = async function* conciseReporter(source) {
     } else if (event.type === 'test:fail' && !isSuite) {
       failed++;
       const err = details ? details.error : null;
-      const errMsg = (err && (err.stack || err.message)) || String(err || 'Test failed');
+      const cause = err && err.cause ? err.cause : null;
+      const errMsg =
+        (cause && (cause.stack || cause.message)) ||
+        (err && (err.stack || err.message)) ||
+        String(err || 'Test failed');
       failures.push('FAIL: ' + event.data.name + '\n' + errMsg);
     } else if (event.type === 'test:summary' && !event.data.file) {
       durationMs = Math.round(event.data.duration_ms || 0);

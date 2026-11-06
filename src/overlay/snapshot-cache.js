@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -8,10 +9,10 @@
  */
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const {spawnSync} = require('child_process');
-const {W, H, FRAME, CACHE_DIR, MAX_FFMPEG_BUFFER_MULTIPLIER} = require('../config');
+const fs = require('node:fs');
+const path = require('node:path');
+const {spawnSync} = require('node:child_process');
+const {W, H, FRAME, CACHE_DIR, MAX_FFMPEG_BUFFER_MULTIPLIER, CameraConfig} = require('../config');
 const {log, formatLocalHm} = require('../logger');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
@@ -22,10 +23,10 @@ const JPEG_ENCODER_QUALITY = '2';
  * Builds the FFmpeg CLI arguments to decode a JPEG file into a scaled raw YUV420p frame.
  *
  * @param {string} filePath - Source JPEG path.
- * @returns {string[]}
+ * @returns {readonly string[]}
  */
 function buildDecodeJpegArgs(filePath) {
-  return [
+  return Object.freeze([
     '-hide_banner',
     '-loglevel',
     'error',
@@ -40,17 +41,17 @@ function buildDecodeJpegArgs(filePath) {
     '-f',
     'rawvideo',
     'pipe:1',
-  ];
+  ]);
 }
 
 /**
  * Builds the FFmpeg CLI arguments to encode a raw YUV420p buffer to a high-quality JPEG file.
  *
  * @param {string} targetFile - Destination JPEG path.
- * @returns {string[]}
+ * @returns {readonly string[]}
  */
 function buildEncodeJpegArgs(targetFile) {
-  return [
+  return Object.freeze([
     '-hide_banner',
     '-loglevel',
     'error',
@@ -68,7 +69,7 @@ function buildEncodeJpegArgs(targetFile) {
     '-q:v',
     JPEG_ENCODER_QUALITY,
     targetFile,
-  ];
+  ]);
 }
 
 /**
@@ -104,20 +105,23 @@ function readFileLastSeenHm(filePath) {
  * Returns the unique cache file path in CACHE_DIR for a specific camera's last verified live frame,
  * keyed by both camera name and hardware serial number so frames can never collide across cameras.
  *
- * @param {{ name: string, serial: string }|Camera} cam - Camera configuration or state object.
+ * @param {CameraConfig|Camera|{ name?: string, serial?: string }} cam - Camera configuration or domain instance.
  * @returns {string} Filesystem path in CACHE_DIR.
  */
-const getCacheFilePath = (cam) => path.join(CACHE_DIR, 'last_' + cam.name + '_' + cam.serial + '.jpg');
+function getCacheFilePath(cam) {
+  return path.join(CACHE_DIR, CameraConfig.resolveCacheFileName(cam));
+}
 
 /**
  * Loads the last cached live frame for a camera from CACHE_DIR (or legacy /tmp) if one was saved
  * prior to a container restart.
  *
- * @param {{ name: string, serial: string }|Camera} cam - Camera configuration object.
+ * @param {CameraConfig|Camera|{ name?: string, serial?: string }} cam - Camera configuration or domain instance.
  * @returns {{ frame: Uint8Array|null, lastSeen: string }} YUV420p frame buffer and formatted mtime.
  */
 function loadCachedFrame(cam) {
-  const candidates = [getCacheFilePath(cam), '/tmp/last_' + cam.name + '_' + cam.serial + '.jpg'];
+  const fileName = CameraConfig.resolveCacheFileName(cam);
+  const candidates = [getCacheFilePath(cam), path.join('/tmp', fileName)];
   for (const file of candidates) {
     if (!fs.existsSync(file)) {
       continue;
@@ -127,11 +131,11 @@ function loadCachedFrame(cam) {
       const lastSeen = readFileLastSeenHm(file);
       const seenSuffix = lastSeen ? ' (lastSeen=' + lastSeen + ')' : '';
       log.debug(cam, 'loaded cached snapshot from ' + file + seenSuffix);
-      return {frame: decoded, lastSeen};
+      return Object.freeze({frame: decoded, lastSeen});
     }
     log.warn(cam, 'failed to decode cached snapshot at ' + file);
   }
-  return {frame: null, lastSeen: ''};
+  return Object.freeze({frame: null, lastSeen: ''});
 }
 
 /**
@@ -145,7 +149,7 @@ function saveCachedFrame(cam) {
   }
   const targetFile = getCacheFilePath(cam);
   try {
-    const r = spawnSync('ffmpeg', buildEncodeJpegArgs(targetFile), {input: cam.lastFrame});
+    const r = spawnSync('ffmpeg', buildEncodeJpegArgs(targetFile), {input: cam.getLastFrameBuffer()});
     if (r.status === 0) {
       log.debug(cam, 'saved cached snapshot to ' + targetFile);
     } else {
@@ -158,6 +162,9 @@ function saveCachedFrame(cam) {
 }
 
 module.exports = {
+  buildDecodeJpegArgs,
+  buildEncodeJpegArgs,
+  getCacheFilePath,
   loadCachedFrame,
   saveCachedFrame,
 };

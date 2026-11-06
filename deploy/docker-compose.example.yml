@@ -1,7 +1,11 @@
 services:
   eufy-frigate-battery-bridge:
-    build: .
-    image: eufy-frigate-battery-bridge:latest
+    # Prebuilt GHCR image (:latest for stable releases, :dev for main branch builds)
+    image: ghcr.io/obatiuk/eufy-frigate-battery-bridge:latest
+    # Optional: uncomment below to build locally from source instead
+    # build:
+    #   context: .
+    #   dockerfile: deploy/Dockerfile
     container_name: eufy-frigate-battery-bridge
     restart: unless-stopped
     environment:

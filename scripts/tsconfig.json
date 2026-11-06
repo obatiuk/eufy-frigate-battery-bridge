@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "baseUrl": "..",
+    "paths": {
+      "*": ["./.venv/node_modules/*", "./.venv/node_modules/@types/*"]
+    },
+    "typeRoots": ["../.venv/node_modules/@types", "../node_modules/@types"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "noImplicitThis": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": [
+    "../src/**/*.js"
+  ]
+}

@@ -1,3 +1,4 @@
+// @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
  * Copyright (c) 2026 ljlongwing
@@ -11,7 +12,17 @@
  */
 'use strict';
 
-const config = require('./config');
+const {
+  cfg,
+  BRIDGE_VERSION,
+  BRIDGE_COMMIT,
+  ACTIVE_HWACCEL,
+  HWACCEL_DEVICE,
+  ACTIVE_LOG_LEVEL_NAME,
+  CACHE_DIR,
+  AUDIO,
+  PROCESS_SIGNALS,
+} = require('./config');
 const {log} = require('./logger');
 const {Camera} = require('./domain/camera');
 const {loadCachedFrame} = require('./overlay/snapshot-cache');
@@ -54,10 +65,10 @@ const isShuttingDown = () => shuttingDown;
  * @returns {{ cams: Camera[], bySerial: Map<string, Camera> }}
  */
 function createCameras() {
-  const cams = config.cfg.cameras.map(
+  const cams = cfg.cameras.map(
       (rawCam) => new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards)
   );
-  const bySerial = new Map(cams.map((cam) => [cam.serial, cam]));
+  const bySerial = new Map(cams.map((cam) => [cam.getSerial(), cam]));
   return {cams, bySerial};
 }
 
@@ -83,6 +94,14 @@ function wireServices(cams, bySerial) {
     onEvent,
     onWsClosedStop: (cam) =>
         stop(cam, 'bridge lost eufy-security-ws connection', false, 'error/ws-disconnect'),
+    onDeviceOfflineStop: (cam) =>
+        stop(
+            cam,
+            'camera reported offline (' + cam.getOfflineReason() + ')',
+            false,
+            'error/device-offline'
+        ),
+    onDeviceOnlineResume: (cam) => startEncoder(cam),
     onInitialTelemetryLoaded: () => void syncFrigateMotionMasks(cams, false, shuttingDown),
   });
 }
@@ -100,9 +119,9 @@ function handleSigUsr1BackfillTest(cams) {
 
   log.info(targetCam, 'received SIGUSR1 signal, queueing test backfill download of latest HomeBase clip');
   for (const cam of cams) {
-    if (cam.usesP2pSlot() && !cam.isInMotion()) {
+    if (cam.shouldStopForSigUsr1Test()) {
       stop(cam, 'yielding P2P slot for SIGUSR1 backfill test', true, 'bridge-backfill');
-    } else if (!cam.active && !cam.isRtspCapable()) {
+    } else if (cam.shouldClearQueueForSigUsr1Test()) {
       cam.clearViewerQueue('SIGUSR1 backfill test');
     }
   }
@@ -125,7 +144,7 @@ function shutdownBridge(cams) {
   log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
 
   for (const cam of cams) {
-    cam.motionUntil = 0;
+    cam.prepareForShutdown();
     stop(cam, 'bridge container shutting down', false, 'system-shutdown');
     cam.stopEncoderProcess();
   }
@@ -138,14 +157,14 @@ function shutdownBridge(cams) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function registerSignalHandlers(cams) {
-  process.on('SIGUSR2', () => {
+  process.on(PROCESS_SIGNALS.SIGUSR2, () => {
     log.info(cams[0], 'received SIGUSR2 signal, triggering synthetic test event');
     frigateEvent(cams[0], 'test detected');
   });
 
-  process.on('SIGUSR1', () => handleSigUsr1BackfillTest(cams));
-  process.on('SIGTERM', () => shutdownBridge(cams));
-  process.on('SIGINT', () => shutdownBridge(cams));
+  process.on(PROCESS_SIGNALS.SIGUSR1, () => handleSigUsr1BackfillTest(cams));
+  process.on(PROCESS_SIGNALS.SIGTERM, () => shutdownBridge(cams));
+  process.on(PROCESS_SIGNALS.SIGINT, () => shutdownBridge(cams));
 
   process.on('uncaughtException', (err) => {
     const details = err && err.stack ? err.stack : err;
@@ -163,19 +182,18 @@ function registerSignalHandlers(cams) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function logStartupBanner(cams) {
-  const camSummary = cams
-      .map((cam) => cam.name + '(' + cam.mode + ':' + Math.round(cam.timers.holdMs / 1000) + 's)')
-      .join(', ');
-  const encoderDesc = config.ACTIVE_HWACCEL
-      ? config.ACTIVE_HWACCEL + ' (' + config.HWACCEL_DEVICE + ')'
+  const camSummary = cams.map((cam) => cam.formatStartupSummary()).join(', ');
+  const encoderDesc = ACTIVE_HWACCEL
+      ? ACTIVE_HWACCEL + ' (' + HWACCEL_DEVICE + ')'
       : 'software (libx264)';
 
   const summary = [
+    'version=' + BRIDGE_VERSION + ' (' + BRIDGE_COMMIT + ')',
     'cameras=[' + camSummary + ']',
-    'logLevel=' + config.ACTIVE_LOG_LEVEL_NAME,
-    'cache=' + config.CACHE_DIR,
+    'logLevel=' + ACTIVE_LOG_LEVEL_NAME,
+    'cache=' + CACHE_DIR,
     'encoder=' + encoderDesc,
-    'audio=' + config.AUDIO,
+    'audio=' + AUDIO,
   ].join(', ');
 
   log.info('bridge', 'eufy-frigate-battery-bridge starting: ' + summary);
@@ -202,9 +220,6 @@ function startServices(cams) {
   startHousekeepingLoop();
   startTelemetryPoller();
 
-  for (const cam of cams) {
-    startEncoder(cam);
-  }
   startHttpServer(cams, {
     wakeCameraExternal,
     isShuttingDown: () => shuttingDown,
