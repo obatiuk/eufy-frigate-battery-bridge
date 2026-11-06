@@ -23,8 +23,8 @@ const RTSP_RETRY_DELAY_MS = 750;
 const DECODER_SIGKILL_DELAY_MS = 2000;
 const STARTUP_PROBE_CAPTURE_MS = 2000;
 const BACKFILL_CANCEL_VIDEO_MS = 5000;
-const MAX_DOWNLOAD_BUFFER_SECS = 60;
-const KEY_PACKET_SCAN_BYTES = 128;
+const MAX_DOWNLOAD_BUFFER_SECS = 120;
+const KEY_PACKET_SCAN_BYTES = 4096;
 const HEVC_NAL_VPS = 32;
 const HEVC_NAL_SPS = 33;
 const H264_NAL_SPS = 7;
@@ -180,13 +180,13 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
 
 /**
  * Appends a decoded s16le PCM audio chunk to a camera's audio queue, dropping oldest chunks
- * if the buffer exceeds 1 second of audio.
+ * if the buffer exceeds 1 second of live audio (or MAX_DOWNLOAD_BUFFER_SECS during clip download).
  *
  * @param {Camera} cam - Camera state object.
  * @param {Uint8Array} chunk - Raw s16le PCM buffer.
  */
 function appendAudioPcmChunk(cam, chunk) {
-  cam.appendAudioChunk(chunk, RATE * 2);
+  cam.appendAudioChunk(chunk, RATE * 2, RATE * 2 * MAX_DOWNLOAD_BUFFER_SECS);
 }
 
 /**
@@ -216,9 +216,6 @@ function commitDecodedFrame(cam, liveFrame, snapshotCopy, now) {
  * @param {number} now - Current epoch timestamp in milliseconds.
  */
 function handleDecodedP2pFrame(cam, rawBuf, now) {
-  if (!cam.firstFrameAt) {
-    cam.firstFrameAt = now;
-  }
   const frameCopy = Buffer.from(rawBuf);
 
   if (cam.isCurrentSession(cam.sessionId, 'download')) {
@@ -337,7 +334,7 @@ function startDecoder(cam, codec) {
   dec.on('exit', (code) => {
     if (cam.dec === dec) {
       cam.dec = null;
-      if (cam.isCurrentSession(mySession)) {
+      if (cam.shouldLogUnexpectedDecoderExit(mySession, code)) {
         log.warn(
             cam,
             'decoder exited while stream active (initiator=ffmpeg-decoder, code=' +
@@ -414,6 +411,30 @@ function startRtspDecoder(cam, rtspUrl) {
       }
     }
   });
+}
+
+/**
+ * Closes the active FFmpeg decoder's video and audio input pipes on EOF (such as when a
+ * HomeBase clip download completes) so FFmpeg flushes any buffered frames in its H.265/H.264
+ * reorder buffer to stdout before exiting cleanly.
+ *
+ * @param {Camera} cam - Camera state object.
+ */
+function flushDecoderInput(cam) {
+  const dec = cam.dec;
+  if (!dec) {
+    return;
+  }
+  try {
+    if (dec.stdin && dec.stdin.writable) {
+      dec.stdin.end();
+    }
+    if (AUDIO && dec.stdio && dec.stdio[3] && dec.stdio[3].writable) {
+      dec.stdio[3].end();
+    }
+  } catch (err) {
+    // Ignore errors when closing decoder input pipes for EOF flush.
+  }
 }
 
 /**
@@ -545,7 +566,7 @@ function onVideo(cam, e) {
   const now = Date.now();
   const buf = bytes(e);
   if (!cam.dec) {
-    if (!isKeyPacket(buf, codec)) {
+    if (!isKeyPacket(buf, codec) && !cam.isBackfillPlayback()) {
       return;
     }
     cam.updateStreamFormat(codec, width, height);
@@ -589,6 +610,7 @@ module.exports = {
   setDecoderStopHandler,
   setRtspDropHandler,
   startRtspDecoder,
+  flushDecoderInput,
   stopDecoder,
   onVideo,
   onAudio,

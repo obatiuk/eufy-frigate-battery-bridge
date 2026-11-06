@@ -16,6 +16,7 @@ const {
   SNAP_DELAY_MS,
   INSTANT_EVENT_SNAPSHOT,
   KEYFRAME_BURST_MS,
+  LIVE_FPS,
   sleep,
 } = require('../config');
 const {log} = require('../logger');
@@ -23,6 +24,7 @@ const {pushFrameToEncoder} = require('../media/encoder');
 const {notifyHA} = require('./ha-notifier');
 
 const FAST_LIVE_SNAP_DELAY_MS = 1000;
+const BACKFILL_SNAP_DELAY_MS = 800;
 const FRIGATE_CONFIG_PUT_TIMEOUT_MS = 8000;
 const FRIGATE_API_TIMEOUT_MS = 5000;
 const FRIGATE_FAST_QUERY_TIMEOUT_MS = 2500;
@@ -133,7 +135,7 @@ function computeRequiredSnapshotDelay(
     snapDelayMs = SNAP_DELAY_MS
 ) {
   if (activeMode === 'download') {
-    return 0;
+    return BACKFILL_SNAP_DELAY_MS;
   }
   return instantSnapshot ? Math.min(snapDelayMs, FAST_LIVE_SNAP_DELAY_MS) : snapDelayMs;
 }
@@ -435,7 +437,10 @@ function frigateEvent(cam, ev, personName = '') {
       pushFrameToEncoder(cam, Date.now());
       await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
     }
-    const {finalLabel, finalPerson, subLabel} = cam.completeFrigateEventFiling(Date.now());
+    const {finalLabel, finalPerson, subLabel, durationSecs} = cam.completeFrigateEventFiling(
+        Date.now(),
+        LIVE_FPS
+    );
 
     try {
       const createUrl = cfg.frigate_api + '/api/events/' + cam.name + '/' + finalLabel + '/create';
@@ -446,7 +451,7 @@ function frigateEvent(cam, ev, personName = '') {
         body: JSON.stringify({
           source_type: 'api',
           sub_label: subLabel,
-          duration: cam.timers.eventSecs,
+          duration: durationSecs,
           include_recording: true,
         }),
       });
@@ -709,6 +714,8 @@ async function pollViewers(cams, hooks) {
 }
 
 module.exports = {
+  BACKFILL_SNAP_DELAY_MS,
+  computeRequiredSnapshotDelay,
   syncFrigateMotionMasks,
   handleEncoderReconnectMaskSync,
   checkPeriodicMaskSync,

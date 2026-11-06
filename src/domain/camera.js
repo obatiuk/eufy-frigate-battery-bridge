@@ -29,9 +29,16 @@ const {
 const {log} = require('../logger');
 const {Telemetry} = require('./telemetry');
 const {StatusCard} = require('./status-card');
-const {DEFAULT_BACKFILL_MAX_AGE_MS, BackfillJob} = require('./backfill-job');
+const {
+  DEFAULT_BACKFILL_MAX_AGE_MS,
+  BACKFILL_POST_CLEAR_SETTLE_MS,
+  BACKFILL_RECORDING_WAIT_CAP_MS,
+  BackfillJob,
+} = require('./backfill-job');
 
 const INITIAL_KEYFRAME_BURST_MS = 2000;
+const DOWNLOAD_EOF_FLUSH_SETTLE_MS = 1000;
+const DOWNLOAD_EVENT_DURATION_MARGIN_SECS = 6;
 
 /**
  * Determines whether a camera needs a brief startup snapshot probe on boot.
@@ -101,12 +108,18 @@ class Camera {
     this.isStartupProbe = false;
     /** @type {BackfillJob|null} */
     this.pendingBackfill = null;
+    /** @type {BackfillJob|null} */
+    this.activeBackfillJob = null;
     this.backfillClip = null;
+    this.backfillClipQueue = [];
+    this.lastDownloadedClipMs = 0;
     this.lastBackfillQueryAt = 0;
     this.downloadedPaths = new Set();
     this.downloadFrames = [];
     this.downloadFinished = false;
+    this.downloadFinishedAt = 0;
     this.isTestBackfill = false;
+    this.activeTriggerEvents = new Set();
 
     // 4. Active Stream Session & Timers
     this.active = false;
@@ -216,6 +229,9 @@ class Camera {
   beginSession(mode, now = Date.now(), p2pReady = true) {
     this.active = true;
     this.activeMode = mode;
+    if (mode !== 'download') {
+      this.activeBackfillJob = null;
+    }
     this.sessionId++;
     this.p2pReady = p2pReady;
     this.startedAt = now;
@@ -227,7 +243,10 @@ class Camera {
     this.rtspRewakeStartedAt = 0;
     this.restarts = 0;
     this.lastVideoAt = 0;
-    this.burstUntil = now + KEYFRAME_BURST_MS;
+    this.frame = null;
+    this.firstFrameAt = 0;
+    this.frameNew = false;
+    this.burstUntil = mode === 'download' ? 0 : now + KEYFRAME_BURST_MS;
   }
 
   /**
@@ -238,11 +257,17 @@ class Camera {
    * @param {boolean} [preemptedByViewer=false] - Whether stopped due to viewer switching cameras.
    * @param {string} [closedMode='p2p'] - Stream mode that just closed.
    */
-  endSession(now = Date.now(), hadVideo = false, preemptedByViewer = false, closedMode = 'p2p') {
+  endSession(
+      now = Date.now(),
+      hadVideo = false,
+      preemptedByViewer = false,
+      closedMode = this.activeMode || 'p2p'
+  ) {
     this.active = false;
     this.activeMode = '';
     this.isTestBackfill = false;
     this.downloadFinished = false;
+    this.downloadFinishedAt = 0;
     this.downloadFrames = [];
     this.starting = false;
     this.startPromise = null;
@@ -258,8 +283,26 @@ class Camera {
     this.sessionId++;
     this.lastStoppedAt = now;
     this.decSpawnedAt = 0;
-    if (hadVideo && !preemptedByViewer && closedMode !== 'download') {
-      this.sleptAt = now;
+    if (closedMode === 'download') {
+      if (
+          !preemptedByViewer &&
+          !this.pendingBackfill &&
+          this.backfillClipQueue.length === 0 &&
+          this.activeBackfillJob &&
+          this.activeBackfillJob.needsFollowUpClipQuery(this.lastDownloadedClipMs)
+      ) {
+        this.activeBackfillJob.prepareFollowUpQuery(now);
+        this.pendingBackfill = this.activeBackfillJob;
+        this.lastBackfillQueryAt = 0;
+      }
+      if (this.backfillClipQueue.length === 0) {
+        this.activeBackfillJob = null;
+      }
+    } else {
+      this.activeTriggerEvents.clear();
+      if (hadVideo && !preemptedByViewer) {
+        this.sleptAt = now;
+      }
     }
     this.burstUntil = now + KEYFRAME_BURST_MS;
     this.clearViewerQueue();
@@ -514,7 +557,9 @@ class Camera {
    */
   clearPendingBackfill() {
     this.pendingBackfill = null;
+    this.activeBackfillJob = null;
     this.backfillClip = null;
+    this.backfillClipQueue = [];
   }
 
   /**
@@ -578,32 +623,41 @@ class Camera {
     ) {
       return false;
     }
-    const isReady =
-        typeof this.pendingBackfill.isReadyToQuery === 'function'
-            ? this.pendingBackfill.isReadyToQuery(now, minEventAgeMs)
-            : now - this.pendingBackfill.at >= minEventAgeMs;
-    return Boolean(isReady);
+    const maxRecordingWaitMs = Math.max(
+        BACKFILL_RECORDING_WAIT_CAP_MS,
+        this.timers.holdMs + BACKFILL_POST_CLEAR_SETTLE_MS
+    );
+    return this.pendingBackfill.isReadyToQuery(now, minEventAgeMs, maxRecordingWaitMs);
   }
 
   /**
    * Attempts to match a parsed HomeBase database clip candidate against this camera's pending
-   * BackfillJob, storing the matched clip descriptor on this.backfillClip when within the window.
+   * or active BackfillJob, queuing matching clips in chronological order on this.backfillClipQueue
+   * and setting this.backfillClip to the next clip to download.
    *
    * @param {{ devSn: string, storagePath: string, cipherId: number, clipMs: number }} candidate - Parsed DB row.
-   * @returns {boolean} True if matched and assigned to this.backfillClip.
+   * @returns {boolean} True if matched and queued for download.
    */
   tryMatchBackfillCandidate(candidate) {
-    if (!this.pendingBackfill || this.backfillClip) {
+    const job = this.pendingBackfill || this.activeBackfillJob;
+    if (!job || !candidate) {
       return false;
     }
-    const job =
-        this.pendingBackfill instanceof BackfillJob
-            ? this.pendingBackfill
-            : new BackfillJob(this.pendingBackfill);
+    if (job.isUrgentTest() && this.backfillClip) {
+      return false;
+    }
+    if (this.backfillClipQueue.some((c) => c.storagePath === candidate.storagePath)) {
+      return false;
+    }
     if (!job.matchesCandidate(candidate, this.downloadedPaths)) {
       return false;
     }
-    this.backfillClip = job.toMatchedClip(candidate);
+    const matched = job.toMatchedClip(candidate);
+    this.backfillClipQueue.push(matched);
+    if (!job.isUrgentTest()) {
+      this.backfillClipQueue.sort((a, b) => (a.clipMs || 0) - (b.clipMs || 0));
+    }
+    this.backfillClip = this.backfillClipQueue[0] || null;
     return true;
   }
 
@@ -709,7 +763,7 @@ class Camera {
     return Boolean(
         this.active &&
         (this.hasFreshFrame(now, freshFrameMaxAgeMs) ||
-            (this.gotVideo && Buffer.isBuffer(this.lastFrame)))
+            (this.firstFrameAt > 0 && this.gotVideo && Buffer.isBuffer(this.lastFrame)))
     );
   }
 
@@ -738,13 +792,13 @@ class Camera {
   }
 
   /**
-   * Returns true if the camera is already active in a live-view or backfill download session.
+   * Returns true if the camera is already active in a live-view session.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    * @returns {boolean}
    */
   isActivelyViewing(now = Date.now()) {
-    return Boolean(this.active && (now < this.viewUntil || this.activeMode === 'download'));
+    return Boolean(this.active && now < this.viewUntil);
   }
 
   /**
@@ -932,8 +986,19 @@ class Camera {
   }
 
   /**
+   * Returns true if the camera has buffered backfill download frames waiting to be encoded.
+   *
+   * @returns {boolean}
+   */
+  hasBufferedDownloadFrames() {
+    return Boolean(
+        this.active && this.activeMode === 'download' && this.downloadFrames.length > 0
+    );
+  }
+
+  /**
    * Returns true if the camera is replaying a buffered backfill download and enough time has
-   * elapsed since lastWrite to advance to the next frame.
+   * elapsed since lastWrite to advance to the next frame without overwriting an unencoded frame.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} frameIntervalMs - Minimum interval between download frames in milliseconds.
@@ -943,6 +1008,7 @@ class Camera {
     return Boolean(
         this.active &&
         this.activeMode === 'download' &&
+        !this.frameNew &&
         this.downloadFrames.length > 0 &&
         now - this.lastWrite >= frameIntervalMs
     );
@@ -1048,7 +1114,7 @@ class Camera {
    */
   prepareSigUsr1BackfillTest(now = Date.now()) {
     this.downloadedPaths.clear();
-    this.backfillClip = null;
+    this.clearPendingBackfill();
     this.lastBackfillQueryAt = 0;
     this.pendingBackfill = BackfillJob.createSigUsr1TestJob(now);
   }
@@ -1063,17 +1129,27 @@ class Camera {
   }
 
   /**
-   * Transitions the camera into active backfill download mode for the given matched clip.
+   * Transitions the camera into active backfill download mode for the given matched clip,
+   * advancing backfillClipQueue to any subsequent clip from the same activity window.
    *
-   * @param {{ storagePath: string, cipherId: number, event: string, personName: string, reason: string }} clip - Matched clip.
+   * @param {{ storagePath: string, cipherId: number, clipMs?: number, event: string, personName: string, reason: string }} clip - Matched clip.
    * @param {boolean} isTest - Whether triggered by SIGUSR1 test hook.
    * @param {number} now - Current epoch timestamp in milliseconds.
    */
   beginBackfillDownload(clip, isTest, now) {
-    this.clearPendingBackfill();
+    if (this.pendingBackfill) {
+      this.activeBackfillJob = this.pendingBackfill;
+      this.pendingBackfill = null;
+    }
+    this.backfillClipQueue = this.backfillClipQueue.filter(
+        (item) => item.storagePath !== clip.storagePath
+    );
+    this.backfillClip = this.backfillClipQueue[0] || null;
     this.downloadedPaths.add(clip.storagePath);
+    this.lastDownloadedClipMs = clip.clipMs || now;
     this.isTestBackfill = Boolean(isTest);
     this.downloadFinished = false;
+    this.downloadFinishedAt = 0;
     this.downloadFrames = [];
     this.eventActive = false;
     this.reason = 'backfill: ' + clip.reason;
@@ -1160,36 +1236,59 @@ class Camera {
   }
 
   /**
-   * Returns true if an active backfill download has finished transferring and playing all frames.
+   * Returns true if an active backfill download has finished transferring, flushed its decoder,
+   * played out all buffered frames, and completed its post-playback hold window.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} idleCompleteMs - Fallback idle duration after last frame if downloadFinished was missed.
+   * @param {number} [postPlaybackHoldMs=0] - Hold duration after the final frame is encoded.
+   * @param {number} [minPlaybackMs=0] - Minimum total playback session duration in milliseconds.
    * @returns {boolean}
    */
-  isDownloadComplete(now, idleCompleteMs) {
+  isDownloadComplete(now, idleCompleteMs, postPlaybackHoldMs = 0, minPlaybackMs = 0) {
     if (this.downloadFrames.length > 0 || !this.gotVideo) {
       return false;
     }
-    return Boolean(this.downloadFinished || now - this.lastVideoAt > idleCompleteMs);
+    if (minPlaybackMs > 0 && now - this.startedAt < minPlaybackMs) {
+      return false;
+    }
+    if (this.downloadFinished) {
+      const decoderFlushed =
+          !this.dec ||
+          now - (this.downloadFinishedAt || this.lastVideoAt) >= DOWNLOAD_EOF_FLUSH_SETTLE_MS;
+      return Boolean(decoderFlushed && now - this.lastVideoAt >= postPlaybackHoldMs);
+    }
+    return now - this.lastVideoAt > idleCompleteMs;
   }
 
   /**
-   * Marks an active backfill download transfer as finished and returns buffered frame count and
-   * any remaining minimum playback wait time.
+   * Marks an active backfill download transfer as finished and returns the number of
+   * buffered frames currently waiting in downloadFrames.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
-   * @param {number} minPlaybackMs - Minimum playback duration in milliseconds.
-   * @returns {{ bufferedCount: number, waitMs: number }}
+   * @returns {number} Number of buffered frames remaining in downloadFrames.
    */
-  markDownloadFinished(now, minPlaybackMs) {
+  markDownloadFinished(now) {
     this.downloadFinished = true;
-    const bufferedCount = this.downloadFrames.length;
-    const elapsed = now - this.startedAt;
-    const waitMs =
-        bufferedCount === 0 && this.gotVideo && elapsed < minPlaybackMs
-            ? minPlaybackMs - elapsed
-            : 0;
-    return {bufferedCount, waitMs};
+    this.downloadFinishedAt = now;
+    return this.downloadFrames.length;
+  }
+
+  /**
+   * Returns true if a decoder process exit while the session is active should be logged as a warning.
+   *
+   * @param {number} sessionId - Session identifier of the exited decoder.
+   * @param {number|null} exitCode - Process exit code.
+   * @returns {boolean}
+   */
+  shouldLogUnexpectedDecoderExit(sessionId, exitCode) {
+    if (!this.isCurrentSession(sessionId)) {
+      return false;
+    }
+    if (this.activeMode === 'download' && this.downloadFinished && exitCode === 0) {
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -1289,13 +1388,16 @@ class Camera {
   }
 
   /**
-   * Appends a decoded s16le PCM audio chunk to the camera audio queue, dropping oldest
-   * chunks if the buffer exceeds maxBytes.
+   * Appends a decoded s16le PCM audio chunk to the camera audio queue, using the larger
+   * download audio buffer cap during burst backfill downloads and dropping oldest chunks
+   * only when the active mode's buffer limit is exceeded.
    *
    * @param {Uint8Array} chunk - Raw s16le PCM buffer.
-   * @param {number} maxBytes - Maximum buffered PCM bytes.
+   * @param {number} maxLiveBytes - Maximum buffered PCM bytes during live streaming.
+   * @param {number} [maxDownloadBytes=maxLiveBytes] - Maximum buffered PCM bytes during clip downloads.
    */
-  appendAudioChunk(chunk, maxBytes) {
+  appendAudioChunk(chunk, maxLiveBytes, maxDownloadBytes = maxLiveBytes) {
+    const maxBytes = this.activeMode === 'download' ? maxDownloadBytes : maxLiveBytes;
     this.pcm.push(chunk);
     this.pcmLen += chunk.length;
     while (this.pcmLen > maxBytes && this.pcm.length > 1) {
@@ -1336,6 +1438,9 @@ class Camera {
    * @param {number} cancelBackfillMs - Minimum video duration to cancel backfill.
    */
   recordDecodedFrame(liveFrame, snapshotCopy, now, lastSeenHm, cancelBackfillMs) {
+    if (!this.firstFrameAt) {
+      this.firstFrameAt = now;
+    }
     this.frame = liveFrame;
     this.frameAt = now;
     this.frameNew = true;
@@ -1592,18 +1697,35 @@ class Camera {
   }
 
   /**
+   * Computes the Frigate event duration in seconds, scaling up for backfill downloads to
+   * cover the pre-playback hold, buffered clip frames, and post-playback hold margin.
+   *
+   * @param {number} [liveFps=15] - Output playback frame rate.
+   * @returns {number}
+   */
+  getEffectiveEventDurationSecs(liveFps = 15) {
+    if (this.activeMode === 'download') {
+      const bufferedSecs = Math.ceil((this.downloadFrames.length + 1) / Math.max(1, liveFps));
+      return Math.max(this.timers.eventSecs, bufferedSecs) + DOWNLOAD_EVENT_DURATION_MARGIN_SECS;
+    }
+    return this.timers.eventSecs;
+  }
+
+  /**
    * Marks a pending Frigate event as dispatched and sets the event cooldown window.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @returns {{ finalLabel: string, finalPerson: string, subLabel: string }}
+   * @param {number} [liveFps=15] - Output playback frame rate for backfill duration scaling.
+   * @returns {{ finalLabel: string, finalPerson: string, subLabel: string, durationSecs: number }}
    */
-  completeFrigateEventFiling(now = Date.now()) {
+  completeFrigateEventFiling(now = Date.now(), liveFps = 15) {
     const finalLabel = this.evLabel;
     const finalPerson = this.evPerson;
     const subLabel = finalPerson || 'eufy';
+    const durationSecs = this.getEffectiveEventDurationSecs(liveFps);
     this.evPending = false;
-    this.evUntil = now + this.timers.eventSecs * 1000;
-    return {finalLabel, finalPerson, subLabel};
+    this.evUntil = now + durationSecs * 1000;
+    return {finalLabel, finalPerson, subLabel, durationSecs};
   }
 
   /**
@@ -2004,20 +2126,34 @@ class Camera {
   }
 
   /**
-   * Records that Eufy reported motion/activity cleared (state: false) and optionally shortens
-   * motionUntil when end_early is enabled.
+   * Records that Eufy reported motion/activity cleared (state: false) for an event property,
+   * marking recording cleared and optionally shortening motionUntil only once all active
+   * trigger properties on this camera have cleared.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} settleMs - Post-clear settle duration in milliseconds.
    * @param {number} minVideoMs - Minimum event video duration in milliseconds.
+   * @param {string} [eventName=''] - Eufy event property that reported state: false.
    * @returns {number|null} Shortened remaining seconds if applied, or null.
    */
-  recordMotionCleared(now, settleMs, minVideoMs) {
-    this.motionClearedAt = now;
-    if (this.pendingBackfill && typeof this.pendingBackfill.markRecordingCleared === 'function') {
-      this.pendingBackfill.markRecordingCleared(now);
-      this.lastBackfillQueryAt = 0;
+  recordMotionCleared(now, settleMs, minVideoMs, eventName = '') {
+    if (eventName) {
+      this.activeTriggerEvents.delete(String(eventName).toLowerCase());
+    } else {
+      this.activeTriggerEvents.clear();
     }
+    const targetJob = this.pendingBackfill || this.activeBackfillJob;
+    let allCleared = this.activeTriggerEvents.size === 0;
+    if (targetJob) {
+      allCleared = targetJob.markRecordingCleared(now, eventName);
+      if (allCleared) {
+        this.lastBackfillQueryAt = 0;
+      }
+    }
+    if (!allCleared) {
+      return null;
+    }
+    this.motionClearedAt = now;
     if (this.timers.letEufyDecideEnd && this.active && this.isInMotion(now) && this.gotVideo) {
       const minEnd = Math.max(now + settleMs, (this.firstVideoAt || now) + minVideoMs);
       if (this.motionUntil > minEnd) {
@@ -2026,6 +2162,15 @@ class Camera {
       }
     }
     return null;
+  }
+
+  /**
+   * Returns true if the camera has a pending BackfillJob whose hardware recording has cleared.
+   *
+   * @returns {boolean}
+   */
+  isBackfillRecordingCleared() {
+    return Boolean(this.pendingBackfill && !this.pendingBackfill.recordingActive);
   }
 
   /**
@@ -2039,6 +2184,9 @@ class Camera {
    * @param {boolean} [recordingActive=true] - Whether the camera hardware clip is still actively recording.
    */
   queueEventBackfill(now, eventName, personName, reason, evPriority, recordingActive = true) {
+    if (recordingActive && eventName) {
+      this.activeTriggerEvents.add(String(eventName).toLowerCase());
+    }
     if (
         !this.backfillDownloads ||
         (!this.alwaysBackfill && (this.runtimeExtended || (this.active && this.gotVideo)))
@@ -2046,34 +2194,54 @@ class Camera {
       return;
     }
     const nextPriority = this.priority + evPriority;
-    if (this.pendingBackfill && !this.pendingBackfill.isExpired(now)) {
-      if (typeof this.pendingBackfill.upgradeEvent === 'function') {
-        this.pendingBackfill.upgradeEvent(eventName, personName, reason, nextPriority);
-      } else if (nextPriority >= this.pendingBackfill.priority) {
-        this.pendingBackfill.event = eventName;
-        this.pendingBackfill.reason = reason;
-        this.pendingBackfill.priority = nextPriority;
-        if (personName) {
-          this.pendingBackfill.personName = personName;
-        }
-      } else if (personName && !this.pendingBackfill.personName) {
-        this.pendingBackfill.personName = personName;
-      }
+    const syncQueuedClipMeta = (sourceJob) => {
       if (this.backfillClip) {
-        this.backfillClip.event = this.pendingBackfill.event;
-        this.backfillClip.personName = this.pendingBackfill.personName;
-        this.backfillClip.reason = this.pendingBackfill.reason;
+        this.backfillClip.event = sourceJob.event;
+        this.backfillClip.personName = sourceJob.personName;
+        this.backfillClip.reason = sourceJob.reason;
       }
+      for (const queuedClip of this.backfillClipQueue) {
+        queuedClip.event = sourceJob.event;
+        queuedClip.personName = sourceJob.personName;
+        queuedClip.reason = sourceJob.reason;
+      }
+    };
+
+    if (this.activeBackfillJob) {
+      this.activeBackfillJob.upgradeEvent(
+          eventName,
+          personName,
+          reason,
+          nextPriority,
+          now,
+          recordingActive
+      );
+      syncQueuedClipMeta(this.activeBackfillJob);
+    }
+
+    if (this.pendingBackfill && !this.pendingBackfill.isExpired(now)) {
+      this.pendingBackfill.upgradeEvent(
+          eventName,
+          personName,
+          reason,
+          nextPriority,
+          now,
+          recordingActive
+      );
+      syncQueuedClipMeta(this.pendingBackfill);
       return;
     }
+
     this.pendingBackfill = new BackfillJob({
       at: now,
+      lastActivityAt: now,
       event: eventName,
       personName,
       reason,
       priority: nextPriority,
       attempts: 0,
       recordingActive,
+      activeEvents: [...this.activeTriggerEvents],
     });
   }
 
@@ -2083,11 +2251,7 @@ class Camera {
    * @returns {boolean}
    */
   hasUrgentTestBackfill() {
-    return Boolean(
-        this.pendingBackfill &&
-        typeof this.pendingBackfill.isUrgentTest === 'function' &&
-        this.pendingBackfill.isUrgentTest()
-    );
+    return Boolean(this.pendingBackfill && this.pendingBackfill.isUrgentTest());
   }
 
   /**
@@ -2104,5 +2268,6 @@ class Camera {
 }
 
 module.exports = {
+  DOWNLOAD_EVENT_DURATION_MARGIN_SECS,
   Camera,
 };

@@ -14,8 +14,9 @@ const DEFAULT_BACKFILL_MAX_AGE_MS = 300000;
 const BACKFILL_MATCH_LOOKBACK_MS = 45000;
 const BACKFILL_MATCH_LOOKAHEAD_MS = 180000;
 const BACKFILL_MAX_QUERY_ATTEMPTS = 6;
-const BACKFILL_POST_CLEAR_SETTLE_MS = 2000;
-const BACKFILL_RECORDING_WAIT_CAP_MS = 25000;
+const BACKFILL_POST_CLEAR_SETTLE_MS = 4000;
+const BACKFILL_RECORDING_WAIT_CAP_MS = 35000;
+const BACKFILL_FOLLOWUP_ACTIVITY_MS = 15000;
 const TEST_BACKFILL_OFFSET_MS = 10000;
 const TEST_BACKFILL_PRIORITY = 9999;
 
@@ -90,6 +91,7 @@ class BackfillJob {
    */
   constructor(opts = {}) {
     this.at = opts.at ?? Date.now();
+    this.lastActivityAt = opts.lastActivityAt ?? this.at;
     this.event = opts.event || 'motion detected';
     this.personName = opts.personName || '';
     this.reason = opts.reason || this.event;
@@ -98,19 +100,42 @@ class BackfillJob {
     this.ignoreTimeWindow = Boolean(opts.ignoreTimeWindow);
     this.recordingActive = Boolean(opts.recordingActive);
     this.clearedAt = opts.clearedAt ?? 0;
+    this.followUpQueried = Boolean(opts.followUpQueried);
+    this.activeEvents = new Set(Array.isArray(opts.activeEvents) ? opts.activeEvents : []);
+    if (this.recordingActive && opts.event && !this.ignoreTimeWindow) {
+      this.activeEvents.add(String(opts.event).toLowerCase());
+    }
   }
 
   /**
    * Upgrades this backfill job in-place when a higher- or equal-priority companion event
-   * arrives during the same motion window while preserving the original start timestamp.
+   * arrives during the same motion window while preserving the original start timestamp
+   * and re-asserting active recording state.
    *
    * @param {string} eventName - New Eufy event string.
    * @param {string} personName - Optional recognized person name.
    * @param {string} reason - Formatted trigger description.
    * @param {number} nextPriority - Combined camera + event priority score.
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {boolean} [recordingActive=true] - Whether the trigger indicates active recording.
    * @returns {boolean} True if event/priority or personName was upgraded.
    */
-  upgradeEvent(eventName, personName, reason, nextPriority) {
+  upgradeEvent(
+      eventName,
+      personName,
+      reason,
+      nextPriority,
+      now = Date.now(),
+      recordingActive = true
+  ) {
+    this.lastActivityAt = Math.max(this.lastActivityAt || this.at, now);
+    if (recordingActive && !this.ignoreTimeWindow) {
+      if (eventName) {
+        this.activeEvents.add(String(eventName).toLowerCase());
+      }
+      this.recordingActive = true;
+      this.clearedAt = 0;
+    }
     let changed = false;
     if (nextPriority >= this.priority) {
       if (this.event !== eventName || this.reason !== reason || this.priority !== nextPriority) {
@@ -128,32 +153,50 @@ class BackfillJob {
   }
 
   /**
-   * Marks the hardware event recording as completed when Eufy reports activity cleared (state: false).
+   * Records that a Eufy trigger property reported state: false, marking the hardware clip
+   * recording as completed only once all active trigger properties have cleared.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {string} [eventName=''] - Eufy event property that cleared.
+   * @returns {boolean} True if all active triggers have cleared and recording is now complete.
    */
-  markRecordingCleared(now = Date.now()) {
+  markRecordingCleared(now = Date.now(), eventName = '') {
+    this.lastActivityAt = Math.max(this.lastActivityAt || this.at, now);
+    if (eventName) {
+      this.activeEvents.delete(String(eventName).toLowerCase());
+    } else {
+      this.activeEvents.clear();
+    }
+    if (this.activeEvents.size > 0) {
+      return false;
+    }
     this.recordingActive = false;
     this.clearedAt = now;
+    return true;
   }
 
   /**
-   * Returns true if enough time has elapsed (or Eufy reported activity cleared + 2s settle)
+   * Returns true if enough time has elapsed (or Eufy reported all activity cleared + 4s settle)
    * to query the HomeBase local database for the recorded clip.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    * @param {number} [minEventAgeMs=8000] - Fallback minimum event age in milliseconds.
+   * @param {number} [maxRecordingWaitMs=BACKFILL_RECORDING_WAIT_CAP_MS] - Maximum wait while recordingActive is true.
    * @returns {boolean}
    */
-  isReadyToQuery(now = Date.now(), minEventAgeMs = 8000) {
+  isReadyToQuery(
+      now = Date.now(),
+      minEventAgeMs = 8000,
+      maxRecordingWaitMs = BACKFILL_RECORDING_WAIT_CAP_MS
+  ) {
     if (this.isUrgentTest()) {
       return true;
     }
-    if (this.clearedAt > 0) {
+    if (!this.recordingActive && this.clearedAt > 0) {
       return now - this.clearedAt >= BACKFILL_POST_CLEAR_SETTLE_MS;
     }
     if (this.recordingActive) {
-      return now - this.at >= BACKFILL_RECORDING_WAIT_CAP_MS;
+      return now - this.at >= maxRecordingWaitMs;
     }
     return now - this.at >= minEventAgeMs;
   }
@@ -166,7 +209,7 @@ class BackfillJob {
    * @returns {boolean}
    */
   isExpired(now = Date.now(), maxAgeMs = DEFAULT_BACKFILL_MAX_AGE_MS) {
-    return now - this.at > maxAgeMs;
+    return now - Math.max(this.at, this.lastActivityAt || this.at) > maxAgeMs;
   }
 
   /**
@@ -204,23 +247,58 @@ class BackfillJob {
     if (this.isUrgentTest() || !candidate.clipMs) {
       return true;
     }
-    return candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS && candidate.clipMs <= this.at + BACKFILL_MATCH_LOOKAHEAD_MS;
+    const endRef = Math.max(this.at, this.lastActivityAt || this.at, this.clearedAt || 0);
+    return (
+        candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS &&
+        candidate.clipMs <= endRef + BACKFILL_MATCH_LOOKAHEAD_MS
+    );
   }
 
   /**
    * Creates a matched clip descriptor ready for device.start_download.
    *
-   * @param {{ storagePath: string, cipherId: number }} candidate - Matched database candidate.
-   * @returns {{ storagePath: string, cipherId: number, event: string, personName: string, reason: string }}
+   * @param {{ storagePath: string, cipherId: number, clipMs?: number }} candidate - Matched database candidate.
+   * @returns {{ storagePath: string, cipherId: number, clipMs: number, event: string, personName: string, reason: string }}
    */
   toMatchedClip(candidate) {
     return {
       storagePath: candidate.storagePath,
       cipherId: candidate.cipherId,
+      clipMs: candidate.clipMs || 0,
       event: this.event,
       personName: this.personName,
       reason: this.reason,
     };
+  }
+
+  /**
+   * Returns true if camera activity continued at least minSpanMs past the downloaded clip's
+   * start timestamp and a follow-up database query has not yet been performed for split clips.
+   *
+   * @param {number} [lastClipMs=0] - Timestamp (ms) of the last downloaded clip.
+   * @param {number} [minSpanMs=BACKFILL_FOLLOWUP_ACTIVITY_MS] - Minimum activity span to trigger follow-up.
+   * @returns {boolean}
+   */
+  needsFollowUpClipQuery(lastClipMs = 0, minSpanMs = BACKFILL_FOLLOWUP_ACTIVITY_MS) {
+    if (this.isUrgentTest() || this.followUpQueried) {
+      return false;
+    }
+    const activityEnd = Math.max(this.lastActivityAt || 0, this.clearedAt || 0);
+    const clipStartRef = lastClipMs > 0 ? lastClipMs : this.at;
+    return activityEnd - clipStartRef >= minSpanMs;
+  }
+
+  /**
+   * Prepares this job for a single post-download follow-up database query to catch split clips.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {number} [maxAttempts=BACKFILL_MAX_QUERY_ATTEMPTS] - Maximum allowed query attempts.
+   */
+  prepareFollowUpQuery(now = Date.now(), maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
+    this.followUpQueried = true;
+    this.recordingActive = false;
+    this.clearedAt = now;
+    this.attempts = Math.max(0, maxAttempts - 1);
   }
 
   /**
@@ -247,6 +325,7 @@ module.exports = {
   BACKFILL_MAX_QUERY_ATTEMPTS,
   BACKFILL_POST_CLEAR_SETTLE_MS,
   BACKFILL_RECORDING_WAIT_CAP_MS,
+  BACKFILL_FOLLOWUP_ACTIVITY_MS,
   BackfillJob,
   extractDatabaseRecordCandidate,
 };

@@ -13,7 +13,10 @@ process.env.LOG_LEVEL = 'error';
 process.env.CACHE_DIR = '/tmp';
 
 const {FRAME} = require('../src/config');
-const {Camera} = require('../src/domain/camera');
+const {
+  DOWNLOAD_EVENT_DURATION_MARGIN_SECS,
+  Camera,
+} = require('../src/domain/camera');
 const {
   BackfillJob,
   BACKFILL_POST_CLEAR_SETTLE_MS,
@@ -21,6 +24,8 @@ const {
 } = require('../src/domain/backfill-job');
 const {prepareBackgroundCanvas} = require('../src/overlay/yuv-canvas');
 const {renderCameraCards, renderLiveFrameWithCard} = require('../src/overlay/card-renderer');
+const {selectEncoderFrame, shouldWriteEncoderFrame, pushFrameToEncoder} = require('../src/media/encoder');
+const {BACKFILL_SNAP_DELAY_MS, computeRequiredSnapshotDelay} = require('../src/services/frigate-client');
 
 describe('Camera & Telemetry Domain Models', () => {
   it('derives Eufy Power Manager property sync changes for "rtsp" and "backfill" modes', () => {
@@ -351,6 +356,12 @@ describe('StatusCard Domain Model & Frigate Polygon Masks', () => {
     const liveIcons = renderLiveFrameWithCard(iconsCam, rawFrame);
     assert.notEqual(liveIcons, rawFrame, 'Corner card must composite onto scratch buffer without mutating rawFrame');
     assert.equal(rawFrame[0], 0x40);
+    const liveIconsNext = renderLiveFrameWithCard(iconsCam, rawFrame);
+    assert.notEqual(
+      liveIconsNext,
+      liveIcons,
+      'Consecutive live overlay renders must alternate double buffers so in-flight encoder pipe writes never tear'
+    );
 
     const liveNone = renderLiveFrameWithCard(noneCam, rawFrame);
     assert.equal(liveNone, rawFrame, '"none" theme must return rawFrame directly');
@@ -358,7 +369,7 @@ describe('StatusCard Domain Model & Frigate Polygon Masks', () => {
 });
 
 describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
-  it('waits for state=false + 2s settle (or 25s cap) when recordingActive=true', () => {
+  it('waits for all active trigger properties to report state=false + 4s settle (or scaled holdMs + 4s cap)', () => {
     const doorbellCam = new Camera({
       serial: 'T8214T2222222222',
       mode: 'backfill',
@@ -366,12 +377,288 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
 
     const t0 = 1000000;
     doorbellCam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+    doorbellCam.queueEventBackfill(t0 + 2000, 'person detected', '', 'person detected', 200, true);
     assert.equal(doorbellCam.canQueryBackfill(t0 + 10000, 8000, 12000), false);
     assert.equal(doorbellCam.canQueryBackfill(t0 + BACKFILL_RECORDING_WAIT_CAP_MS + 50, 8000, 12000), true);
 
+    // Clearing only "person detected" while "motion detected" is still active must NOT mark recording cleared
+    doorbellCam.recordMotionCleared(t0 + 6000, 5000, 10000, 'person detected');
+    assert.equal(doorbellCam.isBackfillRecordingCleared(), false);
+    assert.equal(doorbellCam.canQueryBackfill(t0 + 11000, 8000, 12000), false);
+
+    // Clearing "motion detected" completes all active triggers and starts the 4s post-clear settle window
     const tClear = t0 + 11000;
-    doorbellCam.recordMotionCleared(tClear, 5000, 10000);
+    doorbellCam.recordMotionCleared(tClear, 5000, 10000, 'motion detected');
+    assert.equal(doorbellCam.isBackfillRecordingCleared(), true);
     assert.equal(doorbellCam.canQueryBackfill(tClear + 1000, 8000, 12000), false);
     assert.equal(doorbellCam.canQueryBackfill(tClear + BACKFILL_POST_CLEAR_SETTLE_MS + 50, 8000, 12000), true);
+
+    // Follow-up state=true trigger before query re-asserts active recording state
+    doorbellCam.queueEventBackfill(tClear + 1500, 'rings', '', 'rings', 1000, true);
+    assert.equal(doorbellCam.isBackfillRecordingCleared(), false);
+    assert.equal(doorbellCam.canQueryBackfill(tClear + BACKFILL_POST_CLEAR_SETTLE_MS + 50, 8000, 12000), false);
+  });
+
+  it('queues multi-clip HomeBase recordings in chronological order while keeping SIGUSR1 single-clip', () => {
+    const doorbellCam = new Camera({
+      serial: 'T8214T2222222222',
+      mode: 'backfill',
+    });
+
+    const t0 = 2000000;
+    doorbellCam.queueEventBackfill(t0, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+    doorbellCam.recordMotionCleared(t0 + 25000, 5000, 10000, 'person detected');
+
+    const newerClip = {
+      devSn: 'T8214T2222222222',
+      storagePath: '/media/mmcblk0p1/video/20261105170020.zxvideo',
+      cipherId: 2,
+      clipMs: t0 + 20000,
+    };
+    const olderClip = {
+      devSn: 'T8214T2222222222',
+      storagePath: '/media/mmcblk0p1/video/20261105170002.zxvideo',
+      cipherId: 1,
+      clipMs: t0 + 2000,
+    };
+
+    // Database query returns newest first; Camera must sort queued event clips chronologically (oldest -> newest)
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(newerClip), true);
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(olderClip), true);
+    assert.equal(doorbellCam.backfillClipQueue.length, 2);
+    assert.equal(doorbellCam.backfillClip.storagePath, olderClip.storagePath);
+
+    // Starting download of Clip 1 shifts Clip 1 and keeps Clip 2 ready in backfillClipQueue
+    doorbellCam.beginBackfillDownload(doorbellCam.backfillClip, false, t0 + 30000);
+    assert.equal(doorbellCam.backfillClipQueue.length, 1);
+    assert.equal(doorbellCam.backfillClip.storagePath, newerClip.storagePath);
+    assert.ok(doorbellCam.activeBackfillJob instanceof BackfillJob);
+
+    doorbellCam.endSession(t0 + 40000);
+    assert.equal(doorbellCam.isReadyForBackfillDownload(), true);
+    assert.equal(doorbellCam.backfillClip.storagePath, newerClip.storagePath);
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(olderClip), false, 'Already downloaded path is skipped');
+
+    // SIGUSR1 urgent test clears downloadedPaths and only matches the single newest clip
+    doorbellCam.prepareSigUsr1BackfillTest(t0 + 50000);
+    const sigClip1 = {
+      devSn: 'T8214T2222222222',
+      storagePath: '/media/mmcblk0p1/video/20261105170100.zxvideo',
+      cipherId: 3,
+      clipMs: t0 + 49000,
+    };
+    const sigClip2 = {
+      devSn: 'T8214T2222222222',
+      storagePath: '/media/mmcblk0p1/video/20261105170050.zxvideo',
+      cipherId: 4,
+      clipMs: t0 + 45000,
+    };
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(sigClip1), true);
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(sigClip2), false);
+    assert.equal(doorbellCam.backfillClipQueue.length, 1);
+  });
+
+  it('schedules a follow-up query for split clips and enforces frame-drain, decoder flush, and post-playback hold', () => {
+    const doorbellCam = new Camera({
+      serial: 'T8214T2222222222',
+      mode: 'backfill',
+    });
+
+    const t0 = 3000000;
+    doorbellCam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+    doorbellCam.queueEventBackfill(t0 + 20000, 'person detected', '', 'person detected', 200, true);
+    doorbellCam.recordMotionCleared(t0 + 22000, 5000, 10000);
+
+    const clip1 = {
+      devSn: 'T8214T2222222222',
+      storagePath: '/media/mmcblk0p1/video/20261105171001.zxvideo',
+      cipherId: 10,
+      clipMs: t0 + 1000,
+    };
+    assert.equal(doorbellCam.tryMatchBackfillCandidate(clip1), true);
+    doorbellCam.beginBackfillDownload(doorbellCam.backfillClip, false, t0 + 27000);
+
+    // Burst-downloaded audio chunks are preserved up to maxDownloadBytes instead of being capped at 1s
+    doorbellCam.appendAudioChunk(Buffer.alloc(32000), 32000, 32000 * 120);
+    doorbellCam.appendAudioChunk(Buffer.alloc(32000), 32000, 32000 * 120);
+    assert.equal(doorbellCam.pcmLen, 64000);
+
+    // Frame 0 committed -> advances to Frame 1 on the very next 15 fps tick once encoded (zero still-frame hold)
+    const dummyFrame1 = Buffer.alloc(FRAME, 0x30);
+    const dummyFrame2 = Buffer.alloc(FRAME, 0x50);
+    const tFirstFrame = t0 + 27100;
+    assert.equal(doorbellCam.bufferDownloadFrame(dummyFrame1, 900), false);
+    doorbellCam.recordDecodedFrame(dummyFrame1, dummyFrame1, tFirstFrame, '17:10', 5000);
+    assert.equal(doorbellCam.firstFrameAt, tFirstFrame);
+    assert.equal(doorbellCam.bufferDownloadFrame(dummyFrame2, 900), true);
+    assert.equal(doorbellCam.canAdvanceDownloadFrame(tFirstFrame + 100, 62), false, 'Must not overwrite un-encoded Frame 0');
+
+    doorbellCam.markFrameEncoded(dummyFrame1, tFirstFrame);
+    const tNextTick = tFirstFrame + 62;
+    assert.equal(
+      doorbellCam.canAdvanceDownloadFrame(tNextTick, 62),
+      true,
+      'Must advance immediately to Frame 1 on the next 15 fps tick without holding still frames'
+    );
+    const silenceBuf = Buffer.alloc(3200, 0);
+    assert.notEqual(doorbellCam.consumeAudioChunk(3200, silenceBuf), silenceBuf);
+    doorbellCam.consumeNextDownloadFrame(tNextTick, 62, '17:10');
+    doorbellCam.markFrameEncoded(dummyFrame2, tNextTick + 10);
+    doorbellCam.gotVideo = true;
+
+    // Mark download finished while decoder process is still attached -> waits for EOF flush settle and 2.5s post-playback hold
+    doorbellCam.attachDecoder({});
+    assert.equal(doorbellCam.shouldLogUnexpectedDecoderExit(doorbellCam.sessionId, 0), true);
+    assert.equal(doorbellCam.markDownloadFinished(tNextTick + 500), 0);
+    assert.equal(
+      doorbellCam.shouldLogUnexpectedDecoderExit(doorbellCam.sessionId, 0),
+      false,
+      'Clean exit (code=0) after flushDecoderInput on downloadFinished must not log a warning'
+    );
+    assert.equal(doorbellCam.shouldLogUnexpectedDecoderExit(doorbellCam.sessionId, 1), true);
+    assert.equal(doorbellCam.isDownloadComplete(tNextTick + 1000, 3000, 2500, 4500), false);
+    doorbellCam.detachDecoder();
+    assert.equal(
+      doorbellCam.isDownloadComplete(tNextTick + 4500, 3000, 2500, 4500),
+      true,
+      'Completes once minPlaybackMs (4.5s) and postPlaybackHoldMs (2.5s) have elapsed'
+    );
+
+    // Scales Frigate event duration with DOWNLOAD_EVENT_DURATION_MARGIN_SECS (8s) for backfill downloads
+    doorbellCam.downloadFrames = new Array(600);
+    doorbellCam.tryUpgradeOrQueueFrigateEvent('person', 'Alice', tNextTick + 500);
+    const filed = doorbellCam.completeFrigateEventFiling(tNextTick + 1000, 15);
+    assert.equal(filed.durationSecs, 41 + DOWNLOAD_EVENT_DURATION_MARGIN_SECS);
+    doorbellCam.downloadFrames = [];
+
+    // Ending session promotes activeBackfillJob to a follow-up query because activity spanned 21s past clip1
+    doorbellCam.endSession(tNextTick + 3000);
+    assert.ok(doorbellCam.pendingBackfill instanceof BackfillJob);
+    assert.equal(doorbellCam.pendingBackfill.followUpQueried, true);
+  });
+
+  it('streams backfill clips from Frame 0 at 15 fps without encoding old snapshots, freezing still frames, or filing Frigate events before pipeline transit', () => {
+    const oldSnapshot = Buffer.alloc(FRAME, 0x11);
+    const doorbellCam = new Camera(
+      {
+        serial: 'T8214T2222222222',
+        mode: 'backfill',
+      },
+      {frame: oldSnapshot, lastSeen: '18:21'},
+      renderCameraCards
+    );
+
+    const writtenFrames = [];
+    doorbellCam.attachEncoder(
+      {
+        stdin: {
+          writable: true,
+          writableNeedDrain: false,
+          write(buf) {
+            writtenFrames.push(Buffer.from(buf));
+          },
+        },
+      },
+      1000
+    );
+    // Simulate sleeping state before backfill wake
+    pushFrameToEncoder(doorbellCam, 1000);
+    assert.equal(writtenFrames.length, 1);
+    assert.equal(doorbellCam.lastSent, doorbellCam.card.asleep);
+    writtenFrames.length = 0;
+
+    const tWake = 5000;
+    const clip = {
+      storagePath: '/zx/hdd_data0/Camera02/202611/20261105200709/20261105200709.zxvideo',
+      cipherId: 0,
+      clipMs: tWake - 30000,
+      event: 'person detected',
+      personName: '',
+      reason: 'person detected',
+    };
+
+    // Phase 1: beginBackfillDownload (before Frame 0 is decoded)
+    doorbellCam.beginBackfillDownload(clip, false, tWake);
+    assert.equal(doorbellCam.firstFrameAt, 0);
+    assert.equal(doorbellCam.frame, null);
+    assert.equal(
+      doorbellCam.isActivelyViewing(tWake + 50),
+      false,
+      'Automatic Frigate UI consumer joining during backfill download must be classified as "joined while live", not an active viewer wake'
+    );
+    assert.equal(
+      doorbellCam.isInKeyframeBurst(tWake + 50),
+      false,
+      'Must NOT trigger a 15 fps keyframe burst of old card.asleep before Frame 0 is decoded'
+    );
+
+    // Even after the first raw H.264 network packet arrives (gotVideo=true), isStreamingLive must remain false until Frame 0 is decoded
+    doorbellCam.markP2pVideoPacketReceived(tWake + 200);
+    assert.equal(doorbellCam.gotVideo, true);
+    assert.equal(
+      doorbellCam.isStreamingLive(tWake + 200, 2000),
+      false,
+      'Must NOT treat previous session lastFrame as live video before Frame 0 is decoded'
+    );
+    pushFrameToEncoder(doorbellCam, tWake + 100);
+    pushFrameToEncoder(doorbellCam, tWake + 250);
+    assert.equal(
+      writtenFrames.length,
+      0,
+      'Encoder stdin must remain completely quiet during backfill handshake before Frame 0 is decoded so zero old snapshot frames queue ahead of Frame 0'
+    );
+
+    const requiredDelayMs = computeRequiredSnapshotDelay('download');
+    assert.equal(
+      requiredDelayMs,
+      BACKFILL_SNAP_DELAY_MS,
+      'Backfill download must wait BACKFILL_SNAP_DELAY_MS for Frame 0 to traverse h264_vaapi -> go2rtc -> Frigate before creating the Frigate event'
+    );
+    assert.equal(
+      doorbellCam.isReadyForEventSnapshot(tWake + 250, requiredDelayMs, 1500, 5000),
+      false,
+      'Must not file Frigate event before Frame 0 is decoded'
+    );
+
+    // Phase 2: Frame 0, Frame 1, Frame 2 decoded from .zxvideo
+    const tFrame0 = tWake + 300;
+    const frame0 = Buffer.alloc(FRAME, 0x80);
+    const frame1 = Buffer.alloc(FRAME, 0x81);
+    const frame2 = Buffer.alloc(FRAME, 0x82);
+
+    assert.equal(doorbellCam.bufferDownloadFrame(frame0, 1800), false);
+    doorbellCam.recordDecodedFrame(frame0, frame0, tFrame0, '20:07', 5000);
+    pushFrameToEncoder(doorbellCam, tFrame0);
+    assert.equal(doorbellCam.bufferDownloadFrame(frame1, 1800), true);
+    assert.equal(doorbellCam.bufferDownloadFrame(frame2, 1800), true);
+
+    assert.equal(writtenFrames.length, 1);
+    assert.equal(doorbellCam.lastSent, frame0, 'lastSent must track raw Frame 0');
+    assert.equal(writtenFrames[0][0], 0x80, 'First encoded frame of backfill must be Frame 0, never oldSnapshot or card.asleep');
+
+    // Phase 3: Continuous 15 fps advancement (Frame 0 -> Frame 1 -> Frame 2 with zero still-frame freeze)
+    const tTick1 = tFrame0 + 62;
+    pushFrameToEncoder(doorbellCam, tTick1);
+    assert.equal(writtenFrames.length, 2);
+    assert.equal(doorbellCam.lastSent, frame1);
+    assert.equal(writtenFrames[1][0], 0x81, 'Tick 1 (62ms) must advance immediately to Frame 1 without freezing Frame 0');
+
+    const tTick2 = tTick1 + 62;
+    pushFrameToEncoder(doorbellCam, tTick2);
+    assert.equal(writtenFrames.length, 3);
+    assert.equal(doorbellCam.lastSent, frame2);
+    assert.equal(writtenFrames[2][0], 0x82, 'Tick 2 (124ms) must advance immediately to Frame 2');
+
+    // Phase 4: Frigate event waits for pipeline transit (BACKFILL_SNAP_DELAY_MS) after firstFrameAt
+    assert.equal(
+      doorbellCam.isReadyForEventSnapshot(tFrame0 + 200, requiredDelayMs, 1500, 5000),
+      false,
+      'Must wait while Frame 0 is still in flight through h264_vaapi -> go2rtc -> Frigate'
+    );
+    assert.equal(
+      doorbellCam.isReadyForEventSnapshot(tFrame0 + BACKFILL_SNAP_DELAY_MS, requiredDelayMs, 1500, 5000),
+      true,
+      'Becomes ready to create Frigate event once Frame 0 has reached Frigate'
+    );
   });
 });

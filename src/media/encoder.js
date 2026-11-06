@@ -80,8 +80,8 @@ function advanceDownloadPlaybackFrame(cam, now) {
 }
 
 /**
- * Selects the YUV420p frame buffer to feed to the camera's encoder (live video with optional
- * corner card, clean snapshot fallback, waking card, busy card, or asleep card).
+ * Selects the source YUV420p frame buffer to feed to the camera's encoder (raw live video,
+ * clean snapshot fallback, waking card, busy card, or asleep card).
  *
  * @param {Camera} cam - Camera state object.
  * @param {number} now - Current epoch timestamp in milliseconds.
@@ -90,13 +90,12 @@ function advanceDownloadPlaybackFrame(cam, now) {
 function selectEncoderFrame(cam, now) {
   if (cam.isStreamingLive(now, FRESH_FRAME_MAX_AGE_MS)) {
     const rawLiveFrame = cam.hasFreshFrame(now, FRESH_FRAME_MAX_AGE_MS) ? cam.frame : cam.lastFrame;
-    const liveFrame = rawLiveFrame ? renderLiveFrameWithCard(cam, rawLiveFrame) : rawLiveFrame;
-    return {frame: liveFrame, isLive: true};
+    return {frame: rawLiveFrame, isLive: true};
   }
   if (cam.card.suppressLiveCard && Buffer.isBuffer(cam.lastFrame)) {
     return {frame: cam.lastFrame, isLive: false};
   }
-  if (cam.active) {
+  if (cam.active && !cam.isBackfillPlayback()) {
     return {frame: cam.card.waking, isLive: false};
   }
   if (now < cam.wantUntil()) {
@@ -116,9 +115,20 @@ function selectEncoderFrame(cam, now) {
  * @returns {boolean}
  */
 function shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now) {
+  if (cam.isBackfillPlayback() && !cam.firstFrameAt) {
+    return false;
+  }
   const elapsedMs = now - cam.lastWrite;
   if (isLive) {
-    return Boolean(cam.frameNew || elapsedMs >= LIVE_HEARTBEAT_WRITE_MS);
+    if (cam.isBackfillPlayback()) {
+      return Boolean(
+          cam.frameNew ||
+          stateChanged ||
+          inBurst ||
+          elapsedMs >= Math.floor(1000 / LIVE_FPS) - DOWNLOAD_PACE_LEAD_MS
+      );
+    }
+    return Boolean(cam.frameNew || stateChanged || inBurst || elapsedMs >= LIVE_HEARTBEAT_WRITE_MS);
   }
   return Boolean(stateChanged || inBurst || elapsedMs >= 1000 / IDLE_FPS);
 }
@@ -158,7 +168,8 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   const inBurst = cam.isInKeyframeBurst(now);
 
   if (shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now)) {
-    enc.stdin.write(frame);
+    const outFrame = isLive && frame ? renderLiveFrameWithCard(cam, frame) : frame;
+    enc.stdin.write(outFrame);
     cam.markFrameEncoded(frame, now);
   }
 }
@@ -324,7 +335,7 @@ function startEncoder(cam) {
   enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
   enc.stdin.on('error', () => {});
   enc.stdin.on('drain', () => {
-    if (cam.frameNew) {
+    if (cam.frameNew || cam.hasBufferedDownloadFrames()) {
       pushFrameToEncoder(cam);
     }
   });
@@ -412,6 +423,8 @@ function startMediaTickers(cams) {
 
 module.exports = {
   configureEncoderHooks,
+  selectEncoderFrame,
+  shouldWriteEncoderFrame,
   pushFrameToEncoder,
   startEncoder,
   startMediaTickers,

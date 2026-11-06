@@ -135,7 +135,9 @@ class StatusCard {
     this.backfillTelState = null;
     this.liveCard = null;
     this.backfillCard = null;
-    this.liveOverlayBuf = Buffer.allocUnsafe(FRAME);
+    this.liveOverlayBufs = [Buffer.allocUnsafe(FRAME), Buffer.allocUnsafe(FRAME)];
+    this.liveOverlayIdx = 0;
+    this.liveOverlayBuf = this.liveOverlayBufs[0];
     this.asleep = null;
     this.waking = null;
     this.busy = null;
@@ -211,14 +213,18 @@ class StatusCard {
   }
 
   /**
-   * Copies a raw live YUV420p video frame into the reusable scratch buffer for corner card compositing.
+   * Copies a raw live YUV420p video frame into the next alternating scratch buffer for corner card
+   * compositing so an in-flight encoder pipe write is never mutated mid-frame.
    *
    * @param {Uint8Array} rawFrame - Source YUV420p frame buffer.
    * @returns {Uint8Array} Scratch buffer containing a copy of rawFrame.
    */
   prepareLiveOverlayBuffer(rawFrame) {
-    rawFrame.copy(this.liveOverlayBuf);
-    return this.liveOverlayBuf;
+    this.liveOverlayIdx = (this.liveOverlayIdx + 1) & 1;
+    const targetBuf = this.liveOverlayBufs[this.liveOverlayIdx];
+    rawFrame.copy(targetBuf);
+    this.liveOverlayBuf = targetBuf;
+    return targetBuf;
   }
 
   /**

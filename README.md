@@ -26,7 +26,7 @@ Each camera in your `config.json` can be set to one of five modes depending on h
 | :--- | :--- | :--- | :--- |
 | **`"auto"`** *(default when omitted)* | Automatic detection | Uses `"rtsp"` automatically on cameras that support `HomeBase` `RTSP`, or `"p2p"` (with automatic `HomeBase` clip replay fallback) on all others. | **`60` seconds** (full 60s clip) |
 | **`"rtsp"`** | Cameras with **NAS / `RTSP` Stream** support (e.g. eufyCam 3 / S300 `T8161`, solar cameras) | Streams over `HomeBase` native `RTSP`. Multiple `RTSP` cameras can stream at the same time without blocking your doorbell. | **`60` seconds** (full 60s clip) |
-| **`"backfill"`** | **Battery Doorbells** (e.g. Video Doorbell E340 `T8214`) & high-traffic hallways | **Best battery life & zero missed walk-bys.** Instead of waking a slow live `P2P` stream on motion, the doorbell records its short native clip (including pre-roll from the very start of motion) to `HomeBase 3` and goes right back to sleep. Seconds later, the bridge replays that recording from `HomeBase 3` into Frigate. Opening Live View in Frigate still wakes the doorbell live. | **`30` seconds** (stops early as soon as motion clears) |
+| **`"backfill"`** | **Battery Doorbells** (e.g. Video Doorbell E340 `T8214`) & high-traffic hallways | **Best battery life & zero missed walk-bys.** Instead of waking a slow live `P2P` stream on motion, the doorbell records its native clip (including pre-roll from the very start of motion) to `HomeBase 3` and goes right back to sleep. Once all activity clears, the bridge downloads and replays the full recording (including multi-clip visits) from `HomeBase 3` into Frigate at `15 fps`. Opening Live View in Frigate still wakes the doorbell live. | **`30` seconds** (stops early as soon as motion clears) |
 | **`"p2p"`** | Battery cameras without `RTSP` when you prefer live streaming on motion | Wakes a live `P2P` stream on motion (and automatically falls back to `HomeBase` clip replay if another `P2P` camera is already streaming). | **`60` seconds** (full 60s clip) |
 | **`"custom"`** | Advanced per-camera tuning | Lets you override individual stream, timer, and Eufy Power Manager settings while automatically validating and fixing any contradictory values. | **`60` seconds** (unless overridden) |
 
@@ -57,7 +57,6 @@ Copy [`examples/docker-compose.example.yml`](examples/docker-compose.example.yml
 	"rtsp_publish": "rtsp://frigate:8554/{name}",
 	"frigate_api": "http://frigate:5000",
 	"hwaccel": "vaapi",
-	"card_theme": "minimal",
 	"cameras": [
 		{
 			"serial": "T8161T0000000000",
@@ -165,7 +164,7 @@ You can customize the status indicator and what Frigate shows while a camera is 
 | `frigate_api` | No | — | Frigate's HTTP API (`http://frigate:5000`) for creating events and automatic corner masks |
 | `cameras` | **Yes** | — | List of cameras (see table below) |
 | `card_theme` | No | `"icons"` | `"icons"`, `"minimal"` (3 dots), `"detailed"` (text + icons), or `"none"` |
-| `card_position` | No | `"top-left"` | `"top-left"`, `"bottom-left"`, `"top-right"`, `"bottom-right"`, or `"center"` |
+| `card_position` | No | `"bottom-left"` | `"bottom-left"`, `"top-left"`, `"top-right"`, `"bottom-right"`, or `"center"` |
 | `sleep_screen` | No | `"snapshot"` | `"snapshot"` (last camera frame), `"slate"` (dark gray), or `"black"` |
 | `audio` | No | `true` | Enable audio passthrough (`true` or `false`) |
 | `hwaccel` | No | `false` | GPU encoding: `false`, `"vaapi"` (Intel/AMD), `"qsv"`, `"nvenc"` (NVIDIA), or `"v4l2m2m"` |

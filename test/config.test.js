@@ -286,10 +286,10 @@ describe('Defensive Non-Contradiction Validation ("custom" mode & frame rates)',
 });
 
 describe('Status Card Theme, Position & Sleep Screen Normalization', () => {
-  it('defaults to "icons" theme at "top-left" position with "snapshot" sleep_screen', () => {
+  it('defaults to "icons" theme at "bottom-left" position with "snapshot" sleep_screen', () => {
     const cardCfg = resolveCardConfig({});
     assert.equal(cardCfg.theme, 'icons');
-    assert.equal(cardCfg.position, 'top-left');
+    assert.equal(cardCfg.position, 'bottom-left');
     assert.equal(cardCfg.sleepScreen, 'snapshot');
   });
 
@@ -318,7 +318,7 @@ describe('Status Card Theme, Position & Sleep Screen Normalization', () => {
       card_background: 'black',
     });
     assert.equal(cardCfg.theme, 'icons');
-    assert.equal(cardCfg.position, 'top-left');
+    assert.equal(cardCfg.position, 'bottom-left');
     assert.equal(cardCfg.sleepScreen, 'snapshot');
 
     const timers = resolveCameraTimers({

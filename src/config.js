@@ -180,19 +180,19 @@ function normalizeCardPosition(rawPos, scope = 'bridge') {
 
   switch (token) {
     case '':
+    case 'bottom-left':
+      return 'bottom-left';
     case 'top-left':
       return 'top-left';
     case 'top-right':
       return 'top-right';
-    case 'bottom-left':
-      return 'bottom-left';
     case 'bottom-right':
       return 'bottom-right';
     case 'center':
       return 'center';
     default:
-      log.warn(scope, 'unknown card_position "' + rawPos + '", defaulting to "top-left"');
-      return 'top-left';
+      log.warn(scope, 'unknown card_position "' + rawPos + '", defaulting to "bottom-left"');
+      return 'bottom-left';
   }
 }
 
@@ -483,7 +483,7 @@ function resolveTelemetryConfig(camConfig) {
 function resolveCardConfig(camConfig) {
   const scope = camConfig.name || camConfig.serial || 'bridge';
   const rawTheme = camConfig.card_theme ?? cfg.card_theme ?? 'icons';
-  const rawPos = camConfig.card_position ?? cfg.card_position ?? 'top-left';
+  const rawPos = camConfig.card_position ?? cfg.card_position ?? 'bottom-left';
   const rawScreen = camConfig.sleep_screen ?? cfg.sleep_screen ?? 'snapshot';
 
   const position = normalizeCardPosition(rawPos, scope);

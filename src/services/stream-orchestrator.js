@@ -26,7 +26,14 @@ const {
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {saveCachedFrame} = require('../overlay/snapshot-cache');
 const {pushFrameToEncoder} = require('../media/encoder');
-const {setRtspDropHandler, startRtspDecoder, stopDecoder, onVideo, onAudio} = require('../media/decoder');
+const {
+  setRtspDropHandler,
+  startRtspDecoder,
+  flushDecoderInput,
+  stopDecoder,
+  onVideo,
+  onAudio,
+} = require('../media/decoder');
 const {frigateEvent, isFrigateCameraIdle, checkPeriodicMaskSync} = require('./frigate-client');
 const {
   call,
@@ -98,6 +105,7 @@ const BACKFILL_MIN_EVENT_AGE_MS = 8000;
 const BACKFILL_QUERY_COOLDOWN_MS = 12000;
 const BACKFILL_DATE_WINDOW_MS = 86400000;
 const DOWNLOAD_MIN_PLAYBACK_MS = 4500;
+const DOWNLOAD_POST_PLAYBACK_HOLD_MS = 2500;
 const DOWNLOAD_IDLE_COMPLETE_MS = 3000;
 const DOWNLOAD_NO_VIDEO_TIMEOUT_MS = 10000;
 
@@ -556,7 +564,7 @@ function handleDatabaseQueryResult(e) {
           '", cipherId=' +
           cand.cipherId +
           ', reason="' +
-          cam.pendingBackfill.reason +
+          ((cam.pendingBackfill || cam.activeBackfillJob)?.reason || 'backfill') +
           '")'
       );
     }
@@ -586,13 +594,17 @@ async function processBackfillQueue(now) {
 
   const readyCam = cams
       .filter((c) => c.isReadyForBackfillDownload() && c.isStationIdleForBackfill(cams, now, BACKFILL_DELAY_MS))
-      .sort((a, b) => (b.pendingBackfill?.priority || 0) - (a.pendingBackfill?.priority || 0))[0];
+      .sort(
+          (a, b) =>
+            ((b.pendingBackfill || b.activeBackfillJob)?.priority || 0) -
+            ((a.pendingBackfill || a.activeBackfillJob)?.priority || 0)
+      )[0];
 
   if (readyCam) {
     const clip = readyCam.backfillClip;
     const isTest = readyCam.hasUrgentTestBackfill();
     readyCam.beginBackfillDownload(clip, isTest, now);
-    pushFrameToEncoder(readyCam, now);
+    const mySession = readyCam.sessionId;
 
     log.info(
         readyCam,
@@ -601,10 +613,15 @@ async function processBackfillQueue(now) {
         '", path="' +
         clip.storagePath +
         '", session=' +
-        readyCam.sessionId +
+        mySession +
         ')'
     );
     frigateEvent(readyCam, clip.event || 'motion detected', clip.personName || '');
+
+    await getStationTransition(readyCam);
+    if (!readyCam.isCurrentSession(mySession, 'download')) {
+      return;
+    }
 
     const res = await call({
       command: 'device.start_download',
@@ -612,7 +629,7 @@ async function processBackfillQueue(now) {
       path: clip.storagePath,
       cipherId: clip.cipherId,
     });
-    if (!res.success) {
+    if (!res.success && readyCam.isCurrentSession(mySession, 'download')) {
       log.warn(
           readyCam,
           'device.start_download failed (errorCode=' + (res.errorCode || 'unknown') + ')'
@@ -674,15 +691,15 @@ async function processBackfillQueue(now) {
   );
   await call({command: 'station.connect', serialNumber: stationSn});
   await call({
-    command: 'station.database_query_latest_info',
-    serialNumber: stationSn,
-  });
-  await call({
     command: 'station.database_query_by_date',
     serialNumber: stationSn,
     serialNumbers: [queryCam.serial],
     startDate: fmtYmd(dStart),
     endDate: fmtYmd(dEnd),
+  });
+  await call({
+    command: 'station.database_query_latest_info',
+    serialNumber: stationSn,
   });
 }
 
@@ -919,7 +936,8 @@ function handleDownloadFinishedEvent(cam) {
   if (!cam.isCurrentSession(cam.sessionId, 'download')) {
     return;
   }
-  const {bufferedCount, waitMs} = cam.markDownloadFinished(Date.now(), DOWNLOAD_MIN_PLAYBACK_MS);
+  flushDecoderInput(cam);
+  const bufferedCount = cam.markDownloadFinished(Date.now());
   if (bufferedCount > 0) {
     log.info(
         cam,
@@ -933,19 +951,12 @@ function handleDownloadFinishedEvent(cam) {
     );
     return;
   }
-
-  if (waitMs > 0) {
-    const finSession = cam.sessionId;
-    setTimeout(() => {
-      if (cam.isCurrentSession(finSession, 'download')) {
-        stop(cam, 'post-event clip download finished', false, 'eufy/download-finished');
-        arbitrate();
-      }
-    }, waitMs);
-  } else {
-    stop(cam, 'post-event clip download finished', false, 'eufy/download-finished');
-    arbitrate();
-  }
+  log.debug(
+      cam,
+      'eufy clip transfer complete, flushing decoder and holding final frame before sleep (session=' +
+      cam.sessionId +
+      ')'
+  );
 }
 
 /**
@@ -1000,7 +1011,8 @@ function handleTriggerEvent(cam, e) {
     const shortenedSecs = cam.recordMotionCleared(
         Date.now(),
         EUFY_CLEARED_SETTLE_MS,
-        MIN_EVENT_VIDEO_DURATION_MS
+        MIN_EVENT_VIDEO_DURATION_MS,
+        e.event
     );
     if (shortenedSecs !== null) {
       log.info(
@@ -1014,14 +1026,23 @@ function handleTriggerEvent(cam, e) {
       return;
     }
     if (cam.pendingBackfill) {
-      const clearLog =
-          'eufy reported activity cleared (event="' +
-          e.event +
-          '"), queued clip backfill ready after HomeBase settle delay';
-      if (cam.alwaysBackfill) {
-        log.info(cam, clearLog);
+      if (cam.isBackfillRecordingCleared()) {
+        const clearLog =
+            'eufy reported activity cleared (event="' +
+            e.event +
+            '"), queued clip backfill ready after HomeBase settle delay';
+        if (cam.alwaysBackfill) {
+          log.info(cam, clearLog);
+        } else {
+          log.debug(cam, clearLog);
+        }
       } else {
-        log.debug(cam, clearLog);
+        log.debug(
+            cam,
+            'eufy reported "' +
+            e.event +
+            '" cleared while other trigger events remain active for backfill'
+        );
       }
       return;
     }
@@ -1321,7 +1342,14 @@ function checkRtspSessionHealth(cam, now, quietSince) {
  * @param {number} quietSince - Timestamp of last video packet or start attempt.
  */
 function checkDownloadSessionHealth(cam, now, quietSince) {
-  if (cam.isDownloadComplete(now, DOWNLOAD_IDLE_COMPLETE_MS)) {
+  if (
+      cam.isDownloadComplete(
+          now,
+          DOWNLOAD_IDLE_COMPLETE_MS,
+          DOWNLOAD_POST_PLAYBACK_HOLD_MS,
+          DOWNLOAD_MIN_PLAYBACK_MS
+      )
+  ) {
     stop(cam, 'post-event clip download stream completed', false, 'eufy/download-finished');
     arbitrate();
   } else if (!cam.gotVideo && now - quietSince > DOWNLOAD_NO_VIDEO_TIMEOUT_MS) {

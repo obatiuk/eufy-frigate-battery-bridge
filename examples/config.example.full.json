@@ -15,7 +15,7 @@
 	"hwaccel_device": "/dev/dri/renderD128",
 	"cache_dir": "/config/cache",
 	"card_theme": "icons",
-	"card_position": "top-left",
+	"card_position": "bottom-left",
 	"sleep_screen": "snapshot",
 	"card_show_on_live": true,
 	"auto_frigate_mask": true,
