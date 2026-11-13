@@ -1,6 +1,6 @@
 {
   "name": "eufy-frigate-battery-bridge",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Event-driven Eufy battery camera and doorbell RTSP/P2P/backfill bridge for Frigate and go2rtc",
   "license": "MIT",

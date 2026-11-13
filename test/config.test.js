@@ -1075,11 +1075,11 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
     assert.ok(BRIDGE_VERSION.length > 0);
     assert.equal(typeof BRIDGE_COMMIT, 'string');
     assert.ok(BRIDGE_COMMIT.length > 0);
-    const customBuild = resolveBuildInfo({BRIDGE_VERSION: 'v1.4.0', BRIDGE_COMMIT: 'a1b2c3d-dirty'});
+    const customBuild = resolveBuildInfo({BRIDGE_VERSION: 'v0.0.1', BRIDGE_COMMIT: 'a1b2c3d-dirty'});
     assert.equal(Object.isFrozen(customBuild), true);
-    assert.deepEqual(customBuild, {version: 'v1.4.0', commit: 'a1b2c3d-dirty'});
+    assert.deepEqual(customBuild, {version: 'v0.0.1', commit: 'a1b2c3d-dirty'});
     const fallbackBuild = resolveBuildInfo({});
-    assert.equal(fallbackBuild.version, '1.0.0');
+    assert.equal(fallbackBuild.version, '0.0.1');
     assert.equal(fallbackBuild.commit, 'dev');
     const trimmedBuild = resolveBuildInfo({BRIDGE_VERSION: '  v1.5.0  ', BRIDGE_COMMIT: '  abc1234  '});
     assert.deepEqual(trimmedBuild, {version: 'v1.5.0', commit: 'abc1234'});

@@ -1,6 +1,6 @@
 services:
   eufy-frigate-battery-bridge:
-    # Prebuilt GHCR image (:latest for stable releases, :dev for main branch builds)
+    # Prebuilt GHCR image (:latest for latest releases, :dev for main branch builds)
     image: ghcr.io/obatiuk/eufy-frigate-battery-bridge:latest
     # Optional: uncomment below to build locally from source instead
     # build:

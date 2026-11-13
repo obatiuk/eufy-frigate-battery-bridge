@@ -2,7 +2,7 @@
 
 Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
-## dev
+## v0.0.1
 
 - Add GitHub Actions continuous integration and container publishing for pull request verification, main-branch `dev`
   image builds, and versioned plus `latest` release images on GitHub Container Registry

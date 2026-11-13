@@ -198,7 +198,7 @@ item and never weaken a locked `AT-*` test.
 ### E. Release readiness
 
 - [ ] Align version, Node.js pins, and container build toolchain
-  - `package.json` hardcodes `"version": "1.0.0"` while `Makefile` derives `BUILD_VERSION` from git tags; `Makefile`
+  - `package.json` hardcodes `"version": "0.0.1"` while `Makefile` derives `BUILD_VERSION` from git tags; `Makefile`
     uses Node `22.16.0`, the Docker builder uses `node:22-alpine3.23`, and the runtime stage installs Alpine `nodejs`
     plus writes unused `/app/.version`. Derive version from git tags, align Node 22 across `Makefile` and
     `deploy/Dockerfile`, remove `/app/.version`, and commit a lockfile (`.npmrc` disables `package-lock.json`).

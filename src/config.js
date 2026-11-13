@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {log, initLogger} = require('./logger');
 
-const DEFAULT_FALLBACK_VERSION = '1.0.0';
+const DEFAULT_FALLBACK_VERSION = '0.0.1';
 const DEFAULT_FALLBACK_COMMIT = 'dev';
 const MS_PER_SECOND = 1000;
 
