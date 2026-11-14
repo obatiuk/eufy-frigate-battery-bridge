@@ -20,7 +20,7 @@ The always-on rules and the doc map are in `AGENTS.md`. This skill is the checkl
    `make test` and confirm it fails for the expected reason.
 4. Green: change `src/` without editing the Red test. Run `make check` until it passes.
 5. If config keys, defaults, or bounds changed, sync `src/config.js`, `deploy/config.schema.json`,
-   `deploy/config.example.*.json`, and `README.md` (`test/config.test.js` checks schema defaults). If user-visible
+   `deploy/config.example.*.yaml`, and `README.md` (`test/config.test.js` checks schema defaults). If user-visible
    behavior changed, update `README.md`. If you finished a `docs/TODO.md` item, move it to `CHANGELOG.md` as one
    plain-language line (no file paths or code symbols).
 

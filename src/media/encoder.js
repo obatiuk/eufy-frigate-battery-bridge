@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -28,7 +27,7 @@ const {
   ACTIVE_HWACCEL,
   HWACCEL_DEVICE,
 } = require('../config');
-const {log, formatLocalHm} = require('../logger');
+const {log, maskSecrets, formatLocalHm} = require('../logger');
 const {renderLiveFrameWithCard} = require('../overlay/card-renderer');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
@@ -41,6 +40,7 @@ const HWACCEL_FAIL_WINDOW_MS = 5000;
 const HWACCEL_FALLBACK_RESTART_MS = 1000;
 const ENCODER_DROP_MIN_UPTIME_MS = 10000;
 const ENCODER_RESTART_DELAY_MS = 3000;
+const ENCODER_MAX_RESTART_DELAY_MS = 30000;
 const OFFLINE_SNAPSHOT_SEED_MS = 6000;
 const OFFLINE_SNAPSHOT_MAX_WAIT_MS = 30000;
 const MS_PER_SECOND = 1000;
@@ -48,13 +48,19 @@ const HWACCEL_FAILURE_STDERR_REGEX =
   /vaapi|qsv|nvenc|v4l2|hwupload|device|driver|Invalid argument|Function not implemented/i;
 const MIN_GOP_FRAMES = 4;
 const VAAPI_QP = '18';
+const VAAPI_ASYNC_DEPTH = '1';
 const QSV_GLOBAL_QUALITY = '19';
+const QSV_EXTRA_HW_FRAMES = '8';
 const NVENC_CQ = '19';
 const SOFTWARE_CRF = '19';
+const SOFTWARE_ENCODER_THREADS = '2';
 const MAX_VIDEO_BITRATE = '3500k';
-const VIDEO_BUFSIZE = '5000k';
+const VIDEO_BUFSIZE = '3500k';
 const V4L2_VIDEO_BITRATE = '3000k';
 const AUDIO_BITRATE = '32k';
+const FFMPEG_SINGLE_FILTER_THREAD = '1';
+const RAWVIDEO_THREAD_QUEUE_SIZE = '2';
+const AUDIO_PIPE_THREAD_QUEUE_SIZE = '8';
 const DEC_PCM_PTS_FILTER = 'asetpts=N/(SR*10)/TB';
 
 /**
@@ -74,6 +80,22 @@ class FfmpegArgsBuilder {
    */
   hideBanner(logLevel = 'error') {
     return this.flag('-hide_banner').option('-loglevel', String(logLevel));
+  }
+
+  /**
+   * Caps FFmpeg simple and complex filtergraph worker pools to a single thread so multi-core hosts
+   * do not spawn dozens of idle filter threads per persistent camera process.
+   *
+   * @returns {this}
+   */
+  withSingleFilterThreads() {
+    this._args.push(
+      '-filter_threads',
+      FFMPEG_SINGLE_FILTER_THREAD,
+      '-filter_complex_threads',
+      FFMPEG_SINGLE_FILTER_THREAD
+    );
+    return this;
   }
 
   /**
@@ -112,17 +134,17 @@ class FfmpegArgsBuilder {
   withS16leAudioOutput(enabled, mapSpec, sampleRate) {
     if (enabled) {
       this._args.push(
-          '-map',
-          mapSpec,
-          '-af',
-          DEC_PCM_PTS_FILTER,
-          '-ar',
-          String(sampleRate),
-          '-ac',
-          '1',
-          '-f',
-          's16le',
-          'pipe:4'
+        '-map',
+        mapSpec,
+        '-af',
+        DEC_PCM_PTS_FILTER,
+        '-ar',
+        String(sampleRate),
+        '-ac',
+        '1',
+        '-f',
+        's16le',
+        'pipe:4'
       );
     }
     return this;
@@ -192,28 +214,37 @@ class FfmpegArgsBuilder {
    * @returns {{ getRaw: () => string, getSummary: () => string, getLastLine: () => string }}
    */
   static attachStderrTailCollector(proc, maxChars = STDERR_TAIL_MAX_CHARS) {
-    let tail = '';
+    let stderrWindow = '';
     if (proc && proc.stderr) {
-      proc.stderr.on('data', (d) => {
-        tail = (tail + d).slice(-maxChars);
+      proc.stderr.on('data', (stderrChunk) => {
+        const combined = stderrWindow + String(stderrChunk);
+        stderrWindow = combined.length > maxChars ? combined.slice(combined.length - maxChars) : combined;
       });
     }
     return Object.freeze({
-      getRaw: () => tail,
-      getSummary: () => tail.trim().split('\n').join(' | '),
-      getLastLine: () => tail.trim().split('\n').pop() || 'no stderr output',
+      getRaw: () => stderrWindow,
+      getSummary: () => maskSecrets(stderrWindow.trim()).split(/\r?\n/).join(' | '),
+      getLastLine: () => maskSecrets(stderrWindow.trim()).split(/\r?\n/).pop() || 'no stderr output',
     });
   }
 }
 
 let onEncoderDropCallback = null;
 let isShuttingDownFn = () => false;
+/** @type {typeof spawn} */
+let encoderSpawnFn = spawn;
+/** @type {WeakMap<Camera, { failures: number, retryTimer: ReturnType<typeof setTimeout> | null }>} */
+const encoderRetryStateByCam = new WeakMap();
 
 /**
  * Registers lifecycle callbacks used by the encoder manager when an established
  * encoder process exits or when checking shutdown state.
  *
- * @param {{ isShuttingDown?: () => boolean, onEncoderDrop?: () => void }} hooks - Lifecycle hooks.
+ * @param {{
+ *   isShuttingDown?: () => boolean,
+ *   onEncoderDrop?: () => void,
+ *   spawn?: typeof spawn | null
+ * }} [hooks={}] - Lifecycle hooks.
  */
 function configureEncoderHooks(hooks = {}) {
   if (typeof hooks.isShuttingDown === 'function') {
@@ -222,6 +253,67 @@ function configureEncoderHooks(hooks = {}) {
   if (typeof hooks.onEncoderDrop === 'function') {
     onEncoderDropCallback = hooks.onEncoderDrop;
   }
+  if (hooks.spawn === null) {
+    encoderSpawnFn = spawn;
+  } else if (typeof hooks.spawn === 'function') {
+    encoderSpawnFn = hooks.spawn;
+  }
+}
+
+/**
+ * Returns or initializes the per-camera encoder spawn retry backoff state.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @returns {{ failures: number, retryTimer: ReturnType<typeof setTimeout> | null }}
+ */
+function getEncoderRetryState(cam) {
+  let state = encoderRetryStateByCam.get(cam);
+  if (!state) {
+    state = {failures: 0, retryTimer: null};
+    encoderRetryStateByCam.set(cam, state);
+  }
+  return state;
+}
+
+/**
+ * Clears any pending encoder restart backoff timer for a camera.
+ *
+ * @param {Camera} cam - Camera state object.
+ */
+function clearEncoderRetryTimer(cam) {
+  const state = encoderRetryStateByCam.get(cam);
+  if (state && state.retryTimer) {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+  }
+}
+
+/**
+ * Computes the exponential backoff delay and schedules an encoder restart timer.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @param {boolean} resetBackoff - True when the encoder ran healthily past ENCODER_DROP_MIN_UPTIME_MS.
+ * @returns {number} Scheduled restart delay in milliseconds.
+ */
+function scheduleEncoderRestartBackoff(cam, resetBackoff) {
+  const state = getEncoderRetryState(cam);
+  clearEncoderRetryTimer(cam);
+  if (resetBackoff) {
+    state.failures = 0;
+  }
+  const delayMs = Math.min(ENCODER_MAX_RESTART_DELAY_MS, ENCODER_RESTART_DELAY_MS * 2 ** state.failures);
+  state.failures++;
+  const timer = setTimeout(() => {
+    state.retryTimer = null;
+    if (!cam.hasEncoderProcess() && !isShuttingDownFn()) {
+      startEncoder(cam, cam.isSeedingOfflineSnapshot());
+    }
+  }, delayMs);
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  state.retryTimer = timer;
+  return delayMs;
 }
 
 /**
@@ -272,14 +364,14 @@ function selectEncoderFrame(cam, now) {
  */
 function shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now) {
   return cam.shouldWriteEncoderFrame(
-      isLive,
-      stateChanged,
-      inBurst,
-      now,
-      LIVE_FPS,
-      IDLE_FPS,
-      DOWNLOAD_PACE_LEAD_MS,
-      LIVE_HEARTBEAT_WRITE_MS
+    isLive,
+    stateChanged,
+    inBurst,
+    now,
+    LIVE_FPS,
+    IDLE_FPS,
+    DOWNLOAD_PACE_LEAD_MS,
+    LIVE_HEARTBEAT_WRITE_MS
   );
 }
 
@@ -296,8 +388,9 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   if (cam.isEncoderStdinBackpressured()) {
     if (cam.isEncoderWedged(now, ENCODER_WEDGED_TIMEOUT_MS)) {
       log.error(
-          cam,
-          'encoder stdin wedged for >10s (initiator=bridge-watchdog, reason=encoder_stdin_backpressure), killing encoder process'
+        cam,
+        'encoder stdin wedged for >10s (initiator=bridge-watchdog, reason=encoder_stdin_backpressure), ' +
+          'killing encoder process'
       );
       cam.killWedgedEncoder();
     }
@@ -314,10 +407,7 @@ function pushFrameToEncoder(cam, now = Date.now()) {
   const inBurst = cam.isInKeyframeBurst(now);
 
   if (shouldWriteEncoderFrame(cam, isLive, stateChanged, inBurst, now)) {
-    const outFrame =
-        (isLive || cam.hasDynamicDebugCard()) && frame
-            ? renderLiveFrameWithCard(cam, frame, now)
-            : frame;
+    const outFrame = (isLive || cam.hasDynamicDebugCard()) && frame ? renderLiveFrameWithCard(cam, frame, now) : frame;
     cam.writeEncoderVideoFrame(outFrame, frame, now);
   }
 }
@@ -337,6 +427,8 @@ function buildVideoCodecArgs(hwMode, gop) {
         'format=nv12,hwupload',
         '-c:v',
         'h264_vaapi',
+        '-async_depth',
+        VAAPI_ASYNC_DEPTH,
         '-bf',
         '0',
         '-qp',
@@ -347,7 +439,7 @@ function buildVideoCodecArgs(hwMode, gop) {
     case HWACCEL_MODES.QSV:
       return Object.freeze([
         '-vf',
-        'format=nv12,hwupload=extra_hw_frames=64',
+        'format=nv12,hwupload=extra_hw_frames=' + QSV_EXTRA_HW_FRAMES,
         '-c:v',
         'h264_qsv',
         '-global_quality',
@@ -384,6 +476,8 @@ function buildVideoCodecArgs(hwMode, gop) {
       return Object.freeze([
         '-c:v',
         'libx264',
+        '-threads',
+        SOFTWARE_ENCODER_THREADS,
         '-preset',
         'veryfast',
         '-tune',
@@ -411,7 +505,7 @@ function buildVideoCodecArgs(hwMode, gop) {
  */
 function buildEncoderArgs(cam, hwMode = '') {
   const gop = String(Math.max(MIN_GOP_FRAMES, LIVE_FPS));
-  const builder = new FfmpegArgsBuilder().hideBanner('warning');
+  const builder = new FfmpegArgsBuilder().hideBanner('warning').withSingleFilterThreads();
 
   switch (hwMode) {
     case HWACCEL_MODES.VAAPI:
@@ -425,21 +519,23 @@ function buildEncoderArgs(cam, hwMode = '') {
   }
 
   builder
-      .option('-use_wallclock_as_timestamps', '1')
-      .option('-f', 'rawvideo')
-      .option('-pix_fmt', 'yuv420p')
-      .option('-s', W + 'x' + H)
-      .option('-i', 'pipe:0');
+    .option('-use_wallclock_as_timestamps', '1')
+    .option('-thread_queue_size', RAWVIDEO_THREAD_QUEUE_SIZE)
+    .option('-f', 'rawvideo')
+    .option('-pix_fmt', 'yuv420p')
+    .option('-s', W + 'x' + H)
+    .option('-i', 'pipe:0');
 
   if (AUDIO) {
     builder
-        .option('-use_wallclock_as_timestamps', '1')
-        .option('-f', 's16le')
-        .option('-ar', RATE)
-        .option('-ac', '1')
-        .option('-i', 'pipe:3')
-        .option('-map', '0:v')
-        .option('-map', '1:a');
+      .option('-use_wallclock_as_timestamps', '1')
+      .option('-thread_queue_size', AUDIO_PIPE_THREAD_QUEUE_SIZE)
+      .option('-f', 's16le')
+      .option('-ar', RATE)
+      .option('-ac', '1')
+      .option('-i', 'pipe:3')
+      .option('-map', '0:v')
+      .option('-map', '1:a');
   }
 
   builder.option('-fps_mode', 'passthrough').append(...buildVideoCodecArgs(hwMode, gop));
@@ -448,9 +544,9 @@ function buildEncoderArgs(cam, hwMode = '') {
     builder.option('-af', 'aresample=async=1').option('-c:a', 'aac').option('-b:a', AUDIO_BITRATE);
   }
   builder
-      .option('-f', 'rtsp')
-      .option('-rtsp_transport', 'tcp')
-      .output(cfg.rtsp_output_url.replace('{name}', cam.getName()));
+    .option('-f', 'rtsp')
+    .option('-rtsp_transport', 'tcp')
+    .output(cfg.rtsp_publish_url.replace('{name}', cam.getName()));
   return builder.build();
 }
 
@@ -462,14 +558,16 @@ function buildEncoderArgs(cam, hwMode = '') {
  * @returns {boolean} True if an active encoder process was stopped or newly marked paused for offline.
  */
 function stopEncoder(cam) {
+  clearEncoderRetryTimer(cam);
   const hadProcess = cam.hasEncoderProcess();
+  if (hadProcess) {
+    getEncoderRetryState(cam).failures = 0;
+  }
   const stopped = cam.pauseEncoderForOffline();
   if (stopped) {
     const reason = cam.getOfflineReason() || 'offline';
     const msg = hadProcess
-      ? 'stopping RTSP encoder because camera is offline (' +
-        reason +
-        ') so Frigate marks device offline'
+      ? 'stopping RTSP encoder because camera is offline (' + reason + ') so Frigate marks device offline'
       : 'camera is offline (' +
         reason +
         ') with no cached snapshot to seed; keeping RTSP encoder stopped so Frigate marks device offline';
@@ -485,7 +583,7 @@ function stopEncoder(cam) {
  * immediately without seeding if sleep_screen is not "snapshot" or no cached snapshot exists.
  *
  * @param {Camera} cam - Camera state object.
- * @param {number} [seedDurationMs=OFFLINE_SNAPSHOT_MAX_WAIT_MS] - Max wait duration in milliseconds before stopping the encoder.
+ * @param {number} [seedDurationMs=OFFLINE_SNAPSHOT_MAX_WAIT_MS] - Max wait duration before stopping encoder.
  * @returns {'online'|'stopped'|'seeded'} Resulting offline snapshot seed action.
  */
 function seedOfflineCameraSnapshot(cam, seedDurationMs = OFFLINE_SNAPSHOT_MAX_WAIT_MS) {
@@ -505,10 +603,8 @@ function seedOfflineCameraSnapshot(cam, seedDurationMs = OFFLINE_SNAPSHOT_MAX_WA
   pushFrameToEncoder(cam, now);
   cam.markEncoderStoppedForOffline();
   log.info(
-      cam,
-      'seeding cached snapshot to Frigate before stopping offline encoder (' +
-      (cam.getOfflineReason() || 'offline') +
-      ')'
+    cam,
+    'seeding cached snapshot to Frigate before stopping offline encoder (' + (cam.getOfflineReason() || 'offline') + ')'
   );
   cam.scheduleOfflineSeedStop(waitMs, () => {
     if (cam.isDeviceOffline() && !isShuttingDownFn()) {
@@ -543,82 +639,106 @@ function seedOfflineCameraSnapshots(cams, seedDurationMs = OFFLINE_SNAPSHOT_MAX_
  * @param {boolean} [allowOfflineSeed=false] - Whether to allow spawning while offline for snapshot seeding.
  */
 function startEncoder(cam, allowOfflineSeed = false) {
-  if (
-      isShuttingDownFn() ||
-      cam.hasEncoderProcess() ||
-      (cam.isDeviceOffline() && !allowOfflineSeed)
-  ) {
+  if (isShuttingDownFn() || cam.hasEncoderProcess() || (cam.isDeviceOffline() && !allowOfflineSeed)) {
     return;
   }
 
+  clearEncoderRetryTimer(cam);
   const wasPausedForOffline = !allowOfflineSeed && cam.clearEncoderOfflinePause();
   const hwMode = cam.resolveActiveHwaccel(ACTIVE_HWACCEL);
   const args = buildEncoderArgs(cam, hwMode);
   const spawnAt = Date.now();
-  const enc = spawn('ffmpeg', args, {
-    stdio: ['pipe', 'ignore', 'pipe', AUDIO ? 'pipe' : 'ignore'],
-  });
+  /** @type {import("child_process").ChildProcess} */
+  let enc;
+  try {
+    enc = encoderSpawnFn('ffmpeg', /** @type {string[]} */ (args), {
+      stdio: ['pipe', 'ignore', 'pipe', AUDIO ? 'pipe' : 'ignore'],
+    });
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    const delayMs = scheduleEncoderRestartBackoff(cam, false);
+    log.error(cam, 'encoder process error: ' + msg + ' - restarting in ' + Math.round(delayMs / MS_PER_SECOND) + ' s');
+    return;
+  }
 
   cam.attachEncoder(enc, spawnAt);
   pushFrameToEncoder(cam, spawnAt);
 
-  enc.on('error', (e) => log.error(cam, 'encoder process error: ' + e.message));
-  enc.stdin.on('error', () => {});
-  enc.stdin.on('drain', () => {
-    const frameIntervalMs = Math.floor(MS_PER_SECOND / LIVE_FPS) - DOWNLOAD_PACE_LEAD_MS;
-    if (cam.shouldDrainEncoderOnReady(Date.now(), frameIntervalMs)) {
-      pushFrameToEncoder(cam);
-    }
-  });
-  if (AUDIO && enc.stdio[3]) {
-    enc.stdio[3].on('error', () => {});
-  }
-
   const stderrCollector = FfmpegArgsBuilder.attachStderrTailCollector(enc, STDERR_TAIL_MAX_CHARS);
+  let settled = false;
 
-  enc.on('exit', (code) => {
+  /**
+   * Detaches the terminated encoder process once and schedules fallback or backoff recovery.
+   *
+   * @param {number|null} code - Process exit code, or null on spawn error.
+   * @param {Error|null} spawnErr - Spawn error when terminated via 'error' event.
+   */
+  const handleEncoderTerminated = (code, spawnErr) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
     const wasAttached = cam.detachEncoderIfMatch(enc);
-    if (
-        isShuttingDownFn() ||
-        !wasAttached ||
-        (cam.isDeviceOffline() && !cam.isSeedingOfflineSnapshot())
-    ) {
+    if (isShuttingDownFn() || !wasAttached || (cam.isDeviceOffline() && !cam.isSeedingOfflineSnapshot())) {
       return;
     }
     const tail = stderrCollector.getRaw();
     const errSummary = stderrCollector.getSummary();
+    const uptimeMs = Date.now() - spawnAt;
 
-    if (
-        hwMode &&
-        Date.now() - spawnAt < HWACCEL_FAIL_WINDOW_MS &&
-        HWACCEL_FAILURE_STDERR_REGEX.test(tail)
-    ) {
+    if (!spawnErr && hwMode && uptimeMs < HWACCEL_FAIL_WINDOW_MS && HWACCEL_FAILURE_STDERR_REGEX.test(tail)) {
       cam.disableHwaccel();
-      log.warn(
-          cam,
-          'hwaccel (' +
-          hwMode +
-          ') encoder failed (' +
-          errSummary +
-          '), falling back to software libx264'
-      );
-      setTimeout(() => {
+      log.warn(cam, 'hwaccel (' + hwMode + ') encoder failed (' + errSummary + '), falling back to software libx264');
+      const fallbackTimer = setTimeout(() => {
         if (!cam.hasEncoderProcess() && !isShuttingDownFn()) {
           startEncoder(cam, cam.isSeedingOfflineSnapshot());
         }
-      }, HWACCEL_FALLBACK_RESTART_MS).unref();
+      }, HWACCEL_FALLBACK_RESTART_MS);
+      if (fallbackTimer && typeof fallbackTimer.unref === 'function') {
+        fallbackTimer.unref();
+      }
       return;
     }
 
-    log.error(cam, 'encoder exited (code=' + code + ') ' + errSummary + ' - restarting in 3 s');
-    if (Date.now() - spawnAt > ENCODER_DROP_MIN_UPTIME_MS && onEncoderDropCallback) {
+    const hadHealthyUptime = !spawnErr && uptimeMs > ENCODER_DROP_MIN_UPTIME_MS;
+    const delayMs = scheduleEncoderRestartBackoff(cam, hadHealthyUptime);
+    if (!spawnErr) {
+      log.error(
+        cam,
+        'encoder exited (code=' +
+          code +
+          ') ' +
+          errSummary +
+          ' - restarting in ' +
+          Math.round(delayMs / MS_PER_SECOND) +
+          ' s'
+      );
+    }
+    if (hadHealthyUptime && onEncoderDropCallback) {
       onEncoderDropCallback();
     }
-    setTimeout(() => {
-      if (!cam.hasEncoderProcess() && !isShuttingDownFn()) {
-        startEncoder(cam, cam.isSeedingOfflineSnapshot());
+  };
+
+  const ignoreEncoderPipeError = () => {};
+  enc.on('error', (e) => {
+    log.error(cam, 'encoder process error: ' + e.message);
+    handleEncoderTerminated(null, e);
+  });
+  if (enc.stdin) {
+    enc.stdin.on('error', ignoreEncoderPipeError);
+    enc.stdin.on('drain', () => {
+      const frameIntervalMs = Math.floor(MS_PER_SECOND / LIVE_FPS) - DOWNLOAD_PACE_LEAD_MS;
+      if (cam.shouldDrainEncoderOnReady(Date.now(), frameIntervalMs)) {
+        pushFrameToEncoder(cam);
       }
-    }, ENCODER_RESTART_DELAY_MS).unref();
+    });
+  }
+  if (AUDIO && enc.stdio && enc.stdio[3]) {
+    enc.stdio[3].on('error', ignoreEncoderPipeError);
+  }
+
+  enc.on('exit', (exitCode) => {
+    handleEncoderTerminated(exitCode, null);
   });
 
   const codecLabel = hwMode ? 'h264_' + hwMode : 'libx264';
@@ -633,19 +753,22 @@ function startEncoder(cam, allowOfflineSeed = false) {
  * @param {Camera[]} cams - Array of Camera instances.
  */
 function startMediaTickers(cams) {
-  setInterval(() => {
-    const now = Date.now();
-    for (const cam of cams) {
-      pushFrameToEncoder(cam, now);
+  const videoTickIntervalMs = Math.round(MS_PER_SECOND / LIVE_FPS);
+  const runVideoFrameTick = () => {
+    const tickTimestamp = Date.now();
+    for (let i = 0; i < cams.length; i++) {
+      pushFrameToEncoder(cams[i], tickTimestamp);
     }
-  }, Math.round(MS_PER_SECOND / LIVE_FPS));
+  };
+  setInterval(runVideoFrameTick, videoTickIntervalMs);
 
   if (AUDIO) {
-    setInterval(() => {
-      for (const cam of cams) {
-        cam.writeEncoderAudioTick(AUDIO_CHUNK, SILENCE);
+    const runAudioChunkTick = () => {
+      for (let i = 0; i < cams.length; i++) {
+        cams[i].writeEncoderAudioTick(AUDIO_CHUNK, SILENCE);
       }
-    }, AUDIO_TICK);
+    };
+    setInterval(runAudioChunkTick, AUDIO_TICK);
   }
 }
 

@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -10,18 +9,21 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const jsYaml = require('js-yaml');
 const {log, initLogger} = require('./logger');
 
-const DEFAULT_FALLBACK_VERSION = '0.0.1';
+const DEFAULT_FALLBACK_VERSION = '0.0.2';
 const DEFAULT_FALLBACK_COMMIT = 'dev';
+const DEFAULT_CACHE_DIR = '/config/cache';
+const DEFAULT_HWACCEL_DEVICE = '/dev/dri/renderD128';
+const DEFAULT_CONTAINER_CONFIG_PATH = '/config/config.yaml';
+const DEFAULT_LOCAL_CONFIG_PATH = 'config.yaml';
 const MS_PER_SECOND = 1000;
 
 const DEFAULT_PACKAGE_VERSION = (() => {
-  const candidatePaths = [
-    path.resolve(__dirname, '../package.json'),
-    path.resolve(__dirname, 'package.json'),
-  ];
+  const candidatePaths = [path.resolve(__dirname, '../package.json'), path.resolve(__dirname, 'package.json')];
   for (const pkgPath of candidatePaths) {
     try {
       if (fs.existsSync(pkgPath)) {
@@ -54,34 +56,34 @@ function resolveBuildInfo(env = process.env) {
 
 const {version: BRIDGE_VERSION, commit: BRIDGE_COMMIT} = resolveBuildInfo(process.env);
 
-const REQUIRED_CONFIG_KEYS = ['eufy_security_ws_url', 'frigate_url'];
-const LEGACY_REQUIRED_KEYS = ['eufy_ws', 'rtsp_publish', 'go2rtc_api'];
+const DEFAULT_EUFY_WS_HOST = 'eufy-security-ws';
+const DEFAULT_EUFY_WS_PORT = 3000;
+const DEFAULT_FRIGATE_HOST = 'frigate';
 const DEFAULT_FRIGATE_HTTP_PORT = 5000;
 const DEFAULT_GO2RTC_HTTP_PORT = 1984;
 const DEFAULT_GO2RTC_RTSP_PORT = 8554;
-const DEFAULT_FALLBACK_HOST = 'frigate';
+const DEFAULT_HTTP_PORT = 8080;
+const DEFAULT_LOG_LEVEL = 'info';
+const MIN_TCP_PORT = 1;
+const MIN_HTTP_LISTEN_PORT = 0;
+const MAX_TCP_PORT = 65535;
+const INTEGER_PORT_REGEX = /^\d+$/;
 const DEFAULT_HTTP_PROTOCOL = 'http:';
+const DEFAULT_WS_PROTOCOL = 'ws:';
 const RTSP_NAME_TEMPLATE_TOKEN = '{name}';
+const RTSP_URL_PROTOCOL_REGEX = /^rtsps?:\/\/.+/i;
 const TRAILING_SLASHES_REGEX = /\/+$/;
 const TRAILING_API_PATH_REGEX = /\/api$/i;
+const ENV_VAR_EXPR_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?$/;
+const ENV_ESCAPED_OPEN_TOKEN = '$${';
+const ENV_DOLLAR_CHAR = '$';
+const ENV_DEFAULT_SEPARATOR = ':-';
+const ENV_OPEN_TOKEN = '${';
+const ENV_CLOSE_TOKEN = '}';
+const MAX_MALFORMED_PLACEHOLDER_CHARS = 24;
 
 /** @type {Set<string>} */
-const LEGACY_ONLY_TOP_KEYS = new Set([
-  'eufy_ws',
-  'go2rtc_api',
-  'rtsp_publish',
-  'frigate_api',
-  'ha_webhook',
-  'max_secs',
-  'min_dwell_secs',
-  'viewer_cooldown_secs',
-  'event_secs',
-  'snapshot_delay_secs',
-]);
-
-/** @type {Set<string>} */
-const SHARED_TOP_KEYS = new Set([
-  '$schema',
+const ALLOWED_TOP_KEYS = new Set([
   'cameras',
   'hold_secs',
   'view_linger_secs',
@@ -92,26 +94,12 @@ const SHARED_TOP_KEYS = new Set([
   'live_fps',
   'idle_fps',
   'audio',
-]);
-
-/** @type {Set<string>} */
-const NEW_ONLY_TOP_KEYS = new Set([
-  'eufy_security_ws_url',
-  'frigate_url',
-  'go2rtc_url',
-  'rtsp_output_url',
-  'ha_webhook_url',
   'stream_max_secs',
   'frigate_event_secs',
   'snapshot_capture_delay_secs',
   'view_cooldown_secs',
   'idle_timeout_secs',
   'view_has_priority',
-  'http_port',
-  'log_level',
-  'hwaccel',
-  'hwaccel_device',
-  'cache_dir',
   'card_theme',
   'card_position',
   'sleep_screen',
@@ -123,12 +111,12 @@ const NEW_ONLY_TOP_KEYS = new Set([
   'end_early',
   'use_rtsp',
   'backfill_enabled',
-  'backfill_only',
   'backfill_delay_secs',
   'sync_power',
   'track_stuck_spotlight',
   'enforce_streaming_quality',
   'low_battery_threshold',
+  'critical_battery_threshold',
   'low_battery_hold_secs',
   'low_battery_wake_on_view',
   'telemetry_poll_secs',
@@ -139,13 +127,13 @@ const NEW_ONLY_TOP_KEYS = new Set([
 ]);
 
 /** @type {Set<string>} */
-const SHARED_CAMERA_KEYS = new Set(['name', 'serial', 'title']);
-
-/** @type {Set<string>} */
-const NEW_ONLY_CAMERA_KEYS = new Set([
+const ALLOWED_CAMERA_KEYS = new Set([
+  'name',
+  'serial',
+  'title',
   'mode',
   'station_serial',
-  'homebase_rtsp_url',
+  'rtsp_url',
   'priority',
   'use_rtsp',
   'backfill_only',
@@ -158,6 +146,7 @@ const NEW_ONLY_CAMERA_KEYS = new Set([
   'view_linger_secs',
   'view_max_secs',
   'low_battery_threshold',
+  'critical_battery_threshold',
   'low_battery_hold_secs',
   'low_battery_wake_on_view',
   'sync_power',
@@ -177,18 +166,6 @@ const NEW_ONLY_CAMERA_KEYS = new Set([
   'startup_snapshot',
   'telemetry',
 ]);
-
-const LEGACY_TO_NEW_KEY_MAP = Object.freeze({
-  eufy_ws: 'eufy_security_ws_url',
-  go2rtc_api: 'go2rtc_url',
-  rtsp_publish: 'rtsp_output_url',
-  frigate_api: 'frigate_url',
-  ha_webhook: 'ha_webhook_url',
-  max_secs: 'stream_max_secs',
-  viewer_cooldown_secs: 'view_cooldown_secs',
-  event_secs: 'frigate_event_secs',
-  snapshot_delay_secs: 'snapshot_capture_delay_secs',
-});
 
 /**
  * POSIX process signals used for FFmpeg process termination and bridge runtime hooks.
@@ -211,10 +188,10 @@ const PROCESS_SIGNALS = Object.freeze({
  * @enum {string}
  */
 const CARD_THEMES = Object.freeze({
-  ICONS: 'icons',
+  GLANCE: 'glance',
   MINIMAL: 'minimal',
-  DETAILED: 'detailed',
-  DEBUG: 'debug',
+  PEBBLES: 'pebbles',
+  HUD: 'hud',
   NONE: 'none',
 });
 
@@ -227,10 +204,15 @@ const CARD_THEMES = Object.freeze({
 const CARD_POSITIONS = Object.freeze({
   CENTER: 'center',
   TOP_LEFT: 'top-left',
+  TOP_CENTER: 'top-center',
   TOP_RIGHT: 'top-right',
   BOTTOM_LEFT: 'bottom-left',
+  BOTTOM_CENTER: 'bottom-center',
   BOTTOM_RIGHT: 'bottom-right',
 });
+
+const CARD_POS_ALIAS_CENTER_TOP = 'center-top';
+const CARD_POS_ALIAS_CENTER_BOTTOM = 'center-bottom';
 
 /**
  * Supported sleeping screen background modes.
@@ -261,7 +243,7 @@ const CARD_STATUS_TITLES = Object.freeze({
 });
 
 /**
- * Configured camera operating modes in config.json (distinct from runtime STREAM_MODES).
+ * Configured camera operating modes in config.yaml (distinct from runtime STREAM_MODES).
  *
  * @readonly
  * @enum {string}
@@ -400,10 +382,12 @@ const EVENT_PRIORITIES = Object.freeze([
   ['motion', DEFAULT_EVENT_PRIORITY],
 ]);
 
-// Semantic palette used across 'detailed', 'icons', 'minimal', and 'debug' themes:
-// Red = Live/Backfill, Grey = Disconnected, Green = Asleep (sleep-ready) / Healthy,
-// Blue = Waking/Charging/Good/Cold, Yellow = Waiting/Medium/Fair/Warm,
-// Purple = Critical/Low-Battery/Poor/Hot.
+// Semantic palette used across 'glance', 'minimal', 'pebbles', and 'hud' themes:
+// White = Asleep / Asleep (Low Battery) (sleep-ready) / Healthy sensor, Red = Live/Backfill, Grey = Disconnected / N/A,
+// Blue = Waking / Charging (sky-blue battery fill) / Cold, Yellow = Waiting / Low-Battery / Weak Wi-Fi / Warm,
+// Purple = Critical Battery / Hot, Green = HUD [S] snapshot stage badge.
+const WHITE_CHANNEL = 255;
+const COLOR_WHITE = Object.freeze([WHITE_CHANNEL, WHITE_CHANNEL, WHITE_CHANNEL]);
 const COLOR_RED = Object.freeze([239, 68, 68]);
 const COLOR_GREY = Object.freeze([180, 180, 190]);
 const COLOR_GREEN = Object.freeze([74, 222, 128]);
@@ -428,6 +412,38 @@ function clampNum(val, min, max, fallback) {
   return Math.min(max, Math.max(min, numeric));
 }
 
+const EXPLICIT_SERIAL_SYM = Symbol('explicitSerial');
+
+const URL_SCHEME_DELIM = '://';
+
+/**
+ * Strips any RFC 3986 URI `#fragment` suffix (such as go2rtc's `#backchannel=0`) after the
+ * RTSP authority (`rtsp://[user:pass@]host[:port]`) without altering `#` inside credentials.
+ *
+ * @param {*} rawUrl - Candidate RTSP URL string.
+ * @returns {string}
+ */
+function stripRtspUrlFragment(rawUrl) {
+  const trimmed = String(rawUrl || '').trim();
+  const schemeEnd = trimmed.indexOf(URL_SCHEME_DELIM);
+  if (schemeEnd === -1) return trimmed;
+  const authStart = schemeEnd + URL_SCHEME_DELIM.length;
+  const slashIdx = trimmed.indexOf('/', authStart);
+  const searchFrom = slashIdx !== -1 ? slashIdx : Math.max(authStart, trimmed.lastIndexOf('@') + 1);
+  const hashIdx = trimmed.indexOf('#', searchFrom);
+  return hashIdx === -1 ? trimmed : trimmed.slice(0, hashIdx);
+}
+
+/**
+ * Returns true when a camera configuration entry explicitly specifies a non-empty direct rtsp_url.
+ *
+ * @param {*} camConfig - Candidate camera configuration object.
+ * @returns {boolean}
+ */
+function hasDirectRtspUrl(camConfig) {
+  return Boolean(camConfig && typeof camConfig === 'object' && String(camConfig.rtsp_url || '').trim());
+}
+
 /**
  * Immutable per-camera configuration domain value object encapsulating camera identity
  * normalization, scope resolution, snapshot cache filename formatting, and resolved sub-configs.
@@ -441,7 +457,11 @@ class CameraConfig {
     /** @type {string} */
     this.serial = String(props.serial || '');
     /** @type {string} */
+    this.explicitSerial = String(props.explicitSerial || '');
+    /** @type {string} */
     this.name = String(props.name || this.serial);
+    /** @type {string} */
+    this.rtsp_url = stripRtspUrlFragment(props.rtsp_url);
   }
 
   /**
@@ -502,24 +522,35 @@ class CameraConfig {
 
   /**
    * Normalizes a raw camera configuration object's serial and name (defaulting name to serial
-   * when omitted) and returns an immutable `{ serial, name }` pair.
+   * when omitted, or deriving an internal scope serial from name when direct rtsp_url is set)
+   * and returns an immutable `{ serial, name, explicitSerial }` tuple.
    *
    * @param {Record<string, *>|null|undefined} rawCam - Raw camera configuration entry.
-   * @returns {Readonly<{ serial: string, name: string }>}
+   * @returns {Readonly<{ serial: string, name: string, explicitSerial: string }>}
    */
   static normalizeIdentity(rawCam) {
     if (!rawCam || typeof rawCam !== 'object') {
-      return Object.freeze({serial: '', name: ''});
+      return Object.freeze({serial: '', name: '', explicitSerial: ''});
     }
-    const serial = String(rawCam.serial || '').trim();
-    const name = String(rawCam.name || serial).trim();
+    const rawSerial = String(rawCam.serial || '').trim();
+    const rawName = String(rawCam.name || '').trim();
+    const explicitSerial = EXPLICIT_SERIAL_SYM in rawCam ? String(rawCam[EXPLICIT_SERIAL_SYM] || '') : rawSerial;
+    const serial = rawSerial || (hasDirectRtspUrl(rawCam) ? rawName : '');
+    const name = rawName || serial;
     if (serial && !Object.isFrozen(rawCam)) {
+      if (!(EXPLICIT_SERIAL_SYM in rawCam)) {
+        Object.defineProperty(rawCam, EXPLICIT_SERIAL_SYM, {
+          value: explicitSerial,
+          enumerable: false,
+          configurable: true,
+        });
+      }
       rawCam.serial = serial;
       if (!rawCam.name) {
         rawCam.name = name;
       }
     }
-    return Object.freeze({serial, name});
+    return Object.freeze({serial, name, explicitSerial});
   }
 
   /**
@@ -569,18 +600,49 @@ class CameraConfig {
 }
 
 /**
- * Normalizes a base HTTP service URL (frigate_url or go2rtc_url) by trimming whitespace
- * and stripping any accidental trailing '/' or '/api' path suffix.
+ * Reads a trimmed string value from an environment dictionary without accessing Object.prototype keys.
  *
- * @param {*} rawUrl - Raw URL string from config.json.
+ * @param {Record<string, string|undefined>} env - Environment dictionary.
+ * @param {string} key - Environment variable name.
+ * @returns {string}
+ */
+function readEnvString(env, key) {
+  if (!env || !Object.hasOwn(env, key) || env[key] === undefined) {
+    return '';
+  }
+  return String(env[key]).trim();
+}
+
+/**
+ * Formats a hostname or IP literal for embedding in a URL (wrapping bare IPv6 literals in []).
+ *
+ * @param {string} rawHost - Candidate hostname or IP address.
+ * @returns {string}
+ */
+function formatHostForUrl(rawHost) {
+  const host = String(rawHost || '').trim();
+  if (!host) {
+    return DEFAULT_FRIGATE_HOST;
+  }
+  if (host.includes(':') && !host.startsWith('[')) {
+    return '[' + host + ']';
+  }
+  return host;
+}
+
+/**
+ * Normalizes a base HTTP service URL by trimming whitespace and stripping any accidental trailing
+ * '/' or '/api' path suffix.
+ *
+ * @param {*} rawUrl - Raw URL string.
  * @returns {string}
  */
 function normalizeBaseHttpUrl(rawUrl) {
   return String(rawUrl || '')
-      .trim()
-      .replace(TRAILING_SLASHES_REGEX, '')
-      .replace(TRAILING_API_PATH_REGEX, '')
-      .replace(TRAILING_SLASHES_REGEX, '');
+    .trim()
+    .replace(TRAILING_SLASHES_REGEX, '')
+    .replace(TRAILING_API_PATH_REGEX, '')
+    .replace(TRAILING_SLASHES_REGEX, '');
 }
 
 /**
@@ -595,86 +657,180 @@ function extractUrlProtocolAndHost(rawUrl) {
   if (cleaned) {
     try {
       const parsed = new URL(cleaned);
-      const protocol =
-          parsed.protocol === 'https:' ? 'https:' : DEFAULT_HTTP_PROTOCOL;
-      const host = parsed.hostname.includes(':')
-          ? '[' + parsed.hostname + ']'
-          : parsed.hostname || DEFAULT_FALLBACK_HOST;
+      const protocol = parsed.protocol === 'https:' ? 'https:' : DEFAULT_HTTP_PROTOCOL;
+      const host = formatHostForUrl(parsed.hostname || DEFAULT_FRIGATE_HOST);
       return Object.freeze({protocol, host});
     } catch (err) {
       // Fall back to default host when URL cannot be parsed.
     }
   }
-  return Object.freeze({protocol: DEFAULT_HTTP_PROTOCOL, host: DEFAULT_FALLBACK_HOST});
+  return Object.freeze({protocol: DEFAULT_HTTP_PROTOCOL, host: DEFAULT_FRIGATE_HOST});
 }
 
 /**
- * Derives the bundled go2rtc HTTP base URL ('http://<frigate-host>:1984') from frigate_url
- * when go2rtc_url is omitted in config.json.
+ * Normalizes a direct go2rtc RTSP publish override URL, automatically appending '/{name}' when omitted.
  *
- * @param {*} frigateUrl - Configured Frigate base URL.
+ * @param {string} rawRtspUrl - Explicit GO2RTC_RTSP_URL override.
  * @returns {string}
  */
-function deriveGo2rtcUrl(frigateUrl) {
-  const {protocol, host} = extractUrlProtocolAndHost(frigateUrl);
-  return protocol + '//' + host + ':' + DEFAULT_GO2RTC_HTTP_PORT;
+function normalizeRtspPublishOverride(rawRtspUrl) {
+  return rawRtspUrl.includes(RTSP_NAME_TEMPLATE_TOKEN)
+    ? rawRtspUrl
+    : rawRtspUrl.replace(TRAILING_SLASHES_REGEX, '') + '/' + RTSP_NAME_TEMPLATE_TOKEN;
 }
 
 /**
- * Normalizes or derives the go2rtc RTSP publish URL template ('rtsp://<host>:8554/{name}'),
- * automatically appending '/{name}' when a base RTSP URL is provided without '{name}'.
+ * Parses and strictly validates an integer TCP/HTTP port environment variable.
  *
- * @param {*} rawRtspUrl - Optional rtsp_output_url override from config.json.
- * @param {*} go2rtcUrl - Resolved or raw go2rtc_url.
- * @param {*} frigateUrl - Resolved or raw frigate_url.
- * @returns {string}
+ * @param {Record<string, string|undefined>} env - Environment dictionary.
+ * @param {string} envKey - Environment variable name.
+ * @param {{minPort: number, fallbackPort: number}} opts - Bounds and fallback default port.
+ * @returns {number}
  */
-function normalizeRtspOutputUrl(rawRtspUrl, go2rtcUrl, frigateUrl) {
-  const trimmed = String(rawRtspUrl || '').trim();
-  if (trimmed) {
-    return trimmed.includes(RTSP_NAME_TEMPLATE_TOKEN)
-        ? trimmed
-        : trimmed.replace(TRAILING_SLASHES_REGEX, '') + '/' + RTSP_NAME_TEMPLATE_TOKEN;
+function parseEnvPort(env, envKey, {minPort, fallbackPort}) {
+  const rawPort = readEnvString(env, envKey);
+  if (rawPort === '') {
+    return fallbackPort;
   }
-  const {host} = extractUrlProtocolAndHost(go2rtcUrl || frigateUrl);
-  return 'rtsp://' + host + ':' + DEFAULT_GO2RTC_RTSP_PORT + '/' + RTSP_NAME_TEMPLATE_TOKEN;
+  const parsedPort = Number(rawPort);
+  if (
+    !INTEGER_PORT_REGEX.test(rawPort) ||
+    !Number.isSafeInteger(parsedPort) ||
+    parsedPort < minPort ||
+    parsedPort > MAX_TCP_PORT
+  ) {
+    throw new Error(
+      envKey + ' must be an integer between ' + minPort + ' and ' + MAX_TCP_PORT + ', got "' + rawPort + '"'
+    );
+  }
+  return parsedPort;
 }
 
 /**
- * Derives the Frigate HTTP base URL ('http://<host>:5000') from go2rtc_url when frigate_api
- * was omitted in a legacy configuration.
+ * Resolves external service endpoints from hybrid-prefixed environment variables
+ * (EUFY_WS_*, FRIGATE_*, GO2RTC_*, and HA_WEBHOOK_URL).
  *
- * @param {*} go2rtcUrl - Configured go2rtc base URL.
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {Readonly<{
+ *   eufy_security_ws_url: string,
+ *   frigate_url: string,
+ *   go2rtc_url: string,
+ *   rtsp_publish_url: string,
+ *   ha_webhook_url: string
+ * }>}
+ */
+function resolveServiceEndpoints(env = process.env) {
+  const eufyOverride = readEnvString(env, 'EUFY_WS_URL').replace(TRAILING_SLASHES_REGEX, '');
+  const eufyHost = formatHostForUrl(readEnvString(env, 'EUFY_WS_HOST') || DEFAULT_EUFY_WS_HOST);
+  const eufyPort = parseEnvPort(env, 'EUFY_WS_PORT', {
+    minPort: MIN_TCP_PORT,
+    fallbackPort: DEFAULT_EUFY_WS_PORT,
+  });
+  const eufySecurityWsUrl = eufyOverride || DEFAULT_WS_PROTOCOL + '//' + eufyHost + ':' + eufyPort;
+
+  const frigateOverride = normalizeBaseHttpUrl(readEnvString(env, 'FRIGATE_URL'));
+  const frigateHost = formatHostForUrl(readEnvString(env, 'FRIGATE_HOST') || DEFAULT_FRIGATE_HOST);
+  const frigatePort = parseEnvPort(env, 'FRIGATE_PORT', {
+    minPort: MIN_TCP_PORT,
+    fallbackPort: DEFAULT_FRIGATE_HTTP_PORT,
+  });
+  const frigateUrl = frigateOverride || DEFAULT_HTTP_PROTOCOL + '//' + frigateHost + ':' + frigatePort;
+
+  const derivedFromFrigate = extractUrlProtocolAndHost(frigateUrl);
+  const go2rtcOverride = normalizeBaseHttpUrl(readEnvString(env, 'GO2RTC_URL'));
+  const explicitGo2rtcHost = readEnvString(env, 'GO2RTC_HOST');
+  const go2rtcHost = explicitGo2rtcHost ? formatHostForUrl(explicitGo2rtcHost) : derivedFromFrigate.host;
+  const go2rtcProto = explicitGo2rtcHost ? DEFAULT_HTTP_PROTOCOL : derivedFromFrigate.protocol;
+  const go2rtcApiPort = parseEnvPort(env, 'GO2RTC_API_PORT', {
+    minPort: MIN_TCP_PORT,
+    fallbackPort: DEFAULT_GO2RTC_HTTP_PORT,
+  });
+  const go2rtcUrl = go2rtcOverride || go2rtcProto + '//' + go2rtcHost + ':' + go2rtcApiPort;
+
+  const rtspOverride = readEnvString(env, 'GO2RTC_RTSP_URL');
+  let rtspPublishUrl;
+  if (rtspOverride) {
+    rtspPublishUrl = normalizeRtspPublishOverride(rtspOverride);
+  } else {
+    const rtspHost = explicitGo2rtcHost
+      ? formatHostForUrl(explicitGo2rtcHost)
+      : extractUrlProtocolAndHost(go2rtcUrl || frigateUrl).host;
+    const go2rtcRtspPort = parseEnvPort(env, 'GO2RTC_RTSP_PORT', {
+      minPort: MIN_TCP_PORT,
+      fallbackPort: DEFAULT_GO2RTC_RTSP_PORT,
+    });
+    const rtspUser = readEnvString(env, 'GO2RTC_RTSP_USER');
+    const rtspPass = readEnvString(env, 'GO2RTC_RTSP_PASSWORD');
+    const authPrefix = rtspUser
+      ? encodeURIComponent(rtspUser) + (rtspPass ? ':' + encodeURIComponent(rtspPass) : '') + '@'
+      : '';
+    rtspPublishUrl = 'rtsp://' + authPrefix + rtspHost + ':' + go2rtcRtspPort + '/' + RTSP_NAME_TEMPLATE_TOKEN;
+  }
+
+  return Object.freeze({
+    eufy_security_ws_url: eufySecurityWsUrl,
+    frigate_url: frigateUrl,
+    go2rtc_url: go2rtcUrl,
+    rtsp_publish_url: rtspPublishUrl,
+    ha_webhook_url: readEnvString(env, 'HA_WEBHOOK_URL'),
+  });
+}
+
+/**
+ * Normalizes the requested hardware acceleration mode from BRIDGE_HWACCEL.
+ *
+ * @param {*} rawHwaccel - Raw BRIDGE_HWACCEL string value.
  * @returns {string}
  */
-function deriveFrigateUrl(go2rtcUrl) {
-  const {protocol, host} = extractUrlProtocolAndHost(go2rtcUrl);
-  return protocol + '//' + host + ':' + DEFAULT_FRIGATE_HTTP_PORT;
+function parseHwaccelMode(rawHwaccel) {
+  if (rawHwaccel === true) {
+    return HWACCEL_MODES.VAAPI;
+  }
+  if (typeof rawHwaccel !== 'string') {
+    return HWACCEL_MODES.NONE;
+  }
+  const normalized = rawHwaccel.toLowerCase().trim();
+  return SUPPORTED_HWACCEL_MODES.has(normalized) ? normalized : HWACCEL_MODES.NONE;
 }
 
 /**
- * Classifies top-level and per-camera configuration keys into legacy-only, new-only, and unknown sets.
+ * Resolves bridge container runtime settings from BRIDGE_* environment variables.
+ *
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {Readonly<{
+ *   logLevel: string,
+ *   httpPort: number,
+ *   cacheDir: string,
+ *   hwaccelMode: string,
+ *   hwaccelDevice: string
+ * }>}
+ */
+function resolveRuntimeEnv(env = process.env) {
+  const explicitHwDevice = readEnvString(env, 'BRIDGE_HWACCEL_DEVICE');
+  return Object.freeze({
+    logLevel: readEnvString(env, 'BRIDGE_LOG_LEVEL') || DEFAULT_LOG_LEVEL,
+    httpPort: parseEnvPort(env, 'BRIDGE_HTTP_PORT', {
+      minPort: MIN_HTTP_LISTEN_PORT,
+      fallbackPort: DEFAULT_HTTP_PORT,
+    }),
+    cacheDir: readEnvString(env, 'BRIDGE_CACHE_DIR') || DEFAULT_CACHE_DIR,
+    hwaccelMode: parseHwaccelMode(readEnvString(env, 'BRIDGE_HWACCEL')),
+    hwaccelDevice: explicitHwDevice || DEFAULT_HWACCEL_DEVICE,
+  });
+}
+
+/**
+ * Finds unknown top-level and per-camera configuration keys in a single schema pass.
  *
  * @param {Record<string, *>} rawCfg - Candidate configuration object.
- * @returns {{
- *   legacyKeys: string[],
- *   newKeys: string[],
- *   unknownTopKeys: string[],
- *   unknownCameraKeys: string[]
- * }}
+ * @returns {{ unknownTopKeys: string[], unknownCameraKeys: string[] }}
  */
 function inspectConfigSchemaKeys(rawCfg) {
-  const legacyKeys = [];
-  const newKeys = [];
   const unknownTopKeys = [];
   const unknownCameraKeys = [];
 
   for (const key of Object.keys(rawCfg)) {
-    if (LEGACY_ONLY_TOP_KEYS.has(key)) {
-      legacyKeys.push(key);
-    } else if (NEW_ONLY_TOP_KEYS.has(key)) {
-      newKeys.push(key);
-    } else if (!SHARED_TOP_KEYS.has(key)) {
+    if (!ALLOWED_TOP_KEYS.has(key)) {
       unknownTopKeys.push(key);
     }
   }
@@ -685,145 +841,74 @@ function inspectConfigSchemaKeys(rawCfg) {
         return;
       }
       for (const camKey of Object.keys(cam)) {
-        if (NEW_ONLY_CAMERA_KEYS.has(camKey)) {
-          newKeys.push('cameras[' + idx + '].' + camKey);
-        } else if (!SHARED_CAMERA_KEYS.has(camKey)) {
+        if (!ALLOWED_CAMERA_KEYS.has(camKey)) {
           unknownCameraKeys.push('cameras[' + idx + '].' + camKey);
         }
       }
     });
   }
 
-  return {legacyKeys, newKeys, unknownTopKeys, unknownCameraKeys};
+  return {unknownTopKeys, unknownCameraKeys};
 }
 
 /**
- * Validates a pure legacy upstream configuration, logs a deprecation warning, and maps all legacy
- * keys to the current schema in place with default mode="auto".
+ * Validates per-camera rtsp_url protocol syntax and rejects incompatible camera modes.
  *
- * @param {Record<string, *>} rawCfg - Legacy configuration object.
- * @param {string[]} legacyKeys - Detected legacy top-level keys.
- * @param {string[]} unknownTopKeys - Unknown top-level keys.
- * @param {string[]} unknownCameraKeys - Unknown camera keys.
+ * @param {*} cameras - Candidate rawCfg.cameras array.
+ * @param {string[]} errors - Mutable validation error collector.
  */
-function validateAndMigrateLegacyConfig(rawCfg, legacyKeys, unknownTopKeys, unknownCameraKeys) {
-  const errors = [];
-  for (const reqKey of LEGACY_REQUIRED_KEYS) {
-    if (!rawCfg[reqKey]) {
-      errors.push('"' + reqKey + '" is required');
-    }
-  }
-  if (rawCfg.rtsp_publish && !String(rawCfg.rtsp_publish).includes(RTSP_NAME_TEMPLATE_TOKEN)) {
-    errors.push('"rtsp_publish" must contain ' + RTSP_NAME_TEMPLATE_TOKEN);
-  }
-  const hasValidLegacyCameras =
-      Array.isArray(rawCfg.cameras) &&
-      rawCfg.cameras.length > 0 &&
-      rawCfg.cameras.every(
-          (cam) =>
-            Boolean(cam) &&
-            typeof cam === 'object' &&
-            Boolean(String(cam.name || '').trim()) &&
-            Boolean(String(cam.serial || '').trim())
-      );
-  if (!hasValidLegacyCameras) {
-    errors.push('"cameras" must list at least one {"name", "serial"}');
-  }
-  for (const k of unknownTopKeys) {
-    errors.push('unknown key "' + k + '"');
-  }
-  for (const ck of unknownCameraKeys) {
-    errors.push('unknown camera key "' + ck + '"');
-  }
-  if (errors.length > 0) {
-    throw new Error('config.json: ' + errors.join('; '));
-  }
-
-  log.warn(
-      'bridge',
-      'legacy config.json format detected (' +
-      legacyKeys.join(', ') +
-      '); mapping to current schema with default mode="auto" - please migrate to the new config.json keys (eufy_security_ws_url, frigate_url)'
-  );
-
-  if (Object.isFrozen(rawCfg)) {
+function validateCameraRtspUrls(cameras, errors) {
+  if (!Array.isArray(cameras)) {
     return;
   }
-
-  for (const [oldKey, newKey] of Object.entries(LEGACY_TO_NEW_KEY_MAP)) {
-    if (rawCfg[oldKey] !== undefined) {
-      rawCfg[newKey] = rawCfg[oldKey];
-      delete rawCfg[oldKey];
+  cameras.forEach((cam, idx) => {
+    if (!cam || typeof cam !== 'object' || cam.rtsp_url === undefined) {
+      return;
     }
-  }
-  delete rawCfg.min_dwell_secs;
-
-  const normalizedGo2rtcUrl = normalizeBaseHttpUrl(rawCfg.go2rtc_url);
-  const normalizedFrigateUrl = rawCfg.frigate_url
-      ? normalizeBaseHttpUrl(rawCfg.frigate_url)
-      : deriveFrigateUrl(normalizedGo2rtcUrl);
-  const normalizedRtspOutputUrl = normalizeRtspOutputUrl(
-      rawCfg.rtsp_output_url,
-      normalizedGo2rtcUrl,
-      normalizedFrigateUrl
-  );
-  rawCfg.frigate_url = normalizedFrigateUrl;
-  rawCfg.go2rtc_url = normalizedGo2rtcUrl;
-  rawCfg.rtsp_output_url = normalizedRtspOutputUrl;
+    const directUrl = String(cam.rtsp_url || '').trim();
+    if (!RTSP_URL_PROTOCOL_REGEX.test(directUrl)) {
+      errors.push('cameras[' + idx + '] "rtsp_url" must start with rtsp:// or rtsps://');
+    }
+    const rawMode = String(cam.mode || '')
+      .trim()
+      .toLowerCase();
+    if (rawMode && rawMode !== CAMERA_MODES.RTSP && rawMode !== CAMERA_MODES.AUTO) {
+      errors.push(
+        'cameras[' +
+          idx +
+          '] cannot combine "rtsp_url" with mode "' +
+          cam.mode +
+          '" ("rtsp_url" is only supported with mode "rtsp" or "auto")'
+      );
+    }
+  });
 }
 
 /**
- * Validates a parsed configuration object (supporting pure legacy upstream configs while rejecting
- * mixed legacy/new or unknown keys), normalizes/derives service URLs, and throws descriptive errors
- * listing all validation issues at once.
+ * Validates a parsed YAML camera configuration object in one pass and throws a combined error
+ * listing all missing, invalid, or unknown keys at once.
  *
- * @param {Record<string, *>} rawCfg - Parsed JSON configuration object.
+ * @param {Record<string, *>} rawCfg - Parsed YAML configuration object.
  */
 function validateConfig(rawCfg) {
-  if (!rawCfg || typeof rawCfg !== 'object') {
-    throw new Error('config.json: configuration must be a JSON object');
+  if (!rawCfg || typeof rawCfg !== 'object' || Array.isArray(rawCfg)) {
+    throw new Error('config.yaml: configuration must be a YAML mapping');
   }
 
-  const {legacyKeys, newKeys, unknownTopKeys, unknownCameraKeys} = inspectConfigSchemaKeys(rawCfg);
-
-  if (legacyKeys.length > 0 && newKeys.length > 0) {
-    const errors = [
-      'cannot mix legacy config keys (' +
-      legacyKeys.join(', ') +
-      ') with current config keys (' +
-      newKeys.join(', ') +
-      ')',
-    ];
-    for (const k of unknownTopKeys) {
-      errors.push('unknown key "' + k + '"');
-    }
-    for (const ck of unknownCameraKeys) {
-      errors.push('unknown camera key "' + ck + '"');
-    }
-    throw new Error('config.json: ' + errors.join('; '));
-  }
-
-  if (legacyKeys.length > 0) {
-    validateAndMigrateLegacyConfig(rawCfg, legacyKeys, unknownTopKeys, unknownCameraKeys);
-    return;
-  }
-
+  const {unknownTopKeys, unknownCameraKeys} = inspectConfigSchemaKeys(rawCfg);
   const errors = [];
-  for (const key of REQUIRED_CONFIG_KEYS) {
-    if (!rawCfg[key]) {
-      errors.push('"' + key + '" is required');
-    }
-  }
 
   const hasValidCameras =
-      Array.isArray(rawCfg.cameras) &&
-      rawCfg.cameras.length > 0 &&
-      rawCfg.cameras.every((cam) => CameraConfig.hasValidIdentity(cam));
+    Array.isArray(rawCfg.cameras) &&
+    rawCfg.cameras.length > 0 &&
+    rawCfg.cameras.every((cam) => CameraConfig.hasValidIdentity(cam));
 
   if (!hasValidCameras) {
     errors.push('"cameras" must list at least one {"serial"}');
   }
 
+  validateCameraRtspUrls(rawCfg.cameras, errors);
+
   for (const k of unknownTopKeys) {
     errors.push('unknown key "' + k + '"');
   }
@@ -832,23 +917,7 @@ function validateConfig(rawCfg) {
   }
 
   if (errors.length > 0) {
-    throw new Error('config.json: ' + errors.join('; '));
-  }
-
-  const normalizedFrigateUrl = normalizeBaseHttpUrl(rawCfg.frigate_url);
-  const normalizedGo2rtcUrl = rawCfg.go2rtc_url
-      ? normalizeBaseHttpUrl(rawCfg.go2rtc_url)
-      : deriveGo2rtcUrl(normalizedFrigateUrl);
-  const normalizedRtspOutputUrl = normalizeRtspOutputUrl(
-      rawCfg.rtsp_output_url,
-      normalizedGo2rtcUrl,
-      normalizedFrigateUrl
-  );
-
-  if (!Object.isFrozen(rawCfg)) {
-    rawCfg.frigate_url = normalizedFrigateUrl;
-    rawCfg.go2rtc_url = normalizedGo2rtcUrl;
-    rawCfg.rtsp_output_url = normalizedRtspOutputUrl;
+    throw new Error('config.yaml: ' + errors.join('; '));
   }
 }
 
@@ -907,7 +976,7 @@ function matchesEventKeyword(normalizedEvent, keyword) {
 
 /**
  * Returns the priority boost for a Eufy trigger event name, honoring optional
- * event_priorities overrides from config.json before falling back to built-in tiers.
+ * event_priorities overrides from config.yaml before falling back to built-in tiers.
  *
  * @param {string} evName - Eufy event string.
  * @param {Record<string, *>|null} [customPriorities=null] - Optional custom {event: score} map.
@@ -916,17 +985,19 @@ function matchesEventKeyword(normalizedEvent, keyword) {
 function getEventPriority(evName, customPriorities = null) {
   const normalized = String(evName || '').toLowerCase();
   const overrides =
-      customPriorities !== null
-          ? customPriorities
-          : cfg && typeof cfg.event_priorities === 'object'
-              ? cfg.event_priorities
-              : null;
+    customPriorities !== null
+      ? customPriorities
+      : cfg && typeof cfg.event_priorities === 'object'
+        ? cfg.event_priorities
+        : null;
   if (overrides && typeof overrides === 'object') {
     const customEntries = Object.entries(overrides)
-        .filter(hasNumericPriorityScore)
-        .sort(compareCustomPriorityEntriesByKeywordLength);
+      .filter(hasNumericPriorityScore)
+      .sort(compareCustomPriorityEntriesByKeywordLength);
     for (const [keyword, score] of customEntries) {
-      const token = String(keyword || '').toLowerCase().trim();
+      const token = String(keyword || '')
+        .toLowerCase()
+        .trim();
       if (matchesEventKeyword(normalized, token)) {
         return score;
       }
@@ -943,12 +1014,11 @@ function getEventPriority(evName, customPriorities = null) {
 /**
  * Builds the normalized Set of Eufy event names that wake a camera.
  *
- * @param {string[]|undefined} rawEvents - Optional array of trigger event strings from config.json.
+ * @param {string[]|undefined} rawEvents - Optional array of trigger event strings from config.yaml.
  * @returns {Set<string>} Normalized set of Eufy event names.
  */
 function buildTriggerSet(rawEvents) {
-  const sourceEvents =
-      Array.isArray(rawEvents) && rawEvents.length > 0 ? rawEvents : DEFAULT_TRIGGER_EVENTS;
+  const sourceEvents = Array.isArray(rawEvents) && rawEvents.length > 0 ? rawEvents : DEFAULT_TRIGGER_EVENTS;
   const triggers = new Set();
 
   for (const item of sourceEvents) {
@@ -965,16 +1035,16 @@ function buildTriggerSet(rawEvents) {
 }
 
 /**
- * Normalizes a card placement string into one of the 5 supported positions.
+ * Normalizes a card placement string into one of the 7 canonical `<vertical>-<horizontal>` positions.
  *
  * @param {*} rawPos - Raw card_position value from config.
  * @param {string} [scope='bridge'] - Log scope for warnings.
- * @returns {'center'|'top-left'|'top-right'|'bottom-left'|'bottom-right'}
+ * @returns {'center'|'top-left'|'top-center'|'top-right'|'bottom-left'|'bottom-center'|'bottom-right'}
  */
 function normalizeCardPosition(rawPos, scope = 'bridge') {
   const token = String(rawPos || '')
-      .toLowerCase()
-      .trim();
+    .toLowerCase()
+    .trim();
 
   switch (token) {
     case '':
@@ -982,8 +1052,14 @@ function normalizeCardPosition(rawPos, scope = 'bridge') {
       return CARD_POSITIONS.BOTTOM_LEFT;
     case CARD_POSITIONS.TOP_LEFT:
       return CARD_POSITIONS.TOP_LEFT;
+    case CARD_POSITIONS.TOP_CENTER:
+    case CARD_POS_ALIAS_CENTER_TOP:
+      return CARD_POSITIONS.TOP_CENTER;
     case CARD_POSITIONS.TOP_RIGHT:
       return CARD_POSITIONS.TOP_RIGHT;
+    case CARD_POSITIONS.BOTTOM_CENTER:
+    case CARD_POS_ALIAS_CENTER_BOTTOM:
+      return CARD_POSITIONS.BOTTOM_CENTER;
     case CARD_POSITIONS.BOTTOM_RIGHT:
       return CARD_POSITIONS.BOTTOM_RIGHT;
     case CARD_POSITIONS.CENTER:
@@ -999,32 +1075,32 @@ function normalizeCardPosition(rawPos, scope = 'bridge') {
  *
  * @param {*} rawTheme - Raw card_theme value from config.
  * @param {string} [scope='bridge'] - Log scope for warnings.
- * @returns {'icons'|'minimal'|'detailed'|'debug'|'none'}
+ * @returns {'glance'|'minimal'|'pebbles'|'hud'|'none'}
  */
 function normalizeCardTheme(rawTheme, scope = 'bridge') {
   if (rawTheme === false) {
     return CARD_THEMES.NONE;
   }
 
-  const token = String(rawTheme ?? CARD_THEMES.ICONS)
-      .toLowerCase()
-      .trim();
+  const token = String(rawTheme ?? CARD_THEMES.MINIMAL)
+    .toLowerCase()
+    .trim();
 
   switch (token) {
     case '':
-    case CARD_THEMES.ICONS:
-      return CARD_THEMES.ICONS;
     case CARD_THEMES.MINIMAL:
       return CARD_THEMES.MINIMAL;
-    case CARD_THEMES.DETAILED:
-      return CARD_THEMES.DETAILED;
-    case CARD_THEMES.DEBUG:
-      return CARD_THEMES.DEBUG;
+    case CARD_THEMES.GLANCE:
+      return CARD_THEMES.GLANCE;
+    case CARD_THEMES.PEBBLES:
+      return CARD_THEMES.PEBBLES;
+    case CARD_THEMES.HUD:
+      return CARD_THEMES.HUD;
     case CARD_THEMES.NONE:
       return CARD_THEMES.NONE;
     default:
-      log.warn(scope, 'unknown card_theme "' + rawTheme + '", defaulting to "icons"');
-      return CARD_THEMES.ICONS;
+      log.warn(scope, 'unknown card_theme "' + rawTheme + '", defaulting to "minimal"');
+      return CARD_THEMES.MINIMAL;
   }
 }
 
@@ -1058,27 +1134,181 @@ function normalizeSleepScreen(rawScreen, scope = 'bridge') {
 }
 
 /**
- * Loads and validates the configuration object from BRIDGE_CONFIG, CONFIG_PATH,
- * /config/config.json, or falls back to an in-memory default test configuration.
- * On startup validation or parse errors, logs a clean structured [ERROR] line and exits(1).
+ * Resolves a validated environment placeholder expression ('VAR' or 'VAR:-default') against ctx.env.
  *
+ * @param {string} expr - Inner expression inside ${...}.
+ * @param {string} keyPath - Dotted/indexed configuration path for error reporting.
+ * @param {{ env: Record<string, string|undefined>, errors: string[] }} ctx - Expansion context.
+ * @returns {string}
+ */
+function resolveEnvPlaceholder(expr, keyPath, ctx) {
+  const sepIdx = expr.indexOf(ENV_DEFAULT_SEPARATOR);
+  const varName = sepIdx === -1 ? expr : expr.slice(0, sepIdx);
+  const fallback = sepIdx === -1 ? undefined : expr.slice(sepIdx + ENV_DEFAULT_SEPARATOR.length);
+  const rawVal =
+    ctx.env && Object.hasOwn(ctx.env, varName) && ctx.env[varName] !== undefined ? String(ctx.env[varName]) : '';
+  if (rawVal !== '') return rawVal;
+  if (fallback !== undefined) return fallback;
+  const suffix = keyPath ? ' (' + keyPath + ')' : '';
+  ctx.errors.push('environment variable "' + varName + '" is not set' + suffix);
+  return '';
+}
+
+/**
+ * Expands ${ENV_VAR} and ${ENV_VAR:-default} placeholders in a single configuration string,
+ * unescaping $${...} literals and recording missing variables or malformed/unclosed placeholders
+ * in ctx.errors in a single pass.
+ *
+ * @param {string} rawStr - Candidate string value from config.yaml.
+ * @param {string} keyPath - Dotted/indexed configuration path for error reporting.
+ * @param {{ env: Record<string, string|undefined>, errors: string[] }} ctx - Expansion context.
+ * @returns {string}
+ */
+function expandEnvString(rawStr, keyPath, ctx) {
+  if (!rawStr.includes(ENV_OPEN_TOKEN)) return rawStr;
+  const suffix = keyPath ? ' (' + keyPath + ')' : '';
+  let out = '';
+  let cursor = 0;
+  while (cursor < rawStr.length) {
+    const dollarIdx = rawStr.indexOf(ENV_DOLLAR_CHAR, cursor);
+    if (dollarIdx === -1) {
+      out += rawStr.slice(cursor);
+      break;
+    }
+    out += rawStr.slice(cursor, dollarIdx);
+    if (rawStr.startsWith(ENV_ESCAPED_OPEN_TOKEN, dollarIdx)) {
+      out += ENV_OPEN_TOKEN;
+      cursor = dollarIdx + ENV_ESCAPED_OPEN_TOKEN.length;
+      continue;
+    }
+    if (!rawStr.startsWith(ENV_OPEN_TOKEN, dollarIdx)) {
+      out += ENV_DOLLAR_CHAR;
+      cursor = dollarIdx + 1;
+      continue;
+    }
+    const closeIdx = rawStr.indexOf(ENV_CLOSE_TOKEN, dollarIdx + ENV_OPEN_TOKEN.length);
+    if (closeIdx === -1) {
+      const preview = rawStr.slice(dollarIdx, dollarIdx + MAX_MALFORMED_PLACEHOLDER_CHARS);
+      ctx.errors.push('malformed environment variable placeholder "' + preview + '"' + suffix);
+      break;
+    }
+    const expr = rawStr.slice(dollarIdx + ENV_OPEN_TOKEN.length, closeIdx);
+    if (!ENV_VAR_EXPR_REGEX.test(expr)) {
+      ctx.errors.push('malformed environment variable placeholder "${' + expr + '}"' + suffix);
+    } else {
+      out += resolveEnvPlaceholder(expr, keyPath, ctx);
+    }
+    cursor = closeIdx + 1;
+  }
+  return out;
+}
+
+/**
+ * Recursively walks a parsed YAML configuration value and expands ${ENV_VAR} placeholders
+ * across all string values without mutating the input structure.
+ *
+ * @param {*} value - Parsed YAML configuration value.
+ * @param {string} keyPath - Current configuration key path for error reporting.
+ * @param {{ env: Record<string, string|undefined>, errors: string[] }} ctx - Expansion context.
+ * @returns {*}
+ */
+function expandEnvNode(value, keyPath, ctx) {
+  if (typeof value === 'string') return expandEnvString(value, keyPath, ctx);
+  if (Array.isArray(value)) return value.map((item, idx) => expandEnvNode(item, keyPath + '[' + idx + ']', ctx));
+  if (value && typeof value === 'object') {
+    /** @type {Record<string, *>} */
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      out[key] = expandEnvNode(child, keyPath ? keyPath + '.' + key : key, ctx);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Expands ${ENV_VAR} and ${ENV_VAR:-default} placeholders across all string values in a parsed
+ * config.yaml structure, throwing a single combined error when any required environment variable
+ * is unset or empty.
+ *
+ * @template T
+ * @param {T} rawCfg - Parsed YAML configuration object or value.
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {T}
+ */
+function expandConfigEnvVars(rawCfg, env = process.env) {
+  /** @type {string[]} */
+  const errors = [];
+  const expanded = expandEnvNode(rawCfg, '', {env, errors});
+  if (errors.length > 0) {
+    throw new Error('config.yaml: ' + [...new Set(errors)].join('; '));
+  }
+  return expanded;
+}
+
+/**
+ * Resolves the configuration file path from BRIDGE_CONFIG, /config/config.yaml, or ./config.yaml.
+ *
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {string}
+ */
+function resolveConfigFilePath(env = process.env) {
+  const explicitPath = readEnvString(env, 'BRIDGE_CONFIG');
+  if (explicitPath) {
+    return explicitPath;
+  }
+  if (fs.existsSync(DEFAULT_CONTAINER_CONFIG_PATH)) {
+    return DEFAULT_CONTAINER_CONFIG_PATH;
+  }
+  if (fs.existsSync(DEFAULT_LOCAL_CONFIG_PATH)) {
+    return DEFAULT_LOCAL_CONFIG_PATH;
+  }
+  return DEFAULT_CONTAINER_CONFIG_PATH;
+}
+
+/**
+ * Reads, parses YAML, expands ${ENV_VAR} placeholders, and validates a config.yaml file from disk.
+ *
+ * @param {string} filePath - Path to config.yaml.
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
  * @returns {Record<string, *>}
  */
-function loadConfig() {
-  initLogger(process.env.LOG_LEVEL || 'info');
-  const explicitPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH;
-  const defaultPath = '/config/config.json';
-  const targetPath = explicitPath || (fs.existsSync(defaultPath) ? defaultPath : '');
+function loadConfigFile(filePath, env = process.env) {
+  const parsedYaml = jsYaml.load(fs.readFileSync(filePath, 'utf8'));
+  const expanded = expandConfigEnvVars(parsedYaml, env);
+  const validated = /** @type {Record<string, *>} */ (expanded);
+  validateConfig(validated);
+  return validated;
+}
+
+/**
+ * Loads and validates the configuration object from BRIDGE_CONFIG, /config/config.yaml, or
+ * ./config.yaml. Falls back to an in-memory default test configuration only in Node test runs;
+ * in production, logs a structured [ERROR] line and exits(1) when the config file is missing or invalid.
+ *
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {Record<string, *>}
+ */
+function loadConfig(env = process.env) {
+  initLogger(readEnvString(env, 'BRIDGE_LOG_LEVEL') || DEFAULT_LOG_LEVEL);
+  const targetPath = resolveConfigFilePath(env);
+  const hasConfigFile = Boolean(readEnvString(env, 'BRIDGE_CONFIG')) || fs.existsSync(targetPath);
   try {
-    const parsed = targetPath
-        ? JSON.parse(fs.readFileSync(targetPath, 'utf8'))
-        : {
-            eufy_security_ws_url: 'ws://eufy-security-ws:3000',
-            frigate_url: 'http://frigate:5000',
-            cameras: [{serial: 'T8161T0000000000', mode: 'rtsp'}],
-          };
-    validateConfig(parsed);
-    return parsed;
+    const runtimeEnv = resolveRuntimeEnv(env);
+    initLogger(runtimeEnv.logLevel);
+    resolveServiceEndpoints(env);
+    if (hasConfigFile) {
+      return loadConfigFile(targetPath, env);
+    }
+    const isTestEnv = Boolean(readEnvString(env, 'NODE_TEST_CONTEXT') || readEnvString(env, 'NODE_ENV') === 'test');
+    if (isTestEnv) {
+      const fallback = {
+        cameras: [{serial: 'T8161T0000000000', mode: 'rtsp'}],
+      };
+      validateConfig(fallback);
+      return fallback;
+    }
+    throw new Error('config.yaml: configuration file not found at ' + targetPath);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     log.error('bridge', 'startup configuration error: ' + msg);
@@ -1086,61 +1316,66 @@ function loadConfig() {
   }
 }
 
-const rawLoadedCfg = loadConfig();
+const rawLoadedCfg = loadConfig(process.env);
+const processRuntimeEnv = resolveRuntimeEnv(process.env);
 
-const ACTIVE_LOG_LEVEL_NAME = initLogger(process.env.LOG_LEVEL || rawLoadedCfg.log_level || 'info');
+const ACTIVE_LOG_LEVEL_NAME = initLogger(processRuntimeEnv.logLevel);
 
-// Stream timing and arbitration limits (in milliseconds).
-const MAX_MS = clampNum(rawLoadedCfg.stream_max_secs, 10, 86400, 900) * MS_PER_SECOND;
-const VIEW_MAX_MS = clampNum(rawLoadedCfg.view_max_secs, 10, 86400, 300) * MS_PER_SECOND;
-const LINGER_MS = Math.min(VIEW_MAX_MS, clampNum(rawLoadedCfg.view_linger_secs, 5, 86400, 20) * MS_PER_SECOND);
-const COOLDOWN_MS = clampNum(rawLoadedCfg.view_cooldown_secs, 0, 3600, 5) * MS_PER_SECOND;
-const SNAP_DELAY_MS = clampNum(rawLoadedCfg.snapshot_capture_delay_secs, 0, 60, 3) * MS_PER_SECOND;
-
-// Doorbell, HomeBase 3 face recognition, RTSP, backfill, mask sync, and aspect ratio options.
-const RING_LABEL = rawLoadedCfg.ring_label || 'person';
-const FORWARD_FACE_NAMES = rawLoadedCfg.forward_face_names !== false;
-const GLOBAL_PRESERVE_ASPECT = rawLoadedCfg.preserve_aspect_ratio !== false;
-const PREEMPT_EVENT_STREAMS = rawLoadedCfg.view_has_priority !== false;
-const GLOBAL_USE_RTSP = rawLoadedCfg.use_rtsp !== false;
-const BACKFILL_DOWNLOADS = rawLoadedCfg.backfill_enabled !== false;
 const DEFAULT_BACKFILL_DELAY_SECS = 2;
-const BACKFILL_DELAY_MS = clampNum(rawLoadedCfg.backfill_delay_secs, 2, 120, DEFAULT_BACKFILL_DELAY_SECS) * MS_PER_SECOND;
-const GLOBAL_AUTO_FRIGATE_MASK = rawLoadedCfg.auto_frigate_mask !== false;
-const GLOBAL_CARD_SHOW_ON_LIVE = rawLoadedCfg.card_show_on_live !== false;
-const INSTANT_EVENT_SNAPSHOT = rawLoadedCfg.instant_event_snapshot !== false;
+const DEFAULT_TRACK_STUCK_SPOTLIGHT = false;
 
 // Smart battery conservation, periodic telemetry refresh, and startup snapshot probe options.
-const EARLY_SLEEP_MS = clampNum(rawLoadedCfg.idle_timeout_secs, 0, 3600, 0) * MS_PER_SECOND;
-const LOW_BAT_THRESHOLD = clampNum(rawLoadedCfg.low_battery_threshold, 0, 100, 20);
-const LOW_BAT_HOLD_MS = clampNum(rawLoadedCfg.low_battery_hold_secs, 5, 3600, 20) * MS_PER_SECOND;
-const LOW_BAT_WAKE_ON_VIEW = Boolean(rawLoadedCfg.low_battery_wake_on_view ?? false);
-const DEFAULT_TRACK_STUCK_SPOTLIGHT = false;
-const TRACK_STUCK_SPOTLIGHT = Boolean(rawLoadedCfg.track_stuck_spotlight ?? DEFAULT_TRACK_STUCK_SPOTLIGHT);
-const ENFORCE_QUALITY = rawLoadedCfg.enforce_streaming_quality ?? true;
-const TELEMETRY_POLL_MS = clampNum(rawLoadedCfg.telemetry_poll_secs, 0, 86400, 300) * MS_PER_SECOND;
-const HTTP_PORT = clampNum(rawLoadedCfg.http_port ?? process.env.HTTP_PORT, 0, 65535, 8080);
-const GLOBAL_STARTUP_SNAPSHOT = rawLoadedCfg.startup_snapshot !== undefined ? rawLoadedCfg.startup_snapshot : true;
+const MIN_CRITICAL_BAT_THRESHOLD_PCT = 1;
+const MAX_CRITICAL_BAT_THRESHOLD_PCT = 98;
+const DEFAULT_CRITICAL_BAT_THRESHOLD_PCT = 5;
+const MIN_LOW_BAT_THRESHOLD_PCT = 2;
+const MAX_LOW_BAT_THRESHOLD_PCT = 99;
+const DEFAULT_LOW_BAT_THRESHOLD_PCT = 30;
 
 /**
- * Normalizes the requested hardware acceleration mode from config.json.
+ * Resolves low_battery_threshold and critical_battery_threshold with defensive non-contradiction
+ * clamping (0 < criticalBatThreshold < lowBatThreshold <= 99).
  *
- * @param {*} rawHwaccel - Raw hwaccel value from config.json.
- * @returns {string}
+ * @param {Record<string, *>} [rawCfg=rawLoadedCfg] - Raw configuration object (global or camera).
+ * @param {{ lowFallback?: number, critFallback?: number }} [fallbacks={}] - Default fallback percentages.
+ * @param {string} [scope='bridge'] - Logger scope name.
+ * @returns {Readonly<{ lowBatThreshold: number, criticalBatThreshold: number }>}
  */
-function parseHwaccelMode(rawHwaccel) {
-  if (rawHwaccel === true) {
-    return HWACCEL_MODES.VAAPI;
+function resolveBatteryThresholds(rawCfg = rawLoadedCfg, fallbacks = {}, scope = 'bridge') {
+  const lowFallback = fallbacks.lowFallback ?? DEFAULT_LOW_BAT_THRESHOLD_PCT;
+  const critFallback = fallbacks.critFallback ?? DEFAULT_CRITICAL_BAT_THRESHOLD_PCT;
+  const lowBatThreshold = clampNum(
+    rawCfg.low_battery_threshold,
+    MIN_LOW_BAT_THRESHOLD_PCT,
+    MAX_LOW_BAT_THRESHOLD_PCT,
+    lowFallback
+  );
+  const rawCritical = clampNum(
+    rawCfg.critical_battery_threshold,
+    MIN_CRITICAL_BAT_THRESHOLD_PCT,
+    MAX_CRITICAL_BAT_THRESHOLD_PCT,
+    critFallback
+  );
+  if (rawCritical >= lowBatThreshold) {
+    const clampedCritical = lowBatThreshold - 1;
+    if (rawCfg.critical_battery_threshold !== undefined || rawCfg.low_battery_threshold !== undefined) {
+      log.warn(
+        scope,
+        'critical_battery_threshold (' +
+          rawCritical +
+          '%) must be lower than low_battery_threshold (' +
+          lowBatThreshold +
+          '%), clamping critical_battery_threshold to ' +
+          clampedCritical +
+          '%'
+      );
+    }
   }
-  if (typeof rawHwaccel !== 'string') {
-    return HWACCEL_MODES.NONE;
-  }
-  const normalized = rawHwaccel.toLowerCase().trim();
-  return SUPPORTED_HWACCEL_MODES.has(normalized) ? normalized : HWACCEL_MODES.NONE;
+  return Object.freeze({
+    lowBatThreshold,
+    criticalBatThreshold: Math.min(rawCritical, lowBatThreshold - 1),
+  });
 }
-
-const HWACCEL_MODE = parseHwaccelMode(rawLoadedCfg.hwaccel);
-const HWACCEL_DEVICE = rawLoadedCfg.hwaccel_device || '/dev/dri/renderD128';
 
 /**
  * Resolves live_fps and idle_fps with defensive non-contradiction clamping (idleFps <= liveFps).
@@ -1153,87 +1388,59 @@ function resolveFrameRates(rawCfg = rawLoadedCfg) {
   const rawIdleFps = clampNum(rawCfg.idle_fps, 1, 30, 5);
   if (rawIdleFps > liveFps) {
     log.warn(
-        'bridge',
-        'idle_fps (' + rawIdleFps + ') exceeds live_fps (' + liveFps + '), clamping idle_fps to ' + liveFps
+      'bridge',
+      'idle_fps (' + rawIdleFps + ') exceeds live_fps (' + liveFps + '), clamping idle_fps to ' + liveFps
     );
   }
   return Object.freeze({liveFps, idleFps: Math.min(liveFps, rawIdleFps)});
 }
 
-// Video dimensions (enforced even for YUV420p) and raw frame size in bytes (1.5 bytes per pixel).
-const W = clampNum(rawLoadedCfg.width, 320, 3840, 1280) & ~1;
-const H = clampNum(rawLoadedCfg.height, 240, 2160, 720) & ~1;
-const FRAME = (W * H * 3) / 2;
-const {liveFps: LIVE_FPS, idleFps: IDLE_FPS} = resolveFrameRates(rawLoadedCfg);
-
 // Audio configuration: 16 kHz, 16-bit signed little-endian mono PCM sent in 100 ms chunks.
-const AUDIO = rawLoadedCfg.audio !== false;
 const RATE = 16000;
 const AUDIO_TICK = 100;
 const AUDIO_CHUNK = (RATE * 2 * AUDIO_TICK) / MS_PER_SECOND;
-const SILENCE = Buffer.alloc(AUDIO_CHUNK);
-
-// Mapping of Eufy event keywords to Frigate event labels.
-/** @type {Array<[string, string]>} */
-const LABELS = [
-  ['person', 'person'],
-  ['loitering', 'person'],
-  ['ring', RING_LABEL],
-  ['package', 'package'],
-  ['vehicle', 'car'],
-  ['dog', 'dog'],
-  ['pet', 'dog'],
-];
-
-const TRIGGERS = buildTriggerSet(rawLoadedCfg.trigger_events);
+const SILENCE = Buffer.alloc(AUDIO_CHUNK, 0);
 
 /**
  * Resolves a writable directory for storing cached camera snapshots across restarts.
  *
- * @param {string} [preferredDir] - Preferred cache directory path.
+ * @param {string} [preferredDir=processRuntimeEnv.cacheDir] - Preferred cache directory path.
  * @returns {string} Writable directory path for snapshot cache files.
  */
-function resolveCacheDir(preferredDir = rawLoadedCfg.cache_dir) {
-  const preferred = preferredDir || '/config/cache';
+function resolveCacheDir(preferredDir = processRuntimeEnv.cacheDir) {
+  const preferred = preferredDir || DEFAULT_CACHE_DIR;
   try {
     fs.mkdirSync(preferred, {recursive: true});
     fs.accessSync(preferred, fs.constants.W_OK);
     return preferred;
   } catch (err) {
-    log.warn('bridge', 'cache directory "' + preferred + '" is not writable, falling back to /tmp');
-    return '/tmp';
+    const fallbackDir = os.tmpdir();
+    log.warn('bridge', 'cache directory "' + preferred + '" is not writable, falling back to ' + fallbackDir);
+    return fallbackDir;
   }
 }
-
-const CACHE_DIR = resolveCacheDir();
 
 /**
  * Verifies whether the configured hardware acceleration mode and device node are usable.
  *
- * @param {string} [hwMode=HWACCEL_MODE] - Parsed hwaccel mode.
- * @param {string} [hwDevice=HWACCEL_DEVICE] - Device node path.
+ * @param {string} [hwMode=processRuntimeEnv.hwaccelMode] - Parsed hwaccel mode.
+ * @param {string} [hwDevice=processRuntimeEnv.hwaccelDevice] - Device node path.
  * @returns {string} Validated hwaccel mode ('vaapi', 'qsv', 'nvenc', 'v4l2m2m') or '' for software.
  */
-function resolveHwaccel(hwMode = HWACCEL_MODE, hwDevice = HWACCEL_DEVICE) {
+function resolveHwaccel(hwMode = processRuntimeEnv.hwaccelMode, hwDevice = processRuntimeEnv.hwaccelDevice) {
   if (!hwMode) {
     return HWACCEL_MODES.NONE;
   }
   const requiresRenderDevice = hwMode === HWACCEL_MODES.VAAPI || hwMode === HWACCEL_MODES.QSV;
   if (requiresRenderDevice && !fs.existsSync(hwDevice)) {
     log.warn(
-        'bridge',
-        'hwaccel "' +
-        hwMode +
-        '" requested, but ' +
-        hwDevice +
-        ' is not accessible; falling back to software libx264'
+      'bridge',
+      'hwaccel "' + hwMode + '" requested, but ' + hwDevice + ' is not accessible; falling back to software libx264'
     );
     return HWACCEL_MODES.NONE;
   }
   return hwMode;
 }
-
-const ACTIVE_HWACCEL = resolveHwaccel();
 
 /**
  * Resolves a boolean flag from a telemetry config block (boolean or object).
@@ -1243,11 +1450,7 @@ const ACTIVE_HWACCEL = resolveHwaccel();
  * @returns {boolean}
  */
 function isTelemetryBlockEnabled(block, fallback) {
-  return block === undefined
-      ? fallback
-      : typeof block === 'boolean'
-          ? block
-          : block.enabled !== false;
+  return block === undefined ? fallback : typeof block === 'boolean' ? block : block.enabled !== false;
 }
 
 /**
@@ -1262,27 +1465,38 @@ function resolveTelemetryConfig(camConfig = {}, baseCfg = rawLoadedCfg) {
   if (camConfig && camConfig.telemetryConfig && Object.isFrozen(camConfig.telemetryConfig)) {
     return camConfig.telemetryConfig;
   }
+  if (hasDirectRtspUrl(camConfig)) {
+    return Object.freeze({
+      enabled: false,
+      battery: false,
+      powerSource: false,
+      wifi: false,
+      rssi: false,
+      temperature: false,
+      lastSeen: false,
+    });
+  }
   const globalCfg = baseCfg.telemetry;
   const camCfg = camConfig.telemetry;
 
   const globalEnabled = isTelemetryBlockEnabled(globalCfg, true);
   const camEnabled = isTelemetryBlockEnabled(camCfg, globalEnabled);
 
-  const pickOption = (key) =>
+  const pickOption = (key, defaultVal = true) =>
     camCfg && typeof camCfg === 'object' && key in camCfg
-        ? Boolean(camCfg[key])
-        : globalCfg && typeof globalCfg === 'object' && key in globalCfg
-            ? Boolean(globalCfg[key])
-            : true;
+      ? Boolean(camCfg[key])
+      : globalCfg && typeof globalCfg === 'object' && key in globalCfg
+        ? Boolean(globalCfg[key])
+        : defaultVal;
 
   return Object.freeze({
     enabled: camEnabled,
-    battery: camEnabled && pickOption('battery'),
-    powerSource: camEnabled && pickOption('power_source'),
-    wifi: camEnabled && pickOption('wifi'),
-    rssi: camEnabled && pickOption('rssi'),
-    temperature: camEnabled && pickOption('temperature'),
-    lastSeen: camEnabled && pickOption('last_seen'),
+    battery: camEnabled && pickOption('battery', true),
+    powerSource: camEnabled && pickOption('power_source', true),
+    wifi: camEnabled && pickOption('wifi', true),
+    rssi: camEnabled && pickOption('rssi', true),
+    temperature: camEnabled && pickOption('temperature', false),
+    lastSeen: camEnabled && pickOption('last_seen', false),
   });
 }
 
@@ -1291,14 +1505,18 @@ function resolveTelemetryConfig(camConfig = {}, baseCfg = rawLoadedCfg) {
  *
  * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
  * @param {Record<string, *>} [baseCfg=rawLoadedCfg] - Global configuration object.
- * @returns {{ theme: 'icons'|'minimal'|'detailed'|'debug'|'none', position: 'center'|'top-left'|'top-right'|'bottom-left'|'bottom-right', sleepScreen: 'snapshot'|'slate'|'black' }}
+ * @returns {{
+ *   theme: 'glance'|'minimal'|'pebbles'|'hud'|'none',
+ *   position: 'center'|'top-left'|'top-center'|'top-right'|'bottom-left'|'bottom-center'|'bottom-right',
+ *   sleepScreen: 'snapshot'|'slate'|'black'
+ * }}
  */
 function resolveCardConfig(camConfig = {}, baseCfg = rawLoadedCfg) {
   if (camConfig && camConfig.cardConfig && Object.isFrozen(camConfig.cardConfig)) {
     return camConfig.cardConfig;
   }
   const scope = CameraConfig.resolveScopeName(camConfig);
-  const rawTheme = camConfig.card_theme ?? baseCfg.card_theme ?? CARD_THEMES.ICONS;
+  const rawTheme = camConfig.card_theme ?? baseCfg.card_theme ?? CARD_THEMES.MINIMAL;
   const rawPos = camConfig.card_position ?? baseCfg.card_position ?? CARD_POSITIONS.BOTTOM_LEFT;
   const rawScreen = camConfig.sleep_screen ?? baseCfg.sleep_screen ?? SLEEP_SCREENS.SNAPSHOT;
 
@@ -1324,9 +1542,6 @@ const MAX_EVENT_SECS = 3600;
 const MIN_EARLY_SLEEP_SECS = 0;
 const MAX_EARLY_SLEEP_SECS = 3600;
 const DEFAULT_EARLY_SLEEP_SECS = 0;
-const MIN_LOW_BAT_THRESHOLD_PCT = 0;
-const MAX_LOW_BAT_THRESHOLD_PCT = 100;
-const DEFAULT_LOW_BAT_THRESHOLD_PCT = 20;
 const MIN_LOW_BAT_HOLD_SECS = 5;
 const MAX_LOW_BAT_HOLD_SECS = 3600;
 const DEFAULT_LOW_BAT_HOLD_SECS = 20;
@@ -1358,20 +1573,22 @@ function resolveCameraTriggers(camConfig = {}, globalTriggers = TRIGGERS) {
 }
 
 /**
- * Resolves the normalized streaming mode ('auto', 'rtsp', 'p2p', 'backfill', or 'custom') for a camera.
+ * Resolves the normalized streaming mode ('auto', 'rtsp', 'p2p', 'backfill', or 'custom') for a camera,
+ * resolving omitted or 'auto' mode to 'rtsp' when direct rtsp_url is configured.
  *
  * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
  * @returns {'auto'|'rtsp'|'p2p'|'backfill'|'custom'}
  */
 function resolveCameraMode(camConfig = {}) {
   const scope = CameraConfig.resolveScopeName(camConfig);
+  const isDirect = hasDirectRtspUrl(camConfig);
   if (camConfig.mode === undefined || camConfig.mode === null || camConfig.mode === '') {
-    return CAMERA_MODES.AUTO;
+    return isDirect ? CAMERA_MODES.RTSP : CAMERA_MODES.AUTO;
   }
   const token = String(camConfig.mode).toLowerCase().trim();
   switch (token) {
     case CAMERA_MODES.AUTO:
-      return CAMERA_MODES.AUTO;
+      return isDirect ? CAMERA_MODES.RTSP : CAMERA_MODES.AUTO;
     case CAMERA_MODES.RTSP:
       return CAMERA_MODES.RTSP;
     case CAMERA_MODES.P2P:
@@ -1382,7 +1599,7 @@ function resolveCameraMode(camConfig = {}) {
       return CAMERA_MODES.CUSTOM;
     default:
       log.warn(scope, 'unknown camera mode "' + camConfig.mode + '", defaulting to "auto"');
-      return CAMERA_MODES.AUTO;
+      return isDirect ? CAMERA_MODES.RTSP : CAMERA_MODES.AUTO;
   }
 }
 
@@ -1394,6 +1611,7 @@ function resolveCameraMode(camConfig = {}) {
  * @param {Record<string, *>} [baseCfg=rawLoadedCfg] - Global configuration object.
  * @returns {{
  *   mode: 'auto'|'rtsp'|'p2p'|'backfill'|'custom',
+ *   rtspDirect: boolean,
  *   useRtsp: boolean,
  *   alwaysBackfill: boolean,
  *   backfillDownloads: boolean,
@@ -1404,60 +1622,57 @@ function resolveCameraMode(camConfig = {}) {
  *   eventSecs: number,
  *   earlySleepMs: number,
  *   lowBatThreshold: number,
+ *   criticalBatThreshold: number,
  *   lowBatHoldMs: number,
  *   lowBatWakeOnView: boolean,
  *   letEufyDecideEnd: boolean
  * }}
  */
-function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
+function resolveCameraTimers(camConfig = {}, baseCfg = cfg) {
   if (camConfig && camConfig.timers && Object.isFrozen(camConfig.timers)) {
     return camConfig.timers;
   }
   const scope = CameraConfig.resolveScopeName(camConfig);
   const mode = resolveCameraMode(camConfig);
-  const alwaysBackfill =
-      mode === CAMERA_MODES.BACKFILL ||
+  const isRtspDirect = hasDirectRtspUrl(camConfig);
+  const alwaysBackfill = isRtspDirect
+    ? false
+    : mode === CAMERA_MODES.BACKFILL ||
       (mode === CAMERA_MODES.CUSTOM && Boolean(camConfig.backfill_only ?? baseCfg.backfill_only));
 
-  const globalUseRtsp = baseCfg.use_rtsp !== undefined ? baseCfg.use_rtsp !== false : GLOBAL_USE_RTSP;
+  const globalUseRtsp = baseCfg.use_rtsp !== false;
   const useRtsp =
-      mode === CAMERA_MODES.RTSP ||
-      Boolean(camConfig.homebase_rtsp_url) ||
-      ((mode === CAMERA_MODES.AUTO ||
-        mode === CAMERA_MODES.BACKFILL ||
-        mode === CAMERA_MODES.CUSTOM) &&
-        (camConfig.use_rtsp !== undefined ? Boolean(camConfig.use_rtsp) : globalUseRtsp));
+    mode === CAMERA_MODES.RTSP ||
+    isRtspDirect ||
+    ((mode === CAMERA_MODES.AUTO || mode === CAMERA_MODES.BACKFILL || mode === CAMERA_MODES.CUSTOM) &&
+      (camConfig.use_rtsp !== undefined ? Boolean(camConfig.use_rtsp) : globalUseRtsp));
 
-  const globalBackfillDownloads =
-      baseCfg.backfill_enabled !== undefined ? baseCfg.backfill_enabled !== false : BACKFILL_DOWNLOADS;
+  const globalBackfillDownloads = baseCfg.backfill_enabled !== false;
   const rawBackfillDownloads =
-      camConfig.backfill_enabled !== undefined
-          ? Boolean(camConfig.backfill_enabled)
-          : globalBackfillDownloads;
+    camConfig.backfill_enabled !== undefined ? Boolean(camConfig.backfill_enabled) : globalBackfillDownloads;
   if (alwaysBackfill && !rawBackfillDownloads) {
-    log.warn(
-        scope,
-        'cannot disable backfill_enabled in backfill-only mode; keeping backfill_enabled=true'
-    );
+    log.warn(scope, 'cannot disable backfill_enabled in backfill-only mode; keeping backfill_enabled=true');
   }
-  const backfillDownloads = alwaysBackfill ? true : rawBackfillDownloads;
+  const backfillDownloads = isRtspDirect ? false : alwaysBackfill ? true : rawBackfillDownloads;
 
   const defaultHoldSecs = alwaysBackfill ? DEFAULT_BACKFILL_HOLD_SECS : DEFAULT_HOLD_SECS;
   const rawHoldSecs = camConfig.hold_secs ?? baseCfg.hold_secs;
   const holdSecs =
-      rawHoldSecs !== undefined
-          ? clampNum(rawHoldSecs, MIN_HOLD_SECS, MAX_HOLD_SECS, defaultHoldSecs)
-          : defaultHoldSecs;
+    rawHoldSecs !== undefined ? clampNum(rawHoldSecs, MIN_HOLD_SECS, MAX_HOLD_SECS, defaultHoldSecs) : defaultHoldSecs;
   const holdMs = holdSecs * MS_PER_SECOND;
 
+  const baseMaxMs =
+    baseCfg.maxMs ??
+    clampNum(baseCfg.stream_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) * MS_PER_SECOND;
   const rawMaxMs =
-      camConfig.stream_max_secs !== undefined
-          ? clampNum(camConfig.stream_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) * MS_PER_SECOND
-          : MAX_MS;
+    camConfig.stream_max_secs !== undefined
+      ? clampNum(camConfig.stream_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) *
+        MS_PER_SECOND
+      : baseMaxMs;
   if (rawMaxMs < holdMs) {
     log.warn(
-        scope,
-        'stream_max_secs (' +
+      scope,
+      'stream_max_secs (' +
         Math.round(rawMaxMs / MS_PER_SECOND) +
         's) is shorter than hold_secs (' +
         holdSecs +
@@ -1468,23 +1683,34 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
   }
   const maxMs = Math.max(holdMs, rawMaxMs);
 
+  const baseViewMaxMs =
+    baseCfg.viewMaxMs ??
+    clampNum(baseCfg.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND;
+  const baseLingerMs =
+    baseCfg.lingerMs ??
+    Math.min(
+      baseViewMaxMs,
+      clampNum(baseCfg.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * MS_PER_SECOND
+    );
   const rawLingerMs =
-      camConfig.view_linger_secs !== undefined
-          ? clampNum(camConfig.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * MS_PER_SECOND
-          : LINGER_MS;
+    camConfig.view_linger_secs !== undefined
+      ? clampNum(camConfig.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * MS_PER_SECOND
+      : baseLingerMs;
   const rawViewMaxMs =
-      camConfig.view_max_secs !== undefined
-          ? clampNum(camConfig.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND
-          : VIEW_MAX_MS;
+    camConfig.view_max_secs !== undefined
+      ? clampNum(camConfig.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) *
+        MS_PER_SECOND
+      : baseViewMaxMs;
   if (rawViewMaxMs < rawLingerMs) {
+    const lingerSecs = Math.round(rawLingerMs / MS_PER_SECOND);
     log.warn(
-        scope,
-        'view_max_secs (' +
+      scope,
+      'view_max_secs (' +
         Math.round(rawViewMaxMs / MS_PER_SECOND) +
         's) is shorter than view_linger_secs (' +
-        Math.round(rawLingerMs / MS_PER_SECOND) +
+        lingerSecs +
         's), raising view_max_secs to ' +
-        Math.round(rawLingerMs / MS_PER_SECOND) +
+        lingerSecs +
         's'
     );
   }
@@ -1493,31 +1719,46 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
 
   const rawEventSecs = camConfig.frigate_event_secs ?? baseCfg.frigate_event_secs;
   const eventSecs =
-      rawEventSecs !== undefined
-          ? clampNum(rawEventSecs, MIN_EVENT_SECS, MAX_EVENT_SECS, holdSecs)
-          : clampNum(holdSecs, MIN_EVENT_SECS, MAX_EVENT_SECS, defaultHoldSecs);
+    rawEventSecs !== undefined
+      ? clampNum(rawEventSecs, MIN_EVENT_SECS, MAX_EVENT_SECS, holdSecs)
+      : clampNum(holdSecs, MIN_EVENT_SECS, MAX_EVENT_SECS, defaultHoldSecs);
 
+  const baseEarlySleepMs =
+    baseCfg.earlySleepMs ??
+    clampNum(baseCfg.idle_timeout_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) *
+      MS_PER_SECOND;
   const earlySleepMs =
-      camConfig.idle_timeout_secs !== undefined
-          ? clampNum(camConfig.idle_timeout_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) * MS_PER_SECOND
-          : EARLY_SLEEP_MS;
-  const lowBatThreshold =
-      camConfig.low_battery_threshold !== undefined
-          ? clampNum(
-              camConfig.low_battery_threshold,
-              MIN_LOW_BAT_THRESHOLD_PCT,
-              MAX_LOW_BAT_THRESHOLD_PCT,
-              DEFAULT_LOW_BAT_THRESHOLD_PCT
-          )
-          : LOW_BAT_THRESHOLD;
+    camConfig.idle_timeout_secs !== undefined
+      ? clampNum(camConfig.idle_timeout_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) *
+        MS_PER_SECOND
+      : baseEarlySleepMs;
+  const baseBatThresholds = resolveBatteryThresholds(
+    baseCfg,
+    {lowFallback: DEFAULT_LOW_BAT_THRESHOLD_PCT, critFallback: DEFAULT_CRITICAL_BAT_THRESHOLD_PCT},
+    scope
+  );
+  const {lowBatThreshold, criticalBatThreshold} = resolveBatteryThresholds(
+    camConfig,
+    {lowFallback: baseBatThresholds.lowBatThreshold, critFallback: baseBatThresholds.criticalBatThreshold},
+    scope
+  );
+  const baseLowBatHoldMs =
+    baseCfg.lowBatHoldMs ??
+    clampNum(baseCfg.low_battery_hold_secs, MIN_LOW_BAT_HOLD_SECS, MAX_LOW_BAT_HOLD_SECS, DEFAULT_LOW_BAT_HOLD_SECS) *
+      MS_PER_SECOND;
   const rawLowBatHoldMs =
-      camConfig.low_battery_hold_secs !== undefined
-          ? clampNum(camConfig.low_battery_hold_secs, MIN_LOW_BAT_HOLD_SECS, MAX_LOW_BAT_HOLD_SECS, DEFAULT_LOW_BAT_HOLD_SECS) * MS_PER_SECOND
-          : LOW_BAT_HOLD_MS;
+    camConfig.low_battery_hold_secs !== undefined
+      ? clampNum(
+          camConfig.low_battery_hold_secs,
+          MIN_LOW_BAT_HOLD_SECS,
+          MAX_LOW_BAT_HOLD_SECS,
+          DEFAULT_LOW_BAT_HOLD_SECS
+        ) * MS_PER_SECOND
+      : baseLowBatHoldMs;
   if (camConfig.low_battery_hold_secs !== undefined && rawLowBatHoldMs > holdMs) {
     log.warn(
-        scope,
-        'low_battery_hold_secs (' +
+      scope,
+      'low_battery_hold_secs (' +
         Math.round(rawLowBatHoldMs / MS_PER_SECOND) +
         's) exceeds hold_secs (' +
         holdSecs +
@@ -1528,19 +1769,19 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
   }
   const lowBatHoldMs = Math.min(holdMs, rawLowBatHoldMs);
   const lowBatWakeOnView =
-      camConfig.low_battery_wake_on_view !== undefined
-          ? Boolean(camConfig.low_battery_wake_on_view)
-          : LOW_BAT_WAKE_ON_VIEW;
+    camConfig.low_battery_wake_on_view !== undefined
+      ? Boolean(camConfig.low_battery_wake_on_view)
+      : Boolean(baseCfg.low_battery_wake_on_view ?? false);
 
   const rawEndEarly =
-      camConfig.end_early ??
-      (mode === CAMERA_MODES.CUSTOM ? camConfig.recording_end_early : undefined) ??
-      baseCfg.end_early;
-  const letEufyDecideEnd =
-      rawEndEarly !== undefined ? Boolean(rawEndEarly) : alwaysBackfill;
+    camConfig.end_early ??
+    (mode === CAMERA_MODES.CUSTOM ? camConfig.recording_end_early : undefined) ??
+    baseCfg.end_early;
+  const letEufyDecideEnd = rawEndEarly !== undefined ? Boolean(rawEndEarly) : alwaysBackfill;
 
   return Object.freeze({
     mode,
+    rtspDirect: isRtspDirect,
     useRtsp,
     alwaysBackfill,
     backfillDownloads,
@@ -1551,6 +1792,7 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
     eventSecs,
     earlySleepMs,
     lowBatThreshold,
+    criticalBatThreshold,
     lowBatHoldMs,
     lowBatWakeOnView,
     letEufyDecideEnd,
@@ -1563,8 +1805,8 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
  * with defensive validation against contradictory overrides.
  *
  * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
- * @param {ReturnType<typeof resolveCameraTimers>|null} [resolvedTimers=null] - Pre-resolved camera timers, if available.
- * @param {Record<string, *>} [baseCfg=rawLoadedCfg] - Global configuration object.
+ * @param {ReturnType<typeof resolveCameraTimers>|null} [resolvedTimers=null] - Pre-resolved camera timers.
+ * @param {Record<string, *>} [baseCfg=cfg] - Global configuration object.
  * @returns {{
  *   enforceQuality: boolean|number,
  *   powerWorkingMode: number|null,
@@ -1573,15 +1815,25 @@ function resolveCameraTimers(camConfig = {}, baseCfg = rawLoadedCfg) {
  *   recordingRetriggerInterval: number|null
  * }}
  */
-function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, baseCfg = rawLoadedCfg) {
+function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, baseCfg = cfg) {
   if (camConfig && camConfig.hwRecordingConfig && Object.isFrozen(camConfig.hwRecordingConfig)) {
     return camConfig.hwRecordingConfig;
   }
+  const timers = resolvedTimers || resolveCameraTimers(camConfig, baseCfg);
+  if (timers.rtspDirect || hasDirectRtspUrl(camConfig)) {
+    return Object.freeze({
+      enforceQuality: null,
+      powerWorkingMode: null,
+      recordingClipLength: null,
+      recordingEndClipMotionStops: null,
+      recordingRetriggerInterval: null,
+    });
+  }
   const scope = CameraConfig.resolveScopeName(camConfig);
   const enforceQuality =
-      camConfig.enforce_streaming_quality !== undefined
-          ? camConfig.enforce_streaming_quality
-          : ENFORCE_QUALITY;
+    camConfig.enforce_streaming_quality !== undefined
+      ? camConfig.enforce_streaming_quality
+      : (baseCfg.enforce_streaming_quality ?? true);
 
   const syncPower = camConfig.sync_power ?? baseCfg.sync_power ?? true;
   if (syncPower === false) {
@@ -1594,49 +1846,47 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
     });
   }
 
-  const timers = resolvedTimers || resolveCameraTimers(camConfig, baseCfg);
   const defaultClipSecs = clampNum(
-      Math.round(timers.holdMs / MS_PER_SECOND),
-      MIN_RECORDING_CLIP_SECS,
-      MAX_RECORDING_CLIP_SECS,
-      DEFAULT_HOLD_SECS
+    Math.round(timers.holdMs / MS_PER_SECOND),
+    MIN_RECORDING_CLIP_SECS,
+    MAX_RECORDING_CLIP_SECS,
+    DEFAULT_HOLD_SECS
   );
 
   const explicitClipLen = camConfig.recording_clip_length ?? baseCfg.recording_clip_length;
   const explicitEndEarly = camConfig.recording_end_early ?? baseCfg.recording_end_early;
   const explicitRetrigger = camConfig.recording_retrigger_interval ?? baseCfg.recording_retrigger_interval;
   const hasExplicitClipCfg =
-      explicitClipLen !== undefined ||
-      explicitEndEarly !== undefined ||
-      explicitRetrigger !== undefined;
+    explicitClipLen !== undefined || explicitEndEarly !== undefined || explicitRetrigger !== undefined;
 
   const rawPowerMode = camConfig.power_working_mode ?? baseCfg.power_working_mode;
   let powerWorkingMode =
-      rawPowerMode !== undefined && rawPowerMode !== null && !Number.isNaN(Number(rawPowerMode))
-          ? clampNum(
-              Math.round(Number(rawPowerMode)),
-              MIN_POWER_WORKING_MODE,
-              MAX_POWER_WORKING_MODE,
-              MAX_POWER_WORKING_MODE
-          )
-          : MAX_POWER_WORKING_MODE;
+    rawPowerMode !== undefined && rawPowerMode !== null && !Number.isNaN(Number(rawPowerMode))
+      ? clampNum(
+          Math.round(Number(rawPowerMode)),
+          MIN_POWER_WORKING_MODE,
+          MAX_POWER_WORKING_MODE,
+          MAX_POWER_WORKING_MODE
+        )
+      : MAX_POWER_WORKING_MODE;
 
   if (powerWorkingMode < MAX_POWER_WORKING_MODE) {
     if (hasExplicitClipCfg) {
       log.warn(
-          scope,
-          'power_working_mode=' +
+        scope,
+        'power_working_mode=' +
           powerWorkingMode +
           ' ignores custom clip settings on Eufy firmware; promoting power_working_mode to 2 (Customize Recording)'
       );
       powerWorkingMode = MAX_POWER_WORKING_MODE;
     } else if (
-        powerWorkingMode === MIN_POWER_WORKING_MODE &&
-        (defaultClipSecs > OPTIMAL_BATTERY_MAX_CLIP_SECS || !timers.letEufyDecideEnd)
+      powerWorkingMode === MIN_POWER_WORKING_MODE &&
+      (defaultClipSecs > OPTIMAL_BATTERY_MAX_CLIP_SECS || !timers.letEufyDecideEnd)
     ) {
       log.warn(
-          scope,
-          'power_working_mode=0 (Optimal Battery Life) hardcodes 20s early-ending clips on Eufy firmware, which conflicts with hold_secs=' +
+        scope,
+        'power_working_mode=0 (Optimal Battery Life) hardcodes 20s early-ending clips on Eufy firmware, ' +
+          'which conflicts with hold_secs=' +
           defaultClipSecs +
           's / end_early=' +
           timers.letEufyDecideEnd +
@@ -1655,20 +1905,18 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
   }
 
   const recordingEndClipMotionStops =
-      explicitEndEarly !== undefined && explicitEndEarly !== null
-          ? Boolean(explicitEndEarly)
-          : timers.letEufyDecideEnd;
+    explicitEndEarly !== undefined && explicitEndEarly !== null ? Boolean(explicitEndEarly) : timers.letEufyDecideEnd;
 
   let recordingClipLength = clampNum(
-      Math.round(Number(explicitClipLen ?? defaultClipSecs)),
-      MIN_RECORDING_CLIP_SECS,
-      MAX_RECORDING_CLIP_SECS,
-      defaultClipSecs
+    Math.round(Number(explicitClipLen ?? defaultClipSecs)),
+    MIN_RECORDING_CLIP_SECS,
+    MAX_RECORDING_CLIP_SECS,
+    defaultClipSecs
   );
   if (!recordingEndClipMotionStops && explicitClipLen !== undefined && recordingClipLength < defaultClipSecs) {
     log.warn(
-        scope,
-        'recording_clip_length (' +
+      scope,
+      'recording_clip_length (' +
         recordingClipLength +
         's) is shorter than hold_secs (' +
         defaultClipSecs +
@@ -1680,10 +1928,10 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
   }
 
   const recordingRetriggerInterval = clampNum(
-      Math.round(Number(explicitRetrigger ?? DEFAULT_RETRIGGER_INTERVAL_SECS)),
-      MIN_RETRIGGER_INTERVAL_SECS,
-      MAX_RETRIGGER_INTERVAL_SECS,
-      DEFAULT_RETRIGGER_INTERVAL_SECS
+    Math.round(Number(explicitRetrigger ?? DEFAULT_RETRIGGER_INTERVAL_SECS)),
+    MIN_RETRIGGER_INTERVAL_SECS,
+    MAX_RETRIGGER_INTERVAL_SECS,
+    DEFAULT_RETRIGGER_INTERVAL_SECS
   );
 
   return Object.freeze({
@@ -1693,6 +1941,259 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
     recordingEndClipMotionStops,
     recordingRetriggerInterval,
   });
+}
+
+const RTSP_DIRECT_IGNORED_CAMERA_KEYS = Object.freeze([
+  'station_serial',
+  'priority',
+  'use_rtsp',
+  'backfill_only',
+  'backfill_enabled',
+  'hold_secs',
+  'stream_max_secs',
+  'frigate_event_secs',
+  'end_early',
+  'idle_timeout_secs',
+  'view_linger_secs',
+  'view_max_secs',
+  'low_battery_threshold',
+  'critical_battery_threshold',
+  'low_battery_hold_secs',
+  'low_battery_wake_on_view',
+  'sync_power',
+  'track_stuck_spotlight',
+  'power_working_mode',
+  'recording_clip_length',
+  'recording_end_early',
+  'recording_retrigger_interval',
+  'enforce_streaming_quality',
+  'trigger_events',
+  'startup_snapshot',
+  'telemetry',
+]);
+
+const RTSP_DIRECT_IGNORED_TOP_LEVEL_KEYS = Object.freeze([
+  'hold_secs',
+  'stream_max_secs',
+  'frigate_event_secs',
+  'end_early',
+  'idle_timeout_secs',
+  'view_linger_secs',
+  'view_max_secs',
+  'view_cooldown_secs',
+  'view_has_priority',
+  'use_rtsp',
+  'backfill_enabled',
+  'backfill_delay_secs',
+  'sync_power',
+  'track_stuck_spotlight',
+  'enforce_streaming_quality',
+  'low_battery_threshold',
+  'critical_battery_threshold',
+  'low_battery_hold_secs',
+  'low_battery_wake_on_view',
+  'telemetry_poll_secs',
+  'telemetry',
+  'forward_face_names',
+  'ring_label',
+  'trigger_events',
+  'event_priorities',
+  'startup_snapshot',
+  'instant_event_snapshot',
+  'snapshot_capture_delay_secs',
+]);
+
+const SYNC_POWER_IGNORED_CAMERA_KEYS = Object.freeze([
+  'power_working_mode',
+  'recording_clip_length',
+  'recording_end_early',
+  'recording_retrigger_interval',
+]);
+
+const CARD_NONE_IGNORED_KEYS = Object.freeze(['card_position', 'card_show_on_live', 'telemetry']);
+const TELEMETRY_SUB_KEYS = Object.freeze(['battery', 'power_source', 'wifi', 'rssi', 'temperature', 'last_seen']);
+const MINIMAL_IGNORED_TELEMETRY_KEYS = Object.freeze(['temperature', 'last_seen']);
+
+/**
+ * Logs startup warnings when explicitly specified per-camera mode, transport, timer, or Power Manager
+ * options are ignored due to direct rtsp_url, the resolved camera mode, or sync_power=false.
+ *
+ * @param {Record<string, *>} rawCam - Original un-normalized camera configuration object.
+ * @param {{ timers: ReturnType<typeof resolveCameraTimers>, scope: string }} ctx - Resolved timers and scope.
+ * @param {Record<string, *>} [baseCfg=rawLoadedCfg] - Global configuration object.
+ */
+function warnIgnoredCameraModeOptions(rawCam, {timers, scope}, baseCfg = rawLoadedCfg) {
+  if (!rawCam || typeof rawCam !== 'object') return;
+  if (timers.rtspDirect) {
+    const ignored = RTSP_DIRECT_IGNORED_CAMERA_KEYS.filter((key) => rawCam[key] !== undefined);
+    if (ignored.length > 0) {
+      log.warn(
+        scope,
+        'ignoring ' +
+          ignored.join(', ') +
+          ' when rtsp_url is set (direct RTSP streams continuously without Eufy WS or session timeouts)'
+      );
+    }
+    return;
+  }
+  if (rawCam.backfill_only !== undefined && timers.mode !== CAMERA_MODES.CUSTOM) {
+    log.warn(
+      scope,
+      'ignoring backfill_only=' +
+        rawCam.backfill_only +
+        ' in mode="' +
+        timers.mode +
+        '" (backfill_only only applies in mode="custom")'
+    );
+  }
+  if (
+    rawCam.use_rtsp !== undefined &&
+    (timers.mode === CAMERA_MODES.RTSP || timers.mode === CAMERA_MODES.P2P) &&
+    Boolean(rawCam.use_rtsp) !== timers.useRtsp
+  ) {
+    log.warn(scope, 'ignoring use_rtsp=' + rawCam.use_rtsp + ' in mode="' + timers.mode + '"');
+  }
+  if (rawCam.idle_timeout_secs !== undefined && Number(rawCam.idle_timeout_secs) > 0 && timers.alwaysBackfill) {
+    log.warn(
+      scope,
+      'ignoring idle_timeout_secs=' +
+        rawCam.idle_timeout_secs +
+        ' in backfill-only mode (motion events replay clips instead of starting live streams)'
+    );
+  }
+  if ((rawCam.sync_power ?? baseCfg.sync_power ?? true) === false) {
+    const ignoredPower = SYNC_POWER_IGNORED_CAMERA_KEYS.filter(
+      (key) =>
+        rawCam[key] !== undefined &&
+        !(key === 'recording_end_early' && timers.mode === CAMERA_MODES.CUSTOM && rawCam.end_early === undefined)
+    );
+    if (ignoredPower.length > 0) {
+      log.warn(scope, 'ignoring ' + ignoredPower.join(', ') + ' because sync_power=false');
+    }
+  }
+}
+
+/**
+ * Logs startup warnings when explicitly specified per-camera status card, telemetry, or
+ * startup_snapshot options are ignored due to card_theme, card_position, or sleep_screen.
+ *
+ * @param {Record<string, *>} rawCam - Original un-normalized camera configuration object.
+ * @param {{
+ *   timers: ReturnType<typeof resolveCameraTimers>,
+ *   cardConfig: ReturnType<typeof resolveCardConfig>,
+ *   scope: string
+ * }} ctx - Resolved camera timers, cardConfig, and scope.
+ */
+function warnIgnoredCameraCardOptions(rawCam, {timers, cardConfig, scope}) {
+  if (!rawCam || typeof rawCam !== 'object') return;
+  if (cardConfig.theme === CARD_THEMES.NONE) {
+    const ignoredCard = CARD_NONE_IGNORED_KEYS.filter(
+      (key) => rawCam[key] !== undefined && !(timers.rtspDirect && key === 'telemetry')
+    );
+    if (ignoredCard.length > 0) {
+      log.warn(scope, 'ignoring ' + ignoredCard.join(', ') + ' when card_theme="none"');
+    }
+  } else {
+    if (
+      cardConfig.position === CARD_POSITIONS.CENTER &&
+      cardConfig.theme !== CARD_THEMES.HUD &&
+      rawCam.card_show_on_live === true
+    ) {
+      log.warn(
+        scope,
+        'ignoring card_show_on_live=true when card_position="center" (centered status cards only render while sleeping)'
+      );
+    }
+    const rawTel = !timers.rtspDirect ? rawCam.telemetry : null;
+    if (rawTel && typeof rawTel === 'object') {
+      if (rawTel.enabled === false) {
+        const ignoredTel = TELEMETRY_SUB_KEYS.filter((key) => rawTel[key] === true).map((key) => 'telemetry.' + key);
+        if (ignoredTel.length > 0) {
+          log.warn(scope, 'ignoring ' + ignoredTel.join(', ') + ' because telemetry.enabled=false');
+        }
+      } else if (cardConfig.theme === CARD_THEMES.MINIMAL) {
+        const ignoredMinTel = MINIMAL_IGNORED_TELEMETRY_KEYS.filter((key) => rawTel[key] === true).map(
+          (key) => 'telemetry.' + key
+        );
+        if (ignoredMinTel.length > 0) {
+          log.warn(scope, 'ignoring ' + ignoredMinTel.join(', ') + ' when card_theme="minimal"');
+        }
+      }
+    }
+  }
+  if (!timers.rtspDirect && cardConfig.sleepScreen !== SLEEP_SCREENS.SNAPSHOT && Boolean(rawCam.startup_snapshot)) {
+    log.warn(
+      scope,
+      'ignoring startup_snapshot=' + rawCam.startup_snapshot + ' when sleep_screen="' + cardConfig.sleepScreen + '"'
+    );
+  }
+}
+
+/**
+ * Logs startup warnings when explicitly specified top-level bridge configuration or environment
+ * options are ignored due to BRIDGE_HWACCEL mode, global card/sleep settings, or all cameras
+ * specifying direct rtsp_url.
+ *
+ * @param {Record<string, *>} rawCfg - Raw top-level configuration object.
+ * @param {string} hwMode - Normalized hardware acceleration mode.
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ */
+function warnIgnoredTopLevelOptions(rawCfg, hwMode, env = process.env) {
+  if (!rawCfg || typeof rawCfg !== 'object') return;
+  const cams = Array.isArray(rawCfg.cameras) ? rawCfg.cameras : [];
+  const explicitHwDevice = readEnvString(env, 'BRIDGE_HWACCEL_DEVICE');
+  if (explicitHwDevice && hwMode !== HWACCEL_MODES.VAAPI && hwMode !== HWACCEL_MODES.QSV) {
+    log.warn(
+      'bridge',
+      'ignoring BRIDGE_HWACCEL_DEVICE="' +
+        explicitHwDevice +
+        '" because BRIDGE_HWACCEL is ' +
+        (hwMode ? '"' + hwMode + '"' : 'disabled')
+    );
+  }
+  const allDirect = cams.length > 0 && cams.every((cam) => hasDirectRtspUrl(cam));
+  if (allDirect) {
+    const ignoredDirect = RTSP_DIRECT_IGNORED_TOP_LEVEL_KEYS.filter(
+      (key) => rawCfg[key] !== undefined && rawCfg[key] !== ''
+    );
+    if (ignoredDirect.length > 0) {
+      log.warn('bridge', 'ignoring ' + ignoredDirect.join(', ') + ' because all cameras specify rtsp_url');
+    }
+  }
+  if (rawCfg.card_theme !== undefined && normalizeCardTheme(rawCfg.card_theme) === CARD_THEMES.NONE) {
+    const anyVisibleCamCard = cams.some(
+      (cam) => cam && cam.card_theme !== undefined && normalizeCardTheme(cam.card_theme) !== CARD_THEMES.NONE
+    );
+    if (!anyVisibleCamCard) {
+      const ignoredTopCard = CARD_NONE_IGNORED_KEYS.filter(
+        (key) => rawCfg[key] !== undefined && !(allDirect && key === 'telemetry')
+      );
+      if (ignoredTopCard.length > 0) {
+        log.warn('bridge', 'ignoring ' + ignoredTopCard.join(', ') + ' when card_theme="none"');
+      }
+    }
+  }
+  if (
+    !allDirect &&
+    rawCfg.sleep_screen !== undefined &&
+    normalizeSleepScreen(rawCfg.sleep_screen) !== SLEEP_SCREENS.SNAPSHOT &&
+    Boolean(rawCfg.startup_snapshot)
+  ) {
+    const anySnapshotCam = cams.some(
+      (cam) =>
+        cam && cam.sleep_screen !== undefined && normalizeSleepScreen(cam.sleep_screen) === SLEEP_SCREENS.SNAPSHOT
+    );
+    if (!anySnapshotCam) {
+      log.warn(
+        'bridge',
+        'ignoring startup_snapshot=' +
+          rawCfg.startup_snapshot +
+          ' when sleep_screen="' +
+          normalizeSleepScreen(rawCfg.sleep_screen) +
+          '"'
+      );
+    }
+  }
 }
 
 /**
@@ -1708,51 +2209,47 @@ function resolveCameraConfig(camConfig = {}, baseCfg = rawLoadedCfg) {
   if (CameraConfig.isResolved(camConfig)) {
     return /** @type {Readonly<CameraConfig & Record<string, *>>} */ (camConfig);
   }
-  const {serial, name} = CameraConfig.normalizeIdentity(camConfig);
+  const {serial, name, explicitSerial} = CameraConfig.normalizeIdentity(camConfig);
   const title = camConfig.title ? String(camConfig.title) : '';
   const stationSerial = camConfig.station_serial ? String(camConfig.station_serial) : '';
-  const rtspUrl = camConfig.homebase_rtsp_url ? String(camConfig.homebase_rtsp_url) : '';
+  const rtspUrl = stripRtspUrlFragment(camConfig.rtsp_url);
   /** @type {Record<string, *>} */
-  const normalizedCam = {...camConfig, serial, name, title, station_serial: stationSerial, homebase_rtsp_url: rtspUrl};
+  const normalizedCam = {
+    ...camConfig,
+    serial,
+    explicitSerial,
+    name,
+    title,
+    station_serial: stationSerial,
+    rtsp_url: rtspUrl,
+  };
 
   const timers = resolveCameraTimers(normalizedCam, baseCfg);
-  const triggers = resolveCameraTriggers(
-      normalizedCam,
-      baseCfg.triggers instanceof Set ? baseCfg.triggers : TRIGGERS
-  );
+  const triggers = resolveCameraTriggers(normalizedCam, baseCfg.triggers instanceof Set ? baseCfg.triggers : TRIGGERS);
   const cardConfig = resolveCardConfig(normalizedCam, baseCfg);
   const telemetryConfig = resolveTelemetryConfig(normalizedCam, baseCfg);
   const hwRecordingConfig = resolveHardwareRecordingConfig(normalizedCam, timers, baseCfg);
+  const scope = CameraConfig.resolveScopeName(normalizedCam);
+  warnIgnoredCameraModeOptions(camConfig, {timers, scope}, baseCfg);
+  warnIgnoredCameraCardOptions(camConfig, {timers, cardConfig, scope});
 
   return Object.freeze(
-      new CameraConfig({
-        ...normalizedCam,
-        priority: clampNum(
-            normalizedCam.priority,
-            MIN_CAMERA_PRIORITY,
-            MAX_CAMERA_PRIORITY,
-            DEFAULT_CAMERA_PRIORITY
-        ),
-        preserveAspect: Boolean(
-            normalizedCam.preserve_aspect_ratio ?? baseCfg.preserve_aspect_ratio ?? GLOBAL_PRESERVE_ASPECT
-        ),
-        autoFrigateMask: Boolean(
-            normalizedCam.auto_frigate_mask ?? baseCfg.auto_frigate_mask ?? GLOBAL_AUTO_FRIGATE_MASK
-        ),
-        cardShowOnLive: Boolean(
-            normalizedCam.card_show_on_live ?? baseCfg.card_show_on_live ?? GLOBAL_CARD_SHOW_ON_LIVE
-        ),
-        trackStuckSpotlight: Boolean(
-            normalizedCam.track_stuck_spotlight ?? baseCfg.track_stuck_spotlight ?? TRACK_STUCK_SPOTLIGHT
-        ),
-        startupSnapshot:
-            normalizedCam.startup_snapshot ?? baseCfg.startup_snapshot ?? GLOBAL_STARTUP_SNAPSHOT,
-        timers,
-        triggers,
-        cardConfig,
-        telemetryConfig,
-        hwRecordingConfig,
-      })
+    new CameraConfig({
+      ...normalizedCam,
+      priority: clampNum(normalizedCam.priority, MIN_CAMERA_PRIORITY, MAX_CAMERA_PRIORITY, DEFAULT_CAMERA_PRIORITY),
+      preserveAspect: Boolean(normalizedCam.preserve_aspect_ratio ?? baseCfg.preserve_aspect_ratio ?? true),
+      autoFrigateMask: Boolean(normalizedCam.auto_frigate_mask ?? baseCfg.auto_frigate_mask ?? true),
+      cardShowOnLive: Boolean(normalizedCam.card_show_on_live ?? baseCfg.card_show_on_live ?? true),
+      trackStuckSpotlight: Boolean(
+        normalizedCam.track_stuck_spotlight ?? baseCfg.track_stuck_spotlight ?? DEFAULT_TRACK_STUCK_SPOTLIGHT
+      ),
+      startupSnapshot: timers.rtspDirect ? false : (normalizedCam.startup_snapshot ?? baseCfg.startup_snapshot ?? true),
+      timers,
+      triggers,
+      cardConfig,
+      telemetryConfig,
+      hwRecordingConfig,
+    })
   );
 }
 
@@ -1762,16 +2259,31 @@ function resolveCameraConfig(camConfig = {}, baseCfg = rawLoadedCfg) {
  */
 class BridgeConfigBuilder {
   /**
-   * @param {Record<string, *>} rawCfg - Raw parsed configuration object.
+   * @param {Record<string, *>} rawCfg - Raw parsed YAML configuration object.
+   * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
    */
-  constructor(rawCfg) {
+  constructor(rawCfg, env = process.env) {
     const cloned = {
       ...rawCfg,
-      cameras: Array.isArray(rawCfg.cameras) ? rawCfg.cameras.map((c) => ({...c})) : [],
+      cameras: Array.isArray(rawCfg.cameras)
+        ? rawCfg.cameras.map((c) => {
+            const copy = {...c};
+            if (c && typeof c === 'object' && EXPLICIT_SERIAL_SYM in c) {
+              Object.defineProperty(copy, EXPLICIT_SERIAL_SYM, {
+                value: c[EXPLICIT_SERIAL_SYM],
+                enumerable: false,
+                configurable: true,
+              });
+            }
+            return copy;
+          })
+        : [],
     };
     validateConfig(cloned);
     /** @type {Record<string, *>} */
     this._raw = cloned;
+    /** @type {Record<string, string|undefined>} */
+    this._env = env;
     /** @type {Record<string, *>} */
     this._built = {...cloned};
     this._hasEndpoints = false;
@@ -1782,37 +2294,30 @@ class BridgeConfigBuilder {
   }
 
   /**
-   * Resolves and normalizes network endpoints and HTTP server settings.
+   * Resolves and normalizes external service endpoints and HTTP server settings from env.
    *
    * @returns {this}
    */
   withEndpoints() {
-    const frigateUrl = normalizeBaseHttpUrl(this._raw.frigate_url);
-    const go2rtcUrl = this._raw.go2rtc_url
-        ? normalizeBaseHttpUrl(this._raw.go2rtc_url)
-        : deriveGo2rtcUrl(frigateUrl);
-    const rtspOutputUrl = normalizeRtspOutputUrl(
-        this._raw.rtsp_output_url,
-        go2rtcUrl,
-        frigateUrl
-    );
-    this._built.eufy_security_ws_url = String(this._raw.eufy_security_ws_url).trim();
-    this._built.frigate_url = frigateUrl;
-    this._built.go2rtc_url = go2rtcUrl;
-    this._built.rtsp_output_url = rtspOutputUrl;
-    this._built.ha_webhook_url = this._raw.ha_webhook_url ? String(this._raw.ha_webhook_url).trim() : '';
-    this._built.http_port = clampNum(
-        this._raw.http_port ?? process.env.HTTP_PORT,
-        0,
-        65535,
-        8080
-    );
+    const endpoints = resolveServiceEndpoints(this._env);
+    const runtimeEnv = resolveRuntimeEnv(this._env);
+    const allDirect =
+      Array.isArray(this._raw.cameras) &&
+      this._raw.cameras.length > 0 &&
+      this._raw.cameras.every((cam) => hasDirectRtspUrl(cam));
+
+    this._built.eufy_security_ws_url = allDirect ? '' : endpoints.eufy_security_ws_url;
+    this._built.frigate_url = endpoints.frigate_url;
+    this._built.go2rtc_url = endpoints.go2rtc_url;
+    this._built.rtsp_publish_url = endpoints.rtsp_publish_url;
+    this._built.ha_webhook_url = endpoints.ha_webhook_url;
+    this._built.http_port = runtimeEnv.httpPort;
     this._hasEndpoints = true;
     return this;
   }
 
   /**
-   * Resolves video dimensions, frame rates, audio parameters, and hardware acceleration.
+   * Resolves video dimensions, frame rates, audio parameters, and hardware acceleration from env.
    *
    * @returns {this}
    */
@@ -1820,18 +2325,16 @@ class BridgeConfigBuilder {
     const width = clampNum(this._raw.width, 320, 3840, 1280) & ~1;
     const height = clampNum(this._raw.height, 240, 2160, 720) & ~1;
     const {liveFps, idleFps} = resolveFrameRates(this._raw);
-    const hwMode = parseHwaccelMode(this._raw.hwaccel);
-    const hwDevice = this._raw.hwaccel_device || '/dev/dri/renderD128';
-    const activeHwaccel = resolveHwaccel(hwMode, hwDevice);
+    const runtimeEnv = resolveRuntimeEnv(this._env);
+    const activeHwaccel = resolveHwaccel(runtimeEnv.hwaccelMode, runtimeEnv.hwaccelDevice);
 
     this._built.width = width;
     this._built.height = height;
-    this._built.frameBytes = (width * height * 3) / 2;
     this._built.live_fps = liveFps;
     this._built.idle_fps = idleFps;
     this._built.audio = this._raw.audio !== false;
     this._built.preserve_aspect_ratio = this._raw.preserve_aspect_ratio !== false;
-    this._built.hwaccel_device = hwDevice;
+    this._built.hwaccel_device = runtimeEnv.hwaccelDevice;
     this._built.activeHwaccel = activeHwaccel;
     this._hasVideoAndAudio = true;
     return this;
@@ -1843,11 +2346,18 @@ class BridgeConfigBuilder {
    * @returns {this}
    */
   withTimersAndArbitration() {
-    const maxMs = clampNum(this._raw.stream_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) * MS_PER_SECOND;
-    const viewMaxMs = clampNum(this._raw.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND;
-    const lingerMs = Math.min(viewMaxMs, clampNum(this._raw.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * MS_PER_SECOND);
+    const maxMs =
+      clampNum(this._raw.stream_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_MAX_SECS) * MS_PER_SECOND;
+    const viewMaxMs =
+      clampNum(this._raw.view_max_secs, MIN_SESSION_MAX_SECS, MAX_SESSION_MAX_SECS, DEFAULT_VIEW_MAX_SECS) *
+      MS_PER_SECOND;
+    const lingerMs = Math.min(
+      viewMaxMs,
+      clampNum(this._raw.view_linger_secs, MIN_HOLD_SECS, MAX_HOLD_SECS, DEFAULT_LINGER_SECS) * MS_PER_SECOND
+    );
     const cooldownMs = clampNum(this._raw.view_cooldown_secs, 0, MAX_EVENT_SECS, 5) * MS_PER_SECOND;
-    const snapDelayMs = clampNum(this._raw.snapshot_capture_delay_secs, 0, MAX_RETRIGGER_INTERVAL_SECS, 3) * MS_PER_SECOND;
+    const snapDelayMs =
+      clampNum(this._raw.snapshot_capture_delay_secs, 0, MAX_RETRIGGER_INTERVAL_SECS, 3) * MS_PER_SECOND;
 
     this._built.maxMs = maxMs;
     this._built.viewMaxMs = viewMaxMs;
@@ -1857,15 +2367,27 @@ class BridgeConfigBuilder {
     this._built.view_has_priority = this._raw.view_has_priority !== false;
     this._built.use_rtsp = this._raw.use_rtsp !== false;
     this._built.backfill_enabled = this._raw.backfill_enabled !== false;
-    this._built.backfillDelayMs = clampNum(this._raw.backfill_delay_secs, 2, MAX_RECORDING_CLIP_SECS, DEFAULT_BACKFILL_DELAY_SECS) * MS_PER_SECOND;
+    this._built.backfillDelayMs =
+      clampNum(this._raw.backfill_delay_secs, 2, MAX_RECORDING_CLIP_SECS, DEFAULT_BACKFILL_DELAY_SECS) * MS_PER_SECOND;
     this._built.instant_event_snapshot = this._raw.instant_event_snapshot !== false;
-    this._built.earlySleepMs = clampNum(this._raw.idle_timeout_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) * MS_PER_SECOND;
-    this._built.low_battery_threshold = clampNum(this._raw.low_battery_threshold, MIN_LOW_BAT_THRESHOLD_PCT, MAX_LOW_BAT_THRESHOLD_PCT, DEFAULT_LOW_BAT_THRESHOLD_PCT);
-    this._built.lowBatHoldMs = clampNum(this._raw.low_battery_hold_secs, MIN_LOW_BAT_HOLD_SECS, MAX_LOW_BAT_HOLD_SECS, DEFAULT_LOW_BAT_HOLD_SECS) * MS_PER_SECOND;
+    this._built.earlySleepMs =
+      clampNum(this._raw.idle_timeout_secs, MIN_EARLY_SLEEP_SECS, MAX_EARLY_SLEEP_SECS, DEFAULT_EARLY_SLEEP_SECS) *
+      MS_PER_SECOND;
+    const {lowBatThreshold, criticalBatThreshold} = resolveBatteryThresholds(this._raw);
+    this._built.low_battery_threshold = lowBatThreshold;
+    this._built.critical_battery_threshold = criticalBatThreshold;
+    this._built.lowBatHoldMs =
+      clampNum(
+        this._raw.low_battery_hold_secs,
+        MIN_LOW_BAT_HOLD_SECS,
+        MAX_LOW_BAT_HOLD_SECS,
+        DEFAULT_LOW_BAT_HOLD_SECS
+      ) * MS_PER_SECOND;
     this._built.low_battery_wake_on_view = Boolean(this._raw.low_battery_wake_on_view ?? false);
     this._built.track_stuck_spotlight = Boolean(this._raw.track_stuck_spotlight ?? DEFAULT_TRACK_STUCK_SPOTLIGHT);
     this._built.enforce_streaming_quality = this._raw.enforce_streaming_quality ?? true;
-    this._built.telemetryPollMs = clampNum(this._raw.telemetry_poll_secs, 0, MAX_HOLD_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND;
+    this._built.telemetryPollMs =
+      clampNum(this._raw.telemetry_poll_secs, 0, MAX_HOLD_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND;
     this._built.startup_snapshot = this._raw.startup_snapshot !== undefined ? this._raw.startup_snapshot : true;
     this._hasTimers = true;
     return this;
@@ -1877,16 +2399,17 @@ class BridgeConfigBuilder {
    * @returns {this}
    */
   withEventsAndOverlays() {
+    const runtimeEnv = resolveRuntimeEnv(this._env);
     this._built.ring_label = this._raw.ring_label || 'person';
     this._built.forward_face_names = this._raw.forward_face_names !== false;
     this._built.auto_frigate_mask = this._raw.auto_frigate_mask !== false;
     this._built.card_show_on_live = this._raw.card_show_on_live !== false;
     this._built.triggers = buildTriggerSet(this._raw.trigger_events);
     this._built.event_priorities =
-        this._raw.event_priorities && typeof this._raw.event_priorities === 'object'
-            ? Object.freeze({...this._raw.event_priorities})
-            : null;
-    this._built.cache_dir = resolveCacheDir(this._raw.cache_dir);
+      this._raw.event_priorities && typeof this._raw.event_priorities === 'object'
+        ? Object.freeze({...this._raw.event_priorities})
+        : null;
+    this._built.cache_dir = resolveCacheDir(runtimeEnv.cacheDir);
     this._hasEventsAndOverlays = true;
     return this;
   }
@@ -1900,9 +2423,7 @@ class BridgeConfigBuilder {
     if (!this._hasEventsAndOverlays) {
       this.withEventsAndOverlays();
     }
-    this._built.cameras = Object.freeze(
-        this._raw.cameras.map((cam) => resolveCameraConfig(cam, this._built))
-    );
+    this._built.cameras = Object.freeze(this._raw.cameras.map((cam) => resolveCameraConfig(cam, this._built)));
     this._hasCameras = true;
     return this;
   }
@@ -1918,23 +2439,61 @@ class BridgeConfigBuilder {
     if (!this._hasTimers) this.withTimersAndArbitration();
     if (!this._hasEventsAndOverlays) this.withEventsAndOverlays();
     if (!this._hasCameras) this.withCameras();
+    const runtimeEnv = resolveRuntimeEnv(this._env);
+    warnIgnoredTopLevelOptions(this._raw, runtimeEnv.hwaccelMode, this._env);
     return Object.freeze({...this._built});
   }
 }
 
-const cfg = new BridgeConfigBuilder(rawLoadedCfg)
-    .withEndpoints()
-    .withVideoAndAudio()
-    .withTimersAndArbitration()
-    .withEventsAndOverlays()
-    .withCameras()
-    .build();
+const cfg = new BridgeConfigBuilder(rawLoadedCfg, process.env)
+  .withEndpoints()
+  .withVideoAndAudio()
+  .withTimersAndArbitration()
+  .withEventsAndOverlays()
+  .withCameras()
+  .build();
+
+const COOLDOWN_MS = cfg.cooldownMs;
+const SNAP_DELAY_MS = cfg.snapDelayMs;
+const FORWARD_FACE_NAMES = cfg.forward_face_names;
+const PREEMPT_EVENT_STREAMS = cfg.view_has_priority;
+const BACKFILL_DELAY_MS = cfg.backfillDelayMs;
+const GLOBAL_AUTO_FRIGATE_MASK = cfg.auto_frigate_mask;
+const GLOBAL_CARD_SHOW_ON_LIVE = cfg.card_show_on_live;
+const INSTANT_EVENT_SNAPSHOT = cfg.instant_event_snapshot;
+const LOW_BAT_THRESHOLD = cfg.low_battery_threshold;
+const CRITICAL_BAT_THRESHOLD = cfg.critical_battery_threshold;
+const TELEMETRY_POLL_MS = cfg.telemetryPollMs;
+const HTTP_PORT = cfg.http_port;
+const HWACCEL_DEVICE = cfg.hwaccel_device;
+const ACTIVE_HWACCEL = cfg.activeHwaccel;
+const W = cfg.width;
+const H = cfg.height;
+const FRAME = (W * H * 3) / 2;
+const LIVE_FPS = cfg.live_fps;
+const IDLE_FPS = cfg.idle_fps;
+const AUDIO = cfg.audio;
+
+/** @type {Array<[string, string]>} */
+const LABELS = [
+  ['person', 'person'],
+  ['loitering', 'person'],
+  ['ring', cfg.ring_label],
+  ['package', 'package'],
+  ['vehicle', 'car'],
+  ['dog', 'dog'],
+  ['pet', 'dog'],
+];
+const TRIGGERS = cfg.triggers;
+const CACHE_DIR = cfg.cache_dir;
 
 module.exports = {
   cfg,
   BRIDGE_VERSION,
   BRIDGE_COMMIT,
   resolveBuildInfo,
+  resolveServiceEndpoints,
+  resolveConfigFilePath,
   PROCESS_SIGNALS,
   CARD_THEMES,
   CARD_POSITIONS,
@@ -1959,6 +2518,7 @@ module.exports = {
   GLOBAL_CARD_SHOW_ON_LIVE,
   INSTANT_EVENT_SNAPSHOT,
   LOW_BAT_THRESHOLD,
+  CRITICAL_BAT_THRESHOLD,
   TELEMETRY_POLL_MS,
   HTTP_PORT,
   HWACCEL_DEVICE,
@@ -1973,6 +2533,7 @@ module.exports = {
   AUDIO_TICK,
   AUDIO_CHUNK,
   SILENCE,
+  COLOR_WHITE,
   COLOR_RED,
   COLOR_GREY,
   COLOR_GREEN,
@@ -1990,6 +2551,9 @@ module.exports = {
   CACHE_DIR,
   getEventPriority,
   validateConfig,
+  stripRtspUrlFragment,
+  expandConfigEnvVars,
+  loadConfigFile,
   normalizeCardPosition,
   normalizeCardTheme,
   normalizeSleepScreen,

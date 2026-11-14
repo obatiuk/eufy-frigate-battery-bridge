@@ -1,9 +1,11 @@
 .idea/
+.tmp/
 .venv/
 node_modules/
-package-lock.json
 *.iml
 *.log
 config.json
+config.yaml
 deploy/config.json
+deploy/config.yaml
 cache/

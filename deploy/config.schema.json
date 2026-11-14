@@ -1,631 +1,600 @@
 {
-	"$schema": "http://json-schema.org/draft-07/schema#",
-	"$id": "https://raw.githubusercontent.com/obatiuk/eufy-frigate-battery-bridge/main/deploy/config.schema.json",
-	"title": "Eufy Battery Camera Bridge for Frigate Configuration",
-	"description": "Configuration schema for eufy-frigate-battery-bridge (config.json).",
-	"type": "object",
-	"required": ["eufy_security_ws_url", "frigate_url", "cameras"],
-	"additionalProperties": false,
-	"properties": {
-		"$schema": {
-			"type": "string",
-			"description": "JSON Schema URI or relative file path for IDE validation and autocompletion."
-		},
-		"eufy_security_ws_url": {
-			"type": "string",
-			"pattern": "^wss?://.+",
-			"description": "WebSocket URL of your eufy-security-ws container (e.g. ws://eufy-security-ws:3000)."
-		},
-		"frigate_url": {
-			"type": "string",
-			"pattern": "^https?://.+",
-			"description": "Frigate HTTP base URL (e.g. http://frigate:5000); also used to auto-derive go2rtc_url and rtsp_output_url when omitted."
-		},
-		"go2rtc_url": {
-			"type": "string",
-			"pattern": "^https?://.+",
-			"default": "http://<frigate-host>:1984",
-			"description": "go2rtc HTTP base URL (auto-derived from frigate_url on port 1984 when omitted; set only if go2rtc runs on a custom host or port)."
-		},
-		"rtsp_output_url": {
-			"type": "string",
-			"pattern": "^rtsps?://.+",
-			"default": "rtsp://<frigate-host>:8554/{name}",
-			"description": "RTSP publish URL or template (auto-derived from go2rtc_url or frigate_url on port 8554; appends /{name} automatically if omitted)."
-		},
-		"ha_webhook_url": {
-			"type": "string",
-			"pattern": "^(https?://.+)?$",
-			"description": "Optional Home Assistant webhook URL for instant trigger and Frigate event snapshot notifications."
-		},
-		"http_port": {
-			"type": "integer",
-			"minimum": 0,
-			"maximum": 65535,
-			"default": 8080,
-			"description": "Port for the built-in HTTP server (/healthz, /api/config, and POST /api/wake/:cameras). Set to 0 to disable."
-		},
-		"log_level": {
-			"type": "string",
-			"enum": ["info", "debug", "warn", "warning", "error"],
-			"default": "info",
-			"description": "Minimum log severity level."
-		},
-		"width": {
-			"type": "integer",
-			"minimum": 320,
-			"maximum": 3840,
-			"multipleOf": 2,
-			"default": 1280,
-			"description": "Output RTSP stream width in pixels (even integer)."
-		},
-		"height": {
-			"type": "integer",
-			"minimum": 240,
-			"maximum": 2160,
-			"multipleOf": 2,
-			"default": 720,
-			"description": "Output RTSP stream height in pixels (even integer)."
-		},
-		"live_fps": {
-			"type": "integer",
-			"minimum": 5,
-			"maximum": 60,
-			"default": 15,
-			"description": "Output frame rate while a camera is streaming live or replaying a recorded clip."
-		},
-		"idle_fps": {
-			"type": "integer",
-			"minimum": 1,
-			"maximum": 30,
-			"default": 5,
-			"description": "Output frame rate while a camera is asleep (match Frigate's detect.fps)."
-		},
-		"audio": {
-			"type": "boolean",
-			"default": true,
-			"description": "Include camera audio in the output RTSP stream."
-		},
-		"hwaccel": {
-			"oneOf": [
-				{
-					"type": "boolean"
-				},
-				{
-					"type": "string",
-					"enum": ["vaapi", "qsv", "nvenc", "v4l2m2m", "none", ""]
-				}
-			],
-			"default": false,
-			"description": "GPU video encoding mode (false, true for \"vaapi\", \"vaapi\", \"qsv\", \"nvenc\", or \"v4l2m2m\"). Automatically falls back to CPU encoding if unavailable."
-		},
-		"hwaccel_device": {
-			"type": "string",
-			"default": "/dev/dri/renderD128",
-			"description": "GPU render node device path when hwaccel is \"vaapi\" or \"qsv\"."
-		},
-		"cache_dir": {
-			"type": "string",
-			"default": "/config/cache",
-			"description": "Folder where clean JPEG camera snapshots are saved across restarts."
-		},
-		"card_theme": {
-			"$ref": "#/definitions/cardTheme"
-		},
-		"card_position": {
-			"$ref": "#/definitions/cardPosition"
-		},
-		"sleep_screen": {
-			"$ref": "#/definitions/sleepScreen"
-		},
-		"card_show_on_live": {
-			"$ref": "#/definitions/cardShowOnLive"
-		},
-		"auto_frigate_mask": {
-			"$ref": "#/definitions/autoFrigateMask"
-		},
-		"preserve_aspect_ratio": {
-			"$ref": "#/definitions/preserveAspectRatio"
-		},
-		"startup_snapshot": {
-			"$ref": "#/definitions/startupSnapshot"
-		},
-		"instant_event_snapshot": {
-			"type": "boolean",
-			"default": true,
-			"description": "Create Frigate events after 1s of live video and use a clean cached snapshot if a wake times out."
-		},
-		"snapshot_capture_delay_secs": {
-			"type": "number",
-			"minimum": 0,
-			"maximum": 60,
-			"default": 3,
-			"description": "Maximum seconds of live video to wait before creating a Frigate event when instant_event_snapshot is false."
-		},
-		"hold_secs": {
-			"$ref": "#/definitions/holdSecs"
-		},
-		"stream_max_secs": {
-			"$ref": "#/definitions/streamMaxSecs"
-		},
-		"frigate_event_secs": {
-			"$ref": "#/definitions/frigateEventSecs"
-		},
-		"end_early": {
-			"$ref": "#/definitions/endEarly"
-		},
-		"idle_timeout_secs": {
-			"$ref": "#/definitions/idleTimeoutSecs"
-		},
-		"view_linger_secs": {
-			"$ref": "#/definitions/viewLingerSecs"
-		},
-		"view_max_secs": {
-			"$ref": "#/definitions/viewMaxSecs"
-		},
-		"view_cooldown_secs": {
-			"type": "number",
-			"minimum": 0,
-			"maximum": 3600,
-			"default": 5,
-			"description": "Short pause in seconds after a camera goes to sleep before a new viewer connection can re-wake it."
-		},
-		"view_has_priority": {
-			"type": "boolean",
-			"default": true,
-			"description": "Allow a human Frigate Live View or newer equal-priority motion event to take over an active P2P stream on the same HomeBase."
-		},
-		"use_rtsp": {
-			"$ref": "#/definitions/useRtsp"
-		},
-		"backfill_enabled": {
-			"$ref": "#/definitions/backfillEnabled"
-		},
-		"backfill_only": {
-			"$ref": "#/definitions/backfillOnly"
-		},
-		"backfill_delay_secs": {
-			"type": "number",
-			"minimum": 2,
-			"maximum": 120,
-			"default": 2,
-			"description": "Wait time in seconds after a HomeBase P2P stream finishes before downloading a recorded clip."
-		},
-		"sync_power": {
-			"$ref": "#/definitions/syncPower"
-		},
-		"track_stuck_spotlight": {
-			"$ref": "#/definitions/trackStuckSpotlight"
-		},
-		"enforce_streaming_quality": {
-			"$ref": "#/definitions/enforceStreamingQuality"
-		},
-		"low_battery_threshold": {
-			"$ref": "#/definitions/lowBatteryThreshold"
-		},
-		"low_battery_hold_secs": {
-			"$ref": "#/definitions/lowBatteryHoldSecs"
-		},
-		"low_battery_wake_on_view": {
-			"$ref": "#/definitions/lowBatteryWakeOnView"
-		},
-		"telemetry_poll_secs": {
-			"type": "integer",
-			"minimum": 0,
-			"maximum": 86400,
-			"default": 300,
-			"description": "How often in seconds to refresh battery, Wi-Fi, and temperature while sleeping (0 disables)."
-		},
-		"telemetry": {
-			"$ref": "#/definitions/telemetry"
-		},
-		"forward_face_names": {
-			"type": "boolean",
-			"default": true,
-			"description": "Forward recognized person names from HomeBase 3 to Frigate sub_label and Home Assistant."
-		},
-		"ring_label": {
-			"type": "string",
-			"minLength": 1,
-			"default": "person",
-			"description": "Frigate event label used when someone rings the doorbell."
-		},
-		"trigger_events": {
-			"$ref": "#/definitions/triggerEvents"
-		},
-		"event_priorities": {
-			"type": "object",
-			"additionalProperties": {
-				"type": "number"
-			},
-			"description": "Priority boost per event type (e.g. {\"ring\": 1000, \"identity person\": 300, \"person\": 200, \"motion\": 10})."
-		},
-		"cameras": {
-			"type": "array",
-			"minItems": 1,
-			"items": {
-				"$ref": "#/definitions/camera"
-			},
-			"description": "List of Eufy cameras and video doorbells managed by the bridge."
-		}
-	},
-	"definitions": {
-		"cardTheme": {
-			"type": "string",
-			"enum": ["icons", "minimal", "detailed", "debug", "none"],
-			"default": "icons",
-			"description": "Status card visual theme (\"icons\", \"minimal\", \"detailed\", \"debug\", or \"none\")."
-		},
-		"cardPosition": {
-			"type": "string",
-			"enum": ["bottom-left", "top-left", "top-right", "bottom-right", "center"],
-			"default": "bottom-left",
-			"description": "Placement of the status card on the video frame."
-		},
-		"sleepScreen": {
-			"type": "string",
-			"enum": ["snapshot", "slate", "black"],
-			"default": "snapshot",
-			"description": "Sleeping background screen (\"snapshot\" for last camera frame, \"slate\" for dark gray, or \"black\")."
-		},
-		"cardShowOnLive": {
-			"type": "boolean",
-			"default": true,
-			"description": "Keep the corner status card visible (Red live/replay indicator) during active streams."
-		},
-		"autoFrigateMask": {
-			"type": "boolean",
-			"default": true,
-			"description": "Automatically mask the corner status card in Frigate so status changes never trigger motion."
-		},
-		"preserveAspectRatio": {
-			"type": "boolean",
-			"default": true,
-			"description": "Keep native camera proportions (such as 4:3 or portrait doorbells) with dark sidebars."
-		},
-		"startupSnapshot": {
-			"oneOf": [
-				{
-					"type": "boolean"
-				},
-				{
-					"type": "string",
-					"enum": ["always"]
-				}
-			],
-			"default": true,
-			"description": "Briefly wake a camera on startup if no saved snapshot exists (\"always\" refreshes on every restart)."
-		},
-		"holdSecs": {
-			"type": "number",
-			"minimum": 5,
-			"maximum": 86400,
-			"default": 60,
-			"description": "Recording and event duration in seconds (default 60s, or 30s in \"backfill\" mode; automatically syncs to the Eufy camera, the bridge, and Frigate)."
-		},
-		"streamMaxSecs": {
-			"type": "number",
-			"minimum": 10,
-			"maximum": 86400,
-			"default": 900,
-			"description": "Maximum continuous live session length in seconds (default 900s / 15m) when motion keeps re-triggering."
-		},
-		"frigateEventSecs": {
-			"type": "number",
-			"minimum": 1,
-			"maximum": 3600,
-			"default": 60,
-			"description": "Frigate event duration in seconds (defaults to matching hold_secs: 60s, or 30s in \"backfill\" mode)."
-		},
-		"endEarly": {
-			"type": "boolean",
-			"default": false,
-			"description": "Stop recording early as soon as motion clears (default false, or true in \"backfill\" mode)."
-		},
-		"idleTimeoutSecs": {
-			"type": "number",
-			"minimum": 0,
-			"maximum": 3600,
-			"default": 0,
-			"description": "Optional battery saver: close motion streams early once Frigate sees 0 active objects for N seconds (0 disables)."
-		},
-		"viewLingerSecs": {
-			"type": "number",
-			"minimum": 5,
-			"maximum": 86400,
-			"default": 20,
-			"description": "How long in seconds to stay live after you close Frigate Live View."
-		},
-		"viewMaxSecs": {
-			"type": "number",
-			"minimum": 10,
-			"maximum": 86400,
-			"default": 300,
-			"description": "Maximum duration in seconds for a manual Live View session (default 300s / 5m)."
-		},
-		"useRtsp": {
-			"type": "boolean",
-			"default": true,
-			"description": "Use HomeBase native RTSP (true) or P2P (false)."
-		},
-		"backfillEnabled": {
-			"type": "boolean",
-			"default": true,
-			"description": "Replay recorded clips from HomeBase 3 when a P2P stream is busy or in \"backfill\" mode (set false on HomeBase 2)."
-		},
-		"backfillOnly": {
-			"type": "boolean",
-			"default": false,
-			"description": "Use clip-replay backfill mode on events without waking a live stream."
-		},
-		"syncPower": {
-			"type": "boolean",
-			"default": true,
-			"description": "Automatically sync Eufy Power Manager settings on startup (false leaves camera settings untouched)."
-		},
-		"trackStuckSpotlight": {
-			"type": "boolean",
-			"default": false,
-			"description": "Experimental: monitor idle cameras for a spotlight left stuck on (>130s after activity) and turn it off (light=false). Disabled by default while detection is refined."
-		},
-		"enforceStreamingQuality": {
-			"oneOf": [
-				{
-					"type": "boolean"
-				},
-				{
-					"type": "integer",
-					"minimum": 1,
-					"maximum": 10
-				}
-			],
-			"default": true,
-			"description": "Set P2P streaming quality to 7 (1280x720) so P2P streams start quickly and do not stall at 4K (or specify an integer 1..10)."
-		},
-		"lowBatteryThreshold": {
-			"type": "integer",
-			"minimum": 0,
-			"maximum": 100,
-			"default": 20,
-			"description": "Battery percentage at or below which unplugged cameras enter Low-Battery Saver Mode (0 disables)."
-		},
-		"lowBatteryHoldSecs": {
-			"type": "number",
-			"minimum": 5,
-			"maximum": 3600,
-			"default": 20,
-			"description": "Shorter recording duration in seconds when a camera is in Low-Battery Saver Mode."
-		},
-		"lowBatteryWakeOnView": {
-			"type": "boolean",
-			"default": false,
-			"description": "Allow manual Frigate Live View to wake a camera while its battery is low."
-		},
-		"telemetry": {
-			"oneOf": [
-				{
-					"type": "boolean"
-				},
-				{
-					"type": "object",
-					"additionalProperties": false,
-					"properties": {
-						"enabled": {
-							"type": "boolean",
-							"default": true
-						},
-						"battery": {
-							"type": "boolean",
-							"default": true
-						},
-						"power_source": {
-							"type": "boolean",
-							"default": true
-						},
-						"wifi": {
-							"type": "boolean",
-							"default": true
-						},
-						"rssi": {
-							"type": "boolean",
-							"default": true
-						},
-						"temperature": {
-							"type": "boolean",
-							"default": true
-						},
-						"last_seen": {
-							"type": "boolean",
-							"default": true
-						}
-					}
-				}
-			],
-			"default": true,
-			"description": "Show or hide specific status card telemetry items."
-		},
-		"triggerEvents": {
-			"type": "array",
-			"minItems": 1,
-			"items": {
-				"type": "string",
-				"enum": [
-					"motion",
-					"radar",
-					"person",
-					"identity person",
-					"stranger",
-					"loitering",
-					"package",
-					"pet",
-					"dog",
-					"vehicle",
-					"sound",
-					"crying",
-					"ring",
-					"rings",
-					"ringing",
-					"motion detected",
-					"radar motion detected",
-					"person detected",
-					"someone loitering",
-					"package delivered",
-					"package stranded",
-					"package taken",
-					"pet detected",
-					"vehicle detected",
-					"dog detected",
-					"dog lick detected",
-					"dog poop detected",
-					"stranger person detected",
-					"identity person detected",
-					"sound detected",
-					"crying detected"
-				]
-			},
-			"description": "Event types that wake or backfill cameras."
-		},
-		"camera": {
-			"type": "object",
-			"required": ["serial"],
-			"additionalProperties": false,
-			"properties": {
-				"serial": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Camera serial number from the Eufy app (e.g. SN0000000001)."
-				},
-				"name": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Camera name in Frigate (defaults to serial when omitted)."
-				},
-				"title": {
-					"type": "string",
-					"description": "Friendly display name for logs, notifications, and the \"detailed\" card theme (defaults to the camera's name in the Eufy app)."
-				},
-				"mode": {
-					"type": "string",
-					"enum": ["auto", "rtsp", "backfill", "p2p", "custom"],
-					"default": "auto",
-					"description": "Camera operating mode (\"auto\", \"rtsp\", \"backfill\", \"p2p\", or \"custom\")."
-				},
-				"station_serial": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Explicit HomeBase station serial number for multi-station P2P setups (auto-discovered when omitted)."
-				},
-				"homebase_rtsp_url": {
-					"type": "string",
-					"pattern": "^rtsps?://.+",
-					"description": "Custom HomeBase RTSP stream URL override if not discovered automatically from eufy-security-ws."
-				},
-				"priority": {
-					"type": "integer",
-					"minimum": -10000,
-					"maximum": 10000,
-					"default": 0,
-					"description": "Priority when two P2P cameras trigger at the same time (higher number wins)."
-				},
-				"use_rtsp": {
-					"$ref": "#/definitions/useRtsp"
-				},
-				"backfill_only": {
-					"$ref": "#/definitions/backfillOnly"
-				},
-				"backfill_enabled": {
-					"$ref": "#/definitions/backfillEnabled"
-				},
-				"hold_secs": {
-					"$ref": "#/definitions/holdSecs"
-				},
-				"stream_max_secs": {
-					"$ref": "#/definitions/streamMaxSecs"
-				},
-				"frigate_event_secs": {
-					"$ref": "#/definitions/frigateEventSecs"
-				},
-				"end_early": {
-					"$ref": "#/definitions/endEarly"
-				},
-				"idle_timeout_secs": {
-					"$ref": "#/definitions/idleTimeoutSecs"
-				},
-				"view_linger_secs": {
-					"$ref": "#/definitions/viewLingerSecs"
-				},
-				"view_max_secs": {
-					"$ref": "#/definitions/viewMaxSecs"
-				},
-				"low_battery_threshold": {
-					"$ref": "#/definitions/lowBatteryThreshold"
-				},
-				"low_battery_hold_secs": {
-					"$ref": "#/definitions/lowBatteryHoldSecs"
-				},
-				"low_battery_wake_on_view": {
-					"$ref": "#/definitions/lowBatteryWakeOnView"
-				},
-				"sync_power": {
-					"$ref": "#/definitions/syncPower"
-				},
-				"track_stuck_spotlight": {
-					"$ref": "#/definitions/trackStuckSpotlight"
-				},
-				"power_working_mode": {
-					"type": "integer",
-					"enum": [0, 1, 2],
-					"default": 2,
-					"description": "Eufy Power Manager mode (0 = Optimal Battery Life, 1 = Optimal Surveillance, 2 = Customize Recording)."
-				},
-				"recording_clip_length": {
-					"type": "integer",
-					"minimum": 5,
-					"maximum": 120,
-					"description": "Camera hardware clip length in seconds (defaults to matching hold_secs)."
-				},
-				"recording_end_early": {
-					"type": "boolean",
-					"description": "Camera hardware setting to stop recording early when motion stops (defaults to matching end_early)."
-				},
-				"recording_retrigger_interval": {
-					"type": "integer",
-					"minimum": 0,
-					"maximum": 60,
-					"default": 5,
-					"description": "Minimum pause in seconds between camera hardware motion triggers."
-				},
-				"enforce_streaming_quality": {
-					"$ref": "#/definitions/enforceStreamingQuality"
-				},
-				"trigger_events": {
-					"$ref": "#/definitions/triggerEvents"
-				},
-				"card_theme": {
-					"$ref": "#/definitions/cardTheme"
-				},
-				"card_position": {
-					"$ref": "#/definitions/cardPosition"
-				},
-				"sleep_screen": {
-					"$ref": "#/definitions/sleepScreen"
-				},
-				"card_show_on_live": {
-					"$ref": "#/definitions/cardShowOnLive"
-				},
-				"auto_frigate_mask": {
-					"$ref": "#/definitions/autoFrigateMask"
-				},
-				"preserve_aspect_ratio": {
-					"$ref": "#/definitions/preserveAspectRatio"
-				},
-				"startup_snapshot": {
-					"$ref": "#/definitions/startupSnapshot"
-				},
-				"telemetry": {
-					"$ref": "#/definitions/telemetry"
-				}
-			}
-		}
-	}
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/obatiuk/eufy-frigate-battery-bridge/main/deploy/config.schema.json",
+  "title": "Eufy Battery Camera Bridge for Frigate Configuration",
+  "description": "Configuration schema for eufy-frigate-battery-bridge (config.yaml).",
+  "type": "object",
+  "required": ["cameras"],
+  "additionalProperties": false,
+  "properties": {
+    "width": {
+      "type": "integer",
+      "minimum": 320,
+      "maximum": 3840,
+      "multipleOf": 2,
+      "default": 1280,
+      "description": "Output RTSP stream width in pixels (even integer)."
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 240,
+      "maximum": 2160,
+      "multipleOf": 2,
+      "default": 720,
+      "description": "Output RTSP stream height in pixels (even integer)."
+    },
+    "live_fps": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 60,
+      "default": 15,
+      "description": "Output frame rate while a camera is streaming live or replaying a recorded clip."
+    },
+    "idle_fps": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30,
+      "default": 5,
+      "description": "Output frame rate while a camera is asleep (match Frigate's detect.fps)."
+    },
+    "audio": {
+      "type": "boolean",
+      "default": true,
+      "description": "Include camera audio in the output RTSP stream."
+    },
+    "card_theme": {
+      "$ref": "#/definitions/cardTheme"
+    },
+    "card_position": {
+      "$ref": "#/definitions/cardPosition"
+    },
+    "sleep_screen": {
+      "$ref": "#/definitions/sleepScreen"
+    },
+    "card_show_on_live": {
+      "$ref": "#/definitions/cardShowOnLive"
+    },
+    "auto_frigate_mask": {
+      "$ref": "#/definitions/autoFrigateMask"
+    },
+    "preserve_aspect_ratio": {
+      "$ref": "#/definitions/preserveAspectRatio"
+    },
+    "startup_snapshot": {
+      "$ref": "#/definitions/startupSnapshot"
+    },
+    "instant_event_snapshot": {
+      "type": "boolean",
+      "default": true,
+      "description": "Create Frigate events after 1s of live video and use a clean cached snapshot if a wake times out."
+    },
+    "snapshot_capture_delay_secs": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 60,
+      "default": 3,
+      "description": "Maximum seconds of live video to wait before creating a Frigate event when instant_event_snapshot is false."
+    },
+    "hold_secs": {
+      "$ref": "#/definitions/holdSecs"
+    },
+    "stream_max_secs": {
+      "$ref": "#/definitions/streamMaxSecs"
+    },
+    "frigate_event_secs": {
+      "$ref": "#/definitions/frigateEventSecs"
+    },
+    "end_early": {
+      "$ref": "#/definitions/endEarly"
+    },
+    "idle_timeout_secs": {
+      "$ref": "#/definitions/idleTimeoutSecs"
+    },
+    "view_linger_secs": {
+      "$ref": "#/definitions/viewLingerSecs"
+    },
+    "view_max_secs": {
+      "$ref": "#/definitions/viewMaxSecs"
+    },
+    "view_cooldown_secs": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 3600,
+      "default": 5,
+      "description": "Short pause in seconds after a camera goes to sleep before a new viewer connection can re-wake it."
+    },
+    "view_has_priority": {
+      "type": "boolean",
+      "default": true,
+      "description": "Allow a human Frigate Live View or newer equal-priority motion event to take over an active P2P stream on the same HomeBase."
+    },
+    "use_rtsp": {
+      "$ref": "#/definitions/useRtsp"
+    },
+    "backfill_enabled": {
+      "$ref": "#/definitions/backfillEnabled"
+    },
+    "backfill_delay_secs": {
+      "type": "number",
+      "minimum": 2,
+      "maximum": 120,
+      "default": 2,
+      "description": "Wait time in seconds after a HomeBase P2P stream finishes before downloading a recorded clip."
+    },
+    "sync_power": {
+      "$ref": "#/definitions/syncPower"
+    },
+    "track_stuck_spotlight": {
+      "$ref": "#/definitions/trackStuckSpotlight"
+    },
+    "enforce_streaming_quality": {
+      "$ref": "#/definitions/enforceStreamingQuality"
+    },
+    "low_battery_threshold": {
+      "$ref": "#/definitions/lowBatteryThreshold"
+    },
+    "critical_battery_threshold": {
+      "$ref": "#/definitions/criticalBatteryThreshold"
+    },
+    "low_battery_hold_secs": {
+      "$ref": "#/definitions/lowBatteryHoldSecs"
+    },
+    "low_battery_wake_on_view": {
+      "$ref": "#/definitions/lowBatteryWakeOnView"
+    },
+    "telemetry_poll_secs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400,
+      "default": 300,
+      "description": "How often in seconds to refresh battery, Wi-Fi, and temperature while sleeping (0 disables)."
+    },
+    "telemetry": {
+      "$ref": "#/definitions/telemetry"
+    },
+    "forward_face_names": {
+      "type": "boolean",
+      "default": true,
+      "description": "Forward recognized person names from HomeBase 3 to Frigate sub_label and Home Assistant."
+    },
+    "ring_label": {
+      "type": "string",
+      "minLength": 1,
+      "default": "person",
+      "description": "Frigate event label used when someone rings the doorbell."
+    },
+    "trigger_events": {
+      "$ref": "#/definitions/triggerEvents"
+    },
+    "event_priorities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      },
+      "description": "Priority boost per event type (e.g. {\"ring\": 1000, \"identity person\": 300, \"person\": 200, \"motion\": 10})."
+    },
+    "cameras": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/camera"
+      },
+      "description": "List of Eufy cameras and video doorbells managed by the bridge."
+    }
+  },
+  "definitions": {
+    "cardTheme": {
+      "type": "string",
+      "enum": ["glance", "minimal", "pebbles", "hud", "none"],
+      "default": "minimal",
+      "description": "Status card visual theme (\"minimal\", \"glance\", \"pebbles\", \"hud\", or \"none\")."
+    },
+    "cardPosition": {
+      "type": "string",
+      "enum": ["bottom-left", "bottom-center", "bottom-right", "top-left", "top-center", "top-right", "center"],
+      "default": "bottom-left",
+      "description": "Placement of the status card on the video frame."
+    },
+    "sleepScreen": {
+      "type": "string",
+      "enum": ["snapshot", "slate", "black"],
+      "default": "snapshot",
+      "description": "Sleeping background screen (\"snapshot\" for last camera frame, \"slate\" for dark gray, or \"black\")."
+    },
+    "cardShowOnLive": {
+      "type": "boolean",
+      "default": true,
+      "description": "Keep the corner status card visible (Red live/replay indicator) during active streams."
+    },
+    "autoFrigateMask": {
+      "type": "boolean",
+      "default": true,
+      "description": "Automatically mask the corner status card in Frigate so status changes never trigger motion."
+    },
+    "preserveAspectRatio": {
+      "type": "boolean",
+      "default": true,
+      "description": "Keep native camera proportions (such as 4:3 or portrait doorbells) with dark sidebars."
+    },
+    "startupSnapshot": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string",
+          "enum": ["always"]
+        }
+      ],
+      "default": true,
+      "description": "Briefly wake a camera on startup if no saved snapshot exists (\"always\" refreshes on every restart)."
+    },
+    "holdSecs": {
+      "type": "number",
+      "minimum": 5,
+      "maximum": 86400,
+      "default": 60,
+      "description": "Recording and event duration in seconds (default 60s, or 30s in \"backfill\" mode; automatically syncs to the Eufy camera, the bridge, and Frigate)."
+    },
+    "streamMaxSecs": {
+      "type": "number",
+      "minimum": 10,
+      "maximum": 86400,
+      "default": 900,
+      "description": "Maximum continuous live session length in seconds (default 900s / 15m) when motion keeps re-triggering."
+    },
+    "frigateEventSecs": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 3600,
+      "default": 60,
+      "description": "Frigate event duration in seconds (defaults to matching hold_secs: 60s, or 30s in \"backfill\" mode)."
+    },
+    "endEarly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Stop recording early as soon as motion clears (default false, or true in \"backfill\" mode)."
+    },
+    "idleTimeoutSecs": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 3600,
+      "default": 0,
+      "description": "Optional battery saver: close motion streams early once Frigate sees 0 active objects for N seconds (0 disables)."
+    },
+    "viewLingerSecs": {
+      "type": "number",
+      "minimum": 5,
+      "maximum": 86400,
+      "default": 20,
+      "description": "How long in seconds to stay live after you close Frigate Live View."
+    },
+    "viewMaxSecs": {
+      "type": "number",
+      "minimum": 10,
+      "maximum": 86400,
+      "default": 300,
+      "description": "Maximum duration in seconds for a manual Live View session (default 300s / 5m)."
+    },
+    "useRtsp": {
+      "type": "boolean",
+      "default": true,
+      "description": "Use HomeBase native RTSP (true) or P2P (false)."
+    },
+    "backfillEnabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Replay recorded clips from HomeBase 3 when a P2P stream is busy or in \"backfill\" mode (set false on HomeBase 2)."
+    },
+    "backfillOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Use clip-replay backfill mode on events without waking a live stream (requires mode: \"custom\")."
+    },
+    "syncPower": {
+      "type": "boolean",
+      "default": true,
+      "description": "Automatically sync Eufy Power Manager settings on startup (false leaves camera settings untouched)."
+    },
+    "trackStuckSpotlight": {
+      "type": "boolean",
+      "default": false,
+      "description": "Experimental: monitor idle cameras for a spotlight left stuck on (>130s after activity) and turn it off (light=false). Disabled by default while detection is refined."
+    },
+    "enforceStreamingQuality": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        }
+      ],
+      "default": true,
+      "description": "Set P2P streaming quality to 7 (1280x720) so P2P streams start quickly and do not stall at 4K (or specify an integer 1..10)."
+    },
+    "lowBatteryThreshold": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 99,
+      "default": 30,
+      "description": "Battery percentage at or below which unplugged cameras enter Low-Battery Saver Mode (2..99, must be greater than critical_battery_threshold)."
+    },
+    "criticalBatteryThreshold": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 98,
+      "default": 5,
+      "description": "Battery percentage at or below which unplugged cameras show a critical purple battery indicator (1..98, must be lower than low_battery_threshold)."
+    },
+    "lowBatteryHoldSecs": {
+      "type": "number",
+      "minimum": 5,
+      "maximum": 3600,
+      "default": 20,
+      "description": "Shorter recording duration in seconds when a camera is in Low-Battery Saver Mode."
+    },
+    "lowBatteryWakeOnView": {
+      "type": "boolean",
+      "default": false,
+      "description": "Allow manual Frigate Live View to wake a camera while its battery is low."
+    },
+    "telemetry": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "battery": {
+              "type": "boolean",
+              "default": true
+            },
+            "power_source": {
+              "type": "boolean",
+              "default": true
+            },
+            "wifi": {
+              "type": "boolean",
+              "default": true
+            },
+            "rssi": {
+              "type": "boolean",
+              "default": true
+            },
+            "temperature": {
+              "type": "boolean",
+              "default": false
+            },
+            "last_seen": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      ],
+      "default": true,
+      "description": "Show or hide specific status card telemetry items."
+    },
+    "triggerEvents": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "motion",
+          "radar",
+          "person",
+          "identity person",
+          "stranger",
+          "loitering",
+          "package",
+          "pet",
+          "dog",
+          "vehicle",
+          "sound",
+          "crying",
+          "ring",
+          "rings",
+          "ringing",
+          "motion detected",
+          "radar motion detected",
+          "person detected",
+          "someone loitering",
+          "package delivered",
+          "package stranded",
+          "package taken",
+          "pet detected",
+          "vehicle detected",
+          "dog detected",
+          "dog lick detected",
+          "dog poop detected",
+          "stranger person detected",
+          "identity person detected",
+          "sound detected",
+          "crying detected"
+        ]
+      },
+      "description": "Event types that wake or backfill cameras."
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "if": {
+        "required": ["rtsp_url"]
+      },
+      "then": {
+        "allOf": [
+          {
+            "properties": {
+              "mode": {
+                "enum": ["auto", "rtsp"]
+              }
+            }
+          },
+          {
+            "anyOf": [
+              {
+                "required": ["serial"]
+              },
+              {
+                "required": ["name"]
+              }
+            ]
+          }
+        ]
+      },
+      "else": {
+        "required": ["serial"]
+      },
+      "properties": {
+        "serial": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Camera serial number from the Eufy app (e.g. SN0000000001; optional when rtsp_url and name are set)."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Camera name in Frigate (defaults to serial when omitted)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Friendly display name for logs and notifications (defaults to the camera's name in the Eufy app)."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["auto", "rtsp", "backfill", "p2p", "custom"],
+          "default": "auto",
+          "description": "Camera operating mode (\"auto\", \"rtsp\", \"backfill\", \"p2p\", or \"custom\")."
+        },
+        "station_serial": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Explicit HomeBase station serial number for multi-station P2P setups (auto-discovered when omitted)."
+        },
+        "rtsp_url": {
+          "type": "string",
+          "pattern": "^(?:\\$\\{[^}]+\\}|rtsps?://.+)$",
+          "description": "Direct camera RTSP stream URL (for standalone/non-HomeBase RTSP cameras; bypasses eufy-security-ws completely)."
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": -10000,
+          "maximum": 10000,
+          "default": 0,
+          "description": "Priority when two P2P cameras trigger at the same time (higher number wins)."
+        },
+        "use_rtsp": {
+          "$ref": "#/definitions/useRtsp"
+        },
+        "backfill_only": {
+          "$ref": "#/definitions/backfillOnly"
+        },
+        "backfill_enabled": {
+          "$ref": "#/definitions/backfillEnabled"
+        },
+        "hold_secs": {
+          "$ref": "#/definitions/holdSecs"
+        },
+        "stream_max_secs": {
+          "$ref": "#/definitions/streamMaxSecs"
+        },
+        "frigate_event_secs": {
+          "$ref": "#/definitions/frigateEventSecs"
+        },
+        "end_early": {
+          "$ref": "#/definitions/endEarly"
+        },
+        "idle_timeout_secs": {
+          "$ref": "#/definitions/idleTimeoutSecs"
+        },
+        "view_linger_secs": {
+          "$ref": "#/definitions/viewLingerSecs"
+        },
+        "view_max_secs": {
+          "$ref": "#/definitions/viewMaxSecs"
+        },
+        "low_battery_threshold": {
+          "$ref": "#/definitions/lowBatteryThreshold"
+        },
+        "critical_battery_threshold": {
+          "$ref": "#/definitions/criticalBatteryThreshold"
+        },
+        "low_battery_hold_secs": {
+          "$ref": "#/definitions/lowBatteryHoldSecs"
+        },
+        "low_battery_wake_on_view": {
+          "$ref": "#/definitions/lowBatteryWakeOnView"
+        },
+        "sync_power": {
+          "$ref": "#/definitions/syncPower"
+        },
+        "track_stuck_spotlight": {
+          "$ref": "#/definitions/trackStuckSpotlight"
+        },
+        "power_working_mode": {
+          "type": "integer",
+          "enum": [0, 1, 2],
+          "default": 2,
+          "description": "Eufy Power Manager mode (0 = Optimal Battery Life, 1 = Optimal Surveillance, 2 = Customize Recording)."
+        },
+        "recording_clip_length": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 120,
+          "description": "Camera hardware clip length in seconds (defaults to matching hold_secs)."
+        },
+        "recording_end_early": {
+          "type": "boolean",
+          "description": "Camera hardware setting to stop recording early when motion stops (defaults to matching end_early)."
+        },
+        "recording_retrigger_interval": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60,
+          "default": 5,
+          "description": "Minimum pause in seconds between camera hardware motion triggers."
+        },
+        "enforce_streaming_quality": {
+          "$ref": "#/definitions/enforceStreamingQuality"
+        },
+        "trigger_events": {
+          "$ref": "#/definitions/triggerEvents"
+        },
+        "card_theme": {
+          "$ref": "#/definitions/cardTheme"
+        },
+        "card_position": {
+          "$ref": "#/definitions/cardPosition"
+        },
+        "sleep_screen": {
+          "$ref": "#/definitions/sleepScreen"
+        },
+        "card_show_on_live": {
+          "$ref": "#/definitions/cardShowOnLive"
+        },
+        "auto_frigate_mask": {
+          "$ref": "#/definitions/autoFrigateMask"
+        },
+        "preserve_aspect_ratio": {
+          "$ref": "#/definitions/preserveAspectRatio"
+        },
+        "startup_snapshot": {
+          "$ref": "#/definitions/startupSnapshot"
+        },
+        "telemetry": {
+          "$ref": "#/definitions/telemetry"
+        }
+      }
+    }
+  }
 }

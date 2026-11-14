@@ -14,13 +14,13 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [config-modes.md](config-mo
 ├── CHANGELOG.md                       # Finished work, newest first
 ├── .github/workflows/release.yml      # GitHub Actions CI checks, :dev image on main/master, :v* + :latest on tags
 ├── .agents/skills/                    # Project skill bridge-change-workflow (procedures)
-├── docs/                              # Topic docs, ACCEPTANCE.md, REGRESSION.md, TODO.md, acceptance/, and regression/
+├── docs/                              # Topic docs, ACCEPTANCE.md, REGRESSION.md, TODO.md, acceptance/, regression/, images/
 ├── scripts/                           # check-docs.js, check-commit-msg.js, eslint.config.js, eslint-suppressions.json, tsconfig.json
 ├── deploy/
 │   ├── Dockerfile                     # Multi-stage node:22-alpine3.23 test/build -> alpine:3.23 runtime (/app/)
 │   ├── config.schema.json             # JSON Schema (Draft-07) for IDE validation & autocompletion
-│   ├── config.example.minimal.json    # Minimal configuration example
-│   ├── config.example.full.json       # Full configuration example with all options
+│   ├── config.example.minimal.yaml    # Minimal configuration example
+│   ├── config.example.full.yaml       # Full configuration example with all options
 │   └── docker-compose.example.yml     # Example Docker Compose deployment
 ├── src/
 │   ├── app.js                         # Application composition root, wiring & signal handlers
@@ -32,9 +32,9 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [config-modes.md](config-mo
 │   │   ├── telemetry.js               # Telemetry model (sensor state, Eufy parsing & 6-color rules)
 │   │   └── backfill-job.js            # BackfillJob model (.zxvideo record parser & time-window matcher)
 │   ├── overlay/
-│   │   ├── yuv-canvas.js              # Low-level YUV420p drawing, anti-aliasing & box blur
-│   │   ├── ui-glyphs.js               # Pre-baked proportional UI glyph atlas & Eufy icon alpha sprites
-│   │   ├── card-renderer.js           # Theme engines (detailed, icons, minimal, debug, none) & live overlays
+│   │   ├── yuv-canvas.js              # Low-level YUV420p drawing, crystal/HUD surfaces & box blur
+│   │   ├── ui-glyphs.js               # Embedded Lucide contour icon sprites, clock hands & minimal primitives
+│   │   ├── card-renderer.js           # Theme engines (glance, minimal, pebbles, hud, none) & live overlays
 │   │   └── snapshot-cache.js          # Persistent JPEG <-> YUV420p snapshot cache (/config/cache)
 │   ├── media/
 │   │   ├── encoder.js                 # Persistent FFmpeg RTSP encoder, drain pipe & A/V tickers
@@ -47,7 +47,7 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [config-modes.md](config-mo
 │       └── stream-orchestrator.js     # Per-station arbitration, RTSP/P2P wake, backfill & watchdog
 └── test/
     ├── reporter.js                    # Concise node:test reporter (errors or single summary line)
-    ├── acceptance.test.js             # Locked AT-01..AT-18 acceptance test suite mapping 1:1 to ACCEPTANCE.md
+    ├── acceptance.test.js             # Locked AT-01..AT-19 acceptance test suite mapping 1:1 to ACCEPTANCE.md
     ├── config.test.js                 # node:test suite for config, modes & defensive rules
     ├── domain.test.js                 # node:test suite for Camera, StatusCard, Telemetry & BackfillJob
     ├── media.test.js                  # node:test suite for encoder, decoder, NAL parser & backpressure
@@ -58,7 +58,7 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [config-modes.md](config-mo
 
 Data and dependencies flow top-down from the composition root (`src/app.js`) through `services/*` (where
 `stream-orchestrator` also calls `eufy-client` and `frigate-client`, `http-server` reads `eufy-client` readiness, and
-`frigate-client`/`app.js` call `ha-notifier`) into `media/*` and `overlay/*`, down to `domain/*`, `config.js`, and
+`frigate-client` calls `ha-notifier`) into `media/*` and `overlay/*`, down to `domain/*`, `config.js`, and
 `logger.js` with zero circular `require()` dependencies:
 
 ```text
@@ -123,16 +123,18 @@ READY_TO_QUERY`, and `-> EXPIRED` from any pre-terminal state), logging
   `WakeRequest.motion(...).build()` / `WakeRequest.view(...).build()`, and `FfmpegArgsBuilder.build()` return frozen
   (`Object.freeze`) immutable value objects.
 - **Zero-Allocation Frame & Audio Buffers:**
-  - `StatusCard` pre-allocates three `1.38 MB` (`FRAME`) YUV420p sleeping/waking card buffers (`asleep`, `waking`,
-    `busy`) plus a 2-slot `1.38 MB` `liveOverlayBufs` ring (`prepareLiveOverlayBuffer`) once on construction;
-    `renderSingleStatusCard()` and `renderCameraCards()` mutate those buffers in-place on telemetry updates.
-  - `yuv-canvas.js` reuses module-level `blurScratch`, `regionScratch`, and `bgCanvasScratch` buffers in `boxBlur2D()`,
-    `extractBlurredRegion()`, and `prepareBackgroundCanvas()`.
-  - `attachDecoderStreams()` reuses a single `1.38 MB` `buf` per decoder process; live P2P/RTSP frames alternate across
-    a 2-slot pre-allocated `cam.liveFrameRing` (`acquireNextLiveFrameSlot`), and live TCP decode bursts
-    (`cam.liveFrames`, cap `12`) plus burst backfill downloads recycle buffers through a bounded
-    `cam.downloadFramePool` (`acquireDownloadFrameBuffer`, capped at `32` buffers) so steady-state streaming and
-    backfill playback perform zero `1.38 MB` heap allocations.
+  - `StatusCard` pre-allocates `asleep` (`1.38 MB` `FRAME` YUV420p) on construction while lazy-allocating `waking` and
+    `busy` on first access (`peekWakingBuffer`, `peekBusyBuffer`) and lazy-allocating the 2-slot `1.38 MB`
+    `liveOverlayBufs` ring on first `prepareLiveOverlayBuffer()` call; `renderSingleStatusCard()` and
+    `renderCameraCards()` mutate allocated buffers in-place on telemetry updates.
+  - `yuv-canvas.js` reuses module-level `blurScratch`, `regionScratch`, and `bgCanvasScratch` buffers in
+    `boxBlurPlane()`, `extractBlurredRegion()`, and `prepareBackgroundCanvas()`.
+  - `attachDecoderStreams()` reuses a single lazily allocated `1.38 MB` `cam.decoderReadBuf`
+    (`acquireDecoderReadBuffer`) per camera across decoder restarts and standby probes; live P2P/RTSP frames alternate
+    across a lazily allocated 2-slot `cam.liveFrameRing` (`acquireNextLiveFrameSlot`), and live TCP decode bursts
+    (`cam.liveFrames`, cap `12`) plus burst backfill downloads recycle buffers through a bounded `cam.downloadFramePool`
+    (`acquireDownloadFrameBuffer`, capped at `32` buffers) so steady-state streaming and backfill playback perform zero
+    `1.38 MB` heap allocations.
   - `cam.consumeAudioChunk()` slices directly from `cam.pcm[0]` or copies into a pre-allocated `cam.audioOutBuf` in O(1)
     time without `Buffer.concat`.
 
@@ -142,6 +144,6 @@ READY_TO_QUERY`, and `-> EXPIRED` from any pre-terminal state), logging
   `3.3.2.2m_0.1`, hw `P0`)
 - **Cameras:** Eufy Video Doorbell E340 Dual (`T8214`, fw `3.2.7.2`, hw `P2`) and two eufyCam S300 (eufyCam 3C)
   (`T8161`, fw `3.4.3.0`, hw `P1`)
-- **Runtime:** Multi-stage `alpine:3.23` container under `Podman` Quadlet, using `Mesa 25.2+` (`mesa-va-gallium`),
-  `tini` as `PID 1`, non-root `node` user (`UID 1000`), `ffmpeg`, `go2rtc`, `Frigate 0.18`, and
+- **Runtime:** Multi-stage `node:22-alpine3.23` container under `Podman` Quadlet, using `Mesa 25.2+`
+  (`mesa-va-gallium`), `tini` as `PID 1`, non-root `node` user (`UID 1000`), `ffmpeg`, `go2rtc`, `Frigate 0.18`, and
   `eufy-security-ws` (API schema `21`).

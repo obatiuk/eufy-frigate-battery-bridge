@@ -3,11 +3,14 @@
     "complexity": {
       "count": 2
     },
+    "max-lines": {
+      "count": 1
+    },
     "max-params": {
-      "count": 2
+      "count": 1
     },
     "no-magic-numbers": {
-      "count": 76
+      "count": 43
     }
   },
   "src/domain/backfill-job.js": {
@@ -30,11 +33,6 @@
     },
     "no-magic-numbers": {
       "count": 22
-    }
-  },
-  "src/domain/status-card.js": {
-    "no-magic-numbers": {
-      "count": 2
     }
   },
   "src/domain/telemetry.js": {
@@ -63,17 +61,12 @@
       "count": 1
     }
   },
-  "src/overlay/card-renderer.js": {
-    "no-magic-numbers": {
-      "count": 39
-    }
-  },
   "src/overlay/yuv-canvas.js": {
     "max-params": {
-      "count": 7
+      "count": 4
     },
     "no-magic-numbers": {
-      "count": 377
+      "count": 361
     }
   },
   "src/services/eufy-client.js": {

@@ -20,7 +20,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": [
-    "../src/**/*.js"
-  ]
+  "include": ["../src/**/*.js"]
 }

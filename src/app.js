@@ -1,11 +1,8 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
- *
- * Enhanced and refactored in collaboration with Gemini (Google).
  *
  * eufy-frigate-battery-bridge: application composition root, dependency wiring,
  * signal/test hooks, and graceful shutdown lifecycle.
@@ -37,6 +34,7 @@ const {
 } = require('./services/frigate-client');
 const {
   configureEufyClientHooks,
+  ensureCameraEncodersStarted,
   connectWs,
   startTelemetryPoller,
   fetchAllCameraTelemetry,
@@ -56,8 +54,8 @@ const SIGUSR1_BACKFILL_DELAY_MS = 300;
 const SHUTDOWN_EXIT_DELAY_MS = 1500;
 const VIEWER_POLL_INTERVAL_MS = 750;
 
-let shuttingDown = false;
-const isShuttingDown = () => shuttingDown;
+let bridgeShuttingDown = false;
+const isShuttingDown = () => bridgeShuttingDown;
 
 /**
  * Instantiates all configured Camera domain objects and loads their cached snapshots.
@@ -65,10 +63,8 @@ const isShuttingDown = () => shuttingDown;
  * @returns {{ cams: Camera[], bySerial: Map<string, Camera> }}
  */
 function createCameras() {
-  const cams = cfg.cameras.map(
-      (rawCam) => new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards)
-  );
-  const bySerial = new Map(cams.map((cam) => [cam.getSerial(), cam]));
+  const cams = cfg.cameras.map((rawCam) => new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards));
+  const bySerial = new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
   return {cams, bySerial};
 }
 
@@ -92,17 +88,11 @@ function wireServices(cams, bySerial) {
     bySerial,
     isShuttingDown,
     onEvent,
-    onWsClosedStop: (cam) =>
-        stop(cam, 'bridge lost eufy-security-ws connection', false, 'error/ws-disconnect'),
+    onWsClosedStop: (cam) => stop(cam, 'bridge lost eufy-security-ws connection', false, 'error/ws-disconnect'),
     onDeviceOfflineStop: (cam) =>
-        stop(
-            cam,
-            'camera reported offline (' + cam.getOfflineReason() + ')',
-            false,
-            'error/device-offline'
-        ),
+      stop(cam, 'camera reported offline (' + cam.getOfflineReason() + ')', false, 'error/device-offline'),
     onDeviceOnlineResume: (cam) => startEncoder(cam),
-    onInitialTelemetryLoaded: () => void syncFrigateMotionMasks(cams, false, shuttingDown),
+    onInitialTelemetryLoaded: () => void syncFrigateMotionMasks(cams, false, bridgeShuttingDown),
   });
 }
 
@@ -112,7 +102,8 @@ function wireServices(cams, bySerial) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function handleSigUsr1BackfillTest(cams) {
-  const targetCam = cams.find((cam) => !cam.isRtspCapable()) || cams[cams.length - 1];
+  const eufyCams = cams.filter((cam) => !cam.isRtspDirect());
+  const targetCam = eufyCams.find((cam) => !cam.isRtspCapable()) || eufyCams[eufyCams.length - 1];
   if (!targetCam) {
     return;
   }
@@ -136,10 +127,10 @@ function handleSigUsr1BackfillTest(cams) {
  * @param {Camera[]} cams - Active camera collection.
  */
 function shutdownBridge(cams) {
-  if (shuttingDown) {
+  if (bridgeShuttingDown) {
     return;
   }
-  shuttingDown = true;
+  bridgeShuttingDown = true;
   stopHttpServer();
   log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
 
@@ -183,9 +174,7 @@ function registerSignalHandlers(cams) {
  */
 function logStartupBanner(cams) {
   const camSummary = cams.map((cam) => cam.formatStartupSummary()).join(', ');
-  const encoderDesc = ACTIVE_HWACCEL
-      ? ACTIVE_HWACCEL + ' (' + HWACCEL_DEVICE + ')'
-      : 'software (libx264)';
+  const encoderDesc = ACTIVE_HWACCEL ? ACTIVE_HWACCEL + ' (' + HWACCEL_DEVICE + ')' : 'software (libx264)';
 
   const summary = [
     'version=' + BRIDGE_VERSION + ' (' + BRIDGE_COMMIT + ')',
@@ -207,22 +196,24 @@ function logStartupBanner(cams) {
 function startServices(cams) {
   logStartupBanner(cams);
   startMediaTickers(cams);
+  ensureCameraEncodersStarted({wsConnected: false});
 
-  setInterval(() => {
+  const runViewerPollTick = () => {
     void pollViewers(cams, {
       isShuttingDown,
       fetchAllCameraTelemetry,
       stopCam: stop,
       triggerCam: trigger,
     });
-  }, VIEWER_POLL_INTERVAL_MS);
+  };
+  setInterval(runViewerPollTick, VIEWER_POLL_INTERVAL_MS);
 
   startHousekeepingLoop();
   startTelemetryPoller();
 
   startHttpServer(cams, {
     wakeCameraExternal,
-    isShuttingDown: () => shuttingDown,
+    isShuttingDown: () => bridgeShuttingDown,
   });
   connectWs();
 }

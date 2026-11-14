@@ -1,25 +1,38 @@
 # Configuration and camera modes
 
-Read when: changing `src/config.js`, `deploy/config.*.json`, camera modes, timers, Power Manager sync, or validation.
-Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-05`, `AT-10`, `AT-12`, `AT-18`), [README.md](../README.md) configuration
+Read when: changing `src/config.js`, `deploy/config.*.yaml`, camera modes, timers, Power Manager sync, or validation.
+Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-05`, `AT-10`, `AT-12`, `AT-19`), [README.md](../README.md) configuration
 reference, [config.schema.json](../deploy/config.schema.json).
 Sync targets when adding, renaming, or changing any option default or bound: `src/config.js` (top-level constants,
 `BridgeConfigBuilder`, and `resolveCameraConfig()`), [config.schema.json](../deploy/config.schema.json),
-[config.example.minimal.json](../deploy/config.example.minimal.json),
-[config.example.full.json](../deploy/config.example.full.json), and the configuration tables in
+[config.example.minimal.yaml](../deploy/config.example.minimal.yaml),
+[config.example.full.yaml](../deploy/config.example.full.yaml), and the configuration tables in
 [README.md](../README.md) (`test/config.test.js` enforces schema default parity).
 
 ## Camera Modes (`resolveCameraMode`) & Defensive Validation
 
-Each camera in `cameras[]` normalizes its identity via `CameraConfig.normalizeIdentity()` (`name` defaults to `serial`
-when omitted) and resolves its operating mode via `resolveCameraMode(camConfig)` (`validateConfig()` also auto-derives
-`go2rtc_url` and `rtsp_output_url` from `frigate_url` and migrates pure upstream legacy configs to `mode: "auto"`):
+When loading `config.yaml` from disk (`BRIDGE_CONFIG`, defaulting to `/config/config.yaml` or `./config.yaml`),
+`loadConfigFile()` parses YAML via `js-yaml`, expands `${ENV_VAR}` and `${ENV_VAR:-default}` placeholders across all
+string values via `expandConfigEnvVars()` (escaping literal `$${...}` and failing in a single pass when any required
+variable is unset or empty or any unescaped placeholder is malformed or unclosed), and validates the camera topology in
+one pass via `validateConfig()`. External service
+endpoints (`EUFY_WS_*`, `FRIGATE_*`, `GO2RTC_*`, `HA_WEBHOOK_URL`) and container runtime settings (`BRIDGE_LOG_LEVEL`,
+`BRIDGE_HTTP_PORT`, `BRIDGE_CACHE_DIR`, `BRIDGE_HWACCEL`, `BRIDGE_HWACCEL_DEVICE`, `BRIDGE_VERSION`, `BRIDGE_COMMIT`)
+are resolved exclusively from environment variables via `resolveServiceEndpoints()` and `resolveRuntimeEnv()`. Each
+camera in `cameras[]` normalizes its identity via `CameraConfig.normalizeIdentity()` (`name` defaults to `serial` when
+omitted) and resolves its operating mode via `resolveCameraMode(camConfig)`:
 
 - `"auto"` (default): Uses HomeBase native `RTSP` (`rtspStreamUrl`) when supported by the camera (unless `use_rtsp:
-false` is set), or live `P2P` otherwise, with automatic HomeBase clip backfill when busy or interrupted (`hold_secs:
-60`, `end_early: false`).
+false` is set), resolves to `"rtsp"` when explicit `rtsp_url` is configured, or uses live `P2P` otherwise, with
+  automatic HomeBase clip backfill when busy or interrupted (`hold_secs: 60`, `end_early: false`).
 - `"rtsp"`: Uses HomeBase native `RTSP` (`useRtsp: true`, `alwaysBackfill: false`, default `hold_secs: 60`,
-  `end_early: false`).
+  `end_early: false`) auto-discovered via `eufy-security-ws` `rtspStreamUrl` when `rtsp_url` is omitted. When explicit
+  `rtsp_url` (`rtsp://` or `rtsps://`) is configured on an `"rtsp"` or `"auto"` camera (for Eufy Baby cameras such as
+  Baby Monitor E20 `T8352` / E21 `T8354` or standalone `RTSP` cameras), the bridge pulls directly from `rtsp_url` and
+  never queries `eufy-security-ws` (`backfillDownloads: false`, `sync_power: false`, `telemetry` disabled with
+  `enabled: false`, `serial` optional when `name` is set, active streams flowing continuously with all
+  session/hold/idle/viewer timeouts bypassed, and `validateConfig()` rejecting `rtsp_url` combined with `"p2p"`,
+  `"backfill"`, or `"custom"`).
 - `"p2p"`: Uses live `P2P` on events (`useRtsp: false`, `alwaysBackfill: false`, default `hold_secs: 60`,
   `end_early: false`).
 - `"backfill"`: Battery-saver clip replay mode for battery doorbells and high-traffic cameras (`useRtsp: true` by
@@ -43,7 +56,8 @@ false` is set), or live `P2P` otherwise, with automatic HomeBase clip backfill w
 - `"custom"`: Advanced per-camera tuning mode enabling `backfill_only` (`alwaysBackfill: true`, inheriting `30s` hold,
   `end_early: true`, and `backfillDownloads = true` when `backfill_only: true`) and falling back to
   `recording_end_early` for bridge `end_early` when `end_early` is omitted, alongside per-camera overrides (`use_rtsp`,
-  `backfill_enabled`, `trigger_events`, `low_battery_threshold`, `low_battery_hold_secs`, `low_battery_wake_on_view`,
+  `backfill_enabled`, `trigger_events`, `low_battery_threshold`, `critical_battery_threshold`,
+  `low_battery_hold_secs`, `low_battery_wake_on_view`,
   `frigate_event_secs`, `sync_power`, `track_stuck_spotlight`, `power_working_mode`, `recording_clip_length`,
   `recording_end_early`, `recording_retrigger_interval`, `enforce_streaming_quality`). Defensive non-contradiction rules
   run across all modes:
@@ -52,8 +66,10 @@ false` is set), or live `P2P` otherwise, with automatic HomeBase clip backfill w
      (`"backfill"` or `"custom"` + `backfill_only: true`), logs a warning and keeps `backfillDownloads = true`.
      (`use_rtsp: true` and `backfill_only: true` coexist cleanly so `RTSP`-capable cameras can stream on-demand Live
      View over `RTSP` while backfilling `.zxvideo` clips on motion events.)
-  3. `stream_max_secs >= hold_secs`, `view_max_secs >= view_linger_secs` & `low_battery_hold_secs <= hold_secs`: Clamps
-     `maxMs >= holdMs`, `viewMaxMs >= lingerMs`, and `lowBatHoldMs <= holdMs` with startup warnings.
+  3. `stream_max_secs >= hold_secs`, `view_max_secs >= view_linger_secs`, `low_battery_hold_secs <= hold_secs`, &
+     `0 < critical_battery_threshold < low_battery_threshold <= 99`: Clamps `maxMs >= holdMs`, `viewMaxMs >= lingerMs`,
+     `lowBatHoldMs <= holdMs`, `lowBatThreshold` to `2..99` (default `30`), and `criticalBatThreshold` to
+     `1..min(98, lowBatThreshold - 1)` (default `5`) with startup warnings.
   4. `recording_clip_length >= hold_secs` when `!recordingEndClipMotionStops`: Raises explicit `recordingClipLength` to
      `hold_secs` (`5..120s`) so the Eufy camera hardware does not cut off the stream before `hold_secs` expires.
   5. `power_working_mode < 2` with custom clip overrides or conflicting `hold_secs`: Automatically promotes
@@ -62,6 +78,16 @@ false` is set), or live `P2P` otherwise, with automatic HomeBase clip backfill w
      (`Optimal Battery Life`, which hardcodes `20s` early-ending clips) conflicts with `hold_secs > 20` or
      `end_early: false`; preserves `1` (`Optimal Surveillance`) or compatible `0` (`hold_secs <= 20` +
      `end_early: true`) without sending conflicting clip properties.
+  6. Ignored-option startup warnings & `null`-filtered `/api/config` (`warnIgnoredCameraModeOptions`,
+     `warnIgnoredCameraCardOptions`, `warnIgnoredTopLevelOptions`, `buildConfigPayload`, `Camera.toConfigSummary`):
+     Logs a `[WARN ]` message whenever any explicitly specified top-level or per-camera option is ignored (such as
+     session timeout, Eufy WS, telemetry, backfill, or Power Manager options when `rtsp_url` is set or when all cameras
+     specify `rtsp_url`, `backfill_only` outside `"custom"` mode, `use_rtsp` when overridden by `"rtsp"`/`"p2p"` mode,
+     `idle_timeout_secs` in backfill-only mode, Power Manager clip/mode options when `sync_power: false`,
+     card/telemetry options when `card_theme: "none"`, `card_position: "center"`, `card_theme: "minimal"`, or
+     `telemetry.enabled: false`, `startup_snapshot` when `sleep_screen` is `"slate"` or `"black"`, and
+     `BRIDGE_HWACCEL_DEVICE` when `BRIDGE_HWACCEL` does not use a device node), and sets those inapplicable fields to
+     `null` in `GET /api/config`.
 
 ## Unified `hold_secs` & `end_early` Auto-Sync (`resolveCameraTimers` & `resolveHardwareRecordingConfig`)
 

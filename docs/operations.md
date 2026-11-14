@@ -17,28 +17,32 @@ Read when: you need a build, test, publish, health check, or signal-driven diagn
   acceptance tests via `.venv/node/bin/node --test --test-reporter=./test/reporter.js test/*.test.js`)
 - **Run Full Quality Gate:** `make check` (runs `deadcode`, `lint`, `docs-check`, and `test`)
 - **Build Image Locally:** `make docker-build` (runs `make check` and executes `node --test` with `test/reporter.js`
-  inside the `node:22-alpine3.23` builder stage before building the `alpine:3.23` runtime image)
+  inside the `node:22-alpine3.23` builder stage before building the minimal `alpine:3.23` Node 22 runtime image)
 - **Publish Locally:** `make publish` (builds and tags `localhost/eufy-frigate-battery-bridge:latest`; skips remote push
   when `REGISTRY` is empty)
 - **Publish Dev Image (`:dev`):**
   `make publish REGISTRY=ghcr.io/obatiuk BUILD_VERSION=dev PUBLISH_TAG=dev` (builds and pushes only `:dev` on
   `main`/`master` branch pushes without moving `:latest`)
 - **Publish Release Image (`:vX.Y.Z` + `:latest`):**
+  Update `package.json` and `package-lock.json` to `X.Y.Z` before creating tag `vX.Y.Z`, then run
   `make publish REGISTRY=ghcr.io/obatiuk` (when `BUILD_VERSION` starts with `v`, pushes both `:$(BUILD_VERSION)` and
   `:$(PUBLISH_TAG)` with `--tls-verify=$(TLS_VERIFY)`, where `PUBLISH_TAG` defaults to `latest`)
 - **Clean Images & Local Environment:** `make clean` (removes local build/publish container images, prunes cached build
-  layers labeled with `org.opencontainers.image.source`, and deletes `.venv/`, `node_modules/`, and `package-lock.json`)
+  layers labeled with `org.opencontainers.image.source`, and deletes `.tmp/`, `.venv/`, and `node_modules/`)
 - **Print Makefile Variables:** `make print-vars`
 - **Check Bridge Readiness:**
-  `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/healthz` (or
-  `curl -s http://127.0.0.1:8080/healthz` if port `8080` is published to the host)
+  `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/healthz` (`GET`/`HEAD /healthz` or `/health`;
+  or `curl -s http://127.0.0.1:8080/healthz` if port `8080` is published to the host)
 - **Check Bridge Build Version, Commit & Runtime Config:**
-  `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/config` (or
+  `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/config` (`GET`/`HEAD /api/config`; or
   `curl -s http://127.0.0.1:8080/api/config` if port `8080` is published to the host)
 - **Trigger External Camera Pre-Wake:**
-  `curl -s -X POST http://127.0.0.1:8080/api/wake/all -d '{"reason":"test","duration":30}'`
+  `curl -s -X POST http://127.0.0.1:8080/api/wake/all -d '{"reason":"test","duration":30}'` (also accepts `GET` query
+  parameters `duration`, `reason`, `create_event` on `/api/wake` or `/api/wake/:cameras`; skips direct `rtsp_url`
+  cameras with `status: "unsupported"` in `all`/mixed targets and returns `422` when targeted directly, failing
+  atomically on unknown camera tokens, malformed payloads, or disconnected/offline targets)
 - **Trigger Test Frigate Event:** `podman kill -s USR2 eufy-frigate-battery-bridge` (files a `"test"` event on the first
-  camera without waking it, and sends a `ha_webhook_url` notification if configured)
+  camera without waking it, and sends an `HA_WEBHOOK_URL` notification if configured)
 - **Trigger Test Backfill Download:** `podman kill -s USR1 eufy-frigate-battery-bridge` (picks the first non-`RTSP`
   camera, or last camera, queries `HomeBase 3`, and replays its latest `.zxvideo` clip at `live_fps` into Frigate)
 
@@ -47,11 +51,10 @@ Read when: you need a build, test, publish, health check, or signal-driven diagn
 
 ```shell
 podman exec eufy-frigate-battery-bridge node -e '
-  const fs = require("node:fs");
   const WS = require("ws");
-  const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || "/config/config.json";
-  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-  const ws = new WS(cfg.eufy_security_ws_url || cfg.eufy_ws);
+  const wsUrl = process.env.EUFY_WS_URL ||
+    ("ws://" + (process.env.EUFY_WS_HOST || "eufy-security-ws") + ":" + (process.env.EUFY_WS_PORT || "3000"));
+  const ws = new WS(wsUrl);
   let id = 0;
   let remaining = 0;
   const send = (cmd) => ws.send(JSON.stringify({ messageId: String(++id), ...cmd }));
@@ -93,10 +96,13 @@ podman exec eufy-frigate-battery-bridge node -e '
 ```shell
 podman exec eufy-frigate-battery-bridge node -e '
   const fs = require("node:fs");
+  const jsYaml = require("js-yaml");
   const WS = require("ws");
-  const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || "/config/config.json";
-  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-  const ws = new WS(cfg.eufy_security_ws_url || cfg.eufy_ws);
+  const cfgPath = process.env.BRIDGE_CONFIG || "/config/config.yaml";
+  const cfg = jsYaml.load(fs.readFileSync(cfgPath, "utf8"));
+  const wsUrl = process.env.EUFY_WS_URL ||
+    ("ws://" + (process.env.EUFY_WS_HOST || "eufy-security-ws") + ":" + (process.env.EUFY_WS_PORT || "3000"));
+  const ws = new WS(wsUrl);
   let id = 0;
   let remaining = cfg.cameras.length;
   const send = (cmd) => ws.send(JSON.stringify({ messageId: String(++id), ...cmd }));
@@ -139,11 +145,10 @@ podman exec eufy-frigate-battery-bridge node -e '
 
 ```shell
 podman exec eufy-frigate-battery-bridge node -e '
-  const fs = require("node:fs");
   const WS = require("ws");
-  const cfgPath = process.env.BRIDGE_CONFIG || process.env.CONFIG_PATH || "/config/config.json";
-  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-  const ws = new WS(cfg.eufy_security_ws_url || cfg.eufy_ws);
+  const wsUrl = process.env.EUFY_WS_URL ||
+    ("ws://" + (process.env.EUFY_WS_HOST || "eufy-security-ws") + ":" + (process.env.EUFY_WS_PORT || "3000"));
+  const ws = new WS(wsUrl);
   let id = 0;
   let remaining = 0;
   const connectIds = new Map();
@@ -181,14 +186,17 @@ podman exec eufy-frigate-battery-bridge node -e '
 
 ## Quality gates and documentation tooling
 
-- `make lint`: `eslint` on `src/` (`max-params` 3, `no-magic-numbers`, `complexity` 25, `max-lines` 1,500). Existing
-  violations are recorded in `scripts/eslint-suppressions.json`; only new ones fail.
+- `make format`: `prettier --write` (`120` columns, single quotes, 2-space indent) across `src/`, `scripts/`, `test/`,
+  `deploy/`, `package.json`, and all Markdown documentation.
+- `make lint`: `eslint` across `src/`, `scripts/`, and `test/` (`max-len` 120 everywhere, plus `max-params` 3,
+  `no-magic-numbers`, `complexity` 25, and `max-lines` 1,500 on `src/`) and `prettier --check` on code and JSON/YAML
+  files. Existing structural violations are recorded in `scripts/eslint-suppressions.json`; only new ones fail.
 - `make lint-prune`: remove suppressions that no longer occur after a cleanup. `make lint-baseline` re-records all
   current violations (use only when deliberately accepting them).
 - `make docs-check`: size budgets (`AGENTS.md` 8 KB target / 16 KB hard limit, `docs/` 20 KB each, `.agents/**/SKILL.md`
   4 KB), relative links, ASCII hyphens, 120 columns, PII redaction (`*.md` and `deploy/`), `ACCEPTANCE.md` / `AT-NN.md`
   / `test/acceptance.test.js` 1:1 & literal-assertion parity, `REGRESSION.md` parity, and `prettier --check` tables.
-- `make format-docs`: `prettier --write` for `AGENTS.md`, `CHANGELOG.md`, `docs/`, and `.agents/`.
+- `make format-docs`: `prettier --write` for `AGENTS.md`, `README.md`, `CHANGELOG.md`, `docs/`, and `.agents/`.
 - `make commit-msg-check MSG=<file>`: validate a commit message (`<= 6` bullets, `<= 8` lines total, no subject line,
   blank line + `Co-authored-by:` trailer, no Markdown escapes, no en/em-dashes, no home-directory paths).
 - `make install-hooks`: install a `commit-msg` git hook that runs the same check.

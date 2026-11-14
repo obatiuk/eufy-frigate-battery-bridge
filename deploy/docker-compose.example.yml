@@ -9,24 +9,45 @@ services:
     container_name: eufy-frigate-battery-bridge
     restart: unless-stopped
     environment:
-      # log and "Last live" overlay timestamps
-      TZ: America/New_York
+      # Local timezone for structured log lines and status card clock display
+      TZ: UTC
+      # Optional bridge runtime overrides (defaults shown)
+      # BRIDGE_CONFIG: /config/config.yaml
+      # BRIDGE_LOG_LEVEL: info
+      # BRIDGE_HTTP_PORT: 8080
+      # BRIDGE_CACHE_DIR: /config/cache
+      # Optional hardware-accelerated encoding (uncomment devices/group_add below when enabled)
+      # BRIDGE_HWACCEL: vaapi
+      # BRIDGE_HWACCEL_DEVICE: /dev/dri/renderD128
+      # External service endpoints (ports default to 3000 for EUFY_WS_PORT and 5000 for FRIGATE_PORT)
+      EUFY_WS_HOST: eufy-security-ws
+      # EUFY_WS_PORT: 3000
+      FRIGATE_HOST: frigate
+      # FRIGATE_PORT: 5000
+      # go2rtc defaults to FRIGATE_HOST on :1984 (API) and :8554 (RTSP); set only when standalone or authenticated
+      # GO2RTC_HOST: go2rtc
+      # GO2RTC_API_PORT: 1984
+      # GO2RTC_RTSP_PORT: 8554
+      # GO2RTC_RTSP_USER: ${GO2RTC_RTSP_USER}
+      # GO2RTC_RTSP_PASSWORD: ${GO2RTC_RTSP_PASSWORD}
+      # HA_WEBHOOK_URL: http://homeassistant:8123/api/webhook/eufy_frigate_bridge
     ports:
-      - "127.0.0.1:8080:8080"
+      - '127.0.0.1:8080:8080'
     volumes:
-      - ./config.json:/config/config.json:ro
-      # persists last camera frames across container restarts
+      - ./config.yaml:/config/config.yaml:ro
+      # Persists last camera frames across container restarts
       - ./cache:/config/cache
-    # Optional: uncomment below to enable hardware-accelerated encoding ("hwaccel": "vaapi" or "qsv")
+    # Optional: uncomment below to enable hardware-accelerated encoding (BRIDGE_HWACCEL=vaapi or qsv)
     # devices:
     #   - /dev/dri:/dev/dri
     # group_add:
     #   - "video"
     #   - "render"
-    # Must reach Frigate's go2rtc (API :1984, RTSP :8554) and Frigate's API (:5000) by name.
+    # Attach to the container network shared with eufy-security-ws and Frigate/go2rtc
     networks:
-      - frigate
+      - frigate_net
 
 networks:
-  frigate:
+  frigate_net:
+    name: frigate_default
     external: true

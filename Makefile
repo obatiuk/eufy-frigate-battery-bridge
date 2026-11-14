@@ -11,7 +11,6 @@ SHELL := /bin/bash
 
 MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
 PROJECT_ROOT := $(realpath $(dir $(MKFILE_PATH)))
-SRC_FILE := $(PROJECT_ROOT)/src/app.js
 DOCKERFILE := $(PROJECT_ROOT)/deploy/Dockerfile
 
 DOCKER ?= /usr/bin/podman
@@ -40,6 +39,8 @@ NODE_DIST := node-v$(NODE_VERSION)-$(HOST_OS)-$(HOST_ARCH)
 NODE_URL := https://nodejs.org/dist/v$(NODE_VERSION)/$(NODE_DIST).tar.xz
 
 VENV_DIR := $(PROJECT_ROOT)/.venv
+TMP_DIR := $(PROJECT_ROOT)/.tmp
+TEST_CACHE_DIR := $(TMP_DIR)/cache
 NODE_DIR := $(VENV_DIR)/node
 NODE_BIN := $(NODE_DIR)/bin/node
 NPM_BIN := $(NODE_DIR)/bin/npm
@@ -47,7 +48,10 @@ TSC_BIN := $(VENV_DIR)/node_modules/.bin/tsc
 KNIP_BIN := $(VENV_DIR)/node_modules/.bin/knip
 ESLINT_BIN := $(VENV_DIR)/node_modules/.bin/eslint
 PRETTIER_BIN := $(VENV_DIR)/node_modules/.bin/prettier
-DOC_PATHS := AGENTS.md CHANGELOG.md docs .agents
+CODE_PATHS := src scripts test deploy package.json
+DOC_PATHS := AGENTS.md README.md CHANGELOG.md docs .agents
+LINT_PATHS := "$(PROJECT_ROOT)/src" "$(PROJECT_ROOT)/scripts" "$(PROJECT_ROOT)/test"
+PRETTIER_FLAGS := --ignore-path "$(PROJECT_ROOT)/.gitignore" --ignore-unknown
 MSG ?=
 NPM_CACHE_DIR := $(VENV_DIR)/npm-cache
 NPM_USERCONFIG := $(VENV_DIR)/npmrc
@@ -61,6 +65,8 @@ ESLINT_ARGS := --config "$(ESLINT_CONFIG)" --suppressions-location "$(ESLINT_SUP
 LOCAL_ENV := \
 	PATH="$(NODE_DIR)/bin:$$PATH" \
 	HOME="$(VENV_HOME)" \
+	TMPDIR="$(TMP_DIR)" \
+	BRIDGE_CACHE_DIR="$(TEST_CACHE_DIR)" \
 	NODE_PATH="$(VENV_DIR)/node_modules" \
 	NPM_CONFIG_CACHE="$(NPM_CACHE_DIR)" \
 	NPM_CONFIG_USERCONFIG="$(NPM_USERCONFIG)" \
@@ -77,14 +83,19 @@ CHECK :=
 # Helpers
 # ======================================================================================================================
 
+$(TEST_CACHE_DIR):
+	@mkdir -p "$(TEST_CACHE_DIR)"
+
 $(NODE_BIN):
 	@mkdir -p "$(NODE_DIR)" "$(NPM_CACHE_DIR)" "$(VENV_HOME)"
 	@curl -fsSL "$(NODE_URL)" | tar -xJ -C "$(NODE_DIR)" --strip-components=1
 
-$(DEPS_STAMP): $(PROJECT_ROOT)/package.json | $(NODE_BIN)
-	@mkdir -p "$(NPM_CACHE_DIR)" "$(VENV_HOME)"
+$(DEPS_STAMP): $(PROJECT_ROOT)/package.json $(PROJECT_ROOT)/package-lock.json | $(NODE_BIN) $(TEST_CACHE_DIR)
+	@mkdir -p "$(NPM_CACHE_DIR)" "$(VENV_HOME)" "$(NODE_DIR)/lib" "$(TEST_CACHE_DIR)"
 	@cp "$(PROJECT_ROOT)/package.json" "$(VENV_DIR)/package.json"
-	@$(LOCAL_ENV) "$(NPM_BIN)" install --prefix "$(VENV_DIR)" --no-package-lock --no-audit --no-fund --silent
+	@cp "$(PROJECT_ROOT)/package-lock.json" "$(VENV_DIR)/package-lock.json"
+	@$(LOCAL_ENV) "$(NPM_BIN)" ci --prefix "$(VENV_DIR)" --no-audit --no-fund --silent
+	@ln -sfn ../../node_modules "$(NODE_DIR)/lib/node"
 	@touch "$(DEPS_STAMP)"
 
 ##@ Quality
@@ -92,48 +103,54 @@ $(DEPS_STAMP): $(PROJECT_ROOT)/package.json | $(NODE_BIN)
 CHECK += deadcode
 .PHONY: deadcode
 deadcode: ## Check static types (tsc) and unused code/exports (knip)
-deadcode: | $(DEPS_STAMP)
+deadcode: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
 	@$(LOCAL_ENV) "$(TSC_BIN)" --project "$(TSCONFIG)"
 	@$(LOCAL_ENV) "$(KNIP_BIN)" --directory "$(PROJECT_ROOT)" --tsConfig "$(TSCONFIG)" --no-progress
 
 CHECK += lint
 .PHONY: lint
-lint: ## Run ESLint structural checks on src/
-lint: | $(DEPS_STAMP)
-	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) "$(PROJECT_ROOT)/src"
+lint: ## Run ESLint (structural + 120-col max-len) and Prettier code check
+lint: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) $(LINT_PATHS)
+	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" $(PRETTIER_FLAGS) --check $(CODE_PATHS)
 
 .PHONY: lint-prune
 lint-prune: ## Prune resolved entries from eslint-suppressions.json
-lint-prune: | $(DEPS_STAMP)
-	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) --prune-suppressions "$(PROJECT_ROOT)/src"
+lint-prune: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) --prune-suppressions $(LINT_PATHS)
 
 .PHONY: lint-baseline
 lint-baseline: ## Re-record current ESLint violations in eslint-suppressions.json
-lint-baseline: | $(DEPS_STAMP)
-	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) --suppress-all "$(PROJECT_ROOT)/src" || true
+lint-baseline: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@$(LOCAL_ENV) "$(ESLINT_BIN)" $(ESLINT_ARGS) --suppress-all $(LINT_PATHS) || true
 
 CHECK += docs-check
 .PHONY: docs-check
 docs-check: ## Validate documentation rules, acceptance parity, and formatting
-docs-check: | $(DEPS_STAMP)
+docs-check: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
 	@$(LOCAL_ENV) "$(NODE_BIN)" "$(PROJECT_ROOT)/scripts/check-docs.js"
-	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" --check $(DOC_PATHS)
+	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" $(PRETTIER_FLAGS) --check $(DOC_PATHS)
+
+.PHONY: format
+format: ## Format code, JSON/YAML configs, and Markdown documentation with Prettier
+format: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" $(PRETTIER_FLAGS) --write $(CODE_PATHS) $(DOC_PATHS)
 
 .PHONY: format-docs
 format-docs: ## Format Markdown documentation files with Prettier
-format-docs: | $(DEPS_STAMP)
-	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" --write $(DOC_PATHS)
+format-docs: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@cd "$(PROJECT_ROOT)" && $(LOCAL_ENV) "$(PRETTIER_BIN)" $(PRETTIER_FLAGS) --write $(DOC_PATHS)
 
 .PHONY: commit-msg-check
 commit-msg-check: ## Validate a commit message file (MSG=<path>)
-commit-msg-check: | $(DEPS_STAMP)
+commit-msg-check: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
 	@test -n "$(MSG)" || { echo "usage: make commit-msg-check MSG=<message-file>"; exit 2; }
 	@$(LOCAL_ENV) "$(NODE_BIN)" "$(PROJECT_ROOT)/scripts/check-commit-msg.js" "$(MSG)"
 
 CHECK += test
 .PHONY: test
 test: ## Run syntax checks and acceptance/unit test suites
-test: | $(DEPS_STAMP)
+test: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
 	@for f in $(SRC_FILES) $(TEST_FILES) "$(TEST_REPORTER)"; do \
 		$(LOCAL_ENV) "$(NODE_BIN)" --check "$$f" || exit 1; \
 	done
@@ -185,18 +202,18 @@ install-hooks: | $(DEPS_STAMP)
 	@chmod +x "$(PROJECT_ROOT)/.git/hooks/commit-msg"
 
 .PHONY: clean
-clean: ## Remove local container images, build cache, and .venv
+clean: ## Remove local container images, build cache, .tmp, and .venv
 	-@$(DOCKER) rmi $(REGISTRY_BUILD_TAG) $(REGISTRY_SECONDARY_TAG) $(BUILD_TAG) $(SECONDARY_TAG) 2>/dev/null || true
 	-@$(DOCKER) image prune -a -f \
 		--filter "label=org.opencontainers.image.source=$(IMAGE_SOURCE)" 2>/dev/null || true
-	@rm -rf "$(VENV_DIR)" "$(PROJECT_ROOT)/node_modules" "$(PROJECT_ROOT)/package-lock.json"
+	@rm -rf "$(TMP_DIR)" "$(VENV_DIR)" "$(PROJECT_ROOT)/node_modules"
 
 .PHONY: print-vars
 print-vars: ## Print resolved build and toolchain variables
 	@echo "PROJECT_NAME=$(PROJECT_NAME)"
-	@echo "SRC_FILE=$(SRC_FILE)"
 	@echo "DOCKERFILE=$(DOCKERFILE)"
 	@echo "VENV_DIR=$(VENV_DIR)"
+	@echo "TMP_DIR=$(TMP_DIR)"
 	@echo "NODE_BIN=$(NODE_BIN)"
 	@echo "BUILD_TAG=$(BUILD_TAG)"
 	@echo "PUBLISH_TAG=$(PUBLISH_TAG)"

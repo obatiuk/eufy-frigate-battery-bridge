@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +9,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 const {W, H, FRAME, CACHE_DIR, MAX_FFMPEG_BUFFER_MULTIPLIER, CameraConfig} = require('../config');
@@ -18,6 +18,7 @@ const {log, formatLocalHm} = require('../logger');
 /** @typedef {import("../domain/camera").Camera} Camera */
 
 const JPEG_ENCODER_QUALITY = '2';
+const SNAPSHOT_FFMPEG_THREADS = '1';
 
 /**
  * Builds the FFmpeg CLI arguments to decode a JPEG file into a scaled raw YUV420p frame.
@@ -30,6 +31,10 @@ function buildDecodeJpegArgs(filePath) {
     '-hide_banner',
     '-loglevel',
     'error',
+    '-filter_threads',
+    SNAPSHOT_FFMPEG_THREADS,
+    '-threads',
+    SNAPSHOT_FFMPEG_THREADS,
     '-i',
     filePath,
     '-vf',
@@ -55,6 +60,8 @@ function buildEncodeJpegArgs(targetFile) {
     '-hide_banner',
     '-loglevel',
     'error',
+    '-filter_threads',
+    SNAPSHOT_FFMPEG_THREADS,
     '-y',
     '-f',
     'rawvideo',
@@ -64,6 +71,8 @@ function buildEncodeJpegArgs(targetFile) {
     W + 'x' + H,
     '-i',
     'pipe:0',
+    '-threads',
+    SNAPSHOT_FFMPEG_THREADS,
     '-frames:v',
     '1',
     '-q:v',
@@ -113,7 +122,7 @@ function getCacheFilePath(cam) {
 }
 
 /**
- * Loads the last cached live frame for a camera from CACHE_DIR (or legacy /tmp) if one was saved
+ * Loads the last cached live frame for a camera from CACHE_DIR (or fallback temp directory) if one was saved
  * prior to a container restart.
  *
  * @param {CameraConfig|Camera|{ name?: string, serial?: string }} cam - Camera configuration or domain instance.
@@ -121,7 +130,7 @@ function getCacheFilePath(cam) {
  */
 function loadCachedFrame(cam) {
   const fileName = CameraConfig.resolveCacheFileName(cam);
-  const candidates = [getCacheFilePath(cam), path.join('/tmp', fileName)];
+  const candidates = [getCacheFilePath(cam), path.join(os.tmpdir(), fileName)];
   for (const file of candidates) {
     if (!fs.existsSync(file)) {
       continue;
@@ -153,7 +162,10 @@ function saveCachedFrame(cam) {
     if (r.status === 0) {
       log.debug(cam, 'saved cached snapshot to ' + targetFile);
     } else {
-      const lastErr = String(r.stderr || '').trim().split('\n').pop();
+      const lastErr = String(r.stderr || '')
+        .trim()
+        .split('\n')
+        .pop();
       log.warn(cam, 'failed to save cached snapshot: ' + lastErr);
     }
   } catch (err) {

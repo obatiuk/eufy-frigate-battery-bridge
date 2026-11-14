@@ -8,6 +8,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const {execFileSync} = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const KB = 1024;
@@ -43,8 +44,8 @@ const PII_RULES = [
   {label: 'local/internal hostname', re: /\b[a-z0-9-]+\.(?:local|lan|internal|ts\.net|home\.arpa)\b/i},
   {label: 'full T8 serial (use SN0000000001 placeholder)', re: /\bT8[0-9A-Z]{6,}\b/},
 ];
-const SKIP_DIRS = new Set(['.git', '.venv', 'node_modules', 'cache']);
-const WIDTH_FILES = [/^AGENTS\.md$/, /^CHANGELOG\.md$/, /^docs\//, /^\.agents\//];
+const SKIP_DIRS = new Set(['.git', '.tmp', '.venv', 'node_modules', 'cache']);
+const WIDTH_FILES = [/^AGENTS\.md$/, /^README\.md$/, /^CHANGELOG\.md$/, /^docs\/.*\.md$/, /^\.agents\//];
 const DASH_FILES = [/\.md$/, /^(src|test|scripts)\/.*\.js$/, /^Makefile$/];
 
 /**
@@ -148,7 +149,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
     const [, binding, modPath] = match;
     if (!binding.startsWith('{')) {
       errs.push(
-          ACCEPTANCE_TEST_FILE +
+        ACCEPTANCE_TEST_FILE +
           ': use destructured function/class imports from ../src/' +
           modPath +
           ' (namespace imports could read production constants)'
@@ -156,10 +157,10 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
       continue;
     }
     const entries = binding
-        .slice(1, -1)
-        .split(',')
-        .map((part) => part.trim())
-        .filter(Boolean);
+      .slice(1, -1)
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean);
     for (const entry of entries) {
       const [exportedRaw, localRaw] = entry.split(':').map((s) => s.trim());
       const sym = exportedRaw;
@@ -167,7 +168,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
       importedLocalBindings.add(localName);
       if (UPPER_CONSTANT_REGEX.test(sym) || FORBIDDEN_ACCEPTANCE_IMPORTS.has(sym)) {
         errs.push(
-            ACCEPTANCE_TEST_FILE +
+          ACCEPTANCE_TEST_FILE +
             ': forbidden constant/config import "' +
             sym +
             '" from ../src/' +
@@ -182,7 +183,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
     const staticConstRe = new RegExp('\\b' + localName + '\\.([A-Z][A-Z0-9_]*)\\b', 'g');
     for (const refMatch of testText.matchAll(staticConstRe)) {
       errs.push(
-          ACCEPTANCE_TEST_FILE +
+        ACCEPTANCE_TEST_FILE +
           ': forbidden production constant reference "' +
           localName +
           '.' +
@@ -213,7 +214,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
  */
 function checkRegressionIndex(allFiles, validAtIds, errs) {
   const srcBasenames = new Set(
-      allFiles.filter((f) => f.startsWith('src/') && f.endsWith('.js')).map((f) => path.basename(f))
+    allFiles.filter((f) => f.startsWith('src/') && f.endsWith('.js')).map((f) => path.basename(f))
   );
   const regFiles = allFiles.filter((f) => /^docs\/regression\/\d{2,}-.*\.md$/.test(f)).sort();
   const regByRel = new Map(regFiles.map((f) => ['regression/' + path.basename(f), f]));
@@ -227,9 +228,9 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
     }
     const loc = REGRESSION_INDEX_FILE + ':' + (idx + 1);
     const cols = line
-        .split('|')
-        .slice(1, -1)
-        .map((c) => c.trim());
+      .split('|')
+      .slice(1, -1)
+      .map((c) => c.trim());
     if (cols.length !== 4) {
       errs.push(loc + ': expected 4 table columns');
       return;
@@ -248,7 +249,9 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
     }
     const [, title, rel] = linkMatch;
     if (title.length > MAX_REGRESSION_TITLE) {
-      errs.push(loc + ': title is ' + title.length + ' chars (limit ' + MAX_REGRESSION_TITLE + '; move detail to Scope)');
+      errs.push(
+        loc + ': title is ' + title.length + ' chars (limit ' + MAX_REGRESSION_TITLE + '; move detail to Scope)'
+      );
     }
     if (seenRels.has(rel)) {
       errs.push(loc + ': duplicate link to ' + rel);
@@ -297,73 +300,156 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
   }
 }
 
-const errors = [];
-const files = listFiles(ROOT);
-const matches = (file, patterns) => patterns.some((p) => p.test(file));
-const validAtIds = checkAcceptanceIndex(files, errors);
-checkAcceptanceTestSuite(validAtIds, errors);
-checkRegressionIndex(files, validAtIds, errors);
+/**
+ * Validates CHANGELOG.md release heading parity on exact vX.Y.Z Git tags: forbids ## dev and
+ * requires the newest ## section to match ## vX.Y.Z with at least one bullet entry.
+ *
+ * @param {string} exactTag - Exact Git release tag (e.g. 'v0.0.2').
+ * @param {string} changelogText - Contents of CHANGELOG.md.
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkChangelogReleaseTag(exactTag, changelogText, errs) {
+  const lines = changelogText.split(/\r?\n/);
+  if (lines.some((line) => line.trim() === '## dev')) {
+    errs.push('CHANGELOG.md: unreleased "## dev" heading is forbidden on release tag "' + exactTag + '"');
+  }
+  const headingIndices = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) {
+      headingIndices.push(i);
+    }
+  }
+  const expectedHeading = '## ' + exactTag;
+  if (headingIndices.length === 0 || lines[headingIndices[0]].trim() !== expectedHeading) {
+    errs.push('CHANGELOG.md: newest release heading must be "' + expectedHeading + '" on tag "' + exactTag + '"');
+    return;
+  }
+  const startLine = headingIndices[0] + 1;
+  const endLine = headingIndices.length > 1 ? headingIndices[1] : lines.length;
+  const hasBullets = lines.slice(startLine, endLine).some((line) => /^- /.test(line));
+  if (!hasBullets) {
+    errs.push('CHANGELOG.md: section "' + expectedHeading + '" must contain at least one "- " entry');
+  }
+}
 
-for (const file of files) {
-  const abs = path.join(ROOT, file);
-  const bytes = fs.statSync(abs).size;
-  if (file === AGENTS_FILE && bytes > AGENTS_LIMIT_BYTES) {
-    errors.push(file + ': ' + bytes + ' bytes exceeds the hard limit of ' + AGENTS_LIMIT_BYTES);
-  } else if (file.startsWith('docs/') && file.endsWith('.md') && bytes > DOC_LIMIT_BYTES) {
-    errors.push(file + ': ' + bytes + ' bytes exceeds ' + DOC_LIMIT_BYTES + '; split it');
-  } else if (file.startsWith('.agents/') && file.endsWith('SKILL.md') && bytes > SKILL_LIMIT_BYTES) {
-    errors.push(file + ': ' + bytes + ' bytes exceeds ' + SKILL_LIMIT_BYTES + '; move detail to references/');
+/**
+ * Validates package.json / package-lock.json version parity and exact vX.Y.Z Git tag alignment.
+ *
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkPackageVersionAndLockfile(errs) {
+  const pkgPath = path.join(ROOT, 'package.json');
+  const lockPath = path.join(ROOT, 'package-lock.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  if (!fs.existsSync(lockPath)) {
+    errs.push('package-lock.json: missing lockfile');
+    return;
   }
-  if (!matches(file, DASH_FILES) && !matches(file, WIDTH_FILES) && !matches(file, PII_FILES)) {
-    continue;
+  const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  const lockRootVersion = lock.packages && lock.packages[''] ? lock.packages[''].version : undefined;
+  if (lock.version !== pkg.version || lockRootVersion !== pkg.version) {
+    errs.push('package-lock.json: version does not match package.json (' + pkg.version + ')');
   }
-  const text = fs.readFileSync(abs, 'utf8');
-  if (matches(file, PII_FILES)) {
-    text.split('\n').forEach((line, index) => {
-      for (const rule of PII_RULES) {
-        if (rule.re.test(line)) {
-          errors.push(file + ':' + (index + 1) + ': forbidden personal/environment data (' + rule.label + ')');
+  try {
+    const exactTag = execFileSync('git', ['describe', '--tags', '--exact-match'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const tagMatch = exactTag.match(/^v(\d+\.\d+\.\d+(?:[-+][^\s]+)?)$/);
+    if (tagMatch) {
+      if (pkg.version !== tagMatch[1]) {
+        errs.push('package.json: version "' + pkg.version + '" does not match exact Git tag "' + exactTag + '"');
+      }
+      const changelogText = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
+      checkChangelogReleaseTag(exactTag, changelogText, errs);
+    }
+  } catch (err) {
+    // HEAD is not on an annotated/lightweight tag or git metadata is absent.
+  }
+}
+
+/**
+ * Runs all repository documentation, acceptance, regression, and release parity checks.
+ */
+function runDocsCheck() {
+  const errors = [];
+  const files = listFiles(ROOT);
+  const matches = (file, patterns) => patterns.some((p) => p.test(file));
+  const validAtIds = checkAcceptanceIndex(files, errors);
+  checkAcceptanceTestSuite(validAtIds, errors);
+  checkRegressionIndex(files, validAtIds, errors);
+  checkPackageVersionAndLockfile(errors);
+
+  for (const file of files) {
+    const abs = path.join(ROOT, file);
+    const bytes = fs.statSync(abs).size;
+    if (file === AGENTS_FILE && bytes > AGENTS_LIMIT_BYTES) {
+      errors.push(file + ': ' + bytes + ' bytes exceeds the hard limit of ' + AGENTS_LIMIT_BYTES);
+    } else if (file.startsWith('docs/') && file.endsWith('.md') && bytes > DOC_LIMIT_BYTES) {
+      errors.push(file + ': ' + bytes + ' bytes exceeds ' + DOC_LIMIT_BYTES + '; split it');
+    } else if (file.startsWith('.agents/') && file.endsWith('SKILL.md') && bytes > SKILL_LIMIT_BYTES) {
+      errors.push(file + ': ' + bytes + ' bytes exceeds ' + SKILL_LIMIT_BYTES + '; move detail to references/');
+    }
+    if (!matches(file, DASH_FILES) && !matches(file, WIDTH_FILES) && !matches(file, PII_FILES)) {
+      continue;
+    }
+    const text = fs.readFileSync(abs, 'utf8');
+    if (matches(file, PII_FILES)) {
+      text.split('\n').forEach((line, index) => {
+        for (const rule of PII_RULES) {
+          if (rule.re.test(line)) {
+            errors.push(file + ':' + (index + 1) + ': forbidden personal/environment data (' + rule.label + ')');
+          }
+        }
+      });
+    }
+    if (matches(file, DASH_FILES)) {
+      text.split('\n').forEach((line, index) => {
+        if (DASH_REGEX.test(line)) {
+          errors.push(file + ':' + (index + 1) + ': use a plain ASCII hyphen instead of an en-dash or em-dash');
+        }
+      });
+    }
+    if (file.endsWith('.md') && matches(file, AT_REF_FILES)) {
+      for (const atMatch of text.matchAll(AT_TOKEN_REGEX)) {
+        if (!validAtIds.has(atMatch[0])) {
+          errors.push(file + ': unknown acceptance reference ' + atMatch[0]);
         }
       }
-    });
-  }
-  if (matches(file, DASH_FILES)) {
-    text.split('\n').forEach((line, index) => {
-      if (DASH_REGEX.test(line)) {
-        errors.push(file + ':' + (index + 1) + ': use a plain ASCII hyphen instead of an en-dash or em-dash');
+    }
+    if (file.endsWith('.md') && matches(file, WIDTH_FILES)) {
+      for (const {no, text: line} of widthLines(text)) {
+        if (line.length > MAX_LINE) {
+          errors.push(file + ':' + no + ': line is ' + line.length + ' characters (limit ' + MAX_LINE + ')');
+        }
       }
-    });
-  }
-  if (file.endsWith('.md') && matches(file, AT_REF_FILES)) {
-    for (const atMatch of text.matchAll(AT_TOKEN_REGEX)) {
-      if (!validAtIds.has(atMatch[0])) {
-        errors.push(file + ': unknown acceptance reference ' + atMatch[0]);
+      for (const match of text.matchAll(LINK_REGEX)) {
+        const target = match[1].split('#')[0];
+        const isLocal = target && !/^[a-z]+:/i.test(target);
+        if (isLocal && !fs.existsSync(path.resolve(path.dirname(abs), target))) {
+          errors.push(file + ': broken relative link ' + match[1]);
+        }
       }
     }
   }
-  if (file.endsWith('.md') && matches(file, WIDTH_FILES)) {
-    for (const {no, text: line} of widthLines(text)) {
-      if (line.length > MAX_LINE) {
-        errors.push(file + ':' + no + ': line is ' + line.length + ' characters (limit ' + MAX_LINE + ')');
-      }
-    }
-    for (const match of text.matchAll(LINK_REGEX)) {
-      const target = match[1].split('#')[0];
-      const isLocal = target && !/^[a-z]+:/i.test(target);
-      if (isLocal && !fs.existsSync(path.resolve(path.dirname(abs), target))) {
-        errors.push(file + ': broken relative link ' + match[1]);
-      }
-    }
+
+  const agentsBytes = fs.statSync(path.join(ROOT, AGENTS_FILE)).size;
+  if (agentsBytes > AGENTS_TARGET_BYTES) {
+    console.log('note: ' + AGENTS_FILE + ' is ' + agentsBytes + ' bytes (target ' + AGENTS_TARGET_BYTES + ')');
   }
+  if (errors.length > 0) {
+    console.error(errors.join('\n'));
+    console.error('docs-check failed: ' + errors.length + ' problem(s)');
+    process.exit(1);
+  }
+  console.log('docs-check passed');
 }
 
-const agentsBytes = fs.statSync(path.join(ROOT, AGENTS_FILE)).size;
-if (agentsBytes > AGENTS_TARGET_BYTES) {
-  console.log('note: ' + AGENTS_FILE + ' is ' + agentsBytes + ' bytes (target ' + AGENTS_TARGET_BYTES + ')');
+if (require.main === module) {
+  runDocsCheck();
 }
-if (errors.length > 0) {
-  console.error(errors.join('\n'));
-  console.error('docs-check failed: ' + errors.length + ' problem(s)');
-  process.exit(1);
-}
-console.log('docs-check passed');
+
+module.exports = {
+  checkChangelogReleaseTag,
+};

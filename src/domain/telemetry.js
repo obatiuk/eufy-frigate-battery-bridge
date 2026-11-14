@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -13,11 +12,13 @@
 
 const {
   clampNum,
+  CARD_THEMES,
   CARD_STATUS_TITLES,
   LOW_BAT_THRESHOLD,
+  CRITICAL_BAT_THRESHOLD,
+  COLOR_WHITE,
   COLOR_RED,
   COLOR_GREY,
-  COLOR_GREEN,
   COLOR_BLUE,
   COLOR_YELLOW,
   COLOR_PURPLE,
@@ -40,19 +41,6 @@ const STATUS_KINDS = Object.freeze({
   LOW_BATTERY: 'low',
   DISCONNECTED: 'disconnected',
   ASLEEP: 'asleep',
-});
-
-/**
- * Telemetry segment types rendered on the detailed status card row.
- *
- * @readonly
- * @enum {string}
- */
-const TELEMETRY_SEGMENT_TYPES = Object.freeze({
-  BATTERY: 'bat',
-  WIFI: 'wifi',
-  TEMPERATURE: 'temp',
-  LAST_SEEN: 'seen',
 });
 
 /**
@@ -122,26 +110,15 @@ const WIFI_SIGNAL_LEVELS = Object.freeze({
 
 const MIN_BATTERY_PCT = 0;
 const MAX_BATTERY_PCT = 100;
-const TELEMETRY_HEX_COLOR_BLUE = '0x38bdf8';
-const TELEMETRY_HEX_COLOR_PURPLE = '0xe879f9';
-const TELEMETRY_HEX_COLOR_GREEN = '0x4ade80';
-const TELEMETRY_HEX_COLOR_YELLOW = '0xfacc15';
-const TELEMETRY_HEX_COLOR_ZINC = '0xd4d4d8';
 const RSSI_STRONG_DBM = -65;
 const RSSI_GOOD_DBM = -72;
 const RSSI_FAIR_DBM = -80;
-const DEFAULT_LOW_BAT_CUTOFF_PCT = 20;
-const HEALTHY_BAT_THRESHOLD_PCT = 50;
+const DEFAULT_LOW_BAT_CUTOFF_PCT = 30;
+const DEFAULT_CRITICAL_BAT_CUTOFF_PCT = 5;
 const BATTERY_SWAP_DELTA_PCT = 10;
 const TEMP_COLD_MAX_C = 5;
 const TEMP_NORMAL_MAX_C = 35;
 const TEMP_WARM_MAX_C = 45;
-const TEL_BAT_LABEL_OFFSET_X = 46;
-const TEL_WIFI_LABEL_OFFSET_X = 38;
-const TEL_TEMP_LABEL_OFFSET_X = 23;
-const TEL_SEEN_LABEL_OFFSET_X = 28;
-const TEL_TEXT_CHAR_WIDTH = 11;
-const TEL_TEMP_CHAR_WIDTH = 12;
 const AUTO_STREAMING_QUALITY = 0;
 const MEDIUM_STREAMING_QUALITY = 7;
 const LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS = 300000;
@@ -248,12 +225,16 @@ function rssiToWifiSignalLevel(dbm) {
 }
 
 /**
- * Resolves the status kind and RGB color for a card title ('Live', 'Backfill', 'Waking Up...', 'Waiting', 'Disconnected', 'Asleep').
+ * Resolves the status kind and RGB color for a card title
+ * ('Live', 'Backfill', 'Waking Up...', 'Waiting', 'Disconnected', 'Asleep').
  *
  * @param {string} titleText - Card heading string.
  * @param {boolean} economyMode - Whether the camera is in low-battery economy mode.
- * @param {boolean} [serviceDisrupted=false] - Whether eufy-security-ws, HomeBase/camera, Frigate, or go2rtc is disconnected/unavailable.
- * @returns {Readonly<{ statusKind: 'live'|'backfill'|'waking'|'waiting'|'low'|'disconnected'|'asleep', statusRgb: readonly number[] }>}
+ * @param {boolean} [serviceDisrupted=false] - Whether WS, HomeBase/camera, Frigate, or go2rtc is down.
+ * @returns {Readonly<{
+ *   statusKind: 'live'|'backfill'|'waking'|'waiting'|'low'|'disconnected'|'asleep',
+ *   statusRgb: readonly number[]
+ * }>}
  */
 function resolveStatusVisual(titleText, economyMode, serviceDisrupted = false) {
   if (titleText === CARD_STATUS_TITLES.BACKFILL || BACKFILL_TITLE_REGEX.test(titleText)) {
@@ -268,59 +249,67 @@ function resolveStatusVisual(titleText, economyMode, serviceDisrupted = false) {
   if (titleText === CARD_STATUS_TITLES.WAITING || WAITING_TITLE_REGEX.test(titleText)) {
     return Object.freeze({statusKind: STATUS_KINDS.WAITING, statusRgb: COLOR_YELLOW});
   }
-  if (
-      serviceDisrupted ||
-      titleText === CARD_STATUS_TITLES.DISCONNECTED ||
-      DISCONNECTED_TITLE_REGEX.test(titleText)
-  ) {
+  if (serviceDisrupted || titleText === CARD_STATUS_TITLES.DISCONNECTED || DISCONNECTED_TITLE_REGEX.test(titleText)) {
     return Object.freeze({statusKind: STATUS_KINDS.DISCONNECTED, statusRgb: COLOR_GREY});
   }
-  if (
-      economyMode ||
-      titleText === CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY ||
-      LOW_BATTERY_TITLE_REGEX.test(titleText)
-  ) {
-    return Object.freeze({statusKind: STATUS_KINDS.LOW_BATTERY, statusRgb: COLOR_PURPLE});
+  if (economyMode || titleText === CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY || LOW_BATTERY_TITLE_REGEX.test(titleText)) {
+    return Object.freeze({statusKind: STATUS_KINDS.LOW_BATTERY, statusRgb: COLOR_WHITE});
   }
-  return Object.freeze({statusKind: STATUS_KINDS.ASLEEP, statusRgb: COLOR_GREEN});
+  return Object.freeze({statusKind: STATUS_KINDS.ASLEEP, statusRgb: COLOR_WHITE});
 }
 
 /**
- * Resolves the battery percentage, RGB color, and FFmpeg drawtext hex color.
+ * Resolves the battery percentage and RGB color (sky-blue when charging,
+ * calm white when unplugged and healthy, yellow at/below lowBatThreshold,
+ * purple at/below criticalBatThreshold, grey when unavailable).
  *
  * @param {*} batRaw - Raw battery value.
  * @param {boolean} charging - Whether the camera is actively charging.
- * @param {number} [lowBatThreshold=LOW_BAT_THRESHOLD] - Effective low-battery threshold percentage.
- * @returns {Readonly<{ hasBat: boolean, batPct: number, batRgb: readonly number[], batHex: string }>}
+ * @param {{ lowBatThreshold?: number, criticalBatThreshold?: number }} [thresholds={}] - Battery thresholds.
+ * @returns {Readonly<{ hasBat: boolean, batPct: number, batRgb: readonly number[] }>}
  */
-function resolveBatteryVisual(batRaw, charging, lowBatThreshold = LOW_BAT_THRESHOLD) {
-  const redBatCutoff = lowBatThreshold > MIN_BATTERY_PCT ? lowBatThreshold : DEFAULT_LOW_BAT_CUTOFF_PCT;
+function resolveBatteryVisual(batRaw, charging, thresholds = {}) {
+  const lowBatThreshold = thresholds.lowBatThreshold !== undefined ? thresholds.lowBatThreshold : LOW_BAT_THRESHOLD;
+  const criticalBatThreshold =
+    thresholds.criticalBatThreshold !== undefined ? thresholds.criticalBatThreshold : CRITICAL_BAT_THRESHOLD;
+  const lowBatCutoff = lowBatThreshold > MIN_BATTERY_PCT ? lowBatThreshold : DEFAULT_LOW_BAT_CUTOFF_PCT;
+  const critBatCutoff =
+    criticalBatThreshold > MIN_BATTERY_PCT
+      ? Math.min(criticalBatThreshold, lowBatCutoff - 1)
+      : Math.min(DEFAULT_CRITICAL_BAT_CUTOFF_PCT, lowBatCutoff - 1);
   const hasBat = batRaw != null && !Number.isNaN(Number(batRaw));
   const batPct = hasBat
-      ? clampNum(Math.round(Number(batRaw)), MIN_BATTERY_PCT, MAX_BATTERY_PCT, MIN_BATTERY_PCT)
-      : MIN_BATTERY_PCT;
+    ? clampNum(Math.round(Number(batRaw)), MIN_BATTERY_PCT, MAX_BATTERY_PCT, MIN_BATTERY_PCT)
+    : MIN_BATTERY_PCT;
 
   if (charging) {
-    return Object.freeze({hasBat, batPct, batRgb: COLOR_BLUE, batHex: TELEMETRY_HEX_COLOR_BLUE});
+    return Object.freeze({hasBat, batPct, batRgb: COLOR_BLUE});
   }
   if (!hasBat) {
-    return Object.freeze({hasBat, batPct, batRgb: COLOR_GREY, batHex: TELEMETRY_HEX_COLOR_ZINC});
+    return Object.freeze({hasBat, batPct, batRgb: COLOR_GREY});
   }
-  if (batPct <= redBatCutoff) {
-    return Object.freeze({hasBat, batPct, batRgb: COLOR_PURPLE, batHex: TELEMETRY_HEX_COLOR_PURPLE});
+  if (batPct <= critBatCutoff) {
+    return Object.freeze({hasBat, batPct, batRgb: COLOR_PURPLE});
   }
-  if (batPct >= HEALTHY_BAT_THRESHOLD_PCT) {
-    return Object.freeze({hasBat, batPct, batRgb: COLOR_GREEN, batHex: TELEMETRY_HEX_COLOR_GREEN});
+  if (batPct <= lowBatCutoff) {
+    return Object.freeze({hasBat, batPct, batRgb: COLOR_YELLOW});
   }
-  return Object.freeze({hasBat, batPct, batRgb: COLOR_YELLOW, batHex: TELEMETRY_HEX_COLOR_YELLOW});
+  return Object.freeze({hasBat, batPct, batRgb: COLOR_WHITE});
 }
 
 /**
- * Resolves the Wi-Fi bar count, RSSI integer, and semantic signal RGB color.
+ * Resolves the Wi-Fi bar count, RSSI integer, and semantic signal RGB color
+ * (calm white for 2..4 bars, amber yellow for weak <= 1 bar, grey when unavailable).
  *
  * @param {*} wifiRaw - Raw wifiSignalLevel (0..4).
  * @param {*} rssiRaw - Raw wifiRssi in dBm.
- * @returns {Readonly<{ hasWifi: boolean, wifiBars: number, hasRssi: boolean, rssiNum: number|null, wifiRgb: readonly number[] }>}
+ * @returns {Readonly<{
+ *   hasWifi: boolean,
+ *   wifiBars: number,
+ *   hasRssi: boolean,
+ *   rssiNum: number|null,
+ *   wifiRgb: readonly number[]
+ * }>}
  */
 function resolveWifiVisual(wifiRaw, rssiRaw) {
   const hasWifi = wifiRaw != null && !Number.isNaN(Number(wifiRaw));
@@ -338,56 +327,43 @@ function resolveWifiVisual(wifiRaw, rssiRaw) {
   }
 
   const rawBars = hasWifi
-      ? clampNum(Math.round(Number(wifiRaw)), WIFI_SIGNAL_LEVELS.NONE, WIFI_SIGNAL_LEVELS.FULL, WIFI_SIGNAL_LEVELS.NONE)
-      : WIFI_SIGNAL_LEVELS.NONE;
+    ? clampNum(Math.round(Number(wifiRaw)), WIFI_SIGNAL_LEVELS.NONE, WIFI_SIGNAL_LEVELS.FULL, WIFI_SIGNAL_LEVELS.NONE)
+    : WIFI_SIGNAL_LEVELS.NONE;
   const effectiveLevel = hasRssi ? rssiToWifiSignalLevel(rssiNum) : rawBars;
   const wifiBars = effectiveLevel;
-  let wifiRgb = COLOR_PURPLE;
-  switch (effectiveLevel) {
-    case WIFI_SIGNAL_LEVELS.FULL:
-      wifiRgb = COLOR_GREEN;
-      break;
-    case WIFI_SIGNAL_LEVELS.GOOD:
-      wifiRgb = COLOR_BLUE;
-      break;
-    case WIFI_SIGNAL_LEVELS.FAIR:
-      wifiRgb = COLOR_YELLOW;
-      break;
-    default:
-      wifiRgb = COLOR_PURPLE;
-      break;
-  }
+  const wifiRgb = effectiveLevel <= WIFI_SIGNAL_LEVELS.WEAK ? COLOR_YELLOW : COLOR_WHITE;
 
   return Object.freeze({hasWifi, wifiBars, hasRssi, rssiNum, wifiRgb});
 }
 
 /**
- * Resolves the battery temperature integer, RGB color, and FFmpeg drawtext hex color.
+ * Resolves the battery temperature integer and RGB color
+ * (calm white for normal 6..35C, sky-blue <= 5C, amber 36..44C, purple >= 45C, grey when unavailable).
  *
  * @param {*} tempRaw - Raw temperature in Celsius.
- * @returns {Readonly<{ hasTemp: boolean, tempNum: number|null, tempRgb: readonly number[], tempHex: string }>}
+ * @returns {Readonly<{ hasTemp: boolean, tempNum: number|null, tempRgb: readonly number[] }>}
  */
 function resolveTempVisual(tempRaw) {
   const hasTemp = tempRaw != null && !Number.isNaN(Number(tempRaw));
   const tempNum = hasTemp ? Math.round(Number(tempRaw)) : null;
 
   if (!hasTemp) {
-    return Object.freeze({hasTemp: false, tempNum: null, tempRgb: COLOR_GREY, tempHex: TELEMETRY_HEX_COLOR_ZINC});
+    return Object.freeze({hasTemp: false, tempNum: null, tempRgb: COLOR_GREY});
   }
   if (tempNum <= TEMP_COLD_MAX_C) {
-    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_BLUE, tempHex: TELEMETRY_HEX_COLOR_BLUE});
+    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_BLUE});
   }
   if (tempNum <= TEMP_NORMAL_MAX_C) {
-    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_GREEN, tempHex: TELEMETRY_HEX_COLOR_ZINC});
+    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_WHITE});
   }
   if (tempNum < TEMP_WARM_MAX_C) {
-    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_YELLOW, tempHex: TELEMETRY_HEX_COLOR_YELLOW});
+    return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_YELLOW});
   }
-  return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_PURPLE, tempHex: TELEMETRY_HEX_COLOR_PURPLE});
+  return Object.freeze({hasTemp, tempNum, tempRgb: COLOR_PURPLE});
 }
 
 /**
- * Evaluates the 6-color semantic state (Red, Grey, Green, Blue, Yellow, Purple) for camera status,
+ * Evaluates the 6-color semantic state (White, Red, Grey, Blue, Yellow, Purple) for camera status,
  * battery, Wi-Fi/RSSI, and temperature.
  *
  * @param {string} titleText - Card heading ('Asleep', 'Waking Up...', 'Waiting', 'Live', etc.).
@@ -403,9 +379,13 @@ function evaluateTelemetryState(titleText, status) {
   const powerLabel = (status && status.powerLabel) || '';
 
   const statusVis = resolveStatusVisual(titleText, economyMode, serviceDisrupted);
-  const lowBatCutoff =
-      status && status.lowBatThreshold !== undefined ? status.lowBatThreshold : LOW_BAT_THRESHOLD;
-  const batVis = resolveBatteryVisual(status ? status.battery : null, charging, lowBatCutoff);
+  const lowBatThreshold = status && status.lowBatThreshold !== undefined ? status.lowBatThreshold : LOW_BAT_THRESHOLD;
+  const criticalBatThreshold =
+    status && status.criticalBatThreshold !== undefined ? status.criticalBatThreshold : CRITICAL_BAT_THRESHOLD;
+  const batVis = resolveBatteryVisual(status ? status.battery : null, charging, {
+    lowBatThreshold,
+    criticalBatThreshold,
+  });
   const wifiVis = resolveWifiVisual(status ? status.wifi : null, status ? status.rssi : null);
   const tempVis = resolveTempVisual(status ? status.temp : null);
 
@@ -415,7 +395,6 @@ function evaluateTelemetryState(titleText, status) {
     economyMode,
     serviceDisrupted,
     powerLabel,
-    powerText: powerLabel || (charging ? POWER_LABELS.CHARGING : ''),
     seenVal,
     ...statusVis,
     ...batVis,
@@ -425,100 +404,13 @@ function evaluateTelemetryState(titleText, status) {
 }
 
 /**
- * Formats the suffix text appended to the battery percentage in the 'detailed' theme.
- *
- * @param {Record<string, *>} st - Evaluated telemetry state.
- * @returns {string}
- */
-function formatBatteryPowerSuffix(st) {
-  if (st.telCfg.powerSource && st.powerLabel) {
-    return ' ' + st.powerLabel;
-  }
-  if (st.charging) {
-    return ' ' + POWER_LABELS.CHARGING;
-  }
-  if (st.economyMode) {
-    return ' Eco';
-  }
-  return '';
-}
-
-/**
- * Builds the list of enabled telemetry segments for rendering in the 'detailed' theme.
- *
- * @param {Record<string, *>} st - Evaluated telemetry state from evaluateTelemetryState().
- * @param {Record<string, *>|null} [evaluatedOverride=null] - Optional pre-evaluated telemetry visual state.
- * @returns {Array<Record<string, *>>} Array of telemetry segment descriptors.
- */
-function buildTelemetrySegments(st, evaluatedOverride = null) {
-  const target = evaluatedOverride || st;
-  const {telCfg} = target;
-  if (!telCfg || !telCfg.enabled) {
-    return [];
-  }
-
-  const segments = [];
-  if (telCfg.battery && target.hasBat) {
-    const label = target.batPct + '%' + formatBatteryPowerSuffix(target);
-    segments.push({
-      type: TELEMETRY_SEGMENT_TYPES.BATTERY,
-      batPct: target.batPct,
-      charging: target.charging,
-      powerLabel: target.powerLabel || '',
-      showBolt: Boolean(telCfg.powerSource && (target.charging || target.powerLabel)),
-      batHex: target.batHex,
-      batRgb: target.batRgb,
-      label,
-      width: TEL_BAT_LABEL_OFFSET_X + label.length * TEL_TEXT_CHAR_WIDTH,
-    });
-  }
-
-  if (telCfg.wifi && (target.hasWifi || target.hasRssi)) {
-    const showRssi = telCfg.rssi && target.hasRssi;
-    const label = showRssi ? target.rssiNum + ' dBm' : 'Wi-Fi';
-    segments.push({
-      type: TELEMETRY_SEGMENT_TYPES.WIFI,
-      wifiBars: target.wifiBars,
-      wifiRgb: target.wifiRgb,
-      label,
-      width: TEL_WIFI_LABEL_OFFSET_X + label.length * TEL_TEXT_CHAR_WIDTH,
-    });
-  }
-
-  if (telCfg.temperature && target.hasTemp) {
-    const label = target.tempNum + '°C';
-    segments.push({
-      type: TELEMETRY_SEGMENT_TYPES.TEMPERATURE,
-      tempHex: target.tempHex,
-      tempRgb: target.tempRgb,
-      tempNum: target.tempNum,
-      hasTemp: target.hasTemp,
-      label,
-      width: TEL_TEMP_LABEL_OFFSET_X + label.length * TEL_TEMP_CHAR_WIDTH,
-    });
-  }
-
-  if (telCfg.lastSeen && target.seenVal) {
-    const label = 'Last live ' + target.seenVal;
-    segments.push({
-      type: TELEMETRY_SEGMENT_TYPES.LAST_SEEN,
-      seenVal: target.seenVal,
-      label,
-      width: TEL_SEEN_LABEL_OFFSET_X + label.length * TEL_TEXT_CHAR_WIDTH,
-    });
-  }
-
-  return segments;
-}
-
-/**
  * Domain model representing a camera's live telemetry readings and display preferences.
  */
 class Telemetry {
   /**
-   * @param {Record<string, *>} rawCamCfg - Camera entry from config.json.
+   * @param {Record<string, *>} rawCamCfg - Camera entry from config.yaml.
    * @param {string} [initialLastSeen=''] - Initial lastSeen 'HH:MM' string from snapshot cache.
-   * @param {ReturnType<typeof import("../config").resolveCameraTimers>|null} [resolvedTimers=null] - Pre-resolved camera timers.
+   * @param {ReturnType<typeof import("../config").resolveCameraTimers>|null} [resolvedTimers=null] - Camera timers.
    */
   constructor(rawCamCfg = {}, initialLastSeen = '', resolvedTimers = null) {
     const timers = resolvedTimers || resolveCameraTimers(rawCamCfg);
@@ -526,7 +418,9 @@ class Telemetry {
     this.config = resolveTelemetryConfig(rawCamCfg);
     this.hwRecordingCfg = resolveHardwareRecordingConfig(rawCamCfg, timers);
     this.lowBatThreshold = timers.lowBatThreshold;
+    this.criticalBatThreshold = timers.criticalBatThreshold;
     this.lowBatWakeOnView = Boolean(timers.lowBatWakeOnView);
+    this.isRtspDirect = Boolean(timers.rtspDirect || (rawCamCfg && rawCamCfg.rtsp_url));
     this.deviceName = '';
     /** @type {number|null} */
     this.deviceState = null;
@@ -584,6 +478,33 @@ class Telemetry {
   }
 
   /**
+   * Returns the sanitized telemetry configuration summary for GET /api/config, returning null
+   * when telemetry is unavailable (direct rtsp_url or card_theme="none") and effective boolean
+   * flags for all sub-options under the resolved card theme and parent toggles.
+   *
+   * @param {string} cardTheme - Resolved StatusCard theme name.
+   * @returns {Readonly<Record<string, boolean>>|null}
+   */
+  toConfigSummary(cardTheme) {
+    if (this.isRtspDirect || cardTheme === CARD_THEMES.NONE) {
+      return null;
+    }
+    const enabled = Boolean(this.config.enabled);
+    const isMinimal = cardTheme === CARD_THEMES.MINIMAL;
+    const battery = enabled && Boolean(this.config.battery);
+    const wifi = enabled && Boolean(this.config.wifi);
+    return Object.freeze({
+      enabled,
+      battery,
+      power_source: battery && Boolean(this.config.powerSource),
+      wifi,
+      rssi: wifi && Boolean(this.config.rssi),
+      temperature: enabled && !isMinimal && Boolean(this.config.temperature),
+      last_seen: enabled && !isMinimal && Boolean(this.config.lastSeen),
+    });
+  }
+
+  /**
    * Returns true if battery level is at or below this camera's lowBatThreshold and not charging.
    *
    * @returns {boolean}
@@ -591,25 +512,40 @@ class Telemetry {
   isLowBattery() {
     const level = Number(this.battery);
     return this.lowBatThreshold > 0 && !this.charging && this.battery !== null
-        ? !Number.isNaN(level) && level <= this.lowBatThreshold
-        : false;
+      ? !Number.isNaN(level) && level <= this.lowBatThreshold
+      : false;
+  }
+
+  /**
+   * Returns true if battery level is at or below this camera's criticalBatThreshold and not charging.
+   *
+   * @returns {boolean}
+   */
+  isCriticalBattery() {
+    const level = Number(this.battery);
+    return this.criticalBatThreshold > 0 && !this.charging && this.battery !== null
+      ? !Number.isNaN(level) && level <= this.criticalBatThreshold
+      : false;
   }
 
   /**
    * Returns true if the camera's Eufy deviceState explicitly reports an offline or disabled condition,
-   * distinguishing Eufy battery-camera deep standby (state=0 with healthy battery > 5% and RSSI > -95 dBm)
-   * from genuine offline/low-battery shutoff states (state=3 OFFLINE_LOWBAT, state=2/4/5, or state=0 with dead link/battery).
+   * distinguishing Eufy battery-camera deep standby (state=0 with healthy battery > criticalBatThreshold
+   * and RSSI > -95 dBm) from genuine offline/low-battery shutoff states (state=3 OFFLINE_LOWBAT, state=2/4/5,
+   * or dead link/battery).
    *
    * @returns {boolean}
    */
   isReportedOfflineByState() {
     const st = this.deviceState !== null ? Number(this.deviceState) : Number.NaN;
+    const critCutoff =
+      this.criticalBatThreshold > MIN_BATTERY_PCT ? this.criticalBatThreshold : OFFLINE_STANDBY_MIN_BATTERY_PCT;
     const hasHealthyStandbyLink =
-        (this.charging || (this.battery !== null && Number(this.battery) > OFFLINE_STANDBY_MIN_BATTERY_PCT)) &&
-        (this.rssi === null || Number(this.rssi) > OFFLINE_DEAD_LINK_RSSI_DBM);
+      (this.charging || this.battery === null || Number(this.battery) > critCutoff) &&
+      (this.rssi === null || Number(this.rssi) > OFFLINE_DEAD_LINK_RSSI_DBM);
     return !Number.isNaN(st) && st !== EUFY_DEVICE_STATES.ONLINE
-        ? st !== EUFY_DEVICE_STATES.OFFLINE || !hasHealthyStandbyLink
-        : false;
+      ? st !== EUFY_DEVICE_STATES.OFFLINE || !hasHealthyStandbyLink
+      : false;
   }
 
   /**
@@ -629,11 +565,7 @@ class Telemetry {
    * @returns {boolean}
    */
   isDeviceOffline() {
-    return Boolean(
-        this.isReportedOfflineByState() ||
-        this.isBatteryDepleted() ||
-        this.wakeTimedOutOffline
-    );
+    return Boolean(this.isReportedOfflineByState() || this.isBatteryDepleted() || this.wakeTimedOutOffline);
   }
 
   /**
@@ -644,11 +576,11 @@ class Telemetry {
    */
   hasServiceDisruption() {
     return Boolean(
-        !this.wsConnected ||
-        !this.stationConnected ||
-        !this.frigateConnected ||
-        !this.go2rtcConnected ||
-        this.isDeviceOffline()
+      (!this.isRtspDirect && !this.wsConnected) ||
+      !this.stationConnected ||
+      !this.frigateConnected ||
+      !this.go2rtcConnected ||
+      this.isDeviceOffline()
     );
   }
 
@@ -656,7 +588,12 @@ class Telemetry {
    * Updates service connectivity flags (wsConnected, stationConnected, frigateConnected, go2rtcConnected)
    * and returns true if any flag or overall service disruption state changed.
    *
-   * @param {{ wsConnected?: boolean, stationConnected?: boolean, frigateConnected?: boolean, go2rtcConnected?: boolean }} [flags={}] - Service health flags.
+   * @param {{
+   *   wsConnected?: boolean,
+   *   stationConnected?: boolean,
+   *   frigateConnected?: boolean,
+   *   go2rtcConnected?: boolean
+   * }} [flags={}] - Service health flags.
    * @returns {boolean}
    */
   updateServiceHealth(flags = {}) {
@@ -765,12 +702,11 @@ class Telemetry {
     if (enforceQuality === true && isDoorbellT8214) {
       return Object.freeze({shouldUpdate: false, currentQuality, targetQuality: MEDIUM_STREAMING_QUALITY});
     }
-    const targetQuality =
-        typeof enforceQuality === 'number' ? enforceQuality : MEDIUM_STREAMING_QUALITY;
+    const targetQuality = typeof enforceQuality === 'number' ? enforceQuality : MEDIUM_STREAMING_QUALITY;
     const shouldUpdate =
-        typeof enforceQuality === 'number'
-            ? currentQuality !== targetQuality
-            : currentQuality === AUTO_STREAMING_QUALITY || currentQuality > MEDIUM_STREAMING_QUALITY;
+      typeof enforceQuality === 'number'
+        ? currentQuality !== targetQuality
+        : currentQuality === AUTO_STREAMING_QUALITY || currentQuality > MEDIUM_STREAMING_QUALITY;
     return Object.freeze({shouldUpdate, currentQuality, targetQuality});
   }
 
@@ -809,7 +745,18 @@ class Telemetry {
    *
    * @param {Record<string, *>} props - Properties object from eufy-security-ws.
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @returns {{ hadInitialTelemetry: boolean, prevBattery: number|null, nowLowBat: boolean, nowOffline: boolean, offlineChanged: boolean, stateChanged: boolean, wifiTierChanged: boolean, minorTelemetryChanged: boolean, model: *, swVer: * }}
+   * @returns {{
+   *   hadInitialTelemetry: boolean,
+   *   prevBattery: number|null,
+   *   nowLowBat: boolean,
+   *   nowOffline: boolean,
+   *   offlineChanged: boolean,
+   *   stateChanged: boolean,
+   *   wifiTierChanged: boolean,
+   *   minorTelemetryChanged: boolean,
+   *   model: *,
+   *   swVer: *
+   * }}
    */
   applyProperties(props, now = Date.now()) {
     const hadInitialTelemetry = this.battery !== null;
@@ -820,6 +767,7 @@ class Telemetry {
     const prevTemp = this.temp;
     const prevLight = this.lightOn;
     const wasLowBat = this.isLowBattery();
+    const wasCritBat = this.isCriticalBattery();
     const wasOffline = this.isDeviceOffline();
 
     const devName = unwrapProperty(props.name);
@@ -875,13 +823,7 @@ class Telemetry {
       this.battery = Number(bat);
     }
 
-    const parsedCharge = parseChargingState(
-        chgStatus,
-        chgBool,
-        pwrSrc,
-        this.charging,
-        this.powerLabel
-    );
+    const parsedCharge = parseChargingState(chgStatus, chgBool, pwrSrc, this.charging, this.powerLabel);
     this.charging = parsedCharge.charging;
     this.powerLabel = parsedCharge.powerLabel;
 
@@ -901,60 +843,55 @@ class Telemetry {
 
     const hasBatteryProp = bat !== undefined && bat !== null;
     const batteryIncreased =
-        prevBattery !== null &&
-        this.battery !== null &&
-        this.battery > prevBattery &&
-        this.battery > 0;
+      prevBattery !== null && this.battery !== null && this.battery > prevBattery && this.battery > 0;
+    const batteryRiseSwapped = batteryIncreased && this.battery - prevBattery >= BATTERY_SWAP_DELTA_PCT;
+    const canClearLowBatteryOffline = batteryRiseSwapped || !this.isLowBattery();
     const freshSensorChange =
-        hadInitialTelemetry &&
-        !('state' in props) &&
-        ((prevBattery !== null && this.battery !== prevBattery && this.battery > 0) ||
-            prevCharging !== this.charging ||
-            prevRssi !== this.rssi ||
-            prevTemp !== this.temp);
+      hadInitialTelemetry &&
+      !('state' in props) &&
+      ((prevBattery !== null && this.battery !== prevBattery && this.battery > 0) ||
+        prevCharging !== this.charging ||
+        prevRssi !== this.rssi ||
+        prevTemp !== this.temp);
     if (
-        this.charging ||
-        batteryIncreased ||
-        freshSensorChange ||
-        (hasBatteryProp && !this.isLowBattery()) ||
-        (!this.isReportedOfflineByState() && !this.isBatteryDepleted())
+      this.charging ||
+      batteryIncreased ||
+      freshSensorChange ||
+      (hasBatteryProp && !this.isLowBattery()) ||
+      (!this.isReportedOfflineByState() && !this.isBatteryDepleted())
     ) {
       this.wakeTimedOutOffline = false;
       if (
-          this.deviceState === EUFY_DEVICE_STATES.OFFLINE_LOWBAT &&
-          (this.charging || (hasBatteryProp && !this.isLowBattery()))
+        this.deviceState === EUFY_DEVICE_STATES.OFFLINE_LOWBAT &&
+        (this.charging || (hasBatteryProp && canClearLowBatteryOffline))
       ) {
         this.deviceState = EUFY_DEVICE_STATES.ONLINE;
-      } else if (
-          this.deviceState === EUFY_DEVICE_STATES.OFFLINE &&
-          batteryIncreased &&
-          !this.isLowBattery()
-      ) {
+      } else if (this.deviceState === EUFY_DEVICE_STATES.OFFLINE && batteryIncreased && canClearLowBatteryOffline) {
         this.deviceState = EUFY_DEVICE_STATES.ONLINE;
       }
     }
 
     const nowLowBat = this.isLowBattery();
+    const nowCritBat = this.isCriticalBattery();
     const nowOffline = this.isDeviceOffline();
     const offlineChanged = wasOffline !== nowOffline;
     const batterySwapped =
-        prevBattery !== null && this.battery !== null && Math.abs(this.battery - prevBattery) >= BATTERY_SWAP_DELTA_PCT;
+      prevBattery !== null && this.battery !== null && Math.abs(this.battery - prevBattery) >= BATTERY_SWAP_DELTA_PCT;
     const stateChanged =
-        offlineChanged ||
-        (hadInitialTelemetry &&
-            (wasLowBat !== nowLowBat || prevCharging !== this.charging || batterySwapped));
+      offlineChanged ||
+      (hadInitialTelemetry &&
+        (wasLowBat !== nowLowBat || wasCritBat !== nowCritBat || prevCharging !== this.charging || batterySwapped));
     const prevTempRgb = resolveTempVisual(prevTemp).tempRgb;
     const nextTempRgb = resolveTempVisual(this.temp).tempRgb;
-    const wifiTierChanged =
-        hadInitialTelemetry && (prevWifi !== this.wifi || prevTempRgb !== nextTempRgb);
+    const wifiTierChanged = hadInitialTelemetry && (prevWifi !== this.wifi || prevTempRgb !== nextTempRgb);
     const minorTelemetryChanged =
-        hadInitialTelemetry &&
-        !stateChanged &&
-        (prevBattery !== this.battery ||
-            prevWifi !== this.wifi ||
-            prevRssi !== this.rssi ||
-            prevTemp !== this.temp ||
-            prevLight !== this.lightOn);
+      hadInitialTelemetry &&
+      !stateChanged &&
+      (prevBattery !== this.battery ||
+        prevWifi !== this.wifi ||
+        prevRssi !== this.rssi ||
+        prevTemp !== this.temp ||
+        prevLight !== this.lightOn);
 
     return Object.freeze({
       hadInitialTelemetry,
@@ -973,18 +910,15 @@ class Telemetry {
   /**
    * Builds a plain status snapshot object used by the card renderer.
    *
-   * @param {string} camName - Camera internal name.
-   * @param {string} camTitle - Camera display title.
    * @param {Record<string, *>} cardCfg - Resolved card configuration.
    * @returns {Record<string, *>}
    */
-  toStatusSnapshot(camName, camTitle, cardCfg) {
+  toStatusSnapshot(cardCfg) {
     return {
-      camName,
-      camTitle,
       cardCfg,
       telCfg: this.config,
       lowBatThreshold: this.lowBatThreshold,
+      criticalBatThreshold: this.criticalBatThreshold,
       battery: this.battery,
       charging: this.charging,
       powerLabel: this.powerLabel,
@@ -1007,6 +941,7 @@ class Telemetry {
     return evaluateTelemetryState(titleText, {
       telCfg: this.config,
       lowBatThreshold: this.lowBatThreshold,
+      criticalBatThreshold: this.criticalBatThreshold,
       battery: this.battery,
       charging: this.charging,
       powerLabel: this.powerLabel,
@@ -1048,19 +983,19 @@ class Telemetry {
     const offlineTag = this.isDeviceOffline() ? ' [OFFLINE: ' + this.getOfflineReason() + ']' : '';
     const pwrMode = (this.powerLabel || (nowLowBat ? 'battery [ECO]' : 'battery')) + offlineTag;
     return (
-        'telemetry loaded (' +
-        hwInfo +
-        'battery=' +
-        this.battery +
-        '%, power=' +
-        pwrMode +
-        ', wifi=' +
-        (this.wifi ?? 'n/a') +
-        '/4, rssi=' +
-        (this.rssi ?? 'n/a') +
-        'dBm, temp=' +
-        (this.temp ?? 'n/a') +
-        '°C)'
+      'telemetry loaded (' +
+      hwInfo +
+      'battery=' +
+      this.battery +
+      '%, power=' +
+      pwrMode +
+      ', wifi=' +
+      (this.wifi ?? 'n/a') +
+      '/4, rssi=' +
+      (this.rssi ?? 'n/a') +
+      'dBm, temp=' +
+      (this.temp ?? 'n/a') +
+      '°C)'
     );
   }
 
@@ -1079,15 +1014,15 @@ class Telemetry {
       ecoStatus = 'entered low-battery economy mode';
     }
     return (
-        'battery state updated (' +
-        (prevBattery ?? 'n/a') +
-        '% -> ' +
-        this.battery +
-        '%, power=' +
-        (this.powerLabel || 'battery') +
-        ', ' +
-        ecoStatus +
-        ')'
+      'battery state updated (' +
+      (prevBattery ?? 'n/a') +
+      '% -> ' +
+      this.battery +
+      '%, power=' +
+      (this.powerLabel || 'battery') +
+      ', ' +
+      ecoStatus +
+      ')'
     );
   }
 
@@ -1098,36 +1033,29 @@ class Telemetry {
    */
   formatUpdateLog() {
     return (
-        'telemetry updated (battery=' +
-        (this.battery ?? 'n/a') +
-        '%, power=' +
-        (this.powerLabel || 'battery') +
-        ', wifi=' +
-        (this.wifi ?? 'n/a') +
-        '/4, rssi=' +
-        (this.rssi ?? 'n/a') +
-        'dBm, temp=' +
-        (this.temp ?? 'n/a') +
-        '°C)'
+      'telemetry updated (battery=' +
+      (this.battery ?? 'n/a') +
+      '%, power=' +
+      (this.powerLabel || 'battery') +
+      ', wifi=' +
+      (this.wifi ?? 'n/a') +
+      '/4, rssi=' +
+      (this.rssi ?? 'n/a') +
+      'dBm, temp=' +
+      (this.temp ?? 'n/a') +
+      '°C)'
     );
   }
 }
 
 module.exports = {
   STATUS_KINDS,
-  TELEMETRY_SEGMENT_TYPES,
   POWER_LABELS,
   EUFY_DEVICE_STATES,
   EUFY_CHARGING_STATUS,
   EUFY_POWER_SOURCES,
   WIFI_SIGNAL_LEVELS,
-  TEL_BAT_LABEL_OFFSET_X,
-  TEL_WIFI_LABEL_OFFSET_X,
-  TEL_TEMP_LABEL_OFFSET_X,
-  TEL_SEEN_LABEL_OFFSET_X,
-  TEL_TEXT_CHAR_WIDTH,
   Telemetry,
   unwrapProperty,
   evaluateTelemetryState,
-  buildTelemetrySegments,
 };

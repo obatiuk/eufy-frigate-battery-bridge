@@ -1,71 +1,107 @@
-# Status card themes, mask sync, and debug HUD
+# Status card themes, mask sync, and diagnostic HUD
 
-Read when: changing `src/domain/status-card.js`, `src/overlay/*`, Frigate mask sync, or the `debug` theme.
-Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-17`, `AT-18`).
+Read when: changing `src/domain/status-card.js`, `src/overlay/*`, Frigate mask sync, or the `hud` theme.
+Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-17`, `AT-18`), [status-card-minimal.png](images/status-card-minimal.png),
+[status-card-glance.png](images/status-card-glance.png), [status-card-pebbles.png](images/status-card-pebbles.png),
+[status-card-hud.png](images/status-card-hud.png).
 
 ## Status Card Themes & Overlay Pipeline (`src/domain/status-card.js` & `src/overlay/*`)
 
-- `card_theme`:
-  - `"icons"` (default): Pre-baked 4x4-supersampled Eufy-style alpha sprites (`22px` slot height, bolder strokes, and
-    `1px` directional drop-shadow) inside a `44px`-high frosted-glass capsule (`64%` opacity with a uniform `1.25px`
-    SDF-anti-aliased frosted rim at `18%` opacity) with zero text and no `ffmpeg` spawn (Status glyph with Play, Rewind,
-    Waking arc-ring, Disconnected circle-slash, or Standby pill bars; rounded `38x18` Battery + Solar sun / AC plug /
-    USB charging bolt; rounded-cap `30x22` Wi-Fi arcs colored by `RSSI`; `18x22` Thermometer with graduation ticks; and
-    hollow-ring `22x22` `Last live` clock with cached `HH:MM` hands).
-  - `"minimal"`: Three equal `18x18` halo-free shadowed circles (`Status` solid circle or hollow circular ring for
-    `Backfill`, `Battery`, and `Wi-Fi` - never icons or text) inside a `110x44` frosted-glass capsule (`22px` corner
-    radius, `64%` opacity, and uniform `1.25px` frosted rim shared identically with `"icons"` and `"detailed"`) with no
-    `ffmpeg` spawn.
-  - `"detailed"`: Shared frosted-glass surface (`22px` corner radius, `64%` opacity, and uniform `1.25px` frosted rim)
-    rendered purely in JavaScript via the pre-baked proportional anti-aliased UI glyph atlas (`20px`, `24px`, `36px` in
-    `src/overlay/ui-glyphs.js`) and bolder shadowed Eufy icon sprites with zero external font files and no `ffmpeg`
-    spawn. Renders a centered `820x336` modal (`820x268` when telemetry is disabled or empty) with a `60x60` status
-    glyph when `card_position` is `"center"`, or a compact corner card (`540x88` minimum with telemetry or `400x48`
-    without, expanding dynamically up to `W - 48` for long titles) that blurs live video via the 2-slot alternating
-    `liveOverlayBufs` scratch ring (`prepareLiveOverlayBuffer`).
-  - `"debug"`: Sharp rectangular (`radius: 0`, `borderOpacity: 0`, `74%` blurred background) bottom-anchored diagnostic
-    HUD (`832x76`, `<= 2/3` of the `1280px` frame width; anchored bottom-right for `*-right` positions, else
-    bottom-left) with a left semantic status square (`S`/`FB`/`B`/`L` frame stage glyph + right-padded camera mode +
-    session counter) and 4 vertically aligned multi-column (`110`-char) non-shifting bright-white monospace telemetry
-    rows (`5x9` pixel bitmap font with 1px luma shadow, zero `ffmpeg` spawn) updated dynamically on both sleeping and
-    live frames (`hasDynamicDebugCard()`, regardless of `card_show_on_live`).
+- **Surface, Iconography & Calm-White Palette:**
+  - Capsule status cards (`"glance"`, `"pebbles"`) share a borderless, hairline-free **Smoked Obsidian Crystal**
+    surface (`drawCrystalSurface` in `src/overlay/yuv-canvas.js`: single-pass floating-point compositor with 16x
+    (`4x4` subpixel) cubic Hermite `smoothstep` edge anti-aliasing, `0.5px` tangent inset, `2x2` YUV420p quad chroma
+    averaging, 3-pass luma/chroma box blur with `0.82` chroma damping, `54%` Smoked Obsidian `#080b12` tint on
+    non-jewel capsules, `11%` top-lit white frost sheen, and strictly `0px` outer hairline or white border rim).
+  - Icons and HUD text render purely in JavaScript with zero `ffmpeg` subprocesses or external `.ttf` files via
+    `src/overlay/ui-glyphs.js` and `src/overlay/yuv-canvas.js`: 16x-subpixel `smoothstep` analytical SDF vector sprites
+    and linear deflate-compressed 4-bit nibble alpha atlases for solid-filled **Lucide** (`ISC`) status icons
+    (`standby` crescent moon, `live` play triangle, `backfill` rewind double-triangles, and `waking` lightning bolt
+    `zap`, plus a 16x-subpixel three-horizontal-dots `•••` ellipsis for `waiting`, with strictly zero glare circle
+    behind status icons), 4-tier Wi-Fi arcs, `30x20` battery shells with pre-baked `15x15` top-right power badges
+    (`solar`, `plugged`, `bolt`, and `unknown` `?` when battery percentage is unavailable) and `1.65px` crystal cutouts,
+    and a 5x9 bitmap monospace font for the diagnostic `"hud"` theme.
+  - By default (`resolveTelemetryConfig` in `src/config.js`), `battery`, `power_source`, `wifi`, and `rssi` default to
+    `true`, `temperature` and `last_seen` default to `false` (hidden unless explicitly enabled in `telemetry`), and
+    `telemetry` is completely disabled (`enabled: false`) whenever direct `rtsp_url` is configured on a camera.
+  - Normal states stay **Calm White** (`#ffffff`): `Asleep` and `Asleep (Low Battery)` status silhouettes, healthy
+    unplugged battery (`> 30%`), healthy Wi-Fi (`>= 2` bars / `>= -80 dBm`), and normal temperature (`6..35°C`).
+    Chromatic accents appear only on active state changes or anomalies: **Sky Blue** (`#38bdf8`) for `Waking Up...`,
+    subtle charging battery inner fill (`Solar` / `Plugged` / `Charging` inside a crisp shell with a `15x15` `sun`,
+    `plug`, or `zap` badge overlaid on the top-right corner with a crystal cutout), and cold (`<= 5°C`); **Yellow**
+    (`#facc15`) for `Waiting`, unplugged low battery (`6..30%`), `1-bar` weak Wi-Fi (`<= -81 dBm`), and warm
+    (`36..44°C`); **Purple** (`#e879f9`) for unplugged critical battery (`<= 5%` in `"minimal"`, `"glance"`, and
+    `"pebbles"`) and hot (`>= 45°C`); **Red** (`#ef4444`) for `Live` and `Backfill`; and **Grey** (`#b4b4be`) for
+    `Disconnected` and unavailable sensors.
+- `card_theme` (clean cutover; unknown values log a warning and default to `"minimal"`):
+  - `"minimal"` (default): Backgroundless `64x12` footprint (`26x12` when battery and Wi-Fi telemetry are disabled, such
+    as when `rtsp_url` is set; `0px` capsule padding, `7px` gaps, `{boxX: 24, boxY: 684, boxW: 64, boxH: 12}` in
+    `bottom-left`) rendering a floating `26x12` stadium pill for **Status** (solid `pillFg` in normal/live states, or
+    hollow `2.5px`-stroke `pillRing` during `Backfill`) followed by up to two `12x12` circles for **Battery** and
+    **Wi-Fi** when enabled, with outer optical shadows and no background capsule (never icons or text).
+  - `"glance"`: `44px`-tall Smoked Obsidian crystal capsule (`16px` horizontal padding, `14px` item gaps, `138x44`
+    default bounds or `210x44` when all telemetry items are enabled) with solid-filled `24x24` status icons
+    (crescent `moon` for `Asleep` and `Low Battery`, three horizontal dots `•••` for `Waiting`, `zap` lightning bolt for
+    `Waking Up...`, `play` for `Live`, `rewind` for `Backfill`, `wifi-off` for `Disconnected`), `30x20` battery shell +
+    merged top-right `15x15` power badge (`sun`, `plug`, `zap`, or `?` when battery level is unknown) with crystal
+    cutout, `24x24` 4-tier Wi-Fi arcs, and optional `20x24` thermometer and `24x24` clock ring with cached `HH:MM`
+    hands.
+  - `"pebbles"`: Multi-pebble `44px`-tall layout (`148x44` default or `252x44` all-icons combined Frigate
+    mask bounds) rendering separate `44x44` circular Smoked Obsidian crystal pebbles separated by `8px` untouched
+    live-video gaps: a circular `44x44` **Status Pebble** (pure crystal with a crescent moon when `Asleep` or
+    `Low Battery`, flooding with `72%` semantic `statusRgb` jewel tint + `6%` frost sheen and a crisp white contour icon
+    whenever active/fault) followed by individual `44x44` circular pebbles for each enabled sensor icon (**Battery**
+    `44x44` with `+2px` visually centered `30x20` shell and merged top-right `15x15` power or `?` unknown badge,
+    **Wi-Fi** `44x44`, **Temperature** `44x44`, and **Clock** `44x44`), omitting any pebble whose icon is configured not
+    to be shown.
+  - `"hud"`: High-contrast diagnostic HUD (`832x76`, `<= 2/3` of the `1280px` frame width; positioned at any of the 7
+    `card_position` placements using the same `getCardBoxCoords` rules as other themes)
+    over a `6px` rounded deep-slate matte scrim (`86%`
+    `#0a0d13`, normalized backdrop luma, `92%` chroma desaturation, `1px` `22%` white border, alternating `4.5%`
+    row bands on rows 1 & 3, and `1px` `14%` vertical divider at `boxX + 45`) with a left semantic status square (`S`
+    preserving **Green** when `Asleep`, `FB`, `B`, `L` + mode + `#sessionId`) and 4 non-shifting `110`-char monospace
+    rows (`5x9` bitmap font with 5-sample dark halo and neutral-luma hierarchy: `45%` halo `|` pipes, `75%` halo `KEY:`
+    labels, `88%` halo crisp white values) updated dynamically on both sleeping and live frames
+    (`hasDynamicDebugCard()`).
   - `"none"`: Hides the status overlay while honoring `sleep_screen` (`"snapshot"`, `"slate"`, or `"black"`).
-- `card_position`: `"bottom-left"` (default), `"top-left"`, `"bottom-right"`, `"top-right"`, or `"center"`.
+- `card_position`: `"bottom-left"` (default), `"bottom-center"`, `"bottom-right"`, `"top-left"`, `"top-center"`,
+  `"top-right"`, or `"center"` (aliases `"center-top"` and `"center-bottom"` normalize to `"top-center"` and
+  `"bottom-center"`).
 - `sleep_screen`: `"snapshot"` (default, last camera frame from `/config/cache`), `"slate"` (solid `#222222`), or
   `"black"` (solid `#101010`).
 - `card_show_on_live` (`true` by default): Composites corner status cards onto live/backfill video frames via the 2-slot
-  alternating `liveOverlayBufs` scratch ring (`prepareLiveOverlayBuffer`) using `Red` status indicators (Eufy
-  play/rewind glyphs in `"icons"` and `"detailed"`, or a solid circle / hollow circle ring in `"minimal"`), while
-  keeping `cam.lastFrame` and `/config/cache` snapshots clean (`"debug"` always renders on live frames unless
+  alternating `liveOverlayBufs` scratch ring (`prepareLiveOverlayBuffer`) using `Red` status indicators (Lucide
+  `play`/`rewind` contours in `"glance"` and `"pebbles"`, or a solid pill / hollow pill ring in `"minimal"`), while
+  keeping `cam.lastFrame` and `/config/cache` snapshots clean (`"hud"` always renders on live frames unless
   `suppressLiveCard` is active).
 - `auto_frigate_mask` (`true` by default): Computes the normalized polygon bounding box for each camera's corner status
   card (with a `6px` chroma/anti-aliasing safety margin) and syncs both `motion.mask.eufy_bridge_card` and
   `objects.mask.eufy_bridge_card` into Frigate via `GET /api/config` and `PUT /api/config/set` (`requires_restart: 0`)
-  on startup, every 60s, and after Frigate restarts.
+  on startup, every 60s, and after Frigate restarts (deleting only bridge-created `eufy_bridge_card` masks when
+  `card_theme: "none"` or `card_position: "center"`).
 
-## Troubleshooting & Visual Diagnostics (`card_theme: "debug"`)
+### Theme Previews
 
-Setting `"card_theme": "debug"` (globally or per camera) renders a bottom-anchored diagnostic HUD (`832x76`) over both
-sleeping and live frames so you can visually inspect every state transition, frame stage, hardware property, and
-backfill clip directly inside Frigate Live View or recorded clips:
+Click any preview below to inspect the `1:1` native rendering across dark slate and camera snapshot backgrounds:
 
-```text
-+------+---------------------------------------------------------------------------------------------------------------+
-| [B]  | ST:BF_HSHK -> BF_PLAY  +004s | DEC:DECODE | BF:PLAYING | FPS:15/15 | WS:OK HB:OK FRG:OK RTC:OK | DROP:0 RST:0  |
-|      | LIGHT:OFF     | BAT:084% BAT | WIFI:4/4 -062dBm IDLE:0 | TMP:23C   | HW:M2/030s/EE:Y/Q7/RTSP:N | SEEN:14:32    |
-| BF   | SES:BF   R:00 | HOLD:026s    | IDLE:---   | VID:0.1s   | VW:0/0    | TRIG:CLEAR  008s  Q:00/28 | STOP:N        |
-| #04  | EV:RECORD 026s/4f8a1c        | BFQ:---  TRY:2/10 Q:0   | CONT:N    | CLIP:0060/0450f           | INIT:backfill |
-+------+---------------------------------------------------------------------------------------------------------------+
-```
+|                    `"minimal"` (default)                     |                         `"glance"`                         |                         `"pebbles"`                          |                `"hud"` (diagnostics)                |
+| :----------------------------------------------------------: | :--------------------------------------------------------: | :----------------------------------------------------------: | :-------------------------------------------------: |
+| ![Minimal Status Card Theme](images/status-card-minimal.png) | ![Glance Status Card Theme](images/status-card-glance.png) | ![Pebbles Status Card Theme](images/status-card-pebbles.png) | ![Diagnostic HUD Theme](images/status-card-hud.png) |
+
+## Troubleshooting & Visual Diagnostics (`card_theme: "hud"`)
+
+Setting `"card_theme": "hud"` (globally or per camera) renders a diagnostic HUD (`832x76`, positioned according to
+`card_position`) over both sleeping and live frames so you can visually inspect every state transition, frame stage,
+hardware property, and backfill clip directly inside Frigate Live View or recorded clips.
 
 ### Left Status Column (Frame Stage Square, Camera Mode & Session Counter)
 
 - **Top Colored Square (`[S]` / `[FB]` / `[B]` / `[L]`):**
   - `[S]` (**Snapshot / Sleeping / Waking Frame**): Shown whenever the encoder is outputting the cached sleeping
     snapshot (while idle, waiting, or waking before `gotVideo` is set on the session). The square background color
-    reflects the current non-live status: **Green** (`Asleep`, standby & ready), **Grey** (`Disconnected` when
-    `eufy-security-ws`, `HomeBase`/camera, `Frigate`, or `go2rtc` is down/unavailable), **Blue** (`Waking Up...`),
-    **Yellow** (`Waiting` for station slot or `BackfillJob`), or **Purple** (`Asleep (Low Battery)`).
+    reflects the current non-live status: **Green** (`Asleep` and `Asleep (Low Battery)`, standby & ready), **Grey**
+    (`Disconnected` when `eufy-security-ws`, `HomeBase`/camera, `Frigate`, or `go2rtc` is down/unavailable), **Blue**
+    (`Waking Up...`), or **Yellow** (`Waiting` for station slot or `BackfillJob`).
   - `[FB]` (**First Backfill Frame `0`**, **Yellow** background with dark block letters): Shown on the very first
     decoded frame (`Frame 0`, while `downloadPlayedFrames <= 1`) of a newly started `.zxvideo` backfill download so you
     can visually pinpoint the exact `t=0` start frame of the clip.
@@ -74,7 +110,7 @@ backfill clip directly inside Frigate Live View or recorded clips:
     continuation handshakes when `CONT:Y` is active so the badge never flashes back to `S` or `FB` between split clips).
   - `[L]` (**Live Stream Video Frames**, **Red** background with white block letter): Shown once live `RTSP` or `P2P`
     video is active (`gotVideo === true`).
-- **Middle Tag (`BF` / `RTSP` / `P2P` / `AUTO` / `CUST`):** Configured camera operating mode (`mode`).
+- **Middle Tag (`BF` / `RTSP` / `DIR` / `P2P` / `AUTO` / `CUST`):** Configured camera operating mode (`mode`).
 - **Bottom Tag (`#00`-`#99`):** Monotonic session counter (`sessionId` clamped at `99`) incremented on each session
   start (wake or backfill download).
 
@@ -82,14 +118,15 @@ backfill clip directly inside Frigate Live View or recorded clips:
 
 1. **Row 1 - FSM States, Transitions, Frame Pacing & Service Health:**
    - `ST:<prev>-><curr>+<age>`: Previous -> current session state (`IDLE`, `WK_RTSP`, `WK_P2P`, `LIVE`, `BF_HSHK`,
-     `BF_PLAY`, `BF_TAIL`, `COOLDWN`) and exact seconds in the current state.
+     `BF_PLAY`, `BF_TAIL`, `COOLDWN`) and elapsed duration in the current state (`000s`-`999s`, scaling automatically to
+     minutes `m`, hours `h`, days `d`, weeks `w`, and years `y` past `999s` across all 4-char HUD timer fields).
    - `DEC:<state>`: Decoder FSM state (`DETACH`, `HSHK`, `DECODE`, `PAUSED`, `FLUSH`).
    - `BF:<state>`: Backfill FSM state (`IDLE`, `ACTIVE`, `WAIT_Q`, `QUERY`, `MATCH`, `PLAYING`, `DONE`, `EXPIRED`).
    - `FPS:<measured>/<target>`: Real-time measured output FPS over a rolling `1s` window vs target FPS (`05` idle / `15`
      live).
    - `WS:<OK|DN> HB:<OK|DN> FRG:<OK|DN> RTC:<OK|DN>`: Real-time connectivity indicators for `eufy-security-ws` (`WS`),
      `HomeBase`/camera (`HB`), `Frigate` (`FRG`), and `go2rtc` (`RTC`).
-   - `DROP:0 RST:<n>`: Frame-drop counter slot (`0`) and mid-session restart count (`0-9`).
+   - `DROP:<n> RST:<n>`: Dropped frame/packet count (`0-9+`) and mid-session restart count (`0-9`).
 2. **Row 2 - Spotlight (`light`), Battery, Radio/Idle RSSI Drain Detector & Synced Hardware Settings:**
    - `LIGHT:ON` / `LIGHT:OFF`: Real-time camera spotlight (`light`) state.
    - `BAT:<pct>% <src>`: Battery percentage (`000%-100%`, or `---%` before telemetry) and power status (`CHG` when
@@ -120,5 +157,5 @@ backfill clip directly inside Frigate Live View or recorded clips:
      `backfillClipQueue`.
    - `CONT:<Y|N>`: Whether back-to-back clip continuation (`backfillContinuation`) is active.
    - `CLIP:<played>/<decoded>f`: Backfill frames played vs total frames decoded (e.g. `0450/0450f`).
-   - `INIT:<initiator>`: `8`-char wake initiator (`none`, `eufy-eve`, `viewer`, `backfill`, `api-wake`, `eufy-ws`,
-     `bridge-p`).
+   - `INIT:<initiator>`: `8`-char wake initiator (`none`, `eufy-eve`, `viewer`, `frigate-`, `backfill`, `api-wake`,
+     `eufy-ws`, `bridge-p`, `rtsp-dir`).

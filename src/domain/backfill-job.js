@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -43,6 +42,16 @@ const BACKFILL_STATES = Object.freeze({
   EXPIRED: 'expired',
 });
 
+/** @type {ReadonlySet<string>} */
+const PRE_DOWNLOAD_BACKFILL_STATES = Object.freeze(
+  new Set([
+    BACKFILL_STATES.RECORDING,
+    BACKFILL_STATES.SETTLING,
+    BACKFILL_STATES.READY_TO_QUERY,
+    BACKFILL_STATES.MATCHED,
+  ])
+);
+
 /**
  * Validated transition map for the BackfillJob finite state machine.
  *
@@ -50,50 +59,50 @@ const BACKFILL_STATES = Object.freeze({
  */
 const ALLOWED_BACKFILL_TRANSITIONS = Object.freeze({
   [BACKFILL_STATES.RECORDING]: Object.freeze(
-      new Set([
-        BACKFILL_STATES.RECORDING,
-        BACKFILL_STATES.SETTLING,
-        BACKFILL_STATES.READY_TO_QUERY,
-        BACKFILL_STATES.MATCHED,
-        BACKFILL_STATES.EXPIRED,
-      ])
+    new Set([
+      BACKFILL_STATES.RECORDING,
+      BACKFILL_STATES.SETTLING,
+      BACKFILL_STATES.READY_TO_QUERY,
+      BACKFILL_STATES.MATCHED,
+      BACKFILL_STATES.EXPIRED,
+    ])
   ),
   [BACKFILL_STATES.SETTLING]: Object.freeze(
-      new Set([
-        BACKFILL_STATES.RECORDING,
-        BACKFILL_STATES.SETTLING,
-        BACKFILL_STATES.READY_TO_QUERY,
-        BACKFILL_STATES.MATCHED,
-        BACKFILL_STATES.EXPIRED,
-      ])
+    new Set([
+      BACKFILL_STATES.RECORDING,
+      BACKFILL_STATES.SETTLING,
+      BACKFILL_STATES.READY_TO_QUERY,
+      BACKFILL_STATES.MATCHED,
+      BACKFILL_STATES.EXPIRED,
+    ])
   ),
   [BACKFILL_STATES.READY_TO_QUERY]: Object.freeze(
-      new Set([
-        BACKFILL_STATES.RECORDING,
-        BACKFILL_STATES.SETTLING,
-        BACKFILL_STATES.READY_TO_QUERY,
-        BACKFILL_STATES.MATCHED,
-        BACKFILL_STATES.EXPIRED,
-      ])
+    new Set([
+      BACKFILL_STATES.RECORDING,
+      BACKFILL_STATES.SETTLING,
+      BACKFILL_STATES.READY_TO_QUERY,
+      BACKFILL_STATES.MATCHED,
+      BACKFILL_STATES.EXPIRED,
+    ])
   ),
   [BACKFILL_STATES.MATCHED]: Object.freeze(
-      new Set([
-        BACKFILL_STATES.RECORDING,
-        BACKFILL_STATES.SETTLING,
-        BACKFILL_STATES.READY_TO_QUERY,
-        BACKFILL_STATES.MATCHED,
-        BACKFILL_STATES.DOWNLOADING,
-        BACKFILL_STATES.EXPIRED,
-      ])
+    new Set([
+      BACKFILL_STATES.RECORDING,
+      BACKFILL_STATES.SETTLING,
+      BACKFILL_STATES.READY_TO_QUERY,
+      BACKFILL_STATES.MATCHED,
+      BACKFILL_STATES.DOWNLOADING,
+      BACKFILL_STATES.EXPIRED,
+    ])
   ),
   [BACKFILL_STATES.DOWNLOADING]: Object.freeze(
-      new Set([
-        BACKFILL_STATES.DOWNLOADING,
-        BACKFILL_STATES.MATCHED,
-        BACKFILL_STATES.READY_TO_QUERY,
-        BACKFILL_STATES.COMPLETED,
-        BACKFILL_STATES.EXPIRED,
-      ])
+    new Set([
+      BACKFILL_STATES.DOWNLOADING,
+      BACKFILL_STATES.MATCHED,
+      BACKFILL_STATES.READY_TO_QUERY,
+      BACKFILL_STATES.COMPLETED,
+      BACKFILL_STATES.EXPIRED,
+    ])
   ),
   [BACKFILL_STATES.COMPLETED]: Object.freeze(new Set([BACKFILL_STATES.COMPLETED])),
   [BACKFILL_STATES.EXPIRED]: Object.freeze(new Set([BACKFILL_STATES.EXPIRED])),
@@ -128,12 +137,12 @@ function parseClipTimestampMs(startStr, storagePath) {
     return 0;
   }
   return new Date(
-      Number(tm[1]),
-      Number(tm[2]) - 1,
-      Number(tm[3]),
-      Number(tm[4]),
-      Number(tm[5]),
-      Number(tm[6])
+    Number(tm[1]),
+    Number(tm[2]) - 1,
+    Number(tm[3]),
+    Number(tm[4]),
+    Number(tm[5]),
+    Number(tm[6])
   ).getTime();
 }
 
@@ -191,24 +200,32 @@ class BackfillJob {
     this.priority = opts.priority ?? DEFAULT_EVENT_PRIORITY;
     this.attempts = opts.attempts ?? 0;
     this.ignoreTimeWindow = Boolean(opts.ignoreTimeWindow);
-    this.recordingActive =
-        opts.recordingActive !== undefined ? Boolean(opts.recordingActive) : !this.ignoreTimeWindow;
+    this.recordingActive = opts.recordingActive !== undefined ? Boolean(opts.recordingActive) : !this.ignoreTimeWindow;
     this.clearedAt = opts.clearedAt ?? 0;
     this.followUpQueried = Boolean(opts.followUpQueried);
     this.activeEvents = new Set(Array.isArray(opts.activeEvents) ? opts.activeEvents : []);
     if (this.recordingActive && this.event && !this.ignoreTimeWindow) {
       this.activeEvents.add(String(this.event).toLowerCase());
     }
-    /** @type {Array<{ storagePath: string, cipherId: number, clipMs: number, event: string, personName: string, reason: string }>} */
+    /**
+     * @type {Array<{
+     *   storagePath: string,
+     *   cipherId: number,
+     *   clipMs: number,
+     *   event: string,
+     *   personName: string,
+     *   reason: string
+     * }>}
+     */
     this.matchedClips = [];
     /** @type {string} */
     this.state = this.ignoreTimeWindow
-        ? BACKFILL_STATES.READY_TO_QUERY
-        : this.recordingActive
-            ? BACKFILL_STATES.RECORDING
-            : this.clearedAt > 0
-                ? BACKFILL_STATES.SETTLING
-                : BACKFILL_STATES.READY_TO_QUERY;
+      ? BACKFILL_STATES.READY_TO_QUERY
+      : this.recordingActive
+        ? BACKFILL_STATES.RECORDING
+        : this.clearedAt > 0
+          ? BACKFILL_STATES.SETTLING
+          : BACKFILL_STATES.READY_TO_QUERY;
   }
 
   /**
@@ -245,24 +262,20 @@ class BackfillJob {
    * @returns {boolean} True if event/priority or personName was upgraded.
    */
   upgradeEvent(
-      eventNameOrOpts,
-      personName = '',
-      reason = '',
-      nextPriority = DEFAULT_EVENT_PRIORITY,
-      now = Date.now(),
-      recordingActive = true
+    eventNameOrOpts,
+    personName = '',
+    reason = '',
+    nextPriority = DEFAULT_EVENT_PRIORITY,
+    now = Date.now(),
+    recordingActive = true
   ) {
-    const opts =
-        typeof eventNameOrOpts === 'object' && eventNameOrOpts !== null ? eventNameOrOpts : null;
+    const opts = typeof eventNameOrOpts === 'object' && eventNameOrOpts !== null ? eventNameOrOpts : null;
     const evName = opts ? String(opts.event || this.event) : String(eventNameOrOpts || '');
     const pName = opts ? String(opts.personName || '') : personName;
     const rsn = opts ? String(opts.reason || evName) : reason || evName;
     const prio = opts ? Number(opts.priority ?? this.priority) : nextPriority;
     const ts = opts ? Number(opts.at ?? opts.now ?? Date.now()) : now;
-    const recActive =
-        opts && opts.recordingActive !== undefined
-            ? Boolean(opts.recordingActive)
-            : recordingActive;
+    const recActive = opts && opts.recordingActive !== undefined ? Boolean(opts.recordingActive) : recordingActive;
 
     this.lastActivityAt = Math.max(this.lastActivityAt || this.at, ts);
     if (recActive && !this.ignoreTimeWindow) {
@@ -292,24 +305,15 @@ class BackfillJob {
   /**
    * Records that a Eufy trigger property reported state: false, marking the hardware clip
    * recording as completed (SETTLING) only once all active trigger properties have cleared.
-   * Supports both (now, eventName) and (eventName, now) argument orders.
    *
-   * @param {number|string} [nowOrEvent=Date.now()] - Current epoch timestamp or event name.
-   * @param {string|number} [eventOrNow=''] - Eufy event property that cleared or timestamp.
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {string} [eventName=''] - Eufy event property that cleared (clears all when omitted).
    * @returns {boolean} True if all active triggers have cleared and recording is now settling.
    */
-  markRecordingCleared(nowOrEvent = Date.now(), eventOrNow = '') {
-    const isFirstString = typeof nowOrEvent === 'string';
-    const eventName = isFirstString ? nowOrEvent : String(eventOrNow || '');
-    const now = isFirstString
-        ? typeof eventOrNow === 'number'
-            ? eventOrNow
-            : Date.now()
-        : Number(nowOrEvent);
-
+  markRecordingCleared(now = Date.now(), eventName = '') {
     this.lastActivityAt = Math.max(this.lastActivityAt || this.at, now);
     if (eventName) {
-      this.activeEvents.delete(eventName.toLowerCase());
+      this.activeEvents.delete(String(eventName).toLowerCase());
     } else {
       this.activeEvents.clear();
     }
@@ -338,13 +342,9 @@ class BackfillJob {
       return now - this.clearedAt >= BACKFILL_POST_CLEAR_SETTLE_MS;
     }
     if (this.recordingActive) {
-      const hasSubsequentRetrigger =
-          (this.lastActivityAt || this.at) - this.at > INITIAL_COMPANION_ACTIVITY_WINDOW_MS;
+      const hasSubsequentRetrigger = (this.lastActivityAt || this.at) - this.at > INITIAL_COMPANION_ACTIVITY_WINDOW_MS;
       const refAt = hasSubsequentRetrigger ? this.lastActivityAt : this.at;
-      return (
-        now - refAt >= maxRecordingWaitMs ||
-        now - this.at >= BACKFILL_MAX_TOTAL_RECORDING_WAIT_MS
-      );
+      return now - refAt >= maxRecordingWaitMs || now - this.at >= BACKFILL_MAX_TOTAL_RECORDING_WAIT_MS;
     }
     return now - this.at >= minEventAgeMs;
   }
@@ -358,17 +358,13 @@ class BackfillJob {
    * @param {number} [maxRecordingWaitMs] - Maximum wait while recordingActive is true.
    * @returns {boolean}
    */
-  isReadyToQuery(
-      now = Date.now(),
-      minEventAgeMs = DEFAULT_MIN_EVENT_AGE_MS,
-      maxRecordingWaitMs = undefined
-  ) {
+  isReadyToQuery(now = Date.now(), minEventAgeMs = DEFAULT_MIN_EVENT_AGE_MS, maxRecordingWaitMs = undefined) {
     const effectiveRecordingWaitMs =
-        maxRecordingWaitMs !== undefined
-            ? maxRecordingWaitMs
-            : minEventAgeMs > DEFAULT_MIN_EVENT_AGE_MS
-                ? minEventAgeMs
-                : BACKFILL_RECORDING_WAIT_CAP_MS;
+      maxRecordingWaitMs !== undefined
+        ? maxRecordingWaitMs
+        : minEventAgeMs > DEFAULT_MIN_EVENT_AGE_MS
+          ? minEventAgeMs
+          : BACKFILL_RECORDING_WAIT_CAP_MS;
     const ready = this.hasElapsedQuerySettleWindow(now, minEventAgeMs, effectiveRecordingWaitMs);
     if (ready && (this.state === BACKFILL_STATES.RECORDING || this.state === BACKFILL_STATES.SETTLING)) {
       this.transitionTo(BACKFILL_STATES.READY_TO_QUERY, 'settle window elapsed');
@@ -427,21 +423,30 @@ class BackfillJob {
   matchesCandidate(candidate, downloadedPaths) {
     const endRef = Math.max(this.at, this.lastActivityAt || this.at, this.clearedAt || 0);
     return candidate && !downloadedPaths.has(candidate.storagePath)
-        ? this.isUrgentTest() ||
-            !candidate.clipMs ||
-            (candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS &&
-              candidate.clipMs <= endRef + BACKFILL_MATCH_LOOKAHEAD_MS)
-        : false;
+      ? this.isUrgentTest() ||
+          !candidate.clipMs ||
+          (candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS &&
+            candidate.clipMs <= endRef + BACKFILL_MATCH_LOOKAHEAD_MS)
+      : false;
   }
 
   /**
    * Creates an immutable matched clip descriptor ready for device.start_download and transitions to MATCHED.
    *
    * @param {{ storagePath: string, cipherId: number, clipMs?: number }} candidate - Matched database candidate.
-   * @returns {Readonly<{ storagePath: string, cipherId: number, clipMs: number, event: string, personName: string, reason: string }>}
+   * @returns {Readonly<{
+   *   storagePath: string,
+   *   cipherId: number,
+   *   clipMs: number,
+   *   event: string,
+   *   personName: string,
+   *   reason: string
+   * }>}
    */
   toMatchedClip(candidate) {
-    this.transitionTo(BACKFILL_STATES.MATCHED, 'candidate clip matched');
+    if (PRE_DOWNLOAD_BACKFILL_STATES.has(this.state)) {
+      this.transitionTo(BACKFILL_STATES.MATCHED, 'candidate clip matched');
+    }
     return Object.freeze({
       storagePath: candidate.storagePath,
       cipherId: candidate.cipherId,
@@ -479,7 +484,14 @@ class BackfillJob {
   /**
    * Shifts the next matched clip for download and transitions the job state to DOWNLOADING.
    *
-   * @returns {Readonly<{ storagePath: string, cipherId: number, clipMs: number, event: string, personName: string, reason: string }>|null}
+   * @returns {Readonly<{
+   *   storagePath: string,
+   *   cipherId: number,
+   *   clipMs: number,
+   *   event: string,
+   *   personName: string,
+   *   reason: string
+   * }>|null}
    */
   shiftNextClipForDownload() {
     if (this.matchedClips.length === 0) {

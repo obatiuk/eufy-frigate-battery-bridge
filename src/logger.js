@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -18,6 +17,10 @@ const LOG_LEVELS = Object.freeze({
 });
 
 const LOG_LEVEL_NAME_WIDTH = 5;
+const URL_CREDENTIALS_REGEX = /([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi;
+const URL_CREDENTIALS_REPLACEMENT = '$1***@';
+const LOG_CR_REGEX = /\r/g;
+const LOG_LF_REGEX = /\n/g;
 
 /** @type {number} */
 let currentLogLevel = LOG_LEVELS.info;
@@ -66,7 +69,11 @@ function formatLocalHm(date = new Date()) {
  * @returns {'debug'|'info'|'warn'|'error'}
  */
 function normalizeLevelName(rawLevel) {
-  switch (String(rawLevel || '').toLowerCase().trim()) {
+  switch (
+    String(rawLevel || '')
+      .toLowerCase()
+      .trim()
+  ) {
     case 'debug':
       return 'debug';
     case 'info':
@@ -84,7 +91,16 @@ function normalizeLevelName(rawLevel) {
 /**
  * Resolves the log scope label from a stateful domain object or scope string.
  *
- * @param {string|{getScopeName?: () => string, getName?: () => string, name?: string, cameraName?: string, sessionState?: string, state?: string, decoderState?: string, evState?: string}|null|undefined} scope - Stateful domain instance or scope name.
+ * @param {string|{
+ *   getScopeName?: () => string,
+ *   getName?: () => string,
+ *   name?: string,
+ *   cameraName?: string,
+ *   sessionState?: string,
+ *   state?: string,
+ *   decoderState?: string,
+ *   evState?: string
+ * }|null|undefined} scope - Stateful domain instance or scope name.
  * @returns {string}
  */
 function resolveScopeName(scope) {
@@ -109,7 +125,14 @@ function resolveScopeName(scope) {
  * Resolves the uppercase state badge prefix for log lines when scope is a stateful domain object
  * (Camera with sessionState, BackfillJob with state, or sub-FSM scope with decoderState / evState).
  *
- * @param {string|{name?: string, cameraName?: string, sessionState?: string, state?: string, decoderState?: string, evState?: string}|null|undefined} scope - Stateful domain instance or scope name.
+ * @param {string|{
+ *   name?: string,
+ *   cameraName?: string,
+ *   sessionState?: string,
+ *   state?: string,
+ *   decoderState?: string,
+ *   evState?: string
+ * }|null|undefined} scope - Stateful domain instance or scope name.
  * @returns {string}
  */
 function resolveStatePrefix(scope) {
@@ -126,18 +149,42 @@ function resolveStatePrefix(scope) {
  *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [camera] [STATE] message
  *
  * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
- * @param {string|{name?: string, sessionState?: string}|null|undefined} scope - Camera state/config object or scope string.
+ * @param {string|{name?: string, sessionState?: string}|null|undefined} scope - Camera scope or name.
  * @param {Array<*>} args - Message segments.
  * @param {Date} [now=new Date()] - Timestamp to format.
  * @returns {string}
  */
+/**
+ * Masks embedded URL userinfo credentials (including passwords containing '@') in text.
+ *
+ * @param {string|null|undefined} text - Input text that may contain URLs with userinfo credentials.
+ * @returns {string} Text with embedded credentials replaced by '***'.
+ */
+function maskSecrets(text) {
+  if (text === null || text === undefined) {
+    return '';
+  }
+  return String(text).replace(URL_CREDENTIALS_REGEX, URL_CREDENTIALS_REPLACEMENT);
+}
+
+/**
+ * Redacts embedded credentials and escapes raw CR/LF newlines to prevent log injection.
+ *
+ * @param {*} value - Raw log segment value.
+ * @returns {string} Sanitized single-line segment.
+ */
+function sanitizeLogSegment(value) {
+  return maskSecrets(value).replace(LOG_CR_REGEX, '\\r').replace(LOG_LF_REGEX, '\\n');
+}
+
 function formatLogLine(level, scope, args, now = new Date()) {
   const normLevel = normalizeLevelName(level);
   const timestamp = formatLocalTimestamp(now);
   const levelTag = `[${normLevel.toUpperCase().padEnd(LOG_LEVEL_NAME_WIDTH)}]`;
-  const scopeName = resolveScopeName(scope);
-  const statePrefix = resolveStatePrefix(scope);
-  return `${timestamp} - ${levelTag} - [${scopeName}] ${statePrefix}${args.join(' ')}`;
+  const scopeName = sanitizeLogSegment(resolveScopeName(scope));
+  const statePrefix = sanitizeLogSegment(resolveStatePrefix(scope));
+  const message = sanitizeLogSegment(args.join(' '));
+  return `${timestamp} - ${levelTag} - [${scopeName}] ${statePrefix}${message}`;
 }
 
 /**
@@ -164,19 +211,21 @@ const log = {
 };
 
 /**
- * Initializes the active log severity level from LOG_LEVEL or config.json.
+ * Initializes the active log severity level from BRIDGE_LOG_LEVEL.
  *
  * @param {string|undefined} rawLevel - Configured log level string.
  * @returns {string} Normalized active log level name.
  */
 function initLogger(rawLevel) {
-  const cleaned = String(rawLevel || 'info').toLowerCase().trim();
+  const cleaned = String(rawLevel || 'info')
+    .toLowerCase()
+    .trim();
   const isKnown = cleaned in LOG_LEVELS;
   const activeLogLevelName = normalizeLevelName(cleaned);
   currentLogLevel = LOG_LEVELS[activeLogLevelName];
 
   if (!isKnown) {
-    log.warn('bridge', 'unknown LOG_LEVEL "' + cleaned + '", defaulting to "info"');
+    log.warn('bridge', 'unknown BRIDGE_LOG_LEVEL "' + cleaned + '", defaulting to "info"');
   }
   return activeLogLevelName;
 }
@@ -185,6 +234,7 @@ module.exports = {
   formatLocalTimestamp,
   formatLocalHm,
   normalizeLevelName,
+  maskSecrets,
   formatLogLine,
   log,
   initLogger,

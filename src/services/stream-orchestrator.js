@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -19,11 +18,8 @@ const {
   getEventPriority,
 } = require('../config');
 const {log} = require('../logger');
-const {Camera, WakeRequest, WAKE_KINDS, DOWNLOAD_COMPLETED_INITIATOR} = require('../domain/camera');
-const {
-  BACKFILL_MAX_QUERY_ATTEMPTS,
-  extractDatabaseRecordCandidate,
-} = require('../domain/backfill-job');
+const {Camera, WakeRequest, WAKE_KINDS, API_WAKE_STATUSES, DOWNLOAD_COMPLETED_INITIATOR} = require('../domain/camera');
+const {BACKFILL_MAX_QUERY_ATTEMPTS, extractDatabaseRecordCandidate} = require('../domain/backfill-job');
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {saveCachedFrame} = require('../overlay/snapshot-cache');
 const {pushFrameToEncoder, startEncoder, stopEncoder} = require('../media/encoder');
@@ -123,8 +119,15 @@ let isShuttingDownFn = () => false;
 
 const stationTransitions = new Map();
 const stationNextWakeAt = new Map();
+const getActiveStationTransitionCount = () => stationTransitions.size;
 const getStationTransition = (cam) => stationTransitions.get(cam.getStationKey()) || Promise.resolve();
-const setStationTransition = (cam, p) => stationTransitions.set(cam.getStationKey(), p);
+const setStationTransition = (cam, p) => {
+  const key = cam.getStationKey();
+  const tracked = p.finally(() => {
+    if (stationTransitions.get(key) === tracked) stationTransitions.delete(key);
+  });
+  stationTransitions.set(key, tracked);
+};
 
 /**
  * Initializes the orchestrator with the active camera collection and shutdown state accessor.
@@ -177,15 +180,8 @@ async function evaluateEarlySleep(cam, now) {
   const checkNow = Date.now();
   if (frigateIdle && cam.canSleepEarlyOnIdle(checkNow, MIN_EVENT_VIDEO_DURATION_MS)) {
     const quietSecs = cam.markEarlySleep(checkNow);
-    const initiator = clearedByEufy
-        ? 'bridge-early-sleep/eufy-cleared'
-        : 'bridge-early-sleep/quiet-timeout';
-    stop(
-        cam,
-        'motion cleared early (battery saver, quietFor=' + quietSecs + 's, frigateIdle=true)',
-        false,
-        initiator
-    );
+    const initiator = clearedByEufy ? 'bridge-early-sleep/eufy-cleared' : 'bridge-early-sleep/quiet-timeout';
+    stop(cam, 'motion cleared early (battery saver, quietFor=' + quietSecs + 's, frigateIdle=true)', false, initiator);
     arbitrate();
   }
 }
@@ -228,11 +224,11 @@ async function evaluateActiveHoldExtension(cam, clockNow) {
     }
     const liveSecs = cam.getLiveDurationSecs(extNow);
     const reasonLabel = !frigateIdle
-        ? 'active object still in progress in Frigate'
-        : 'eufy hardware trigger still active';
+      ? 'active object still in progress in Frigate'
+      : 'eufy hardware trigger still active';
     log.info(
-        cam,
-        reasonLabel +
+      cam,
+      reasonLabel +
         ', extended stream hold by +' +
         Math.round(extendMs / MS_PER_SECOND) +
         's (holdExtendedTo=' +
@@ -262,29 +258,40 @@ async function evaluateActiveHoldExtension(cam, clockNow) {
  */
 function queueApiWakeBackfill(cam, reason, now) {
   cam.prepareForMotionTrigger();
-  if (cam.hasPendingBackfill() || cam.hasActiveHardwareTriggers()) {
-    return false;
+  const queuedOrUpgraded = cam.queueOrUpgradeApiWakeBackfill(now, reason || 'external api wake', {
+    evPriority: API_WAKE_EVENT_PRIORITY,
+    defaultEvent: DEFAULT_EXTERNAL_WAKE_EVENT,
+  });
+  if (queuedOrUpgraded) {
+    pushFrameToEncoder(cam, now);
   }
-  cam.queueEventBackfill(
-      now,
-      DEFAULT_EXTERNAL_WAKE_EVENT,
-      '',
-      reason || 'external api wake',
-      API_WAKE_EVENT_PRIORITY,
-      false
-  );
-  pushFrameToEncoder(cam, now);
-  return true;
+  return queuedOrUpgraded;
 }
 
 /**
  * Wakes or extends a camera stream in response to an external /api/wake HTTP request.
  *
  * @param {Camera} cam - Target Camera instance.
- * @param {{ durationMs: number, reason: string, createEvent: boolean, delayMs?: number }} opts - Wake options or built WakeRequest.
- * @returns {{ camera: string, title: string, status: string, mode: string, hold_secs: number, delay_ms: number }}
+ * @param {{
+ *   durationMs: number,
+ *   reason: string,
+ *   createEvent: boolean,
+ *   delayMs?: number
+ * }} opts - Wake options or built WakeRequest.
+ * @returns {{
+ *   camera: string,
+ *   title: string,
+ *   status: string,
+ *   mode: string,
+ *   hold_secs: number,
+ *   delay_ms: number,
+ *   error?: string,
+ * }}
  */
 function wakeCameraExternal(cam, opts) {
+  if (!cam.supportsApiWake()) {
+    return cam.toApiWakeErrorResponse(API_WAKE_STATUSES.UNSUPPORTED);
+  }
   const {durationMs, reason, createEvent, delayMs} = opts;
   const now = Date.now();
   cam.cancelStartupProbe();
@@ -293,7 +300,11 @@ function wakeCameraExternal(cam, opts) {
     if (isShuttingDownFn()) {
       return;
     }
-    cam.recordApiWakeTriggered(Date.now(), wakeCreateEvent);
+    if (!isWsReady() && !cam.isRtspDirect()) {
+      log.warn(cam, 'api-wake "' + wakeReason + '" aborted (eufy-security-ws disconnected)');
+      return;
+    }
+    cam.recordApiWakeTriggered(wakeCreateEvent);
     if (wakeCreateEvent) {
       trigger(cam, wakeReason, wakeDurationMs, WAKE_KINDS.MOTION, 'api-wake', API_WAKE_EVENT_PRIORITY);
       if (cam.isActiveLiveSession()) {
@@ -309,20 +320,20 @@ function wakeCameraExternal(cam, opts) {
     applyWakeTrigger(reason, durationMs, createEvent);
     if (cam.resetStalledRtspWakeIfNeeded(now, API_WAKE_STALLED_RTSP_MS)) {
       log.info(
-          cam,
-          'refreshing stalled RTSP wake on new api-wake "' + reason + '" (session=' + cam.getSessionId() + ')'
+        cam,
+        'refreshing stalled RTSP wake on new api-wake "' + reason + '" (session=' + cam.getSessionId() + ')'
       );
       stopDecoder(cam);
       void startRtspStream(cam);
     }
-    return cam.toApiWakeResponse('extended', durationMs, 0);
+    return cam.toApiWakeResponse(API_WAKE_STATUSES.EXTENDED, durationMs, 0);
   }
 
   if (cam.isDeviceOffline()) {
     if (cam.shouldRefreshOfflineOnView(now)) {
       log.info(
-          cam,
-          'api-wake "' +
+        cam,
+        'api-wake "' +
           reason +
           '" received while camera is offline (' +
           (cam.getOfflineReason() || 'offline') +
@@ -338,45 +349,44 @@ function wakeCameraExternal(cam, opts) {
         }
       });
     }
-    return cam.toApiWakeResponse('offline', 0, 0);
+    return cam.toApiWakeErrorResponse(
+      API_WAKE_STATUSES.OFFLINE,
+      'Camera is offline (' + (cam.getOfflineReason() || 'offline') + '); telemetry refresh requested'
+    );
   }
 
   if (cam.shouldBackfillOnlyOnApiWake()) {
     cam.clearApiWakeTimer();
     if (queueApiWakeBackfill(cam, reason, now)) {
       log.info(
-          cam,
-          'api-wake "' + reason + '" queued for HomeBase clip backfill (active Eufy trigger/backfill, skipping live wake)'
+        cam,
+        'api-wake "' + reason + '" queued for HomeBase clip backfill (active Eufy trigger/backfill, skipping live wake)'
       );
     } else {
       log.debug(
-          cam,
-          'api-wake "' + reason + '" skipped (pending backfill or active trigger is already being processed)'
+        cam,
+        'api-wake "' + reason + '" skipped (pending backfill or active trigger is already being processed)'
       );
     }
-    return cam.toApiWakeResponse('backfill', durationMs, 0);
+    return cam.toApiWakeResponse(API_WAKE_STATUSES.BACKFILL, durationMs, 0);
   }
 
   if (cam.hasPendingApiWakeTimer()) {
     const remainingDelayMs = cam.coalesceApiWake(durationMs, reason, createEvent, now);
     log.debug(
-        cam,
-        'coalesced duplicate api-wake "' +
-        reason +
-        '" into pending wake timer (in ' +
-        remainingDelayMs +
-        'ms)'
+      cam,
+      'coalesced duplicate api-wake "' + reason + '" into pending wake timer (in ' + remainingDelayMs + 'ms)'
     );
-    return cam.toApiWakeResponse('scheduled', cam.getScheduledApiWakeDurationMs(), remainingDelayMs);
+    return cam.toApiWakeResponse(API_WAKE_STATUSES.SCHEDULED, cam.getScheduledApiWakeDurationMs(), remainingDelayMs);
   }
 
   if (cam.shouldBackfillOnlyOnEvent()) {
     log.info(
-        cam,
-        'api-wake "' +
+      cam,
+      'api-wake "' +
         reason +
-        '" starting a live stream on a backfill-mode camera (no Eufy trigger, BackfillJob, or live session is active, ' +
-        'so there is no clip to wait for' +
+        '" starting a live stream on a backfill-mode camera (no Eufy trigger, BackfillJob, or live session ' +
+        'is active, so there is no clip to wait for' +
         (createEvent ? ')' : '; view-only wake, create_event=false)')
     );
   }
@@ -384,32 +394,41 @@ function wakeCameraExternal(cam, opts) {
   const stationKey = cam.getStationKey();
   const nextSlotAt = Math.max(now, stationNextWakeAt.get(stationKey) || 0);
   const rawDelayMs = delayMs !== undefined && delayMs > 0 ? delayMs : Math.max(0, nextSlotAt - now);
-  const pacedReq = (createEvent
-      ? WakeRequest.motion(reason, durationMs)
-      : WakeRequest.view(reason, durationMs))
-      .withInitiator('api-wake')
-      .withCreateEvent(Boolean(createEvent))
-      .withDelay(rawDelayMs)
-      .build();
+  const pacedReq = (createEvent ? WakeRequest.motion(reason, durationMs) : WakeRequest.view(reason, durationMs))
+    .withInitiator('api-wake')
+    .withCreateEvent(Boolean(createEvent))
+    .withDelay(rawDelayMs)
+    .build();
   const effectiveDelayMs = pacedReq.delayMs;
-  stationNextWakeAt.set(stationKey, now + effectiveDelayMs + STATION_WAKE_PACING_MS);
+  const scheduledSlotAt = now + effectiveDelayMs + STATION_WAKE_PACING_MS;
+  stationNextWakeAt.set(stationKey, scheduledSlotAt);
 
   if (effectiveDelayMs > 0) {
     cam.scheduleApiWake(
-        pacedReq.durationMs,
-        pacedReq.reason,
-        pacedReq.createEvent,
-        effectiveDelayMs,
-        now,
-        (pending) => {
-          applyWakeTrigger(pending.reason, pending.durationMs, pending.createEvent);
+      pacedReq.durationMs,
+      pacedReq.reason,
+      pacedReq.createEvent,
+      effectiveDelayMs,
+      now,
+      (pending) => {
+        if (isShuttingDownFn()) {
+          return;
         }
+        if (!isWsReady() && !cam.isRtspDirect()) {
+          if (stationNextWakeAt.get(stationKey) === scheduledSlotAt) {
+            stationNextWakeAt.delete(stationKey);
+          }
+          log.warn(cam, 'scheduled api-wake "' + pending.reason + '" skipped (eufy-security-ws disconnected)');
+          return;
+        }
+        applyWakeTrigger(pending.reason, pending.durationMs, pending.createEvent);
+      }
     );
-    return cam.toApiWakeResponse('scheduled', pacedReq.durationMs, effectiveDelayMs);
+    return cam.toApiWakeResponse(API_WAKE_STATUSES.SCHEDULED, pacedReq.durationMs, effectiveDelayMs);
   }
 
   applyWakeTrigger(pacedReq.reason, pacedReq.durationMs, pacedReq.createEvent);
-  return cam.toApiWakeResponse('waking', pacedReq.durationMs, 0);
+  return cam.toApiWakeResponse(API_WAKE_STATUSES.WAKING, pacedReq.durationMs, 0);
 }
 
 /**
@@ -424,19 +443,19 @@ function wakeCameraExternal(cam, opts) {
  * @param {number} [evPriority=DEFAULT_EVENT_PRIORITY] - Event priority boost score.
  */
 function trigger(cam, reason, ms, kind, initiator = '', evPriority = DEFAULT_EVENT_PRIORITY) {
-  if (!isWsReady()) {
+  if (!isWsReady() && !cam.isRtspDirect()) {
     return;
   }
   const now = Date.now();
   const req =
-      kind === WAKE_KINDS.MOTION
-          ? WakeRequest.motion(reason, ms)
-              .withInitiator(initiator || 'eufy-event')
-              .withPriority(evPriority)
-              .build()
-          : WakeRequest.view(reason, ms)
-              .withInitiator(initiator || 'viewer')
-              .build();
+    kind === WAKE_KINDS.MOTION
+      ? WakeRequest.motion(reason, ms)
+          .withInitiator(initiator || 'eufy-event')
+          .withPriority(evPriority)
+          .build()
+      : WakeRequest.view(reason, ms)
+          .withInitiator(initiator || 'viewer')
+          .build();
 
   const logOutcome = cam.applyWakeRequest(req, now, cams);
   if (logOutcome.shouldLog) {
@@ -491,10 +510,10 @@ function arbitrateStationP2pSlot(stationKey, now) {
       return;
     }
     stop(
-        cur,
-        'backfill download preempted by live request on ' + pick.getName() + ' (' + pick.getReason() + ')',
-        !pick.isInMotion(now),
-        'bridge-arbitrator/live-over-download'
+      cur,
+      'backfill download preempted by live request on ' + pick.getName() + ' (' + pick.getReason() + ')',
+      !pick.isInMotion(now),
+      'bridge-arbitrator/live-over-download'
     );
     cur = null;
   }
@@ -517,10 +536,10 @@ function arbitrateStationP2pSlot(stationKey, now) {
     const curScore = cur.getEffectivePriority(now);
     const preemptInitiator = pick.resolvePreemptInitiator(cur, now);
     stop(
-        cur,
-        'preempted by ' + pick.getName() + ' (' + pick.getReason() + ', priority=' + pickScore + ' vs ' + curScore + ')',
-        !pick.isInMotion(now),
-        preemptInitiator
+      cur,
+      'preempted by ' + pick.getName() + ' (' + pick.getReason() + ', priority=' + pickScore + ' vs ' + curScore + ')',
+      !pick.isInMotion(now),
+      preemptInitiator
     );
   }
 
@@ -580,14 +599,28 @@ function maybeRecoverStationOnWakeRpcFailure(stationSn, cmdLabel, errorCode = ''
  * Starts a HomeBase RTSP pull stream for a camera and requests device.start_rtsp_livestream.
  *
  * @param {Camera} cam - Camera domain instance.
+ * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  */
-async function startRtspStream(cam) {
+async function startRtspStream(cam, now = Date.now()) {
+  if (cam.isRtspDirect() && !cam.isSessionActive()) {
+    const wakeLog = cam.prepareRtspDirectStart(now);
+    if (wakeLog) {
+      pushFrameToEncoder(cam, now);
+      log.info(cam, wakeLog);
+    }
+  }
   if (!cam.canStartRtspStream()) {
     return;
   }
-  const mySession = cam.markRtspAttemptStart(Date.now());
+  const mySession = cam.markRtspAttemptStart(now);
   if (cam.shouldFileInitialRtspEvent()) {
     frigateEvent(cam, cam.getReason(), '');
+  }
+  if (cam.isRtspDirect()) {
+    if (cam.canSpawnRtspDecoder(mySession)) {
+      startRtspDecoder(cam);
+    }
+    return;
   }
   await getStationTransition(cam);
   if (!cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
@@ -602,12 +635,7 @@ async function startRtspStream(cam) {
   const r = await call({command: 'device.start_rtsp_livestream', serialNumber: serial});
   if (!r.success && r.errorCode && !ALREADY_RUNNING_ERROR_REGEX.test(r.errorCode)) {
     maybeRecoverStationOnWakeRpcFailure(stationSn, 'start_rtsp_livestream', r.errorCode);
-    log.debug(
-        cam,
-        'device.start_rtsp_livestream returned ' +
-        r.errorCode +
-        ' (relying on rtspStream property wake)'
-    );
+    log.debug(cam, 'device.start_rtsp_livestream returned ' + r.errorCode + ' (relying on rtspStream property wake)');
   }
   await ensureRtspUrlAfterWakeStart(cam, mySession, stationSn);
   if (cam.canSpawnRtspDecoder(mySession)) {
@@ -615,8 +643,9 @@ async function startRtspStream(cam) {
   } else if (!cam.getRtspUrl() && cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
     const logFn = cam.isFirstWakeAttempt() ? log.debug : log.warn;
     logFn(
-        cam,
-        'HomeBase did not provide rtspStreamUrl after start_rtsp_livestream - verify HomeBase P2P connection and NAS/RTSP setting (session=' +
+      cam,
+      'HomeBase did not provide rtspStreamUrl after start_rtsp_livestream - verify HomeBase P2P connection ' +
+        'and NAS/RTSP setting (session=' +
         mySession +
         ')'
     );
@@ -631,9 +660,9 @@ async function startRtspStream(cam) {
  */
 function handleDatabaseQueryResult(e) {
   const rows = Array.isArray(e.data) ? e.data : [];
-  log.info(
-      'bridge',
-      'received HomeBase (' +
+  log.debug(
+    'bridge',
+    'received HomeBase (' +
       (e.serialNumber || 'station') +
       ') event "' +
       e.event +
@@ -655,7 +684,7 @@ function handleDatabaseQueryResult(e) {
     const cam = bySerial.get(cand.devSn);
     if (cam && cam.tryMatchBackfillCandidate(cand)) {
       matchedAny = true;
-      log.info(cam, cam.formatBackfillClipMatchLog(cand));
+      log.debug(cam, cam.formatBackfillClipMatchLog(cand));
     }
   }
 
@@ -683,15 +712,15 @@ async function processBackfillQueue(now = Date.now()) {
   }
 
   const readyCam = cams
-      .filter((c) => c.canStartBackfillDownloadNow(cams, now, BACKFILL_DELAY_MS))
-      .sort(Camera.compareBackfillPriority)[0];
+    .filter((c) => c.canStartBackfillDownloadNow(cams, now, BACKFILL_DELAY_MS))
+    .sort(Camera.compareBackfillPriority)[0];
 
   if (readyCam) {
     const {clip, sessionId: mySession} = readyCam.startNextBackfillDownload(now);
 
     log.info(
-        readyCam,
-        'WAKE [BACKFILL DOWNLOAD] (initiator=bridge-backfill, reason="' +
+      readyCam,
+      'WAKE [BACKFILL DOWNLOAD] (initiator=bridge-backfill, reason="' +
         clip.reason +
         '", path="' +
         clip.storagePath +
@@ -713,26 +742,17 @@ async function processBackfillQueue(now = Date.now()) {
       cipherId: clip.cipherId,
     });
     if (!res.success && readyCam.isCurrentSession(mySession, STREAM_MODES.DOWNLOAD)) {
-      log.warn(
-          readyCam,
-          'device.start_download failed (errorCode=' + (res.errorCode || 'unknown') + ')'
-      );
+      log.warn(readyCam, 'device.start_download failed (errorCode=' + (res.errorCode || 'unknown') + ')');
       stop(readyCam, 'start_download RPC failed', false, 'error/download-failed');
     }
     return;
   }
 
   const queryCam = cams
-      .filter((c) =>
-        c.canQueryBackfillNow(
-            cams,
-            now,
-            BACKFILL_MIN_EVENT_AGE_MS,
-            BACKFILL_QUERY_COOLDOWN_MS,
-            BACKFILL_DELAY_MS
-        )
-      )
-      .sort(Camera.compareBackfillPriority)[0];
+    .filter((c) =>
+      c.canQueryBackfillNow(cams, now, BACKFILL_MIN_EVENT_AGE_MS, BACKFILL_QUERY_COOLDOWN_MS, BACKFILL_DELAY_MS)
+    )
+    .sort(Camera.compareBackfillPriority)[0];
 
   if (!queryCam) {
     return;
@@ -740,9 +760,9 @@ async function processBackfillQueue(now = Date.now()) {
   const queryState = queryCam.beginBackfillDatabaseQuery(now, BACKFILL_MAX_QUERY_ATTEMPTS);
   if (!queryState.allowed) {
     pushFrameToEncoder(queryCam, now);
-    log.debug(
-        queryCam,
-        'giving up on backfill query after ' + BACKFILL_MAX_QUERY_ATTEMPTS + ' attempts (' + queryState.reason + ')'
+    log.warn(
+      queryCam,
+      'giving up on backfill query after ' + BACKFILL_MAX_QUERY_ATTEMPTS + ' attempts (' + queryState.reason + ')'
     );
     return;
   }
@@ -756,13 +776,11 @@ async function processBackfillQueue(now = Date.now()) {
   const dStart = new Date(now - BACKFILL_DATE_WINDOW_MS);
   const dEnd = new Date(now + BACKFILL_DATE_WINDOW_MS);
   const fmtYmd = (d) =>
-      d.getFullYear() +
-      String(d.getMonth() + 1).padStart(2, '0') +
-      String(d.getDate()).padStart(2, '0');
+    d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
 
-  log.info(
-      queryCam,
-      'querying HomeBase (' +
+  log.debug(
+    queryCam,
+    'querying HomeBase (' +
       stationSn +
       ') local database for missed event clip (attempt=' +
       queryState.attempts +
@@ -791,9 +809,10 @@ async function processBackfillQueue(now = Date.now()) {
 /**
  * Sends device.start_livestream to eufy-security-ws for the specified camera.
  *
- * @param {Camera} cam - Camera domain instance.
+ * @param {Camera} targetCam - Camera domain instance.
  */
-async function startLivestream(cam) {
+async function startLivestream(targetCam) {
+  const cam = targetCam;
   if (!cam.canBeginP2pStart()) {
     return;
   }
@@ -805,8 +824,8 @@ async function startLivestream(cam) {
       await getStationTransition(cam);
       if (!cam.isCurrentSession(mySession)) {
         log.debug(
-            cam,
-            'aborted start_livestream before RPC call (initiator=bridge, reason=session_canceled_or_preempted, session=' +
+          cam,
+          'aborted start_livestream before RPC call (initiator=bridge, reason=session_canceled_or_preempted, session=' +
             mySession +
             ')'
         );
@@ -814,9 +833,7 @@ async function startLivestream(cam) {
       }
 
       for (let i = 0; i < RTSP_HANDSHAKE_MAX_POLLS; i++) {
-        const rtspWaking = cams.some((c) =>
-          c.isWakingRtspOnStation(cam, Date.now(), RTSP_HANDSHAKE_WINDOW_MS)
-        );
+        const rtspWaking = cams.some((c) => c.isWakingRtspOnStation(cam, Date.now(), RTSP_HANDSHAKE_WINDOW_MS));
         if (!rtspWaking || !cam.isCurrentSession(mySession)) {
           break;
         }
@@ -837,8 +854,8 @@ async function startLivestream(cam) {
       if (!cam.isCurrentSession(mySession)) {
         if (r.success) {
           log.info(
-              cam,
-              'stopping newly woken stream because session ' +
+            cam,
+            'stopping newly woken stream because session ' +
               mySession +
               ' was preempted/closed during wake (initiator=bridge)'
           );
@@ -849,8 +866,8 @@ async function startLivestream(cam) {
 
       if (!r.success && ALREADY_RUNNING_ERROR_REGEX.test(r.errorCode || '')) {
         log.warn(
-            cam,
-            'eufy-security-ws reports stale livestream (errorCode=' +
+          cam,
+          'eufy-security-ws reports stale livestream (errorCode=' +
             r.errorCode +
             '), forcing stop and restart (initiator=bridge/eufy-ws, session=' +
             mySession +
@@ -867,8 +884,8 @@ async function startLivestream(cam) {
         if (!cam.isCurrentSession(mySession)) {
           if (r.success) {
             log.info(
-                cam,
-                'stopping restarted stream because session ' +
+              cam,
+              'stopping restarted stream because session ' +
                 mySession +
                 ' was preempted/closed during retry (initiator=bridge)'
             );
@@ -881,8 +898,8 @@ async function startLivestream(cam) {
       if (!r.success) {
         maybeRecoverStationOnWakeRpcFailure(stationSn, 'start_livestream', r.errorCode);
         log.error(
-            cam,
-            'start_livestream failed (initiator=eufy-ws, errorCode=' +
+          cam,
+          'start_livestream failed (initiator=eufy-ws, errorCode=' +
             (r.errorCode || 'unknown') +
             ', session=' +
             mySession +
@@ -908,83 +925,69 @@ async function startLivestream(cam) {
  * @param {string} [initiator='bridge'] - Decision maker identifier.
  */
 function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
-  if (!cam.isSessionActive()) {
-    return;
-  }
+  if (!cam.isSessionActive()) return;
   const {
     inFlightStart,
     closedMode,
     hadDownloadFinished,
     hadUnexpectedRtsp,
     wokeWithoutDeviceReply,
+    shouldPersistSnapshot,
     sleepMsg,
   } = cam.terminateSession(Date.now(), why, preemptedByViewer, initiator);
   const serial = cam.getSerial();
-  if (wokeWithoutDeviceReply) {
-    void recordStationWakeTimeout(cam.resolveHomeBaseStationSerial(cams), initiator);
-  }
+  if (wokeWithoutDeviceReply) void recordStationWakeTimeout(cam.resolveHomeBaseStationSerial(cams), initiator);
 
   // Clear station wake pacing when a P2P/download session ends so back-to-back switching starts immediately.
-  if (closedMode !== STREAM_MODES.RTSP) {
-    stationNextWakeAt.delete(cam.getStationKey());
-  }
+  if (closedMode !== STREAM_MODES.RTSP) stationNextWakeAt.delete(cam.getStationKey());
 
-  if (initiator.startsWith('error/')) {
-    log.error(cam, sleepMsg);
-  } else if (initiator === 'bridge-max-limit') {
-    log.warn(cam, sleepMsg);
-  } else {
-    log.info(cam, sleepMsg);
-  }
+  const sleepLogFn = initiator.startsWith('error/')
+    ? log.error
+    : initiator === 'bridge-max-limit' || initiator === 'bridge-view-limit'
+      ? log.warn
+      : initiator === 'rtsp-direct-probe'
+        ? log.debug
+        : log.info;
+  sleepLogFn(cam, sleepMsg);
 
   stopDecoder(cam);
 
-  setStationTransition(
+  if (!cam.isRtspDirect()) {
+    setStationTransition(
       cam,
       getStationTransition(cam)
-          .then(async () => {
-            if (inFlightStart) {
+        .then(async () => {
+          if (inFlightStart) await inFlightStart.catch(() => {});
+          switch (closedMode) {
+            case STREAM_MODES.RTSP:
+              await sleep(RTSP_STOP_SETTLE_MS);
+              break;
+            case STREAM_MODES.DOWNLOAD:
+              if (!hadDownloadFinished) {
+                await call({command: 'device.cancel_download', serialNumber: serial});
+                await sleep(P2P_STOP_SETTLE_MS);
+              }
+              break;
+            default: {
               try {
-                await inFlightStart;
-              } catch (err) {
-                // Ignore errors from canceled start promise.
-              }
-            }
-            switch (closedMode) {
-              case STREAM_MODES.RTSP:
-                await sleep(RTSP_STOP_SETTLE_MS);
-                break;
-              case STREAM_MODES.DOWNLOAD:
-                if (!hadDownloadFinished) {
-                  await call({command: 'device.cancel_download', serialNumber: serial});
-                  await sleep(P2P_STOP_SETTLE_MS);
+                const res = await call({command: 'device.stop_livestream', serialNumber: serial});
+                if (!res.success && res.errorCode && !EXPECTED_STOP_ERROR_REGEX.test(res.errorCode)) {
+                  log.debug(cam, 'device.stop_livestream returned errorCode=' + res.errorCode);
                 }
-                break;
-              default: {
-                try {
-                  const res = await call({command: 'device.stop_livestream', serialNumber: serial});
-                  if (
-                      !res.success &&
-                      res.errorCode &&
-                      !EXPECTED_STOP_ERROR_REGEX.test(res.errorCode)
-                  ) {
-                    log.debug(cam, 'device.stop_livestream returned errorCode=' + res.errorCode);
-                  }
-                  if (hadUnexpectedRtsp) {
-                    await call({command: 'device.stop_rtsp_livestream', serialNumber: serial});
-                  }
-                  await sleep(P2P_STOP_SETTLE_MS);
-                } finally {
-                  cam.clearP2pStopInFlight();
-                }
-                break;
+                if (hadUnexpectedRtsp) await call({command: 'device.stop_rtsp_livestream', serialNumber: serial});
+                await sleep(P2P_STOP_SETTLE_MS);
+              } finally {
+                cam.clearP2pStopInFlight();
               }
+              break;
             }
-          })
-          .catch(() => {})
-  );
+          }
+        })
+        .catch(() => {})
+    );
+  }
 
-  saveCachedFrame(cam);
+  if (shouldPersistSnapshot) saveCachedFrame(cam);
   renderCameraCards(cam);
   if (cam.isDeviceOffline()) {
     stopEncoder(cam);
@@ -992,7 +995,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
     pushFrameToEncoder(cam);
   }
 
-  if (closedMode !== STREAM_MODES.DOWNLOAD && !cam.isDeviceOffline()) {
+  if (closedMode !== STREAM_MODES.DOWNLOAD && !cam.isDeviceOffline() && !cam.isRtspDirect()) {
     call({command: 'device.get_properties', serialNumber: serial}).then((res) => {
       if (res.success && res.result && res.result.properties) {
         applyDeviceProperties(cam, res.result.properties, false);
@@ -1017,8 +1020,8 @@ function handleStationEvent(e) {
       }
       if (isStationRecycling(e.serialNumber || '')) {
         log.debug(
-            'bridge',
-            'ignoring HomeBase station (' + stationId + ') ' + e.event + ' during active station recycle'
+          'bridge',
+          'ignoring HomeBase station (' + stationId + ') ' + e.event + ' during active station recycle'
         );
         return;
       }
@@ -1081,14 +1084,12 @@ function handleDownloadFinishedEvent(cam) {
     frigateEvent(cam, cam.getReason(), cam.getEventPerson());
   }
   if (bufferedCount > 0) {
-    log.info(cam, cam.formatBackfillTransferCompleteLog(bufferedCount, LIVE_FPS));
+    log.debug(cam, cam.formatBackfillTransferCompleteLog(bufferedCount, LIVE_FPS));
     return;
   }
   log.debug(
-      cam,
-      'eufy clip transfer complete, flushing decoder and holding final frame before sleep (session=' +
-      mySession +
-      ')'
+    cam,
+    'eufy clip transfer complete, flushing decoder and holding final frame before sleep (session=' + mySession + ')'
   );
 }
 
@@ -1140,20 +1141,11 @@ function handleTriggerEvent(cam, e) {
     return;
   }
   if (e.state === false) {
-    const shortenedSecs = cam.recordMotionCleared(
-        now,
-        EUFY_CLEARED_SETTLE_MS,
-        MIN_EVENT_VIDEO_DURATION_MS,
-        e.event
-    );
+    const shortenedSecs = cam.recordMotionCleared(now, EUFY_CLEARED_SETTLE_MS, MIN_EVENT_VIDEO_DURATION_MS, e.event);
     if (shortenedSecs !== null) {
       log.info(
-          cam,
-          'eufy reported activity cleared (event="' +
-          e.event +
-          '"), ending stream in ' +
-          shortenedSecs +
-          's'
+        cam,
+        'eufy reported activity cleared (event="' + e.event + '"), ending stream in ' + shortenedSecs + 's'
       );
       return;
     }
@@ -1175,10 +1167,10 @@ function handleTriggerEvent(cam, e) {
     if (cam.shouldBackfillOnlyOnEvent()) {
       pushFrameToEncoder(cam, now);
       log.info(
-          cam,
-          'event trigger "' +
+        cam,
+        'event trigger "' +
           triggerDesc +
-          '" queued for HomeBase clip backfill (always_backfill=true, skipping live wake to conserve battery)'
+          '" queued for HomeBase clip backfill (backfill_only=true, skipping live wake to conserve battery)'
       );
       return;
     }
@@ -1204,8 +1196,8 @@ function tryAdoptExternalP2pWake(cam, now) {
   }
   pushFrameToEncoder(cam, now);
   log.info(
-      cam,
-      'WAKE (initiator=eufy-ws, reason="external P2P wake - eufy-security-ws", station=' +
+    cam,
+    'WAKE (initiator=eufy-ws, reason="external P2P wake - eufy-security-ws", station=' +
       cam.getStationKey() +
       ', priority=' +
       cam.getEffectivePriority(now) +
@@ -1231,8 +1223,8 @@ function tryAdoptExternalRtspWake(cam, now) {
   }
   pushFrameToEncoder(cam, now);
   log.info(
-      cam,
-      'WAKE [RTSP] (initiator=eufy-ws, reason="external RTSP wake - eufy-security-ws", priority=' +
+    cam,
+    'WAKE [RTSP] (initiator=eufy-ws, reason="external RTSP wake - eufy-security-ws", priority=' +
       cam.getEffectivePriority(now) +
       ', session=' +
       cam.getSessionId() +
@@ -1262,8 +1254,8 @@ function handleStreamStartedOrRetriggered(cam, label) {
     }
     if (extended) {
       log.info(
-          cam,
-          label +
+        cam,
+        label +
           ' re-triggered while active, extended hold by +' +
           Math.round(extendMs / MS_PER_SECOND) +
           's (holdExtendedTo=' +
@@ -1273,18 +1265,10 @@ function handleStreamStartedOrRetriggered(cam, label) {
           ')'
       );
     } else {
-      log.debug(
-          cam,
-          label +
-          ' re-triggered while active (holdRemaining=' +
-          holdSecs +
-          's, session=' +
-          sessionId +
-          ')'
-      );
+      log.debug(cam, label + ' re-triggered while active (holdRemaining=' + holdSecs + 's, session=' + sessionId + ')');
     }
   } else {
-    log.info(cam, label + ' started (session=' + sessionId + ')');
+    log.debug(cam, label + ' started (session=' + sessionId + ')');
   }
 }
 
@@ -1299,43 +1283,42 @@ function handleStreamStartedOrRetriggered(cam, label) {
 function forceStopWedgedP2pRadio(cam) {
   const serial = cam.getSerial();
   log.warn(
-      cam,
-      'detected wedged-awake P2P radio while idle (rapid wifiRssi updates while asleep) - forcing P2P stop to restore deep sleep'
+    cam,
+    'detected wedged-awake P2P radio while idle (rapid wifiRssi updates while asleep) - ' +
+      'forcing P2P stop to restore deep sleep'
   );
   if (cam.shouldTurnOffStuckIdleLight(Date.now())) {
-    log.warn(
-        cam,
-        'turning off stuck spotlight during idle wifiRssi drain (light=false) to restore deep sleep'
-    );
+    log.warn(cam, 'turning off stuck spotlight during idle wifiRssi drain (light=false) to restore deep sleep');
     setCameraProperty(cam, 'light', false);
   }
   cam.markP2pStopInFlight();
   setStationTransition(
-      cam,
-      getStationTransition(cam)
-          .then(async () => {
-            try {
-              await call({command: 'device.stop_livestream', serialNumber: serial});
-              await sleep(P2P_STOP_SETTLE_MS);
-            } finally {
-              cam.clearP2pStopInFlight();
-            }
-          })
-          .catch(() => {
-            cam.clearP2pStopInFlight();
-          })
+    cam,
+    getStationTransition(cam)
+      .then(async () => {
+        try {
+          await call({command: 'device.stop_livestream', serialNumber: serial});
+          await sleep(P2P_STOP_SETTLE_MS);
+        } finally {
+          cam.clearP2pStopInFlight();
+        }
+      })
+      .catch(() => {
+        cam.clearP2pStopInFlight();
+      })
   );
 }
 
 /**
  * Handles incoming event notifications from eufy-security-ws.
  *
- * @param {Record<string, *>} e - Event object from eufy-security-ws.
+ * @param {Record<string, *>} eventPayload - Event object from eufy-security-ws.
  */
-function onEvent(e) {
+function onEvent(eventPayload) {
+  const e = eventPayload;
   if (e.event === 'device added' && e.device && e.device.serialNumber) {
     const cam = bySerial.get(e.device.serialNumber);
-    if (cam) {
+    if (cam && !cam.isRtspDirect()) {
       applyDeviceProperties(cam, e.device);
     }
     return;
@@ -1344,9 +1327,16 @@ function onEvent(e) {
     handleStationEvent(e);
     return;
   }
+  if (e.source === 'driver') {
+    if (e.event === 'connect' && isWsReady() && !isShuttingDownFn()) {
+      log.info('bridge', 'eufy-security-ws cloud driver connected, refreshing camera telemetry');
+      void fetchAllCameraTelemetry(false);
+    }
+    return;
+  }
 
-  const cam = bySerial.get(e.serialNumber);
-  if (!cam) {
+  const cam = bySerial.get(String(e.serialNumber || ''));
+  if (!cam || cam.isRtspDirect()) {
     return;
   }
 
@@ -1364,14 +1354,12 @@ function onEvent(e) {
           return;
         }
         const now = Date.now();
-        const {shouldStop, sleptAgo} = cam.shouldStopUnsolicitedVideo(
-            now,
-            UNSOLICITED_VIDEO_STOP_DELAY_MS
-        );
+        const {shouldStop, sleptAgo} = cam.shouldStopUnsolicitedVideo(now, UNSOLICITED_VIDEO_STOP_DELAY_MS);
         if (shouldStop) {
           log.warn(
-              cam,
-              'received video while inactive, forcing stop of late stream (initiator=bridge, cause=eufy_unsolicited_video, sleptAgo=' +
+            cam,
+            'received video while inactive, forcing stop of late stream ' +
+              '(initiator=bridge, cause=eufy_unsolicited_video, sleptAgo=' +
               sleptAgo +
               ')'
           );
@@ -1406,7 +1394,7 @@ function onEvent(e) {
         return;
       }
       cam.markP2pStreamReady(Date.now(), false);
-      log.info(cam, 'eufy clip download started (session=' + sessionId + ')');
+      log.debug(cam, 'eufy clip download started (session=' + sessionId + ')');
       return;
 
     case 'download finished':
@@ -1423,44 +1411,40 @@ function onEvent(e) {
         if (cam.canSpawnRtspDecoder()) {
           startRtspDecoder(cam);
         }
-        if (
-            !cam.isEstablishedRtspStream() ||
-            cam.isMidStreamRetrigger(Date.now(), MID_STREAM_RETRIGGER_GRACE_MS)
-        ) {
+        if (!cam.isEstablishedRtspStream() || cam.isMidStreamRetrigger(Date.now(), MID_STREAM_RETRIGGER_GRACE_MS)) {
           handleStreamStartedOrRetriggered(cam, 'eufy RTSP livestream');
         }
       } else {
         if (!cam.isActiveLiveSession()) {
           const now = Date.now();
+          if (cam.isWithinPostSleepGuard(now, EXTERNAL_WAKE_GUARD_MS)) {
+            return;
+          }
           if (cam.shouldBackfillOnlyOnEvent()) {
             cam.queueEventBackfill(
-                now,
-                'rtsp livestream started',
-                '',
-                'rtsp livestream started',
-                getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT),
-                true
+              now,
+              'rtsp livestream started',
+              '',
+              'rtsp livestream started',
+              getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT),
+              true
             );
             if (!cam.isSessionActive()) {
               pushFrameToEncoder(cam, now);
             }
-            log.debug(
-                cam,
-                'rtsp livestream started while idle in backfill mode, queued/extended BackfillJob'
-            );
+            log.debug(cam, 'rtsp livestream started while idle in backfill mode, queued/extended BackfillJob');
             return;
           }
           if (!cam.isSessionActive() && tryAdoptExternalRtspWake(cam, now)) {
-            log.info(cam, 'eufy RTSP livestream started (session=' + cam.getSessionId() + ')');
+            log.debug(cam, 'eufy RTSP livestream started (session=' + cam.getSessionId() + ')');
             return;
           }
         }
-        const {shouldStopRtsp, shouldDisableRtspProp, shouldRestartP2p} =
-            cam.evaluateUnexpectedRtspStart();
+        const {shouldStopRtsp, shouldDisableRtspProp, shouldRestartP2p} = cam.evaluateUnexpectedRtspStart();
         if (shouldDisableRtspProp) {
           log.warn(
-              cam,
-              'received RTSP livestream started while in P2P/idle mode, forcing RTSP stop and disabling rtspStream'
+            cam,
+            'received RTSP livestream started while in P2P/idle mode, forcing RTSP stop and disabling rtspStream'
           );
           setCameraProperty(cam, 'rtspStream', false);
         } else {
@@ -1468,11 +1452,7 @@ function onEvent(e) {
         }
         if (shouldStopRtsp) {
           void call({command: 'device.stop_rtsp_livestream', serialNumber: serial}).then(() => {
-            if (
-                shouldRestartP2p &&
-                cam.isCurrentSession(sessionId, STREAM_MODES.P2P) &&
-                !cam.gotVideo
-            ) {
+            if (shouldRestartP2p && cam.isCurrentSession(sessionId, STREAM_MODES.P2P) && !cam.gotVideo) {
               stopDecoder(cam);
               void startLivestream(cam);
             }
@@ -1486,10 +1466,10 @@ function onEvent(e) {
         handleRtspStreamDropped(cam, 0, 'rtsp livestream stopped event');
       } else if (!cam.isActiveLiveSession() && cam.hasPendingBackfill()) {
         cam.recordMotionCleared(
-            Date.now(),
-            EUFY_CLEARED_SETTLE_MS,
-            MIN_EVENT_VIDEO_DURATION_MS,
-            'rtsp livestream started'
+          Date.now(),
+          EUFY_CLEARED_SETTLE_MS,
+          MIN_EVENT_VIDEO_DURATION_MS,
+          'rtsp livestream started'
         );
       }
       return;
@@ -1501,33 +1481,31 @@ function onEvent(e) {
         return;
       }
       if (!cam.isSessionActive()) {
-        if (cam.isStoppingP2p()) {
+        const now = Date.now();
+        if (cam.isWithinPostSleepGuard(now, EXTERNAL_WAKE_GUARD_MS)) {
           return;
         }
-        const now = Date.now();
         if (tryAdoptExternalP2pWake(cam, now)) {
-          log.info(cam, 'eufy livestream started (session=' + cam.getSessionId() + ')');
+          log.debug(cam, 'eufy livestream started (session=' + cam.getSessionId() + ')');
           return;
         }
         if (cam.shouldBackfillOnlyOnEvent()) {
           cam.queueEventBackfill(
-              now,
-              'livestream started',
-              '',
-              'livestream started',
-              getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT),
-              true
+            now,
+            'livestream started',
+            '',
+            'livestream started',
+            getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT),
+            true
           );
           pushFrameToEncoder(cam, now);
-          log.debug(
-              cam,
-              'livestream started while idle in backfill mode, queued/extended BackfillJob'
-          );
+          log.debug(cam, 'livestream started while idle in backfill mode, queued/extended BackfillJob');
           return;
         }
         log.warn(
-            cam,
-            'eufy livestream started after session was already closed/canceled, forcing immediate stop (initiator=bridge, cause=eufy_late_start)'
+          cam,
+          'eufy livestream started after session was already closed/canceled, forcing immediate stop ' +
+            '(initiator=bridge, cause=eufy_late_start)'
         );
         void call({command: 'device.stop_livestream', serialNumber: serial});
         return;
@@ -1547,19 +1525,11 @@ function onEvent(e) {
       if (isTrackedPropertyEvent(e.name)) {
         applyDeviceProperties(cam, {[e.name]: e.value}, false);
       }
-      if (
-          e.name === 'wifiRssi' &&
-          cam.getRssi() !== prevRssi &&
-          cam.recordIdleRssiChange(Date.now())
-      ) {
+      if (e.name === 'wifiRssi' && cam.getRssi() !== prevRssi && cam.recordIdleRssiChange(Date.now())) {
         forceStopWedgedP2pRadio(cam);
       }
       const mappedTriggerEvent = resolvePropertyTriggerEvent(e.name);
-      if (
-          mappedTriggerEvent &&
-          typeof e.value === 'boolean' &&
-          cam.shouldTriggerOnEvent(mappedTriggerEvent)
-      ) {
+      if (mappedTriggerEvent && typeof e.value === 'boolean' && cam.shouldTriggerOnEvent(mappedTriggerEvent)) {
         handleTriggerEvent(cam, {
           event: mappedTriggerEvent,
           state: e.value,
@@ -1591,6 +1561,16 @@ function handleRtspStreamDropped(cam, code, reasonText) {
     return;
   }
   const now = Date.now();
+  if (cam.isRtspDirect()) {
+    const out = cam.evaluateRtspDirectDrop(code, reasonText);
+    stop(cam, out.stopWhy, false, out.stopInitiator);
+    if (out.disruptionChanged) {
+      (out.isReachableStandby ? log.info : log.warn)(cam, out.statusLog);
+      renderCameraCards(cam);
+      pushFrameToEncoder(cam);
+    }
+    return;
+  }
   if (!cam.shouldRewakeRtspOnDrop(now)) {
     stop(cam, 'eufy ended RTSP livestream', false, 'eufy/rtsp-end');
     arbitrate();
@@ -1604,9 +1584,10 @@ function handleRtspStreamDropped(cam, code, reasonText) {
   }
   renderCameraCards(cam);
   pushFrameToEncoder(cam, now);
-  log.info(
-      cam,
-      'RTSP stream ended mid-session (code=' +
+  const rewakeLogFn = code === 0 ? log.debug : log.info;
+  rewakeLogFn(
+    cam,
+    'RTSP stream ended mid-session (code=' +
       code +
       ', info="' +
       reasonText +
@@ -1637,7 +1618,7 @@ function checkRtspSessionHealth(cam, now) {
   const {action, killStalledDec, logMsg} = cam.evaluateRtspHealth(now);
   switch (action) {
     case 'retry':
-      log.info(cam, logMsg);
+      log.debug(cam, logMsg);
       if (killStalledDec) {
         stopDecoder(cam);
       }
@@ -1670,8 +1651,8 @@ function checkDownloadSessionHealth(cam, now) {
   }
   if (cam.hasDownloadTimedOut(now, DOWNLOAD_NO_VIDEO_TIMEOUT_MS)) {
     log.warn(
-        cam,
-        'post-event clip download timed out with no video after ' +
+      cam,
+      'post-event clip download timed out with no video after ' +
         Math.round(DOWNLOAD_NO_VIDEO_TIMEOUT_MS / MS_PER_SECOND) +
         's'
     );
@@ -1741,7 +1722,7 @@ function runHousekeepingTick(clockNow) {
   prepareExpiredCameraHolds(now, clockNow);
   arbitrate(now);
   void processBackfillQueue(now);
-  if (isWsReady()) {
+  if (isWsReady() || cams.some((c) => c.isRtspDirect())) {
     checkPeriodicMaskSync(cams, now, isShuttingDownFn());
   }
 
@@ -1755,11 +1736,12 @@ function runHousekeepingTick(clockNow) {
 
   for (const cam of cams) {
     if (!cam.isSessionActive()) {
+      if (cam.shouldStartRtspDirectSession(now)) {
+        void startRtspStream(cam, now);
+        continue;
+      }
       if (isWsReady() && cam.shouldTurnOffStuckIdleLight(now)) {
-        log.warn(
-            cam,
-            'turning off stuck spotlight while idle (light=false) to restore deep sleep'
-        );
+        log.warn(cam, 'turning off stuck spotlight while idle (light=false) to restore deep sleep');
         setCameraProperty(cam, 'light', false);
       }
       continue;
@@ -1799,17 +1781,17 @@ function runHousekeepingTick(clockNow) {
  * Starts the 500ms housekeeping & watchdog loop.
  */
 function startHousekeepingLoop() {
-  setInterval(() => {
-    runHousekeepingTick();
-  }, HOUSEKEEPING_INTERVAL_MS);
+  setInterval(() => runHousekeepingTick(), HOUSEKEEPING_INTERVAL_MS);
 }
 
 module.exports = {
   initOrchestrator,
+  getActiveStationTransitionCount,
   wakeCameraExternal,
   trigger,
   stop,
   onEvent,
+  handleRtspStreamDropped,
   processBackfillQueue,
   runHousekeepingTick,
   startHousekeepingLoop,

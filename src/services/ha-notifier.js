@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -23,24 +22,30 @@ const HA_WEBHOOK_TIMEOUT_MS = 5000;
  * @param {Camera} cam - Camera domain instance.
  * @param {Record<string, *>} [extra={}] - Additional JSON fields to include in the webhook body.
  * @param {string} [webhookUrl=cfg.ha_webhook_url] - Home Assistant webhook URL.
+ * @returns {Promise<boolean>} Resolves to true when the webhook request succeeds.
  */
-function notifyHA(cam, extra = {}, webhookUrl = cfg.ha_webhook_url) {
+async function notifyHA(cam, extra = {}, webhookUrl = cfg.ha_webhook_url) {
   if (!webhookUrl) {
-    return;
+    return false;
   }
-  const payload = cam.toHaWebhookPayload(extra);
-  fetch(webhookUrl, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    signal: AbortSignal.timeout(HA_WEBHOOK_TIMEOUT_MS),
-    body: JSON.stringify(payload),
-  })
-      .then((r) => {
-        if (!r.ok) {
-          log.warn(cam, 'HA webhook failed (HTTP ' + r.status + ')');
-        }
-      })
-      .catch((err) => log.warn(cam, 'HA webhook failed: ' + err.message));
+  const bodyJson = JSON.stringify(cam.toHaWebhookPayload(extra));
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      signal: AbortSignal.timeout(HA_WEBHOOK_TIMEOUT_MS),
+      body: bodyJson,
+    });
+    if (!response.ok) {
+      log.warn(cam, 'HA webhook failed (HTTP ' + response.status + ')');
+      return false;
+    }
+    return true;
+  } catch (err) {
+    const errMsg = err && err.message ? err.message : String(err);
+    log.warn(cam, 'HA webhook failed: ' + errMsg);
+    return false;
+  }
 }
 
 module.exports = {

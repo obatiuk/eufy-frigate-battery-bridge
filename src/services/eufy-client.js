@@ -1,7 +1,6 @@
 // @ts-check
 // noinspection JSUnresolvedReference,NpmUsedModulesInstalled
 /**
- * Copyright (c) 2026 ljlongwing
  * Copyright (c) 2026 obatiuk
  * SPDX-License-Identifier: MIT
  *
@@ -10,13 +9,7 @@
  */
 'use strict';
 
-const {
-  cfg,
-  FORWARD_FACE_NAMES,
-  STREAM_MODES,
-  TELEMETRY_POLL_MS,
-  sleep,
-} = require('../config');
+const {cfg, FORWARD_FACE_NAMES, STREAM_MODES, TELEMETRY_POLL_MS, sleep} = require('../config');
 const {log} = require('../logger');
 const {unwrapProperty} = require('../domain/telemetry');
 const {renderCameraCards} = require('../overlay/card-renderer');
@@ -102,9 +95,14 @@ const DETECTION_PROPERTY_EVENT_MAP = Object.freeze({
 let ws = null;
 let wsReady = false;
 let wsReadyAt = 0;
+let wsHasEverDisconnected = false;
+let wsOutageWarned = false;
+let wsOutageErrorLogged = false;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let wsReconnectTimer = null;
 let initialTelemetryLoaded = false;
-let seq = 0;
-const waiting = new Map();
+let rpcSequence = 0;
+const pendingRpcMap = new Map();
 /** @type {Set<string>} */
 const knownStationSerials = new Set();
 /** @type {Set<string>} */
@@ -147,9 +145,35 @@ function configureEufyClientHooks(hooks = {}) {
   }
   if (typeof hooks.onInitialTelemetryLoaded === 'function') {
     onInitialTelemetryCallback = hooks.onInitialTelemetryLoaded;
+    initialTelemetryLoaded = false;
   }
   if (typeof hooks.WebSocket === 'function') {
     WebSocketCtor = hooks.WebSocket;
+    clearWsReconnectTimer();
+    wsHasEverDisconnected = false;
+    wsOutageWarned = false;
+    wsOutageErrorLogged = false;
+  }
+}
+
+function clearWsReconnectTimer() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+}
+
+function scheduleWsReconnect() {
+  clearWsReconnectTimer();
+  if (isShuttingDownFn()) {
+    return;
+  }
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWs();
+  }, WS_RECONNECT_DELAY_MS);
+  if (wsReconnectTimer && typeof wsReconnectTimer.unref === 'function') {
+    wsReconnectTimer.unref();
   }
 }
 
@@ -208,25 +232,28 @@ function resolvePropertyTriggerEvent(propName) {
 function call(commandPayload) {
   return new Promise((resolve) => {
     if (!ws || ws.readyState !== WS_OPEN) {
-      return resolve({success: false, errorCode: 'ws_closed'});
+      resolve({success: false, errorCode: 'ws_closed'});
+      return;
     }
-    const id = 'b' + ++seq;
-    const timer = setTimeout(() => {
-      if (waiting.delete(id)) {
+    rpcSequence += 1;
+    const requestId = 'b' + rpcSequence;
+    const timeoutTimer = setTimeout(() => {
+      if (pendingRpcMap.delete(requestId)) {
         resolve({success: false, errorCode: 'no_reply'});
       }
     }, WS_RPC_TIMEOUT_MS);
-    if (timer && typeof timer.unref === 'function') {
-      timer.unref();
+    if (timeoutTimer && typeof timeoutTimer.unref === 'function') {
+      timeoutTimer.unref();
     }
-    waiting.set(id, (res) => {
-      clearTimeout(timer);
-      resolve(res);
+    pendingRpcMap.set(requestId, (responsePayload) => {
+      clearTimeout(timeoutTimer);
+      resolve(responsePayload);
     });
-    ws.send(JSON.stringify({messageId: id, ...commandPayload}), (err) => {
-      if (err && waiting.delete(id)) {
-        clearTimeout(timer);
-        resolve({success: false, errorCode: err.message});
+    const serializedCommand = JSON.stringify({messageId: requestId, ...commandPayload});
+    ws.send(serializedCommand, (sendErr) => {
+      if (sendErr && pendingRpcMap.delete(requestId)) {
+        clearTimeout(timeoutTimer);
+        resolve({success: false, errorCode: sendErr.message});
       }
     });
   });
@@ -251,39 +278,38 @@ function setCameraProperty(cam, name, value) {
   const serial = cam.getSerial();
   const prev = propertySyncChains.get(serial) || Promise.resolve();
   const next = prev
-      .catch(() => {})
-      .then(async () => {
-        if (ws !== targetWs || !ws || ws.readyState !== WS_OPEN) {
-          return;
-        }
-        const res = await call({
-          command: 'device.set_property',
-          serialNumber: serial,
-          name,
-          value,
-        });
-        if (!res.success) {
-          const logFn =
-              res.errorCode === 'device_invalid_property_value' ||
-              res.errorCode === 'device_invalid_property'
-                  ? log.debug
-                  : log.warn;
-          logFn(cam, 'could not set ' + name + ': ' + (res.errorCode || 'unknown'));
-          return;
-        }
-        if (name === 'rtspStream' && value === true && !cam.getRtspUrl()) {
-          const propsRes = await call({command: 'device.get_properties', serialNumber: serial});
-          if (propsRes.success && propsRes.result && propsRes.result.properties) {
-            const p = propsRes.result.properties;
-            syncCameraRtspProperties(
-                cam,
-                unwrapProperty(p.stationSerialNumber),
-                unwrapProperty(p.rtspStreamUrl),
-                unwrapProperty(p.rtspStream)
-            );
-          }
-        }
+    .catch(() => {})
+    .then(async () => {
+      if (ws !== targetWs || !ws || ws.readyState !== WS_OPEN) {
+        return;
+      }
+      const res = await call({
+        command: 'device.set_property',
+        serialNumber: serial,
+        name,
+        value,
       });
+      if (!res.success) {
+        const logFn =
+          res.errorCode === 'device_invalid_property_value' || res.errorCode === 'device_invalid_property'
+            ? log.debug
+            : log.warn;
+        logFn(cam, 'could not set ' + name + ': ' + (res.errorCode || 'unknown'));
+        return;
+      }
+      if (name === 'rtspStream' && value === true && !cam.getRtspUrl()) {
+        const propsRes = await call({command: 'device.get_properties', serialNumber: serial});
+        if (propsRes.success && propsRes.result && propsRes.result.properties) {
+          const p = propsRes.result.properties;
+          syncCameraRtspProperties(
+            cam,
+            unwrapProperty(p.stationSerialNumber),
+            unwrapProperty(p.rtspStreamUrl),
+            unwrapProperty(p.rtspStream)
+          );
+        }
+      }
+    });
   propertySyncChains.set(serial, next);
 }
 
@@ -299,8 +325,8 @@ function checkStreamingQuality(cam, props) {
   const {shouldUpdate, currentQuality, targetQuality} = cam.evaluateQualityChange(props);
   if (shouldUpdate) {
     log.info(
-        cam,
-        'videoStreamingQuality is ' +
+      cam,
+      'videoStreamingQuality is ' +
         currentQuality +
         ' (' +
         (currentQuality === 0 ? 'Auto' : 'High/4K') +
@@ -324,14 +350,8 @@ function checkHardwareRecordingSettings(cam, props) {
   const updates = cam.evaluateRecordingModeChanges(props);
   for (const upd of updates) {
     log.info(
-        cam,
-        'syncing Eufy hardware property ' +
-        upd.name +
-        ' (' +
-        (upd.currentValue ?? 'n/a') +
-        ' -> ' +
-        upd.targetValue +
-        ')'
+      cam,
+      'syncing Eufy hardware property ' + upd.name + ' (' + (upd.currentValue ?? 'n/a') + ' -> ' + upd.targetValue + ')'
     );
     setCameraProperty(cam, upd.name, upd.targetValue);
   }
@@ -352,7 +372,8 @@ function clearStationRecoveryState() {
 }
 
 /**
- * Returns true while recoverUnresponsiveStation is actively recycling stationSn via station.disconnect -> station.connect.
+ * Returns true while recoverUnresponsiveStation is actively recycling stationSn via
+ * station.disconnect -> station.connect.
  *
  * @param {string} stationSn - Station serial number.
  * @returns {boolean}
@@ -430,7 +451,8 @@ function noteStationActivity(stationSn) {
  *
  * @param {string} stationSn - Target station serial number.
  * @param {string} reason - Diagnostic reason for recovery.
- * @param {boolean} [forceRecycle=false] - Whether to recycle via station.disconnect -> station.connect even when station.is_connected reports true.
+ * @param {boolean} [forceRecycle=false] - Whether to recycle via station.disconnect -> station.connect
+ *   even when station.is_connected reports true.
  * @returns {Promise<boolean>} True if a station reconnect or recycle command was dispatched.
  */
 async function recoverUnresponsiveStation(stationSn, reason, forceRecycle = false) {
@@ -442,12 +464,14 @@ async function recoverUnresponsiveStation(stationSn, reason, forceRecycle = fals
   if (stRes.success && stRes.result && stRes.result.connected === false) {
     updateStationHealth(stationSn, false);
     log.warn(
-        'bridge',
-        'HomeBase station (' + stationSn + ') P2P is disconnected (' + reason + '), sending station.connect'
+      'bridge',
+      'HomeBase station (' + stationSn + ') P2P is disconnected (' + reason + '), sending station.connect'
     );
     const connRes = await call({command: 'station.connect', serialNumber: stationSn});
     if (connRes.success) {
       noteStationActivity(stationSn);
+    } else {
+      scheduleStationReconnect(stationSn);
     }
     return true;
   }
@@ -457,9 +481,7 @@ async function recoverUnresponsiveStation(stationSn, reason, forceRecycle = fals
 
   const now = Date.now();
   const lastRecAt = stationLastRecoveryAt.get(stationSn) || 0;
-  const hasActiveVideo = camsRef.some(
-      (c) => c.isOnStation(stationSn) && c.isSessionActive() && c.gotVideo
-  );
+  const hasActiveVideo = camsRef.some((c) => c.isOnStation(stationSn) && c.isSessionActive() && c.gotVideo);
   if (hasActiveVideo || (lastRecAt > 0 && now - lastRecAt < STATION_RECOVERY_COOLDOWN_MS)) {
     return false;
   }
@@ -472,8 +494,8 @@ async function recoverUnresponsiveStation(stationSn, reason, forceRecycle = fals
     }
   }
   log.warn(
-      'bridge',
-      'HomeBase station (' +
+    'bridge',
+    'HomeBase station (' +
       stationSn +
       ') P2P session appears wedged (' +
       reason +
@@ -507,12 +529,14 @@ async function ensureStationConnected(stationSn) {
   if (res.success && res.result && res.result.connected === false) {
     updateStationHealth(stationSn, false);
     log.warn(
-        'bridge',
-        'HomeBase station (' + stationSn + ') P2P link is disconnected, reconnecting via station.connect'
+      'bridge',
+      'HomeBase station (' + stationSn + ') P2P link is disconnected, reconnecting via station.connect'
     );
     const connRes = await call({command: 'station.connect', serialNumber: stationSn});
     if (connRes.success) {
       noteStationActivity(stationSn);
+    } else {
+      scheduleStationReconnect(stationSn);
     }
     return true;
   }
@@ -536,11 +560,7 @@ async function ensureStationReadyForP2pRetry(cam, stationSn) {
     return;
   }
   if (cam.restarts >= 2 && !cam.heardFromDeviceInSession) {
-    await recoverUnresponsiveStation(
-        stationSn,
-        'p2p wake stalled (retry=' + cam.restarts + ')',
-        true
-    );
+    await recoverUnresponsiveStation(stationSn, 'p2p wake stalled (retry=' + cam.restarts + ')', true);
     return;
   }
   await ensureStationConnected(stationSn);
@@ -572,9 +592,9 @@ async function prepareRtspWakeAttempt(cam, mySession, stationSn) {
   }
   await ensureStationConnected(stationSn);
   if (cam.restarts === 1 && !cam.getRtspUrl() && cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
-    log.info(
-        cam,
-        'RTSP URL still empty on retry, toggling rtspStream (false -> true) to refresh HomeBase URL (session=' +
+    log.debug(
+      cam,
+      'RTSP URL still empty on retry, toggling rtspStream (false -> true) to refresh HomeBase URL (session=' +
         mySession +
         ')'
     );
@@ -600,18 +620,14 @@ async function ensureRtspUrlAfterWakeStart(cam, mySession, stationSn) {
     }
   }
   if (
-      cam.restarts < 1 ||
-      cam.getRtspUrl() ||
-      cam.heardFromDeviceInSession ||
-      !cam.isCurrentSession(mySession, STREAM_MODES.RTSP)
+    cam.restarts < 1 ||
+    cam.getRtspUrl() ||
+    cam.heardFromDeviceInSession ||
+    !cam.isCurrentSession(mySession, STREAM_MODES.RTSP)
   ) {
     return;
   }
-  const recycled = await recoverUnresponsiveStation(
-      stationSn,
-      'rtspStreamUrl empty after retry toggle',
-      true
-  );
+  const recycled = await recoverUnresponsiveStation(stationSn, 'rtspStreamUrl empty after retry toggle', true);
   if (recycled && cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
     await call({command: 'device.set_property', serialNumber: serial, name: 'rtspStream', value: true});
     await call({command: 'device.start_rtsp_livestream', serialNumber: serial});
@@ -638,9 +654,10 @@ async function refreshMissingRtspUrlOnStart(cam, mySession) {
   if (cam.getRtspUrl() || !cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
     return;
   }
-  log.info(
-      cam,
-      'RTSP URL still empty after RTSP livestream started, toggling rtspStream (false -> true) to refresh HomeBase URL (session=' +
+  log.debug(
+    cam,
+    'RTSP URL still empty after RTSP livestream started, ' +
+      'toggling rtspStream (false -> true) to refresh HomeBase URL (session=' +
       mySession +
       ')'
   );
@@ -667,11 +684,7 @@ async function recordStationWakeTimeout(stationSn, initiator) {
   }
   const count = (stationUnresponsiveTimeouts.get(stationSn) || 0) + 1;
   stationUnresponsiveTimeouts.set(stationSn, count);
-  await recoverUnresponsiveStation(
-      stationSn,
-      initiator + ' x' + count,
-      count >= ZOMBIE_STATION_TIMEOUT_THRESHOLD
-  );
+  await recoverUnresponsiveStation(stationSn, initiator + ' x' + count, count >= ZOMBIE_STATION_TIMEOUT_THRESHOLD);
 }
 
 /**
@@ -690,7 +703,7 @@ function scheduleStationReconnect(stationSn) {
     }
     await ensureStationConnected(stationSn);
     const checkRes = await call({command: 'station.is_connected', serialNumber: stationSn});
-    if (wsReady && checkRes.success && checkRes.result && checkRes.result.connected === false) {
+    if (wsReady && (!checkRes.success || (checkRes.result && checkRes.result.connected === false))) {
       scheduleStationReconnect(stationSn);
     }
   }, STATION_DISCONNECT_RETRY_MS);
@@ -749,10 +762,13 @@ async function ensureInitialDriverAndStationsConnected(stateObj) {
     registerStationSerial(sn);
     if (typeof entry === 'object' && entry !== null && entry.connected === false) {
       handledStations.add(sn);
+      updateStationHealth(sn, false);
       log.warn('bridge', 'HomeBase station (' + sn + ') is disconnected on startup, sending station.connect');
       const connRes = await call({command: 'station.connect', serialNumber: sn});
       if (connRes.success) {
         noteStationActivity(sn);
+      } else {
+        scheduleStationReconnect(sn);
       }
     }
   }
@@ -804,10 +820,10 @@ function applyDeviceProperties(cam, props, allowCardRebuild = !cam.hasBatteryRea
   checkStreamingQuality(cam, props);
   checkHardwareRecordingSettings(cam, props);
   syncCameraRtspProperties(
-      cam,
-      unwrapProperty(props.stationSerialNumber),
-      unwrapProperty(props.rtspStreamUrl),
-      unwrapProperty(props.rtspStream)
+    cam,
+    unwrapProperty(props.stationSerialNumber),
+    unwrapProperty(props.rtspStreamUrl),
+    unwrapProperty(props.rtspStream)
   );
   const outcome = cam.applyTelemetryProperties(props, allowCardRebuild);
   switch (outcome.logLevel) {
@@ -854,32 +870,63 @@ function applyDeviceProperties(cam, props, allowCardRebuild = !cam.hasBatteryRea
 }
 
 /**
+ * Ensures non-offline cameras have an active FFmpeg RTSP encoder (and updates wsConnected health
+ * and status cards when specified).
+ *
+ * @param {{wsConnected?: boolean, rtspDirectOnly?: boolean}} [opts={}] - Startup options.
+ */
+function ensureCameraEncodersStarted(opts = {}) {
+  const {wsConnected, rtspDirectOnly = false} = opts;
+  for (const cam of camsRef) {
+    if (rtspDirectOnly && !cam.isRtspDirect()) {
+      continue;
+    }
+    const healthChanged = typeof wsConnected === 'boolean' && cam.updateServiceHealth({wsConnected});
+    if (healthChanged) {
+      renderCameraCards(cam);
+    }
+    if (!cam.isDeviceOffline() && !cam.hasEncoderProcess() && onDeviceOnlineResumeCallback) {
+      onDeviceOnlineResumeCallback(cam);
+    } else if (healthChanged) {
+      pushFrameToEncoder(cam);
+    }
+  }
+}
+
+/**
  * Queries device.get_properties for all configured cameras so battery, charging/power mode,
  * Wi-Fi signal/RSSI, temperature, and streaming quality are populated on API schema 13+.
  *
  * @param {boolean} [forceRefresh=false] - Whether to force a driver.poll_refresh before reading properties.
  */
 async function fetchAllCameraTelemetry(forceRefresh = false) {
+  ensureCameraEncodersStarted({rtspDirectOnly: true});
   if (!wsReady) {
     return;
   }
-  const shouldRefreshHomeBase = forceRefresh || camsRef.some((c) => c.isDeviceOffline());
+  const eufyCams = camsRef.filter((c) => !c.isRtspDirect());
+  const shouldRefreshHomeBase = eufyCams.length > 0 && (forceRefresh || eufyCams.some((c) => c.isDeviceOffline()));
   if (shouldRefreshHomeBase) {
     log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
     const pollRes = await call({command: 'driver.poll_refresh'});
     if (!pollRes.success) {
       log.warn(
-          'bridge',
-          'driver.poll_refresh failed (errorCode=' +
+        'bridge',
+        'driver.poll_refresh failed (errorCode=' +
           (pollRes.errorCode || 'unknown') +
           '), reconnecting eufy-security-ws driver and stations'
       );
       await recoverDriverAndStations('driver.poll_refresh ' + (pollRes.errorCode || 'failed'));
+      for (const cam of eufyCams) {
+        if (!cam.isDeviceOffline() && !cam.hasEncoderProcess() && onDeviceOnlineResumeCallback) {
+          onDeviceOnlineResumeCallback(cam);
+        }
+      }
       return;
     }
     await sleep(POLL_REFRESH_SETTLE_MS);
   }
-  for (const cam of camsRef) {
+  for (const cam of eufyCams) {
     if (!wsReady) {
       return;
     }
@@ -921,11 +968,20 @@ async function handleVersionMessage(m) {
   }
 
   if (!wsReady) {
-    log.error('bridge', 'start_listening failed: ' + (st.errorCode || 'unknown'));
+    wsHasEverDisconnected = true;
+    log.error('bridge', 'start_listening failed (' + (st.errorCode || 'unknown') + '), retrying connection in 10 s');
+    ensureCameraEncodersStarted({wsConnected: false});
+    scheduleWsReconnect();
     return;
   }
 
-  log.info('bridge', 'listening for eufy events (apiSchema=' + targetSchema + ')');
+  const listenMsg = wsHasEverDisconnected
+    ? 'eufy-security-ws reconnected, listening for eufy events (apiSchema=' + targetSchema + ')'
+    : 'listening for eufy events (apiSchema=' + targetSchema + ')';
+  wsHasEverDisconnected = false;
+  wsOutageWarned = false;
+  wsOutageErrorLogged = false;
+  log.info('bridge', listenMsg);
   const stateSnapshot = (st.result && st.result.state) || {};
   await ensureInitialDriverAndStationsConnected(stateSnapshot);
   await fetchAllCameraTelemetry();
@@ -933,87 +989,150 @@ async function handleVersionMessage(m) {
   for (const dev of devices) {
     if (dev && typeof dev === 'object' && dev.serialNumber) {
       const cam = bySerialRef.get(dev.serialNumber);
-      if (cam && !cam.hasBatteryReading() && !cam.isDeviceOffline()) {
+      if (cam && !cam.isRtspDirect() && !cam.hasBatteryReading() && !cam.isDeviceOffline()) {
         applyDeviceProperties(cam, dev, true);
       }
     }
   }
   setTimeout(() => {
-    if (wsReady && camsRef.some((c) => !c.hasBatteryReading())) {
+    if (
+      wsReady &&
+      camsRef.some(
+        (c) =>
+          !c.isRtspDirect() &&
+          (!c.hasBatteryReading() || c.hasServiceDisruption() || (c.useRtsp && !c.isDoorbell() && !c.getRtspUrl()))
+      )
+    ) {
       void fetchAllCameraTelemetry();
     }
   }, INITIAL_TELEMETRY_RETRY_MS).unref();
 }
 
 /**
+ * Rejects all in-flight RPC requests with ws_closed when the WebSocket disconnects or resets.
+ */
+function failPendingRpcRequests() {
+  for (const [requestId, resolveRpc] of pendingRpcMap) {
+    pendingRpcMap.delete(requestId);
+    resolveRpc({success: false, errorCode: 'ws_closed'});
+  }
+}
+
+/**
  * Establishes and maintains the WebSocket connection to eufy-security-ws.
+ *
+ * @returns {void}
  */
 function connectWs() {
+  clearWsReconnectTimer();
   if (isShuttingDownFn()) {
     return;
   }
+  ensureCameraEncodersStarted({rtspDirectOnly: true});
+  if (!cfg.eufy_security_ws_url || (camsRef.length > 0 && camsRef.every((c) => c.isRtspDirect()))) {
+    log.info('bridge', 'skipping eufy-security-ws connection (all cameras specify direct rtsp_url)');
+    if (!initialTelemetryLoaded) {
+      initialTelemetryLoaded = true;
+      if (onInitialTelemetryCallback) {
+        onInitialTelemetryCallback();
+      }
+    }
+    return;
+  }
+  const prevWs = ws;
+  ws = null;
+  if (prevWs && typeof prevWs.close === 'function') {
+    try {
+      prevWs.close();
+    } catch (err) {
+      // Ignore errors closing a superseded socket.
+    }
+  }
   clearStationRecoveryState();
   propertySyncChains.clear();
-  for (const [id, resolve] of waiting) {
-    waiting.delete(id);
-    resolve({success: false, errorCode: 'ws_closed'});
-  }
+  failPendingRpcRequests();
   const WebSocket = getWebSocketConstructor();
-  ws = new WebSocket(cfg.eufy_security_ws_url);
+  let socket;
+  try {
+    socket = new WebSocket(cfg.eufy_security_ws_url);
+  } catch (err) {
+    wsReady = Boolean(false);
+    wsHasEverDisconnected = true;
+    const errMsg = err && err.message ? err.message : String(err);
+    const logConnectErr = !wsOutageErrorLogged ? log.error : log.debug;
+    wsOutageErrorLogged = true;
+    logConnectErr('bridge', 'eufy-security-ws connect failed (' + errMsg + '), retrying in 10 s');
+    ensureCameraEncodersStarted({wsConnected: false});
+    scheduleWsReconnect();
+    return;
+  }
+  ws = socket;
 
-  ws.on('open', () => log.info('bridge', 'eufy-security-ws connected (' + cfg.eufy_security_ws_url + ')'));
+  socket.on('open', () => log.debug('bridge', 'eufy-security-ws connected (' + cfg.eufy_security_ws_url + ')'));
 
-  ws.on('close', () => {
-    wsReady = false;
+  socket.on('close', () => {
+    if (socket !== ws) {
+      return;
+    }
+    wsReady = Boolean(false);
+    wsHasEverDisconnected = true;
     initialTelemetryLoaded = false;
     clearStationRecoveryState();
     propertySyncChains.clear();
-    for (const [id, resolve] of waiting) {
-      waiting.delete(id);
-      resolve({success: false, errorCode: 'ws_closed'});
-    }
-    log.warn('bridge', 'eufy-security-ws connection closed, retrying in 10 s');
+    failPendingRpcRequests();
+    const logClose = !wsOutageWarned ? log.warn : log.debug;
+    wsOutageWarned = true;
+    logClose('bridge', 'eufy-security-ws connection closed, retrying in 10 s');
     for (const c of camsRef) {
       const healthChanged = c.updateServiceHealth({wsConnected: false});
       if (c.handleStationDisconnected('ws_closed') && onWsClosedStopCallback) {
         onWsClosedStopCallback(c);
+      } else if (!c.isDeviceOffline() && !c.hasEncoderProcess() && onDeviceOnlineResumeCallback) {
+        if (healthChanged) {
+          renderCameraCards(c);
+        }
+        onDeviceOnlineResumeCallback(c);
       } else if (healthChanged) {
         renderCameraCards(c);
         pushFrameToEncoder(c);
       }
     }
-    if (!isShuttingDownFn()) {
-      setTimeout(connectWs, WS_RECONNECT_DELAY_MS);
+    scheduleWsReconnect();
+  });
+
+  socket.on('error', (err) => {
+    if (socket === ws) {
+      const logWsErr = !wsOutageErrorLogged ? log.error : log.debug;
+      wsOutageErrorLogged = true;
+      logWsErr('bridge', 'eufy-security-ws error: ' + err.message);
     }
   });
 
-  ws.on('error', (e) => log.error('bridge', 'eufy-security-ws error: ' + e.message));
-
-  ws.on('message', async (raw) => {
-    let m;
+  socket.on('message', async (rawFrame) => {
+    let parsedMsg;
     try {
-      m = JSON.parse(String(raw));
+      parsedMsg = JSON.parse(String(rawFrame));
     } catch (err) {
       return;
     }
 
-    switch (m.type) {
+    switch (parsedMsg.type) {
       case 'version':
-        await handleVersionMessage(m);
+        await handleVersionMessage(parsedMsg);
         break;
       case 'result':
-        if (m.messageId) {
-          const r = waiting.get(m.messageId);
-          if (r) {
-            waiting.delete(m.messageId);
-            r(m);
+        if (parsedMsg.messageId) {
+          const resolvePending = pendingRpcMap.get(parsedMsg.messageId);
+          if (resolvePending) {
+            pendingRpcMap.delete(parsedMsg.messageId);
+            resolvePending(parsedMsg);
           }
         }
         break;
       case 'event':
         if (onEventCallback) {
           try {
-            onEventCallback(m.event || {});
+            onEventCallback(parsedMsg.event || {});
           } catch (err) {
             log.error('bridge', 'unhandled error in onEvent: ' + err.message);
           }
@@ -1030,11 +1149,12 @@ function connectWs() {
  */
 function startTelemetryPoller() {
   if (TELEMETRY_POLL_MS > 0) {
-    setInterval(() => {
+    const runTelemetryRefresh = () => {
       if (wsReady && !isShuttingDownFn()) {
         void fetchAllCameraTelemetry(false);
       }
-    }, TELEMETRY_POLL_MS);
+    };
+    setInterval(runTelemetryRefresh, TELEMETRY_POLL_MS);
   }
 }
 
@@ -1082,6 +1202,7 @@ module.exports = {
   noteStationActivity,
   scheduleStationReconnect,
   updateStationHealth,
+  ensureCameraEncodersStarted,
   connectWs,
   startTelemetryPoller,
   extractRecognizedPerson,
