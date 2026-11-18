@@ -47,6 +47,8 @@ const PII_RULES = [
 const SKIP_DIRS = new Set(['.git', '.tmp', '.venv', 'node_modules', 'cache']);
 const WIDTH_FILES = [/^AGENTS\.md$/, /^README\.md$/, /^CHANGELOG\.md$/, /^docs\/.*\.md$/, /^\.agents\//];
 const DASH_FILES = [/\.md$/, /^(src|test|scripts)\/.*\.js$/, /^Makefile$/];
+const COMPOSE_FILE_REGEX = /(?:^|\/)(?:docker-)?compose[^/]*\.ya?ml$/;
+const COMPOSE_HEALTHCHECK_REGEX = /^\s*healthcheck\s*:/;
 
 /**
  * Lists repository files below dir (relative paths with forward slashes), skipping tool folders.
@@ -492,6 +494,21 @@ function checkPackageVersionAndLockfile(errs) {
 }
 
 /**
+ * Rejects a `healthcheck:` key in Compose files: the Dockerfile HEALTHCHECK is the single home of the probe.
+ *
+ * @param {string} file - Relative Compose file path.
+ * @param {string} text - Compose file content.
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkComposeHasNoHealthcheck(file, text, errs) {
+  text.split('\n').forEach((line, index) => {
+    if (COMPOSE_HEALTHCHECK_REGEX.test(line)) {
+      errs.push(file + ':' + (index + 1) + ': remove healthcheck, deploy/Dockerfile HEALTHCHECK is its only home');
+    }
+  });
+}
+
+/**
  * Runs all repository documentation, acceptance, regression, and release parity checks.
  */
 function runDocsCheck() {
@@ -502,6 +519,9 @@ function runDocsCheck() {
   checkAcceptanceTestSuite(validAtIds, errors);
   checkRegressionIndex(files, validAtIds, errors);
   checkPackageVersionAndLockfile(errors);
+  for (const file of files.filter((f) => COMPOSE_FILE_REGEX.test(f))) {
+    checkComposeHasNoHealthcheck(file, fs.readFileSync(path.join(ROOT, file), 'utf8'), errors);
+  }
 
   for (const file of files) {
     const abs = path.join(ROOT, file);
@@ -575,4 +595,5 @@ if (require.main === module) {
 module.exports = {
   checkChangelogReleaseTag,
   checkChangelogPostRelease,
+  checkComposeHasNoHealthcheck,
 };

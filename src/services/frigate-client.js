@@ -59,6 +59,9 @@ const DIRECT_RTSP_VIEWER_ACTIONS = Object.freeze({
 let isSyncingMasks = false;
 let frigateApiDown = false;
 let go2rtcApiDown = false;
+let go2rtcUnusableReplyLogged = false;
+const NO_GO2RTC_POLL = Object.freeze({reachable: false, streams: null, error: ''});
+const NO_STREAM_INFO = Object.freeze({consumers: Object.freeze([])});
 let lastMaskCheckAt = Date.now();
 let isPollingViewers = false;
 
@@ -756,7 +759,84 @@ function classifyViewerAction(params) {
 }
 
 /**
- * Polls go2rtc for active stream consumers on each camera every 750ms.
+ * Fetches the go2rtc stream table (stream name -> info with `consumers`) for all streams in one request. Never
+ * throws: HTTP failures and network errors are reported through `error` with `reachable: false`, and an unreadable
+ * body through `error` with `reachable: true`.
+ *
+ * @returns {Promise<{ reachable: boolean, streams: Record<string, *>|null, error: string }>}
+ */
+async function fetchGo2rtcStreams() {
+  let response;
+  try {
+    response = await fetch(cfg.go2rtc_url + '/api/streams', {
+      signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const snippet = await readHttpErrorSnippet(response);
+      return {reachable: false, streams: null, error: 'HTTP ' + response.status + (snippet ? ': ' + snippet : '')};
+    }
+  } catch (err) {
+    return {reachable: false, streams: null, error: formatErrorMessage(err)};
+  }
+  try {
+    const streams = await response.json();
+    const isStreamTable = Boolean(streams) && typeof streams === 'object' && !Array.isArray(streams);
+    return {
+      reachable: true,
+      streams: isStreamTable ? streams : null,
+      error: isStreamTable ? '' : 'unexpected response',
+    };
+  } catch (err) {
+    return {reachable: true, streams: null, error: formatErrorMessage(err)};
+  }
+}
+
+/**
+ * Applies one camera's go2rtc consumers: refreshes encoder consumer observation, registers new viewers (appending
+ * them to `newConnections`), and prunes viewers that disconnected.
+ *
+ * @param {Camera} cam - Camera whose stream was polled.
+ * @param {Record<string, *>} streamInfo - go2rtc stream info containing `consumers`.
+ * @param {Array<{ cam: Camera, id: string, clientInfo: string, now: number }>} newConnections - New viewer sink.
+ */
+function applyStreamConsumers(cam, streamInfo, newConnections) {
+  const consumers = streamInfo.consumers || [];
+  const pollTimestamp = Date.now();
+  if (cam.notifyEncoderConsumersObserved(consumers.length, OFFLINE_SNAPSHOT_SEED_MS, pollTimestamp)) {
+    pushFrameToEncoder(cam, pollTimestamp);
+  }
+  const activeViewers = consumers.filter((c) => !INTERNAL_RECORDER_USER_AGENT_REGEX.test(c.user_agent || ''));
+  const activeConsumerIds = new Set();
+
+  for (let i = 0; i < activeViewers.length; i++) {
+    const consumer = activeViewers[i];
+    activeConsumerIds.add(consumer.id);
+    if (cam.hasRegisteredViewer(consumer.id)) {
+      continue;
+    }
+
+    const clientInfo = (consumer.format_name || consumer.protocol || '') + ' ' + (consumer.remote_addr || '');
+    cam.registerNewViewer(consumer.id, pollTimestamp);
+    pushFrameToEncoder(cam, pollTimestamp);
+    newConnections.push({cam, id: consumer.id, clientInfo: clientInfo.trim(), now: pollTimestamp});
+  }
+
+  for (const {id, wasActiveViewer} of cam.pruneDisconnectedViewers(activeConsumerIds, activeViewers.length)) {
+    log.debug(
+      cam,
+      'viewer disconnected (id=' +
+        id +
+        ', wasWakingViewer=' +
+        wasActiveViewer +
+        ', remainingViewers=' +
+        activeViewers.length +
+        ')'
+    );
+  }
+}
+
+/**
+ * Polls go2rtc once every 750ms (bulk `/api/streams`) for the active stream consumers of every camera.
  *
  * @param {Camera[]} cams - Array of Camera instances.
  * @param {Record<string, Function>} hooks - Orchestrator/telemetry callbacks.
@@ -771,60 +851,26 @@ async function pollViewers(cams, hooks) {
     const findStationMotionCam = (cam) => cams.find((c) => c.isHoldingStationP2pForMotion(cam.getStationKey()));
     const newConnections = [];
 
-    let anyPollOk = false;
-    let allPollsFailed = true;
-    let lastPollError = '';
-    for (const cam of cams) {
-      try {
-        const r = await fetch(cfg.go2rtc_url + '/api/streams?src=' + cam.getName(), {
-          signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS),
-        });
-        if (!r.ok) {
-          const snippet = await readHttpErrorSnippet(r);
-          lastPollError = 'HTTP ' + r.status + (snippet ? ': ' + snippet : '');
-          continue;
+    // One bulk request per tick; a stream go2rtc does not list yet simply has no consumers.
+    const poll = cams.length > 0 ? await fetchGo2rtcStreams() : NO_GO2RTC_POLL;
+    let lastPollError = poll.error;
+    if (poll.streams) {
+      for (const cam of cams) {
+        try {
+          const hasStream = Object.hasOwn(poll.streams, cam.getName());
+          applyStreamConsumers(cam, hasStream ? poll.streams[cam.getName()] : NO_STREAM_INFO, newConnections);
+        } catch (err) {
+          lastPollError = formatErrorMessage(err);
         }
-        allPollsFailed = false;
-        anyPollOk = true;
-        const streamInfo = await r.json();
-        const consumers = streamInfo.consumers || [];
-        const pollTimestamp = Date.now();
-        if (cam.notifyEncoderConsumersObserved(consumers.length, OFFLINE_SNAPSHOT_SEED_MS, pollTimestamp)) {
-          pushFrameToEncoder(cam, pollTimestamp);
-        }
-        const activeViewers = consumers.filter((c) => !INTERNAL_RECORDER_USER_AGENT_REGEX.test(c.user_agent || ''));
-        const activeConsumerIds = new Set();
-
-        for (let i = 0; i < activeViewers.length; i++) {
-          const consumer = activeViewers[i];
-          activeConsumerIds.add(consumer.id);
-          if (cam.hasRegisteredViewer(consumer.id)) {
-            continue;
-          }
-
-          const clientInfo = (consumer.format_name || consumer.protocol || '') + ' ' + (consumer.remote_addr || '');
-          cam.registerNewViewer(consumer.id, pollTimestamp);
-          pushFrameToEncoder(cam, pollTimestamp);
-          newConnections.push({cam, id: consumer.id, clientInfo: clientInfo.trim(), now: pollTimestamp});
-        }
-
-        for (const {id, wasActiveViewer} of cam.pruneDisconnectedViewers(activeConsumerIds, activeViewers.length)) {
-          log.debug(
-            cam,
-            'viewer disconnected (id=' +
-              id +
-              ', wasWakingViewer=' +
-              wasActiveViewer +
-              ', remainingViewers=' +
-              activeViewers.length +
-              ')'
-          );
-        }
-      } catch (err) {
-        lastPollError = formatErrorMessage(err);
       }
     }
-    if (allPollsFailed && cams.length > 0) {
+    // A reachable go2rtc with an unusable reply must not look like "nobody is watching": warn once per episode.
+    const unusableReply = poll.reachable ? lastPollError : '';
+    if (unusableReply && !go2rtcUnusableReplyLogged) {
+      log.warn('bridge', 'go2rtc API returned an unusable stream list (' + cfg.go2rtc_url + ', ' + unusableReply + ')');
+    }
+    go2rtcUnusableReplyLogged = Boolean(unusableReply);
+    if (cams.length > 0 && !poll.reachable) {
       const wasGo2rtcApiDown = go2rtcApiDown;
       go2rtcApiDown = true;
       syncServiceHealthFlags(cams, {go2rtcConnected: false});
@@ -837,7 +883,7 @@ async function pollViewers(cams, hooks) {
       } else {
         log.debug('bridge', 'go2rtc API still unreachable (' + cfg.go2rtc_url + reasonSuffix + ')');
       }
-    } else if (anyPollOk) {
+    } else if (poll.reachable) {
       const wasGo2rtcApiDown = go2rtcApiDown;
       go2rtcApiDown = false;
       syncServiceHealthFlags(cams, {go2rtcConnected: true});

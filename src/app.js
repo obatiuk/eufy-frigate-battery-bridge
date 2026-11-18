@@ -83,15 +83,17 @@ function clearBridgeReady() {
 }
 
 /**
- * Instantiates all configured Camera domain objects into `cams` and loads their cached snapshots.
+ * Instantiates all configured Camera domain objects into `cams` after decoding their cached snapshots in parallel
+ * off the event loop, so the already-bound HTTP listener keeps answering health probes meanwhile.
  *
  * @param {Camera[]} cams - Active camera collection populated in place during bootstrap.
- * @returns {Map<string, Camera>} Lookup map by hardware serial number.
+ * @returns {Promise<Map<string, Camera>>} Lookup map by hardware serial number.
  */
-function initCameras(cams) {
-  for (const rawCam of cfg.cameras) {
-    cams.push(new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards));
-  }
+async function initCameras(cams) {
+  const snapshots = await Promise.all(cfg.cameras.map((rawCam) => loadCachedFrame(rawCam)));
+  cfg.cameras.forEach((rawCam, index) => {
+    cams.push(new Camera(rawCam, snapshots[index], renderCameraCards));
+  });
   return new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
 }
 
@@ -244,8 +246,10 @@ function startServices(cams) {
 /**
  * Application bootstrap entrypoint. Binds the HTTP listener immediately after configuration
  * validation so container /healthz probes succeed without waiting on snapshot decodes or external services.
+ *
+ * @returns {Promise<void>}
  */
-function main() {
+async function main() {
   /** @type {Camera[]} */
   const cams = [];
   registerSignalHandlers(cams);
@@ -254,9 +258,12 @@ function main() {
     isShuttingDown: () => bridgeShuttingDown,
   });
   markBridgeReady();
-  const bySerial = initCameras(cams);
+  const bySerial = await initCameras(cams);
   wireServices(cams, bySerial);
   startServices(cams);
 }
 
-main();
+main().catch((err) => {
+  log.error('bridge', 'startup failed: ' + formatErrorMessage(err, true));
+  process.exit(1);
+});

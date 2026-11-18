@@ -1812,6 +1812,34 @@ describe('Environment Variable Expansion (${ENV_VAR} in config.yaml)', () => {
     assert.ok(emptyErrors.length > 0);
   });
 
+  it('rejects a healthcheck in Compose files because the Dockerfile owns it in scripts/check-docs.js', () => {
+    // Verify Compose files never redefine the image HEALTHCHECK, while commented mentions stay allowed
+    const checkDocsPath = path.join(REPO_ROOT, 'scripts/check-docs.js');
+    if (!fs.existsSync(checkDocsPath)) {
+      return;
+    }
+    const {checkComposeHasNoHealthcheck} = require(checkDocsPath);
+    assert.equal(typeof checkComposeHasNoHealthcheck, 'function');
+
+    const cleanErrs = [];
+    checkComposeHasNoHealthcheck(
+      'deploy/docker-compose.example.yml',
+      'services:\n  bridge:\n    # healthcheck: is defined in the Dockerfile\n    restart: unless-stopped\n',
+      cleanErrs
+    );
+    assert.deepEqual(cleanErrs, []);
+
+    const dupErrs = [];
+    checkComposeHasNoHealthcheck(
+      'deploy/docker-compose.example.yml',
+      'services:\n  bridge:\n    healthcheck:\n      test: [CMD, true]\n',
+      dupErrs
+    );
+    assert.equal(dupErrs.length, 1);
+    assert.ok(dupErrs[0].includes('deploy/docker-compose.example.yml:3'));
+    assert.ok(dupErrs[0].includes('Dockerfile'));
+  });
+
   it('enforces post-release ## dev section and immutable tagged sections in scripts/check-docs.js', () => {
     // Verify post-release CHANGELOG.md edits must go under ## dev above the latest tag and never mutate tagged sections
     const checkDocsPath = path.join(REPO_ROOT, 'scripts/check-docs.js');

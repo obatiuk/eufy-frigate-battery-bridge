@@ -12,8 +12,8 @@
   pre-encoded fixed-length `{"ok":true}` (`200`) or `{"ok":false}` (`503` on shutdown) buffer with `Connection: close`
   on a synchronous fast-path before `URL` allocation and with zero external service fields (`ws_connected` lives on
   `/api/status`); moved `startHttpServer()` ahead of `initCameras()` in `src/app.js` (exiting `1` if the HTTP port
-  cannot bind); tightened `HEALTHCHECK` in `deploy/Dockerfile` (and `deploy/docker-compose.example.yml`) to `5s` (`2s`
-  timeout) while verifying a live post-validation PID marker when `BRIDGE_HTTP_PORT=0`; and enforced strict URL scheme,
+  cannot bind); tightened `HEALTHCHECK` in `deploy/Dockerfile` to `5s` (`2s` timeout) while verifying a live
+  post-validation PID marker when `BRIDGE_HTTP_PORT=0`; and enforced strict URL scheme,
   runtime env, identity uniqueness, safe-name, and scalar/integer type checks at startup in `src/config.js`.
 - **Tests:** `test/acceptance.test.js` (`AT-08`), `test/services.test.js` (`serves dependency-free fixed-length
 /healthz responses...`), and `test/config.test.js` (`rejects non-integer or out-of-range port environment

@@ -4,6 +4,14 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Keep the bridge responsive while camera snapshots are decoded at startup and saved when a stream ends by running
+  `ffmpeg` in the background with a kill timeout, decoding all snapshots in parallel, and writing each snapshot to a
+  temporary file first so a failed or killed save never corrupts the previous one
+- Detect Frigate Live View viewers with a single `go2rtc` request per poll for all cameras instead of one request per
+  camera, so a slow or unreachable `go2rtc` no longer multiplies wake-detection delay by the camera count, and warn once
+  when `go2rtc` answers with an unusable stream list instead of silently missing viewers
+- Remove the duplicated container health check from the example `Compose` file so the image remains its only
+  definition, and fail the documentation check when any `Compose` file defines one again
 - Validate configuration value types, integer fields, service URL schemes, runtime log and hardware-acceleration modes,
   and unique safe camera identities at startup, and require a live post-validation process marker when the `HTTP`
   listener is disabled so invalid configurations never report healthy

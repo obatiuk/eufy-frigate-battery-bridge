@@ -19,6 +19,16 @@ const {log, formatLocalHm, formatErrorMessage, extractFfmpegStderrLines} = requi
 
 const JPEG_ENCODER_QUALITY = '2';
 const SNAPSHOT_FFMPEG_THREADS = '1';
+const SNAPSHOT_FFMPEG_TIMEOUT_MS = 10000;
+const SNAPSHOT_FFMPEG_KILL_SIGNAL = 'SIGKILL';
+const SNAPSHOT_TEMP_SUFFIX = '.tmp.jpg';
+const MAX_SNAPSHOT_STDERR_BYTES = 16384;
+const ENCODE_MAX_STDOUT_BYTES = 0;
+
+/** Cache files with an FFmpeg encode in flight, so repeated session stops never stack encodes of one snapshot. */
+const pendingSaveFiles = new Set();
+
+const ignoreError = () => {};
 
 /**
  * Builds the FFmpeg CLI arguments to decode a JPEG file into a scaled raw YUV420p frame.
@@ -82,9 +92,19 @@ function buildEncodeJpegArgs(targetFile) {
 }
 
 /**
- * Formats a concise diagnostic reason from a failed spawnSync('ffmpeg', ...) result.
+ * @typedef {{
+ *   status: number|null,
+ *   signal: string|null,
+ *   error: Error|undefined,
+ *   stdout: Buffer,
+ *   stderr: Buffer,
+ * }} SnapshotFfmpegResult
+ */
+
+/**
+ * Formats a concise diagnostic reason from a failed snapshot FFmpeg run.
  *
- * @param {import("node:child_process").SpawnSyncReturns<Buffer|string>} res - spawnSync result.
+ * @param {SnapshotFfmpegResult} res - Settled FFmpeg result.
  * @returns {string}
  */
 function formatSnapshotFfmpegFailure(res) {
@@ -102,22 +122,84 @@ function formatSnapshotFfmpegFailure(res) {
 }
 
 /**
+ * Runs FFmpeg asynchronously (never blocking the event loop) with a hard kill timeout, capturing bounded stdout and
+ * stderr. Always resolves, reporting spawn failures and kills through the result instead of rejecting.
+ *
+ * @param {readonly string[]} args - FFmpeg CLI arguments.
+ * @param {Buffer|undefined} input - Bytes piped to FFmpeg stdin, if any.
+ * @param {number} maxStdoutBytes - Stdout size after which FFmpeg is killed.
+ * @returns {Promise<SnapshotFfmpegResult>}
+ */
+function runSnapshotFfmpeg(args, input, maxStdoutBytes) {
+  return new Promise((resolve) => {
+    /** @type {Buffer[]} */
+    const stdoutChunks = [];
+    /** @type {Buffer[]} */
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const settle = (status, signal, error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        status,
+        signal,
+        error,
+        stdout: Buffer.concat(stdoutChunks),
+        stderr: Buffer.concat(stderrChunks),
+      });
+    };
+
+    let child;
+    try {
+      child = childProcess.spawn('ffmpeg', args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: SNAPSHOT_FFMPEG_TIMEOUT_MS,
+        killSignal: SNAPSHOT_FFMPEG_KILL_SIGNAL,
+      });
+    } catch (err) {
+      settle(null, null, err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    child.on('error', (err) => settle(null, null, err));
+    child.on('close', (code, signal) => settle(code, signal, undefined));
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxStdoutBytes) {
+        child.kill(SNAPSHOT_FFMPEG_KILL_SIGNAL);
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= MAX_SNAPSHOT_STDERR_BYTES) {
+        stderrChunks.push(chunk);
+      }
+    });
+    // FFmpeg may exit before consuming stdin (EPIPE); its exit status and stderr already report the cause.
+    child.stdin.on('error', ignoreError);
+    child.stdin.end(input);
+  });
+}
+
+/**
  * Decodes a JPEG file into a raw WxH YUV420p frame Buffer, returning the decoded frame or a
- * diagnostic error string when FFmpeg fails or produces a truncated buffer.
+ * diagnostic error string when FFmpeg fails, times out, or produces a truncated buffer.
  *
  * @param {string} filePath - Filesystem path to a JPEG image.
- * @returns {{ frame: Uint8Array|null, error: string }}
+ * @returns {Promise<{ frame: Uint8Array|null, error: string }>}
  */
-function tryDecodeJpegToYuv(filePath) {
-  const r = childProcess.spawnSync('ffmpeg', buildDecodeJpegArgs(filePath), {
-    maxBuffer: FRAME * MAX_FFMPEG_BUFFER_MULTIPLIER,
-  });
-  if (!r.error && r.status === 0 && Buffer.isBuffer(r.stdout) && r.stdout.length === FRAME) {
+async function tryDecodeJpegToYuv(filePath) {
+  const r = await runSnapshotFfmpeg(buildDecodeJpegArgs(filePath), undefined, FRAME * MAX_FFMPEG_BUFFER_MULTIPLIER);
+  if (!r.error && r.status === 0 && r.stdout.length === FRAME) {
     return {frame: r.stdout, error: ''};
   }
   if (!r.error && r.status === 0) {
-    const byteLen = Buffer.isBuffer(r.stdout) ? r.stdout.length : 0;
-    return {frame: null, error: 'unexpected output size (' + byteLen + ' bytes, expected ' + FRAME + ')'};
+    return {frame: null, error: 'unexpected output size (' + r.stdout.length + ' bytes, expected ' + FRAME + ')'};
   }
   return {frame: null, error: formatSnapshotFfmpegFailure(r)};
 }
@@ -126,14 +208,29 @@ function tryDecodeJpegToYuv(filePath) {
  * Reads the file modification time of a cached snapshot as a local 'HH:MM' string.
  *
  * @param {string} filePath - Snapshot file path.
- * @returns {string}
+ * @returns {Promise<string>}
  */
-function readFileLastSeenHm(filePath) {
+async function readFileLastSeenHm(filePath) {
   try {
-    const st = fs.statSync(filePath);
+    const st = await fs.promises.stat(filePath);
     return formatLocalHm(new Date(st.mtimeMs));
   } catch (err) {
     return '';
+  }
+}
+
+/**
+ * Returns true if a file exists at the path.
+ *
+ * @param {string} filePath - Filesystem path.
+ * @returns {Promise<boolean>}
+ */
+async function fileExists(filePath) {
+  try {
+    await fs.promises.access(filePath);
+    return true;
+  } catch (err) {
+    return false;
   }
 }
 
@@ -178,23 +275,23 @@ function migrateLegacyDuplicateCacheFile(cam, cacheDir = CACHE_DIR) {
 
 /**
  * Loads the last cached live frame for a camera from CACHE_DIR (or fallback temp directory) if one was saved
- * prior to a container restart.
+ * prior to a container restart. FFmpeg runs off the event loop so startup health probes keep answering.
  *
  * @param {CameraConfig|Camera|{ name?: string, serial?: string }} cam - Camera configuration or domain instance.
- * @returns {{ frame: Uint8Array|null, lastSeen: string }} YUV420p frame buffer and formatted mtime.
+ * @returns {Promise<{ frame: Uint8Array|null, lastSeen: string }>} YUV420p frame buffer and formatted mtime.
  */
-function loadCachedFrame(cam) {
+async function loadCachedFrame(cam) {
   migrateLegacyDuplicateCacheFile(cam, CACHE_DIR);
   migrateLegacyDuplicateCacheFile(cam, os.tmpdir());
   const fileName = CameraConfig.resolveCacheFileName(cam);
   const candidates = [getCacheFilePath(cam), path.join(os.tmpdir(), fileName)];
   for (const file of candidates) {
-    if (!fs.existsSync(file)) {
+    if (!(await fileExists(file))) {
       continue;
     }
-    const {frame: decoded, error: decodeErr} = tryDecodeJpegToYuv(file);
+    const {frame: decoded, error: decodeErr} = await tryDecodeJpegToYuv(file);
     if (decoded) {
-      const lastSeen = readFileLastSeenHm(file);
+      const lastSeen = await readFileLastSeenHm(file);
       const seenSuffix = lastSeen ? ' (lastSeen=' + lastSeen + ')' : '';
       log.debug(cam, 'loaded cached snapshot from ' + file + seenSuffix);
       return Object.freeze({frame: decoded, lastSeen});
@@ -205,18 +302,31 @@ function loadCachedFrame(cam) {
 }
 
 /**
- * Saves the camera's latest verified raw YUV420p live frame to CACHE_DIR as a JPEG snapshot.
+ * Saves the camera's latest verified raw YUV420p live frame to CACHE_DIR as a JPEG snapshot without blocking the
+ * event loop: encodes a private copy of the frame into a temp file, then renames it over the snapshot so a failed
+ * or killed encode never truncates the previous one. Skips the save while one for the same file is still running.
+ * Never rejects.
  *
  * @param {Camera} cam - Camera domain instance.
+ * @returns {Promise<void>}
  */
-function saveCachedFrame(cam) {
+async function saveCachedFrame(cam) {
   if (!cam.hasValidSnapshotFrame()) {
     return;
   }
   const targetFile = getCacheFilePath(cam);
+  if (pendingSaveFiles.has(targetFile)) {
+    log.debug(cam, 'skipping cached snapshot save, previous save still running');
+    return;
+  }
+  pendingSaveFiles.add(targetFile);
+  const tempFile = targetFile + SNAPSHOT_TEMP_SUFFIX;
   try {
-    const r = childProcess.spawnSync('ffmpeg', buildEncodeJpegArgs(targetFile), {input: cam.getLastFrameBuffer()});
+    // Copy before the first await: the live buffers are recycled once the session ends.
+    const frameCopy = Buffer.from(cam.getLastFrameBuffer());
+    const r = await runSnapshotFfmpeg(buildEncodeJpegArgs(tempFile), frameCopy, ENCODE_MAX_STDOUT_BYTES);
     if (!r.error && r.status === 0) {
+      await fs.promises.rename(tempFile, targetFile);
       migrateLegacyDuplicateCacheFile(cam, CACHE_DIR);
       log.debug(cam, 'saved cached snapshot to ' + targetFile);
     } else {
@@ -224,6 +334,9 @@ function saveCachedFrame(cam) {
     }
   } catch (err) {
     log.warn(cam, 'error saving cached snapshot: ' + formatErrorMessage(err));
+  } finally {
+    pendingSaveFiles.delete(targetFile);
+    await fs.promises.rm(tempFile, {force: true}).catch(ignoreError);
   }
 }
 

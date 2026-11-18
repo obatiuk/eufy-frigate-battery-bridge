@@ -1047,7 +1047,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
     );
   }
 
-  if (shouldPersistSnapshot) saveCachedFrame(cam);
+  if (shouldPersistSnapshot) void saveCachedFrame(cam);
   renderCameraCards(cam);
   if (cam.isDeviceOffline()) {
     stopEncoder(cam);

@@ -273,6 +273,121 @@ describe('Frigate & go2rtc Service Helpers (src/services/frigate-client.js)', ()
     assert.equal(statusNetErr, 'failed');
   });
 
+  it('polls go2rtc once for all cameras through the bulk streams endpoint and ignores unrelated streams', async () => {
+    // Verify: viewer detection costs one go2rtc request per tick regardless of camera count, picks each camera's
+    // consumers by stream name, ignores streams the bridge does not own, treats a stream that is not registered yet
+    // as having no consumers (not as a go2rtc outage), and still reports an outage when the single request fails.
+    const pollCams = [1, 2, 3].map(
+      (n) => new Camera({serial: 'T8161T771000000' + n, name: 'poll_bulk_' + n, mode: 'rtsp'})
+    );
+    const hooks = {
+      isShuttingDown: () => false,
+      fetchAllCameraTelemetry: () => {},
+      stopCam: () => {},
+      triggerCam: () => {},
+    };
+    const requestedUrls = [];
+    const origFetch = global.fetch;
+    try {
+      global.fetch = async (url) => {
+        requestedUrls.push(String(url));
+        throw new Error('connect ECONNREFUSED');
+      };
+      await pollViewers(pollCams, hooks);
+      assert.equal(requestedUrls.length, 1, 'a failing go2rtc must cost a single request, not one per camera');
+      assert.equal(
+        pollCams.every((c) => c.isGo2rtcConnected()),
+        false,
+        'one failed bulk request marks go2rtc down for every camera'
+      );
+
+      requestedUrls.length = 0;
+      global.fetch = async (url) => {
+        requestedUrls.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              poll_bulk_1: {producers: [], consumers: []},
+              poll_bulk_3: {
+                producers: [{url: 'rtsp://user:pw@192.0.2.9:554/live'}],
+                consumers: [{id: 'viewer-bulk-3', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
+              },
+              unrelated_frigate_cam: {
+                consumers: [{id: 'viewer-unrelated', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
+              },
+            };
+          },
+        };
+      };
+      await pollViewers(pollCams, hooks);
+      assert.equal(requestedUrls.length, 1);
+      assert.ok(requestedUrls[0].endsWith('/api/streams'), 'must use the bulk endpoint without a src filter');
+      assert.equal(pollCams[2].hasRegisteredViewer('viewer-bulk-3'), true);
+      assert.equal(pollCams[0].hasRegisteredViewer('viewer-bulk-3'), false);
+      assert.equal(pollCams[1].hasRegisteredViewer('viewer-bulk-3'), false);
+      assert.equal(
+        pollCams.some((c) => c.hasRegisteredViewer('viewer-unrelated')),
+        false,
+        'consumers of streams the bridge does not own must be ignored'
+      );
+      assert.equal(
+        pollCams.every((c) => c.isGo2rtcConnected()),
+        true,
+        'a stream missing from the response (poll_bulk_2) is not a go2rtc outage'
+      );
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('warns once when go2rtc answers with an unusable stream list so missed viewers are never silent', async () => {
+    // Verify: a reachable go2rtc whose reply is not a stream table (wrong shape or unreadable body) must not look
+    // like "nobody is watching"; it is logged once per episode and re-armed after a good reply.
+    const shapeCam = new Camera({serial: 'T8161T7720000001', name: 'poll_shape_cam', mode: 'rtsp'});
+    const hooks = {
+      isShuttingDown: () => false,
+      fetchAllCameraTelemetry: () => {},
+      stopCam: () => {},
+      triggerCam: () => {},
+    };
+    const warnings = [];
+    const origWarn = log.warn;
+    const origFetch = global.fetch;
+    log.warn = (scope, ...args) => {
+      warnings.push(String(scope) + ': ' + args.join(' '));
+    };
+    const replyWith = (body) => {
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+      });
+    };
+    const unusableWarnings = () => warnings.filter((w) => w.includes('unusable stream list')).length;
+    try {
+      replyWith([]);
+      await pollViewers([shapeCam], hooks);
+      await pollViewers([shapeCam], hooks);
+      assert.equal(unusableWarnings(), 1, 'repeated unusable replies must warn once');
+      assert.equal(shapeCam.isGo2rtcConnected(), true, 'a reachable go2rtc is not an outage');
+
+      replyWith({poll_shape_cam: {consumers: []}});
+      await pollViewers([shapeCam], hooks);
+      assert.equal(unusableWarnings(), 1);
+
+      replyWith(null);
+      await pollViewers([shapeCam], hooks);
+      assert.equal(unusableWarnings(), 2, 'a new episode after a good reply must warn again');
+    } finally {
+      log.warn = origWarn;
+      global.fetch = origFetch;
+    }
+  });
+
   it(
     'tracks go2rtc health separately from Frigate API health during pollViewers and ' + 'syncFrigateMotionMasks',
     async () => {
@@ -710,43 +825,17 @@ describe('Frigate & go2rtc Service Helpers (src/services/frigate-client.js)', ()
         return true;
       };
       try {
-        global.fetch = async (url) => {
-          const u = String(url);
-          if (u.includes('src=yard_battery_cam')) {
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          async json() {
             return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'v-yard', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-              },
+              yard_battery_cam: {consumers: [{id: 'v-yard', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+              baby_crib_cam: {consumers: [{id: 'v-crib', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+              baby_playroom_cam: {consumers: [{id: 'v-play', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
             };
-          }
-          if (u.includes('src=baby_crib_cam')) {
-            return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'v-crib', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-              },
-            };
-          }
-          if (u.includes('src=baby_playroom_cam')) {
-            return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'v-play', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-              },
-            };
-          }
-          return {
-            ok: true,
-            status: 200,
-            async json() {
-              return {consumers: []};
-            },
-          };
-        };
+          },
+        });
 
         await pollViewers([batteryGridCam, directActiveCam, directIdleCam], {
           isShuttingDown: () => false,
@@ -1655,60 +1744,34 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       const origFetch = global.fetch;
       let telemetryForceRefreshes = 0;
       let viewerMode = 'online_single';
-      global.fetch = async (url) => {
-        const u = String(url);
-        if (viewerMode === 'online_single' && u.endsWith('src=driveway')) {
-          return {
-            ok: true,
-            async json() {
-              return {
-                consumers: [
-                  {id: 'frigate-rec-1', user_agent: 'FFmpeg Frigate'},
-                  {id: 'browser-1', user_agent: 'Mozilla/5.0', format_name: 'mse'},
-                ],
-              };
-            },
-          };
-        }
-        if (viewerMode === 'direct_single' && u.endsWith('src=nursery_direct_poll')) {
-          return {
-            ok: true,
-            async json() {
-              return {consumers: [{id: 'direct-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-            },
-          };
-        }
-        if (viewerMode === 'grid' && (u.endsWith('src=backyard') || u.endsWith('src=doorbell'))) {
-          return {
-            ok: true,
-            async json() {
-              return {
-                consumers: [
-                  {
-                    id: u.endsWith('src=backyard') ? 'grid-backyard' : 'grid-doorbell',
-                    user_agent: 'Mozilla/5.0',
-                    format_name: 'mse',
-                  },
-                ],
-              };
-            },
-          };
-        }
-        if (viewerMode === 'offline_single' && u.endsWith('src=doorbell')) {
-          return {
-            ok: true,
-            async json() {
-              return {consumers: [{id: 'offline-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-            },
-          };
-        }
-        return {
-          ok: true,
-          async json() {
-            return {consumers: []};
+      const viewerStreamsByMode = {
+        online_single: {
+          driveway: {
+            consumers: [
+              {id: 'frigate-rec-1', user_agent: 'FFmpeg Frigate'},
+              {id: 'browser-1', user_agent: 'Mozilla/5.0', format_name: 'mse'},
+            ],
           },
-        };
+        },
+        direct_single: {
+          nursery_direct_poll: {
+            consumers: [{id: 'direct-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
+          },
+        },
+        grid: {
+          backyard: {consumers: [{id: 'grid-backyard', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+          doorbell: {consumers: [{id: 'grid-doorbell', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+        },
+        offline_single: {
+          doorbell: {consumers: [{id: 'offline-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+        },
       };
+      global.fetch = async () => ({
+        ok: true,
+        async json() {
+          return viewerStreamsByMode[viewerMode] || {};
+        },
+      });
 
       try {
         for (const mode of ['online_single', 'direct_single', 'grid']) {
@@ -1923,25 +1986,12 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       offlineDoorbell.applyTelemetryProperties({state: 1, battery: 3, wifiRssi: -24, temperature: 30}, false);
       offlineDoorbell.telemetry.lastLowBatRefreshAt = 0;
       let lowBatViewerForceRefreshes = 0;
-      global.fetch = async (url) => {
-        const u = String(url);
-        if (u.endsWith('src=doorbell')) {
-          return {
-            ok: true,
-            async json() {
-              return {
-                consumers: [{id: 'mse-probe-1', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
-              };
-            },
-          };
-        }
-        return {
-          ok: true,
-          async json() {
-            return {consumers: []};
-          },
-        };
-      };
+      global.fetch = async () => ({
+        ok: true,
+        async json() {
+          return {doorbell: {consumers: [{id: 'mse-probe-1', user_agent: 'Mozilla/5.0', format_name: 'mse'}]}};
+        },
+      });
       try {
         await pollViewers(cams, {
           isShuttingDown: () => false,
@@ -3839,21 +3889,15 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
               },
             };
           }
-          if (u.includes('src=quiet_live_cam')) {
+          if (u.endsWith('/api/streams')) {
             return {
               ok: true,
               status: 200,
               async json() {
-                return {consumers: [{id: 'v-join', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-              },
-            };
-          }
-          if (u.includes('src=quiet_cool_cam')) {
-            return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'v-cool', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
+                return {
+                  quiet_live_cam: {consumers: [{id: 'v-join', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+                  quiet_cool_cam: {consumers: [{id: 'v-cool', user_agent: 'Mozilla/5.0', format_name: 'mse'}]},
+                };
               },
             };
           }

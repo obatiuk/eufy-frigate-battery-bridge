@@ -1697,7 +1697,7 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
   it(
     'preserves root-cause FFmpeg stderr lines instead of overriding with FFmpeg 7/8 exit footers ' +
       'or truncating at 500 chars',
-    (t) => {
+    async (t) => {
       // Regression: FFmpeg 7/8 appends generic "Error opening input file ...", "Error opening input files: ...",
       // and "Conversion failed!" footers after protocol/muxer root-cause lines, STDERR_TAIL_MAX_CHARS=500 truncated
       // multi-line bursts, and snapshot-cache hid decode/save FFmpeg root causes.
@@ -1788,38 +1788,24 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
       log.warn = (scope, ...args) => {
         capturedWarns.push(args.join(' '));
       };
-      t.mock.method(childProcess, 'spawnSync', (_cmd, args) => {
+      t.mock.method(childProcess, 'spawn', (_cmd, args) => {
         const isDecode = Array.isArray(args) && args.includes('rawvideo') && args[args.length - 1] === 'pipe:1';
-        if (isDecode) {
-          return {
-            status: 1,
-            signal: null,
-            stdout: Buffer.alloc(0),
-            stderr: Buffer.from(
-              '[mjpeg @ 0x7f22] No JPEG data found in image\n' +
-                '[in#0 @ 0x7f20] Error decodingframes\n' +
-                'Conversion failed!\n'
-            ),
-            error: undefined,
-          };
-        }
-        return {
-          status: 1,
-          signal: null,
-          stdout: Buffer.alloc(0),
-          stderr: Buffer.from(
-            "[image2 @ 0x7f33] Could not open file '/config/cache/last_snap_diag_cam.jpg': Read-only file system\n" +
-              '[vost#0:0/mjpeg @ 0x7f34] Error submitting a packet to the muxer: Read-only file system\n' +
-              '[out#0/image2 @ 0x7f35] Error muxing a packet\n' +
-              '[out#0/image2 @ 0x7f35] video:24KiB audio:0KiB subtitle:0KiB other streams:0KiB ' +
-              'global headers:0KiB muxing overhead: unknown\n' +
-              'Conversion failed!\n'
-          ),
-          error: undefined,
-        };
+        const proc = createFakeFfmpegProcess();
+        const stderrText = isDecode
+          ? '[mjpeg @ 0x7f22] No JPEG data found in image\n' +
+            '[in#0 @ 0x7f20] Error decodingframes\n' +
+            'Conversion failed!\n'
+          : "[image2 @ 0x7f33] Could not open file '/config/cache/last_snap_diag_cam.jpg': Read-only file system\n" +
+            '[vost#0:0/mjpeg @ 0x7f34] Error submitting a packet to the muxer: Read-only file system\n' +
+            '[out#0/image2 @ 0x7f35] Error muxing a packet\n' +
+            '[out#0/image2 @ 0x7f35] video:24KiB audio:0KiB subtitle:0KiB other streams:0KiB ' +
+            'global headers:0KiB muxing overhead: unknown\n' +
+            'Conversion failed!\n';
+        setImmediate(() => finishFakeFfmpegProcess(proc, {status: 1, stderr: Buffer.from(stderrText)}));
+        return proc;
       });
       try {
-        const loaded = loadCachedFrame(snapCam);
+        const loaded = await loadCachedFrame(snapCam);
         assert.equal(loaded.frame, null);
         assert.equal(
           capturedWarns.some(
@@ -1831,7 +1817,7 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
 
         capturedWarns.length = 0;
         snapCam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
-        saveCachedFrame(snapCam);
+        await saveCachedFrame(snapCam);
         assert.equal(
           capturedWarns.some(
             (w) =>
@@ -1848,4 +1834,206 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
       }
     }
   );
+});
+
+/**
+ * Creates a fake FFmpeg child process driven manually by the test (stdin chunks are kept by reference).
+ *
+ * @returns {*} EventEmitter child with stdout, stderr, stdin, and stdinChunks.
+ */
+function createFakeFfmpegProcess() {
+  const EventEmitter = require('node:events');
+  const proc = new EventEmitter();
+  proc.stdout = new EventEmitter();
+  proc.stderr = new EventEmitter();
+  proc.stdinChunks = [];
+  proc.stdin = Object.assign(new EventEmitter(), {
+    end(chunk) {
+      if (chunk) {
+        proc.stdinChunks.push(chunk);
+      }
+    },
+  });
+  proc.kill = () => true;
+  return proc;
+}
+
+/**
+ * Settles a fake FFmpeg child process with optional stdout and stderr output, then emits close.
+ *
+ * @param {*} proc - Fake process from createFakeFfmpegProcess().
+ * @param {{status: number, stdout?: Buffer, stderr?: Buffer}} outcome - Exit status and captured output.
+ */
+function finishFakeFfmpegProcess(proc, outcome) {
+  if (outcome.stdout) {
+    proc.stdout.emit('data', outcome.stdout);
+  }
+  if (outcome.stderr) {
+    proc.stderr.emit('data', outcome.stderr);
+  }
+  proc.emit('close', outcome.status, null);
+}
+
+/**
+ * Yields to the event loop until predicate() is true (bounded by iterations, never by wall-clock time).
+ *
+ * @param {() => boolean} predicate - Condition to wait for.
+ * @returns {Promise<void>}
+ */
+async function waitUntil(predicate) {
+  const MAX_TURNS = 200;
+  for (let turn = 0; turn < MAX_TURNS && !predicate(); turn++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+describe('Snapshot Cache Event-Loop Safety (src/overlay/snapshot-cache.js)', () => {
+  it('decodes cached snapshots with an async timeboxed FFmpeg spawn that never blocks the event loop', async (t) => {
+    // Verify: startup snapshot decoding must not use spawnSync (it stalls /healthz and every other camera), must be
+    // killed when FFmpeg hangs, and must leave the event loop free while FFmpeg runs.
+    const childProcess = require('node:child_process');
+    const cam = new Camera({serial: 'T8161T0000009992', name: 'snap_async_cam'});
+    const snapFile = getCacheFilePath(cam);
+    fs.writeFileSync(snapFile, Buffer.from('jpeg-bytes'));
+    const spawned = [];
+    let spawnSyncCalls = 0;
+    t.mock.method(childProcess, 'spawnSync', () => {
+      spawnSyncCalls += 1;
+      throw new Error('spawnSync must not be used for snapshot cache FFmpeg calls');
+    });
+    t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
+      const proc = createFakeFfmpegProcess();
+      spawned.push({cmd, args, opts, proc});
+      return proc;
+    });
+    try {
+      const pending = loadCachedFrame(cam);
+      assert.ok(pending instanceof Promise, 'loadCachedFrame must be asynchronous');
+      await waitUntil(() => spawned.length > 0);
+      assert.equal(spawned.length, 1);
+      assert.equal(spawned[0].cmd, 'ffmpeg');
+      assert.equal(spawned[0].opts.killSignal, 'SIGKILL');
+      assert.ok(spawned[0].opts.timeout > 0, 'a hung FFmpeg decode must be killed after a timeout');
+
+      let loopTicked = false;
+      setImmediate(() => {
+        loopTicked = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(loopTicked, true, 'event loop must keep running while FFmpeg decodes');
+
+      spawned[0].proc.stdout.emit('data', Buffer.alloc(FRAME - 10, 0x44));
+      finishFakeFfmpegProcess(spawned[0].proc, {status: 0, stdout: Buffer.alloc(10, 0x44)});
+      const loaded = await pending;
+      assert.equal(loaded.frame.length, FRAME);
+      assert.match(loaded.lastSeen, /^\d\d:\d\d$/);
+      assert.equal(spawnSyncCalls, 0);
+    } finally {
+      fs.rmSync(snapFile, {force: true});
+    }
+  });
+
+  it('saves cached snapshots atomically from a stable copy of the last frame without spawnSync', async (t) => {
+    // Verify: stop() must not block on a synchronous JPEG encode; the previous snapshot must stay intact until the new
+    // JPEG is complete, the encoded bytes must not change if the live buffers are recycled meanwhile, and a hung
+    // FFmpeg must be killed after a timeout.
+    const childProcess = require('node:child_process');
+    const cam = new Camera({serial: 'T8161T0000009993', name: 'snap_save_cam'});
+    cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
+    const finalFile = getCacheFilePath(cam);
+    fs.writeFileSync(finalFile, 'previous-good-snapshot');
+    const spawned = [];
+    t.mock.method(childProcess, 'spawnSync', () => {
+      throw new Error('spawnSync must not be used for snapshot cache FFmpeg calls');
+    });
+    t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
+      const proc = createFakeFfmpegProcess();
+      spawned.push({cmd, args, opts, proc});
+      return proc;
+    });
+    try {
+      const saving = saveCachedFrame(cam);
+      assert.ok(saving instanceof Promise, 'saveCachedFrame must be asynchronous');
+      cam.getLastFrameBuffer().fill(0x77);
+      await waitUntil(() => spawned.length > 0);
+      assert.equal(spawned.length, 1);
+      assert.equal(spawned[0].opts.killSignal, 'SIGKILL');
+      assert.ok(spawned[0].opts.timeout > 0, 'a hung FFmpeg encode must be killed after a timeout');
+
+      const tempFile = spawned[0].args[spawned[0].args.length - 1];
+      assert.notEqual(tempFile, finalFile, 'FFmpeg must write to a temp file, never straight to the snapshot');
+      assert.equal(path.dirname(tempFile), path.dirname(finalFile));
+      assert.ok(tempFile.endsWith('.jpg'), 'temp file keeps the .jpg extension so FFmpeg picks the JPEG muxer');
+      const written = spawned[0].proc.stdinChunks[0];
+      assert.equal(written.length, FRAME);
+      assert.equal(written[0], 0x33, 'encoded bytes must come from a copy taken when the save started');
+      assert.equal(written[FRAME - 1], 0x33);
+      assert.equal(fs.readFileSync(finalFile, 'utf8'), 'previous-good-snapshot');
+
+      fs.writeFileSync(tempFile, 'new-jpeg');
+      finishFakeFfmpegProcess(spawned[0].proc, {status: 0});
+      await saving;
+      assert.equal(fs.readFileSync(finalFile, 'utf8'), 'new-jpeg');
+      assert.equal(fs.existsSync(tempFile), false);
+    } finally {
+      fs.rmSync(finalFile, {force: true});
+    }
+  });
+
+  it('keeps the previous snapshot and removes the temp file when an async save fails', async (t) => {
+    // Regression: a failed or killed JPEG encode must never leave a truncated snapshot or a stray temp file.
+    const childProcess = require('node:child_process');
+    const cam = new Camera({serial: 'T8161T0000009994', name: 'snap_fail_cam'});
+    cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
+    const finalFile = getCacheFilePath(cam);
+    fs.writeFileSync(finalFile, 'previous-good-snapshot');
+    const spawned = [];
+    t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
+      const proc = createFakeFfmpegProcess();
+      spawned.push({cmd, args, opts, proc});
+      return proc;
+    });
+    try {
+      const saving = saveCachedFrame(cam);
+      await waitUntil(() => spawned.length > 0);
+      const tempFile = spawned[0].args[spawned[0].args.length - 1];
+      fs.writeFileSync(tempFile, 'partial');
+      finishFakeFfmpegProcess(spawned[0].proc, {status: 1, stderr: Buffer.from('Error muxing a packet\n')});
+      await saving;
+      assert.equal(fs.readFileSync(finalFile, 'utf8'), 'previous-good-snapshot');
+      assert.equal(fs.existsSync(tempFile), false);
+    } finally {
+      fs.rmSync(finalFile, {force: true});
+    }
+  });
+
+  it('skips a new save for a camera while its previous save is still running', async (t) => {
+    // Verify: repeated session stops must not pile up concurrent FFmpeg encodes writing the same snapshot.
+    const childProcess = require('node:child_process');
+    const cam = new Camera({serial: 'T8161T0000009995', name: 'snap_dedupe_cam'});
+    cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
+    const finalFile = getCacheFilePath(cam);
+    const spawned = [];
+    t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
+      const proc = createFakeFfmpegProcess();
+      spawned.push({cmd, args, opts, proc});
+      return proc;
+    });
+    try {
+      const first = saveCachedFrame(cam);
+      const second = saveCachedFrame(cam);
+      await waitUntil(() => spawned.length > 0);
+      assert.equal(spawned.length, 1, 'a second save while one is running must not spawn another FFmpeg');
+      finishFakeFfmpegProcess(spawned[0].proc, {status: 1});
+      await Promise.all([first, second]);
+
+      const third = saveCachedFrame(cam);
+      await waitUntil(() => spawned.length > 1);
+      assert.equal(spawned.length, 2, 'a save after the previous one finished must run again');
+      finishFakeFfmpegProcess(spawned[1].proc, {status: 1});
+      await third;
+    } finally {
+      fs.rmSync(finalFile, {force: true});
+    }
+  });
 });

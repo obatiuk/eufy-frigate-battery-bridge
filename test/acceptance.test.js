@@ -450,7 +450,11 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       global.fetch = async () => ({
         ok: true,
         async json() {
-          return {consumers: [{id: 'viewer-blocked-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}]};
+          return {
+            [garageRtspBf.getName()]: {
+              consumers: [{id: 'viewer-blocked-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}],
+            },
+          };
         },
       });
       try {
@@ -499,7 +503,11 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       global.fetch = async () => ({
         ok: true,
         async json() {
-          return {consumers: [{id: 'viewer-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}]};
+          return {
+            [garageRtspBf.getName()]: {
+              consumers: [{id: 'viewer-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}],
+            },
+          };
         },
       });
       try {
@@ -590,7 +598,11 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       global.fetch = async () => ({
         ok: true,
         async json() {
-          return {consumers: [{id: 'viewer-db-blocked', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}]};
+          return {
+            [doorbellBf.getName()]: {
+              consumers: [{id: 'viewer-db-blocked', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}],
+            },
+          };
         },
       });
       try {
@@ -633,7 +645,11 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       global.fetch = async () => ({
         ok: true,
         async json() {
-          return {consumers: [{id: 'viewer-db-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}]};
+          return {
+            [doorbellBf.getName()]: {
+              consumers: [{id: 'viewer-db-1', user_agent: 'Mozilla/5.0', format_name: 'webrtc'}],
+            },
+          };
         },
       });
       try {
@@ -1948,34 +1964,20 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         () => false
       );
       try {
-        global.fetch = async (url) => {
-          const u = String(url);
-          if (u.includes('src=porch_grid_cam')) {
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          async json() {
             return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'grid-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
+              porch_grid_cam: {
+                consumers: [{id: 'grid-v1', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
+              },
+              nursery_direct: {
+                consumers: [{id: 'grid-v2', user_agent: 'Mozilla/5.0', format_name: 'mse'}],
               },
             };
-          }
-          if (u.includes('src=nursery_direct')) {
-            return {
-              ok: true,
-              status: 200,
-              async json() {
-                return {consumers: [{id: 'grid-v2', user_agent: 'Mozilla/5.0', format_name: 'mse'}]};
-              },
-            };
-          }
-          return {
-            ok: true,
-            status: 200,
-            async json() {
-              return {consumers: []};
-            },
-          };
-        };
+          },
+        });
         await pollViewers([gridBatteryCam, directGridCam], {
           isShuttingDown: () => false,
           fetchAllCameraTelemetry: async () => {},
