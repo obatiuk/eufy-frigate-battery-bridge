@@ -43,7 +43,7 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [config-modes.md](config-mo
 │       ├── eufy-client.js             # eufy-security-ws WebSocket RPC client & telemetry/power sync
 │       ├── frigate-client.js          # Frigate & go2rtc HTTP client (events, masks, idle & viewer poll)
 │       ├── ha-notifier.js             # Home Assistant webhook notification client
-│       ├── http-server.js             # Built-in HTTP server (/api/wake/:cameras, /api/config & /healthz)
+│       ├── http-server.js             # Built-in HTTP server (/api/wake/:cameras, /api/config, /api/status & /healthz)
 │       └── stream-orchestrator.js     # Per-station arbitration, RTSP/P2P wake, backfill & watchdog
 └── test/
     ├── reporter.js                    # Concise node:test reporter (errors or single summary line)

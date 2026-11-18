@@ -54,6 +54,7 @@ const POWER_LABELS = Object.freeze({
   PLUGGED: 'Plugged',
   SOLAR: 'Solar',
 });
+const DEFAULT_BATTERY_POWER_SOURCE = 'battery';
 
 /**
  * Eufy hardware device connection states reported via the `state` property in eufy-security-ws.
@@ -422,6 +423,8 @@ class Telemetry {
     this.lowBatWakeOnView = Boolean(timers.lowBatWakeOnView);
     this.isRtspDirect = Boolean(timers.rtspDirect || (rawCamCfg && rawCamCfg.rtsp_url));
     this.deviceName = '';
+    this.model = '';
+    this.firmware = '';
     /** @type {number|null} */
     this.deviceState = null;
     this.wakeTimedOutOffline = false;
@@ -501,6 +504,96 @@ class Telemetry {
       rssi: wifi && Boolean(this.config.rssi),
       temperature: enabled && !isMinimal && Boolean(this.config.temperature),
       last_seen: enabled && !isMinimal && Boolean(this.config.lastSeen),
+    });
+  }
+
+  /**
+   * Returns true if eufy-security-ws connectivity is marked healthy on this Telemetry model.
+   *
+   * @returns {boolean}
+   */
+  isWsConnected() {
+    return Boolean(this.wsConnected);
+  }
+
+  /**
+   * Returns true if the HomeBase station (or direct RTSP endpoint) is marked connected/reachable.
+   *
+   * @returns {boolean}
+   */
+  isStationConnected() {
+    return Boolean(this.stationConnected);
+  }
+
+  /**
+   * Returns true if Frigate HTTP API connectivity is marked healthy on this Telemetry model.
+   *
+   * @returns {boolean}
+   */
+  isFrigateConnected() {
+    return Boolean(this.frigateConnected);
+  }
+
+  /**
+   * Returns true if go2rtc HTTP API connectivity is marked healthy on this Telemetry model.
+   *
+   * @returns {boolean}
+   */
+  isGo2rtcConnected() {
+    return Boolean(this.go2rtcConnected);
+  }
+
+  /**
+   * Returns the formatted HH:MM timestamp of the last decoded frame (or empty string if none).
+   *
+   * @returns {string}
+   */
+  getLastSeen() {
+    return this.lastSeen || '';
+  }
+
+  /**
+   * Resolves the normalized power source string ('battery', 'charging', 'plugged', 'solar', or null).
+   *
+   * @returns {string|null}
+   */
+  resolvePowerSource() {
+    if (this.powerLabel) {
+      return this.powerLabel.toLowerCase();
+    }
+    return this.battery !== null || this.charging ? DEFAULT_BATTERY_POWER_SOURCE : null;
+  }
+
+  /**
+   * Returns an immutable live sensor and hardware-settings summary for GET /api/status,
+   * or null on direct rtsp_url cameras where Eufy hardware telemetry does not apply.
+   *
+   * @returns {Readonly<Record<string, *>>|null}
+   */
+  toStatusSummary() {
+    if (this.isRtspDirect) {
+      return null;
+    }
+    return Object.freeze({
+      model: this.model || null,
+      firmware: this.firmware || null,
+      device_state: this.deviceState,
+      battery_pct: this.battery,
+      charging: Boolean(this.charging),
+      power_source: this.resolvePowerSource(),
+      low_battery: this.isLowBattery(),
+      critical_battery: this.isCriticalBattery(),
+      wifi_signal: this.wifi,
+      rssi_dbm: this.rssi,
+      temperature_c: this.temp,
+      light_on: Boolean(this.lightOn),
+      last_seen: this.lastSeen || null,
+      hardware_settings: Object.freeze({
+        power_working_mode: this.hwPowerMode,
+        recording_clip_length: this.hwClipLength,
+        recording_end_early: this.hwEndEarly,
+        streaming_quality: this.hwQuality,
+      }),
     });
   }
 
@@ -810,6 +903,12 @@ class Telemetry {
 
     if (devName && typeof devName === 'string') {
       this.deviceName = devName.trim();
+    }
+    if (model && typeof model === 'string') {
+      this.model = model.trim();
+    }
+    if (swVer && typeof swVer === 'string') {
+      this.firmware = swVer.trim();
     }
 
     if (devState !== undefined && devState !== null && !Number.isNaN(Number(devState))) {

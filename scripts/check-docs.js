@@ -333,6 +333,95 @@ function checkChangelogReleaseTag(exactTag, changelogText, errs) {
 }
 
 /**
+ * Parses top-level `## ` sections of CHANGELOG.md in order.
+ *
+ * @param {string} changelogText - Raw CHANGELOG.md contents.
+ * @returns {Array<{heading: string, body: string}>}
+ */
+function parseChangelogSections(changelogText) {
+  const lines = changelogText.replace(/\r\n/g, '\n').split('\n');
+  const indices = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) {
+      indices.push(i);
+    }
+  }
+  return indices.map((startIdx, pos) => {
+    const endIdx = pos + 1 < indices.length ? indices[pos + 1] : lines.length;
+    return {
+      heading: lines[startIdx].trim(),
+      body: lines
+        .slice(startIdx + 1, endIdx)
+        .join('\n')
+        .trim(),
+    };
+  });
+}
+
+/**
+ * Validates post-release CHANGELOG.md edits: ensures all previously tagged `## vX.Y.Z` sections
+ * remain untouched and any new changes added after latestTag live under `## dev` (or the next
+ * bumped `## vX.Y.Z` release heading) above `## <latestTag>`.
+ *
+ * @param {string} latestTag - Latest reachable vX.Y.Z Git tag (e.g. 'v0.0.2').
+ * @param {string} taggedChangelogText - CHANGELOG.md contents at latestTag.
+ * @param {string} currentChangelogText - Current working-tree CHANGELOG.md contents.
+ * @param {string} pkgVersion - Current version string from package.json (e.g. '0.0.2').
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkChangelogPostRelease(latestTag, taggedChangelogText, currentChangelogText, pkgVersion, errs) {
+  const taggedNorm = taggedChangelogText.replace(/\r\n/g, '\n').trim();
+  const currentNorm = currentChangelogText.replace(/\r\n/g, '\n').trim();
+  if (currentNorm === taggedNorm) {
+    return;
+  }
+
+  const taggedSections = parseChangelogSections(taggedNorm);
+  const currentSections = parseChangelogSections(currentNorm);
+  const currentByHeading = new Map(currentSections.map((s) => [s.heading, s]));
+
+  for (const taggedSec of taggedSections) {
+    const curSec = currentByHeading.get(taggedSec.heading);
+    if (!curSec || curSec.body !== taggedSec.body) {
+      errs.push(
+        'CHANGELOG.md: released section "' +
+          taggedSec.heading +
+          '" must not be modified after tag "' +
+          latestTag +
+          '" (record new changes under "## dev")'
+      );
+    }
+  }
+
+  if (currentSections.length === 0) {
+    errs.push('CHANGELOG.md: missing "## dev" section above "## ' + latestTag + '"');
+    return;
+  }
+
+  const topSection = currentSections[0];
+  const nextTagHeading = '## v' + pkgVersion;
+  const canStampNextRelease = Boolean(pkgVersion && 'v' + pkgVersion !== latestTag);
+  const allowedTopHeadings = canStampNextRelease ? ['## dev', nextTagHeading] : ['## dev'];
+  if (!allowedTopHeadings.includes(topSection.heading)) {
+    errs.push(
+      'CHANGELOG.md: new changes after tag "' +
+        latestTag +
+        '" must be recorded under "## dev" above "## ' +
+        latestTag +
+        '" (found "' +
+        topSection.heading +
+        '")'
+    );
+    return;
+  }
+
+  const hasBullets = topSection.body.split('\n').some((line) => /^- /.test(line));
+  if (!hasBullets) {
+    errs.push('CHANGELOG.md: section "' + topSection.heading + '" must contain at least one "- " entry');
+  }
+}
+
+/**
  * Validates package.json / package-lock.json version parity and exact vX.Y.Z Git tag alignment.
  *
  * @param {string[]} errs - Error accumulator.
@@ -350,22 +439,55 @@ function checkPackageVersionAndLockfile(errs) {
   if (lock.version !== pkg.version || lockRootVersion !== pkg.version) {
     errs.push('package-lock.json: version does not match package.json (' + pkg.version + ')');
   }
+
+  const changelogText = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
+  let statusPorcelain = '';
   try {
-    const exactTag = execFileSync('git', ['describe', '--tags', '--exact-match'], {
+    statusPorcelain = execFileSync('git', ['status', '--porcelain'], {
       cwd: ROOT,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    const tagMatch = exactTag.match(/^v(\d+\.\d+\.\d+(?:[-+][^\s]+)?)$/);
-    if (tagMatch) {
-      if (pkg.version !== tagMatch[1]) {
-        errs.push('package.json: version "' + pkg.version + '" does not match exact Git tag "' + exactTag + '"');
+  } catch (err) {
+    return;
+  }
+
+  if (!statusPorcelain) {
+    try {
+      const exactTag = execFileSync('git', ['describe', '--tags', '--exact-match'], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      const tagMatch = exactTag.match(/^v(\d+\.\d+\.\d+(?:[-+][^\s]+)?)$/);
+      if (tagMatch) {
+        if (pkg.version !== tagMatch[1]) {
+          errs.push('package.json: version "' + pkg.version + '" does not match exact Git tag "' + exactTag + '"');
+        }
+        checkChangelogReleaseTag(exactTag, changelogText, errs);
+        return;
       }
-      const changelogText = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
-      checkChangelogReleaseTag(exactTag, changelogText, errs);
+    } catch (err) {
+      // HEAD is ahead of the latest tag; fall through to post-release check.
+    }
+  }
+
+  try {
+    const latestTag = execFileSync('git', ['describe', '--tags', '--abbrev=0', '--match', 'v[0-9]*'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (latestTag) {
+      const taggedChangelog = execFileSync('git', ['show', latestTag + ':CHANGELOG.md'], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      checkChangelogPostRelease(latestTag, taggedChangelog, changelogText, pkg.version, errs);
     }
   } catch (err) {
-    // HEAD is not on an annotated/lightweight tag or git metadata is absent.
+    // No reachable v* release tag yet or CHANGELOG.md did not exist at tag.
   }
 }
 
@@ -452,4 +574,5 @@ if (require.main === module) {
 
 module.exports = {
   checkChangelogReleaseTag,
+  checkChangelogPostRelease,
 };

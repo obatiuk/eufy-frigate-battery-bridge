@@ -7,7 +7,8 @@
  * Built-in HTTP server exposing:
  *   - POST/GET /api/wake/:cameras (external pre-wake webhook for CLI testing or external services)
  *   - GET/HEAD /api/config (build version, Git commit hash & sanitized resolved runtime config in JSON)
- *   - GET/HEAD /healthz (container process health check)
+ *   - GET/HEAD /api/status (full runtime status, upstream services, stations & per-camera telemetry)
+ *   - GET/HEAD /healthz (minimal container process liveness check)
  */
 'use strict';
 
@@ -36,9 +37,17 @@ const {
   GLOBAL_AUTO_FRIGATE_MASK,
   GLOBAL_CARD_SHOW_ON_LIVE,
 } = require('../config');
-const {Camera, WakeRequest, API_WAKE_STATUSES} = require('../domain/camera');
-const {log} = require('../logger');
-const {isWsReady} = require('./eufy-client');
+const {Camera, WakeRequest, API_WAKE_STATUSES, CAMERA_RUNTIME_STATUSES} = require('../domain/camera');
+const {log, formatErrorMessage} = require('../logger');
+const {
+  isWsReady,
+  isInitialTelemetryLoaded,
+  getKnownStationSerials,
+  isStationRecycling,
+  isStationReconnecting,
+  isStationDisconnected,
+} = require('./eufy-client');
+const {isFrigateConnected, isGo2rtcConnected} = require('./frigate-client');
 
 const MAX_JSON_BODY_BYTES = 16384;
 const MIN_WAKE_DURATION_SECS = 5;
@@ -53,6 +62,7 @@ const HTTP_STATUS_INTERNAL_ERROR = 500;
 const HTTP_STATUS_SERVICE_UNAVAILABLE = 503;
 const CONTENT_TYPE_JSON = Object.freeze({'Content-Type': 'application/json'});
 const ALLOWED_WAKE_METHODS_HEADER = 'POST, GET';
+const ALLOWED_READONLY_METHODS_HEADER = 'GET, HEAD';
 const DEFAULT_WAKE_REASON = 'external api wake';
 const WS_DISCONNECTED_ERROR = 'eufy-security-ws not connected';
 const SHUTTING_DOWN_ERROR = 'Bridge is shutting down';
@@ -89,6 +99,17 @@ const startedAtMs = Date.now();
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, CONTENT_TYPE_JSON);
   res.end(JSON.stringify(payload));
+}
+
+/**
+ * Writes HTTP response headers without a body for HEAD requests.
+ *
+ * @param {http.ServerResponse} res - Outgoing HTTP response.
+ * @param {number} statusCode - HTTP status code.
+ */
+function sendJsonHead(res, statusCode) {
+  res.writeHead(statusCode, CONTENT_TYPE_JSON);
+  res.end();
 }
 
 /**
@@ -338,24 +359,161 @@ function buildConfigPayload(cams) {
 }
 
 /**
- * Builds the JSON payload returned by GET/HEAD /healthz. Reports healthy (200) whenever the
- * bridge process is running and not shutting down; external outages keep ok=true while reporting
- * diagnostic status such as ws_connected.
+ * Builds the minimal JSON payload returned by GET /healthz (and /health) so frequent container
+ * supervisor probes perform zero camera-array iterations or allocations. Reports healthy (200)
+ * whenever the bridge process is running and not shutting down.
  *
- * @param {Camera[]} cams - Configured Camera instances.
+ * @param {Camera[]} _cams - Configured Camera instances (unused; full camera status lives on /api/status).
  * @param {boolean} shuttingDown - Whether the bridge is shutting down.
  * @param {number} [startMs=startedAtMs] - Process start timestamp in milliseconds.
  * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  * @returns {Readonly<Record<string, *>>}
  */
-function buildHealthPayload(cams, shuttingDown, startMs = startedAtMs, now = Date.now()) {
-  const wsConnected = isWsReady();
+function buildHealthPayload(_cams, shuttingDown, startMs = startedAtMs, now = Date.now()) {
   return Object.freeze({
     ok: !shuttingDown,
-    ws_connected: wsConnected,
-    uptime_secs: Math.round((now - startMs) / MS_PER_SECOND),
-    active_cameras: cams.filter((c) => c.isSessionActive()).map((c) => c.getName()),
-    offline_cameras: cams.filter((c) => c.isDeviceOffline()).map((c) => c.getName()),
+    ws_connected: isWsReady(),
+    uptime_secs: Math.max(0, Math.round((now - startMs) / MS_PER_SECOND)),
+  });
+}
+
+/**
+ * Builds per-station P2P connectivity and single-slot arbitration summaries for GET /api/status.
+ *
+ * @param {Camera[]} cams - Configured Camera instances.
+ * @param {boolean} wsConnected - Whether eufy-security-ws is currently connected.
+ * @returns {ReadonlyArray<Readonly<Record<string, *>>>}
+ */
+function buildStationsSummary(cams, wsConnected) {
+  /** @type {Set<string>} */
+  const serials = new Set();
+  for (const cam of cams) {
+    const stSn = cam.getStationSerial();
+    if (stSn) {
+      serials.add(stSn);
+    }
+  }
+  for (const discoveredSn of getKnownStationSerials(cams)) {
+    if (discoveredSn) {
+      serials.add(discoveredSn);
+    }
+  }
+  const stations = [];
+  for (const stationSn of serials) {
+    const stationCams = [];
+    for (const cam of cams) {
+      if (cam.getStationSerial() === stationSn) {
+        stationCams.push(cam);
+      }
+    }
+    const activeP2pCam = stationCams.find((c) => c.isOccupyingStationP2pChannel()) || null;
+    const allCamsStationOk = stationCams.length === 0 || stationCams.every((c) => c.isStationConnected());
+    stations.push(
+      Object.freeze({
+        serial: stationSn,
+        connected: Boolean(wsConnected && !isStationDisconnected(stationSn) && allCamsStationOk),
+        recycling: isStationRecycling(stationSn),
+        reconnecting: isStationReconnecting(stationSn),
+        p2p_busy: Boolean(activeP2pCam),
+        active_p2p_camera: activeP2pCam ? activeP2pCam.getName() : null,
+        cameras: Object.freeze(stationCams.map((c) => c.getName())),
+      })
+    );
+  }
+  return Object.freeze(stations);
+}
+
+/**
+ * Aggregates high-level camera status, disruption, battery, backfill, and viewer counts in one pass.
+ *
+ * @param {ReadonlyArray<Record<string, *>>} cameraSummaries - Per-camera toStatusSummary() objects.
+ * @returns {Readonly<Record<string, number>>}
+ */
+function buildCamerasAggregateSummary(cameraSummaries) {
+  let streaming = 0;
+  let waking = 0;
+  let waiting = 0;
+  let sleeping = 0;
+  let disrupted = 0;
+  let offline = 0;
+  let lowBattery = 0;
+  let pendingBackfills = 0;
+  let connectedViewers = 0;
+
+  for (const cam of cameraSummaries) {
+    if (cam.status === CAMERA_RUNTIME_STATUSES.LIVE || cam.status === CAMERA_RUNTIME_STATUSES.BACKFILL) {
+      streaming++;
+    } else if (cam.status === CAMERA_RUNTIME_STATUSES.WAKING) {
+      waking++;
+    } else if (cam.status === CAMERA_RUNTIME_STATUSES.WAITING) {
+      waiting++;
+    } else if (cam.status === CAMERA_RUNTIME_STATUSES.ASLEEP || cam.status === CAMERA_RUNTIME_STATUSES.LOW_BATTERY) {
+      sleeping++;
+    }
+    if (cam.disrupted) {
+      disrupted++;
+    }
+    if (cam.offline) {
+      offline++;
+    }
+    if (!cam.offline && cam.telemetry && cam.telemetry.low_battery) {
+      lowBattery++;
+    }
+    if (cam.backfill && (cam.backfill.pending || cam.backfill.playing)) {
+      pendingBackfills++;
+    }
+    connectedViewers += cam.viewers ? cam.viewers.connected : 0;
+  }
+
+  return Object.freeze({
+    total_cameras: cameraSummaries.length,
+    streaming_cameras: streaming,
+    waking_cameras: waking,
+    waiting_cameras: waiting,
+    sleeping_cameras: sleeping,
+    disrupted_cameras: disrupted,
+    offline_cameras: offline,
+    low_battery_cameras: lowBattery,
+    pending_backfills: pendingBackfills,
+    connected_viewers: connectedViewers,
+  });
+}
+
+/**
+ * Builds the full runtime status payload returned by GET/HEAD /api/status, exposing upstream
+ * service health, HomeBase station P2P slots, aggregate counts, and every configured camera's
+ * live session, encoder, viewer, event, backfill, trigger, and sensor telemetry state.
+ *
+ * @param {Camera[]} cams - Configured Camera instances.
+ * @param {{ shuttingDown?: boolean, startMs?: number, now?: number }} [opts={}] - Status timing/shutdown options.
+ * @returns {Readonly<Record<string, *>>}
+ */
+function buildStatusPayload(cams, opts = {}) {
+  const shuttingDown = Boolean(opts.shuttingDown);
+  const startMs = opts.startMs !== undefined ? opts.startMs : startedAtMs;
+  const now = opts.now !== undefined ? opts.now : Date.now();
+  const hasEufyCameras = cams.length === 0 || cams.some((c) => !c.isRtspDirect());
+  const wsConnected = isWsReady();
+  const frigateOk = cams.length > 0 ? cams.every((c) => c.isFrigateConnected()) : isFrigateConnected();
+  const go2rtcOk = cams.length > 0 ? cams.every((c) => c.isGo2rtcConnected()) : isGo2rtcConnected();
+  const cameraSummaries = Object.freeze(cams.map((c) => c.toStatusSummary(now)));
+
+  return Object.freeze({
+    ok: !shuttingDown,
+    shutting_down: shuttingDown,
+    version: BRIDGE_VERSION,
+    commit: BRIDGE_COMMIT,
+    uptime_secs: Math.max(0, Math.round((now - startMs) / MS_PER_SECOND)),
+    services: Object.freeze({
+      ws_connected: hasEufyCameras ? Boolean(wsConnected) : null,
+      initial_telemetry_loaded: hasEufyCameras ? Boolean(isInitialTelemetryLoaded()) : null,
+      frigate_connected: Boolean(frigateOk),
+      go2rtc_connected: Boolean(go2rtcOk),
+      ha_webhook_configured: Boolean(cfg.ha_webhook_url),
+    }),
+    stations: hasEufyCameras ? buildStationsSummary(cams, wsConnected) : Object.freeze([]),
+    summary: buildCamerasAggregateSummary(cameraSummaries),
+    cameras: cameraSummaries,
   });
 }
 
@@ -543,15 +701,45 @@ function createHttpRequestHandler(cams, hooks) {
         return;
       }
       const pathname = urlObj.pathname;
+      const isHead = req.method === 'HEAD';
 
-      if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/api/config') {
-        sendJson(res, HTTP_STATUS_OK, buildConfigPayload(cams));
+      if ((req.method === 'GET' || isHead) && pathname === '/api/config') {
+        if (isHead) {
+          sendJsonHead(res, HTTP_STATUS_OK);
+        } else {
+          sendJson(res, HTTP_STATUS_OK, buildConfigPayload(cams));
+        }
         return;
       }
 
-      if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/healthz' || pathname === '/health')) {
-        const payload = buildHealthPayload(cams, Boolean(isShuttingDown && isShuttingDown()));
-        sendJson(res, payload.ok ? HTTP_STATUS_OK : HTTP_STATUS_SERVICE_UNAVAILABLE, payload);
+      if (pathname === '/api/status') {
+        if (req.method !== 'GET' && !isHead) {
+          res.setHeader('Allow', ALLOWED_READONLY_METHODS_HEADER);
+          sendJson(res, HTTP_STATUS_METHOD_NOT_ALLOWED, {
+            ok: false,
+            error_code: ERROR_CODES.METHOD_NOT_ALLOWED,
+            error: 'Method not allowed; use GET or HEAD /api/status',
+          });
+          return;
+        }
+        const shuttingDown = Boolean(isShuttingDown && isShuttingDown());
+        const statusCode = shuttingDown ? HTTP_STATUS_SERVICE_UNAVAILABLE : HTTP_STATUS_OK;
+        if (isHead) {
+          sendJsonHead(res, statusCode);
+        } else {
+          sendJson(res, statusCode, buildStatusPayload(cams, {shuttingDown}));
+        }
+        return;
+      }
+
+      if ((req.method === 'GET' || isHead) && (pathname === '/healthz' || pathname === '/health')) {
+        const shuttingDown = Boolean(isShuttingDown && isShuttingDown());
+        const statusCode = shuttingDown ? HTTP_STATUS_SERVICE_UNAVAILABLE : HTTP_STATUS_OK;
+        if (isHead) {
+          sendJsonHead(res, statusCode);
+        } else {
+          sendJson(res, statusCode, buildHealthPayload(cams, shuttingDown));
+        }
         return;
       }
 
@@ -575,7 +763,7 @@ function createHttpRequestHandler(cams, hooks) {
         error: 'Not found',
       });
     } catch (err) {
-      log.error('bridge', 'HTTP request handler error: ' + (err && err.message ? err.message : String(err)));
+      log.error('bridge', 'HTTP request handler error: ' + formatErrorMessage(err, true));
       sendJson(res, HTTP_STATUS_INTERNAL_ERROR, {
         ok: false,
         error_code: ERROR_CODES.INTERNAL_ERROR,
@@ -599,13 +787,13 @@ function startHttpServer(cams, hooks) {
   httpServer = http.createServer(createHttpRequestHandler(cams, hooks));
 
   httpServer.on('error', (err) => {
-    log.error('bridge', 'HTTP server error on port ' + HTTP_PORT + ': ' + err.message);
+    log.error('bridge', 'HTTP server error on port ' + HTTP_PORT + ': ' + formatErrorMessage(err));
   });
 
   httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
     log.info(
       'bridge',
-      'HTTP server listening on 0.0.0.0:' + HTTP_PORT + ' (/api/wake/:cameras, /api/config, /healthz)'
+      'HTTP server listening on 0.0.0.0:' + HTTP_PORT + ' (/api/wake/:cameras, /api/config, /api/status, /healthz)'
     );
   });
 }
@@ -632,6 +820,7 @@ module.exports = {
   canServeWakeRequest,
   buildConfigPayload,
   buildHealthPayload,
+  buildStatusPayload,
   createHttpRequestHandler,
   startHttpServer,
   stopHttpServer,

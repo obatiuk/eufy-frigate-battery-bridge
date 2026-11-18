@@ -246,28 +246,28 @@ Bridge configuration is split into two places so container networking stays sepa
 
 ### Environment Variables (Docker Compose / Container)
 
-| Variable                |           Default           | Meaning                                                                                                  |
-| :---------------------- | :-------------------------: | :------------------------------------------------------------------------------------------------------- |
-| `BRIDGE_CONFIG`         |    `/config/config.yaml`    | Path to `config.yaml` (falls back to `./config.yaml` when `/config/config.yaml` is absent)               |
-| `BRIDGE_LOG_LEVEL`      |           `info`            | Log verbosity (`info`, `debug`, `warn` / `warning`, or `error`)                                          |
-| `BRIDGE_HTTP_PORT`      |           `8080`            | HTTP listen port (`0 - 65535`, `0` disables) for `/healthz`, `/api/config`, and `/api/wake/:cameras`     |
-| `BRIDGE_CACHE_DIR`      |       `/config/cache`       | Folder where clean `JPEG` camera snapshots are saved across restarts                                     |
-| `BRIDGE_HWACCEL`        |              -              | GPU encoding: empty (`libx264` CPU), `vaapi` (Intel/AMD), `qsv`, `nvenc` (NVIDIA), or `v4l2m2m`          |
-| `BRIDGE_HWACCEL_DEVICE` |    `/dev/dri/renderD128`    | GPU device node used when `BRIDGE_HWACCEL` is `vaapi` or `qsv`                                           |
-| `EUFY_WS_HOST`          |     `eufy-security-ws`      | Hostname of `eufy-security-ws` (skipped automatically when all cameras use `rtsp_url`)                   |
-| `EUFY_WS_PORT`          |           `3000`            | `WebSocket` port of `eufy-security-ws`                                                                   |
-| `EUFY_WS_URL`           |              -              | Optional full `ws://` / `wss://` override for `eufy-security-ws`                                         |
-| `FRIGATE_HOST`          |          `frigate`          | Hostname of Frigate (also becomes default `GO2RTC_HOST` when `GO2RTC_HOST` is omitted)                   |
-| `FRIGATE_PORT`          |           `5000`            | Frigate HTTP API port                                                                                    |
-| `FRIGATE_URL`           |              -              | Optional full HTTP/HTTPS override for Frigate API                                                        |
-| `GO2RTC_HOST`           | Derived from `FRIGATE_HOST` | Hostname of `go2rtc` (inherits host from `FRIGATE_URL` / `FRIGATE_HOST` by default)                      |
-| `GO2RTC_API_PORT`       |           `1984`            | `go2rtc` HTTP API port                                                                                   |
-| `GO2RTC_RTSP_PORT`      |           `8554`            | `go2rtc` RTSP publish port                                                                               |
-| `GO2RTC_RTSP_USER`      |              -              | Optional RTSP publish username (URL-encoded into generated `rtsp://` publish URL)                        |
-| `GO2RTC_RTSP_PASSWORD`  |              -              | Optional RTSP publish password (URL-encoded into generated `rtsp://` publish URL)                        |
-| `GO2RTC_URL`            |              -              | Optional full HTTP/HTTPS override for `go2rtc` API                                                       |
-| `GO2RTC_RTSP_URL`       |              -              | Optional full `rtsp://` / `rtsps://` publish URL override (appends `/{name}` automatically when omitted) |
-| `HA_WEBHOOK_URL`        |              -              | Optional Home Assistant webhook URL for instant event & snapshot notifications                           |
+| Variable                |           Default           | Meaning                                                                                                             |
+| :---------------------- | :-------------------------: | :------------------------------------------------------------------------------------------------------------------ |
+| `BRIDGE_CONFIG`         |    `/config/config.yaml`    | Path to `config.yaml` (falls back to `./config.yaml` when `/config/config.yaml` is absent)                          |
+| `BRIDGE_LOG_LEVEL`      |           `info`            | Log verbosity (`info`, `debug`, `warn` / `warning`, or `error`)                                                     |
+| `BRIDGE_HTTP_PORT`      |           `8080`            | HTTP listen port (`0 - 65535`, `0` disables) for `/healthz`, `/api/status`, `/api/config`, and `/api/wake/:cameras` |
+| `BRIDGE_CACHE_DIR`      |       `/config/cache`       | Folder where clean `JPEG` camera snapshots are saved across restarts                                                |
+| `BRIDGE_HWACCEL`        |              -              | GPU encoding: empty (`libx264` CPU), `vaapi` (Intel/AMD), `qsv`, `nvenc` (NVIDIA), or `v4l2m2m`                     |
+| `BRIDGE_HWACCEL_DEVICE` |    `/dev/dri/renderD128`    | GPU device node used when `BRIDGE_HWACCEL` is `vaapi` or `qsv`                                                      |
+| `EUFY_WS_HOST`          |     `eufy-security-ws`      | Hostname of `eufy-security-ws` (skipped automatically when all cameras use `rtsp_url`)                              |
+| `EUFY_WS_PORT`          |           `3000`            | `WebSocket` port of `eufy-security-ws`                                                                              |
+| `EUFY_WS_URL`           |              -              | Optional full `ws://` / `wss://` override for `eufy-security-ws`                                                    |
+| `FRIGATE_HOST`          |          `frigate`          | Hostname of Frigate (also becomes default `GO2RTC_HOST` when `GO2RTC_HOST` is omitted)                              |
+| `FRIGATE_PORT`          |           `5000`            | Frigate HTTP API port                                                                                               |
+| `FRIGATE_URL`           |              -              | Optional full HTTP/HTTPS override for Frigate API                                                                   |
+| `GO2RTC_HOST`           | Derived from `FRIGATE_HOST` | Hostname of `go2rtc` (inherits host from `FRIGATE_URL` / `FRIGATE_HOST` by default)                                 |
+| `GO2RTC_API_PORT`       |           `1984`            | `go2rtc` HTTP API port                                                                                              |
+| `GO2RTC_RTSP_PORT`      |           `8554`            | `go2rtc` RTSP publish port                                                                                          |
+| `GO2RTC_RTSP_USER`      |              -              | Optional RTSP publish username (URL-encoded into generated `rtsp://` publish URL)                                   |
+| `GO2RTC_RTSP_PASSWORD`  |              -              | Optional RTSP publish password (URL-encoded into generated `rtsp://` publish URL)                                   |
+| `GO2RTC_URL`            |              -              | Optional full HTTP/HTTPS override for `go2rtc` API                                                                  |
+| `GO2RTC_RTSP_URL`       |              -              | Optional full `rtsp://` / `rtsps://` publish URL override (appends `/{name}` automatically when omitted)            |
+| `HA_WEBHOOK_URL`        |              -              | Optional Home Assistant webhook URL for instant event & snapshot notifications                                      |
 
 ### Main Settings (`config.yaml`)
 
@@ -630,13 +630,17 @@ If something does not behave the way you expect after configuring your cameras, 
 
 ### Diagnostics & Health Checks
 
-- **How do I check if the bridge is healthy or inspect its active config?**
-  - Run `curl http://127.0.0.1:8080/healthz` - returns `200` (`"ok": true`) whenever the bridge container is running
-    with a valid configuration, along with diagnostic fields (`"ws_connected"`, `"uptime_secs"`, `"active_cameras"`,
-    and `"offline_cameras"`), and returns `503` (`"ok": false`) only while shutting down. External service outages
-    (`eufy-security-ws`, `Frigate`, `go2rtc`, or offline cameras) do **not** mark `/healthz` unhealthy so container
-    restart policies (`--health-on-failure=restart`, `autoheal`) will not restart the bridge while it automatically
-    logs disconnects and reconnects.
+- **How do I check if the bridge is healthy or inspect its runtime status and active config?**
+  - Run `curl http://127.0.0.1:8080/healthz` - lightweight container readiness probe returning `200` (`"ok": true`,
+    `"ws_connected"`, `"uptime_secs"`) whenever the bridge process is running with a valid configuration, and `503`
+    (`"ok": false`) only while shutting down. External service outages (`eufy-security-ws`, `Frigate`, `go2rtc`, or
+    offline cameras) do **not** mark `/healthz` unhealthy so container restart policies (`--health-on-failure=restart`,
+    `autoheal`) will not restart the bridge while it automatically logs disconnects and reconnects.
+  - Run `curl http://127.0.0.1:8080/api/status` - returns full runtime status in `JSON`, including upstream service
+    connectivity (`eufy-security-ws`, `Frigate`, `go2rtc`), `HomeBase` station `P2P` health and active slot state,
+    summary camera counts, and every configured camera's live session/decoder state, encoder codec (`hwaccel` fallback
+    status), connected viewers, `Frigate` event/mask state, backfill queue, hardware triggers, and live sensor telemetry
+    (battery, power source, Wi-Fi/RSSI, temperature, spotlight, model, firmware, and `last_seen`).
   - Run `curl http://127.0.0.1:8080/api/config` - returns the running bridge version, Git commit, and active settings.
 - **How do I visually see what the bridge and camera are doing inside Frigate?**
   Set `card_theme: hud` (globally or on a single camera in `config.yaml`). This displays a diagnostic bar (at your

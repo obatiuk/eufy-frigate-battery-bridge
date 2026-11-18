@@ -20,7 +20,7 @@ const {
   AUDIO,
   PROCESS_SIGNALS,
 } = require('./config');
-const {log} = require('./logger');
+const {log, formatErrorMessage} = require('./logger');
 const {Camera} = require('./domain/camera');
 const {loadCachedFrame} = require('./overlay/snapshot-cache');
 const {renderCameraCards} = require('./overlay/card-renderer');
@@ -158,12 +158,11 @@ function registerSignalHandlers(cams) {
   process.on(PROCESS_SIGNALS.SIGINT, () => shutdownBridge(cams));
 
   process.on('uncaughtException', (err) => {
-    const details = err && err.stack ? err.stack : err;
-    log.error('bridge', 'uncaught exception (service continuing): ' + details);
+    log.error('bridge', 'uncaught exception (service continuing): ' + formatErrorMessage(err, true));
   });
 
   process.on('unhandledRejection', (reason) => {
-    log.error('bridge', 'unhandled promise rejection (service continuing): ' + reason);
+    log.error('bridge', 'unhandled promise rejection (service continuing): ' + formatErrorMessage(reason, true));
   });
 }
 

@@ -12,7 +12,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const jsYaml = require('js-yaml');
-const {log, initLogger} = require('./logger');
+const {log, formatErrorMessage, initLogger} = require('./logger');
 
 const DEFAULT_FALLBACK_VERSION = '0.0.2';
 const DEFAULT_FALLBACK_COMMIT = 'dev';
@@ -359,7 +359,7 @@ const MAX_CAMERA_PRIORITY = 10000;
 const DEFAULT_CAMERA_PRIORITY = 0;
 const KEYFRAME_BURST_MS = 1500;
 const SHORT_KEYFRAME_BURST_MS = 1200;
-const STDERR_TAIL_MAX_CHARS = 500;
+const STDERR_TAIL_MAX_CHARS = 4096;
 const MAX_FFMPEG_BUFFER_MULTIPLIER = 2;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -493,12 +493,13 @@ class CameraConfig {
   }
 
   /**
-   * Returns the unique snapshot cache filename ('last_<name>_<serial>.jpg') for this camera.
+   * Returns the unique snapshot cache filename (`last_<name>.jpg` when `serial === name`,
+   * or `last_<name>_<serial>.jpg` when they differ) for this camera.
    *
    * @returns {string}
    */
   getCacheFileName() {
-    return 'last_' + this.name + '_' + this.serial + '.jpg';
+    return CameraConfig.formatCacheFileName(this.name, this.serial);
   }
 
   /**
@@ -584,8 +585,21 @@ class CameraConfig {
   }
 
   /**
-   * Resolves the deterministic JPEG cache filename ('last_<name>_<serial>.jpg') for any
-   * camera configuration or domain instance.
+   * Formats the deterministic JPEG cache filename (`last_<name>.jpg` when `serial === name`,
+   * or `last_<name>_<serial>.jpg` when both differ).
+   *
+   * @param {string} name - Camera stream name.
+   * @param {string} serial - Camera serial number.
+   * @returns {string}
+   */
+  static formatCacheFileName(name, serial) {
+    const suffix = serial && serial !== name ? name + '_' + serial : name || serial;
+    return 'last_' + suffix + '.jpg';
+  }
+
+  /**
+   * Resolves the deterministic JPEG cache filename (`last_<name>.jpg` when `serial === name`,
+   * or `last_<name>_<serial>.jpg` when they differ) for any camera configuration or domain instance.
    *
    * @param {*} rawCam - Camera configuration or domain instance.
    * @returns {string}
@@ -595,7 +609,24 @@ class CameraConfig {
       return rawCam.getCacheFileName();
     }
     const {serial, name} = CameraConfig.normalizeIdentity(rawCam);
-    return 'last_' + name + '_' + serial + '.jpg';
+    return CameraConfig.formatCacheFileName(name, serial);
+  }
+
+  /**
+   * Returns the legacy duplicated cache filename (`last_<name>_<name>.jpg`) when a camera's
+   * normalized serial equals its name, or an empty string when no legacy duplicate existed.
+   *
+   * @param {*} rawCam - Camera configuration or domain instance.
+   * @returns {string}
+   */
+  static resolveLegacyDuplicateCacheFileName(rawCam) {
+    const name =
+      rawCam && typeof rawCam.getName === 'function' ? rawCam.getName() : CameraConfig.normalizeIdentity(rawCam).name;
+    const serial =
+      rawCam && typeof rawCam.getSerial === 'function'
+        ? rawCam.getSerial()
+        : CameraConfig.normalizeIdentity(rawCam).serial;
+    return name && serial && serial === name ? 'last_' + name + '_' + serial + '.jpg' : '';
   }
 }
 
@@ -1310,7 +1341,7 @@ function loadConfig(env = process.env) {
     }
     throw new Error('config.yaml: configuration file not found at ' + targetPath);
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
+    const msg = formatErrorMessage(err);
     log.error('bridge', 'startup configuration error: ' + msg);
     process.exit(1);
   }
@@ -1415,7 +1446,15 @@ function resolveCacheDir(preferredDir = processRuntimeEnv.cacheDir) {
     return preferred;
   } catch (err) {
     const fallbackDir = os.tmpdir();
-    log.warn('bridge', 'cache directory "' + preferred + '" is not writable, falling back to ' + fallbackDir);
+    log.warn(
+      'bridge',
+      'cache directory "' +
+        preferred +
+        '" is not writable (' +
+        formatErrorMessage(err) +
+        '), falling back to ' +
+        fallbackDir
+    );
     return fallbackDir;
   }
 }

@@ -10,7 +10,7 @@
 'use strict';
 
 const {cfg, FORWARD_FACE_NAMES, STREAM_MODES, TELEMETRY_POLL_MS, sleep} = require('../config');
-const {log} = require('../logger');
+const {log, formatErrorMessage} = require('../logger');
 const {unwrapProperty} = require('../domain/telemetry');
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {pushFrameToEncoder, stopEncoder, seedOfflineCameraSnapshot} = require('../media/encoder');
@@ -106,6 +106,8 @@ const pendingRpcMap = new Map();
 /** @type {Set<string>} */
 const knownStationSerials = new Set();
 /** @type {Set<string>} */
+const disconnectedStations = new Set();
+/** @type {Set<string>} */
 const recyclingStations = new Set();
 /** @type {Map<string, number>} */
 const stationUnresponsiveTimeouts = new Map();
@@ -178,6 +180,7 @@ function scheduleWsReconnect() {
 }
 
 const isWsReady = () => wsReady;
+const isInitialTelemetryLoaded = () => initialTelemetryLoaded;
 
 /**
  * Returns true when the WebSocket connection has been open and settled for at least settleMs.
@@ -224,6 +227,23 @@ function resolvePropertyTriggerEvent(propName) {
 }
 
 /**
+ * Formats an eufy-security-ws RPC error response, combining errorCode with any diagnostic
+ * message or error detail so generic errorCodes like 'unknown_error' do not hide root causes.
+ *
+ * @param {Record<string, *>|null|undefined} res - RPC response object from eufy-security-ws.
+ * @returns {string}
+ */
+function formatRpcError(res) {
+  const code = res && res.errorCode ? String(res.errorCode).trim() : '';
+  const rawDetail = res ? res.message || res.error || '' : '';
+  const detail = typeof rawDetail === 'string' ? rawDetail.trim() : rawDetail ? formatErrorMessage(rawDetail) : '';
+  if (code && detail && detail !== code) {
+    return code + ' (' + detail + ')';
+  }
+  return code || detail || 'unknown';
+}
+
+/**
  * Sends a command object to eufy-security-ws over WebSocket and resolves with the response message.
  *
  * @param {Record<string, *>} commandPayload - Command fields to send alongside the generated messageId.
@@ -253,7 +273,7 @@ function call(commandPayload) {
     ws.send(serializedCommand, (sendErr) => {
       if (sendErr && pendingRpcMap.delete(requestId)) {
         clearTimeout(timeoutTimer);
-        resolve({success: false, errorCode: sendErr.message});
+        resolve({success: false, errorCode: formatErrorMessage(sendErr)});
       }
     });
   });
@@ -294,7 +314,7 @@ function setCameraProperty(cam, name, value) {
           res.errorCode === 'device_invalid_property_value' || res.errorCode === 'device_invalid_property'
             ? log.debug
             : log.warn;
-        logFn(cam, 'could not set ' + name + ': ' + (res.errorCode || 'unknown'));
+        logFn(cam, 'could not set ' + name + ': ' + formatRpcError(res));
         return;
       }
       if (name === 'rtspStream' && value === true && !cam.getRtspUrl()) {
@@ -362,6 +382,7 @@ function checkHardwareRecordingSettings(cam, props) {
  */
 function clearStationRecoveryState() {
   knownStationSerials.clear();
+  disconnectedStations.clear();
   recyclingStations.clear();
   stationUnresponsiveTimeouts.clear();
   stationLastRecoveryAt.clear();
@@ -380,6 +401,36 @@ function clearStationRecoveryState() {
  */
 function isStationRecycling(stationSn) {
   return Boolean(stationSn && recyclingStations.has(stationSn));
+}
+
+/**
+ * Returns true when a reconnect timer is currently scheduled for stationSn.
+ *
+ * @param {string} stationSn - Station serial number.
+ * @returns {boolean}
+ */
+function isStationReconnecting(stationSn) {
+  return Boolean(stationSn && stationReconnectTimers.has(stationSn));
+}
+
+/**
+ * Returns true when stationSn has explicitly reported a disconnected P2P link.
+ *
+ * @param {string} stationSn - Station serial number.
+ * @returns {boolean}
+ */
+function isStationDisconnected(stationSn) {
+  return Boolean(stationSn && disconnectedStations.has(stationSn));
+}
+
+/**
+ * Returns discovered station serial numbers for the active runtime camera collection.
+ *
+ * @param {Camera[]} cams - Camera collection being inspected.
+ * @returns {readonly string[]}
+ */
+function getKnownStationSerials(cams) {
+  return cams === camsRef ? Object.freeze(Array.from(knownStationSerials)) : Object.freeze([]);
 }
 
 /**
@@ -416,6 +467,11 @@ function collectKnownStationSerials() {
 function updateStationHealth(stationSn, connected) {
   if (!stationSn) {
     return;
+  }
+  if (connected) {
+    disconnectedStations.delete(stationSn);
+  } else {
+    disconnectedStations.add(stationSn);
   }
   for (const cam of camsRef) {
     if (cam.isOnStation(stationSn) && cam.updateServiceHealth({stationConnected: connected})) {
@@ -910,13 +966,12 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
     log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
     const pollRes = await call({command: 'driver.poll_refresh'});
     if (!pollRes.success) {
+      const pollErr = formatRpcError(pollRes);
       log.warn(
         'bridge',
-        'driver.poll_refresh failed (errorCode=' +
-          (pollRes.errorCode || 'unknown') +
-          '), reconnecting eufy-security-ws driver and stations'
+        'driver.poll_refresh failed (errorCode=' + pollErr + '), reconnecting eufy-security-ws driver and stations'
       );
-      await recoverDriverAndStations('driver.poll_refresh ' + (pollRes.errorCode || 'failed'));
+      await recoverDriverAndStations('driver.poll_refresh ' + pollErr);
       for (const cam of eufyCams) {
         if (!cam.isDeviceOffline() && !cam.hasEncoderProcess() && onDeviceOnlineResumeCallback) {
           onDeviceOnlineResumeCallback(cam);
@@ -934,7 +989,7 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
     if (res.success && res.result && res.result.properties) {
       applyDeviceProperties(cam, res.result.properties);
     } else if (!res.success) {
-      log.warn(cam, 'device.get_properties failed: ' + (res.errorCode || 'unknown'));
+      log.warn(cam, 'device.get_properties failed: ' + formatRpcError(res));
       if (!cam.isDeviceOffline() && !cam.hasEncoderProcess() && onDeviceOnlineResumeCallback) {
         onDeviceOnlineResumeCallback(cam);
       }
@@ -969,7 +1024,7 @@ async function handleVersionMessage(m) {
 
   if (!wsReady) {
     wsHasEverDisconnected = true;
-    log.error('bridge', 'start_listening failed (' + (st.errorCode || 'unknown') + '), retrying connection in 10 s');
+    log.error('bridge', 'start_listening failed (' + formatRpcError(st) + '), retrying connection in 10 s');
     ensureCameraEncodersStarted({wsConnected: false});
     scheduleWsReconnect();
     return;
@@ -1058,7 +1113,7 @@ function connectWs() {
   } catch (err) {
     wsReady = Boolean(false);
     wsHasEverDisconnected = true;
-    const errMsg = err && err.message ? err.message : String(err);
+    const errMsg = formatErrorMessage(err);
     const logConnectErr = !wsOutageErrorLogged ? log.error : log.debug;
     wsOutageErrorLogged = true;
     logConnectErr('bridge', 'eufy-security-ws connect failed (' + errMsg + '), retrying in 10 s');
@@ -1104,7 +1159,7 @@ function connectWs() {
     if (socket === ws) {
       const logWsErr = !wsOutageErrorLogged ? log.error : log.debug;
       wsOutageErrorLogged = true;
-      logWsErr('bridge', 'eufy-security-ws error: ' + err.message);
+      logWsErr('bridge', 'eufy-security-ws error: ' + formatErrorMessage(err));
     }
   });
 
@@ -1113,6 +1168,7 @@ function connectWs() {
     try {
       parsedMsg = JSON.parse(String(rawFrame));
     } catch (err) {
+      log.warn('bridge', 'ignoring malformed eufy-security-ws message (' + formatErrorMessage(err) + ')');
       return;
     }
 
@@ -1134,7 +1190,7 @@ function connectWs() {
           try {
             onEventCallback(parsedMsg.event || {});
           } catch (err) {
-            log.error('bridge', 'unhandled error in onEvent: ' + err.message);
+            log.error('bridge', 'unhandled error in onEvent: ' + formatErrorMessage(err, true));
           }
         }
         break;
@@ -1184,10 +1240,12 @@ function extractRecognizedPerson(e, forwardEnabled = FORWARD_FACE_NAMES) {
 module.exports = {
   configureEufyClientHooks,
   isWsReady,
+  isInitialTelemetryLoaded,
   isWsSettledForEvents,
   canRunStartupProbeNow,
   isTrackedPropertyEvent,
   resolvePropertyTriggerEvent,
+  formatRpcError,
   call,
   setCameraProperty,
   applyDeviceProperties,
@@ -1197,6 +1255,9 @@ module.exports = {
   ensureRtspUrlAfterWakeStart,
   refreshMissingRtspUrlOnStart,
   isStationRecycling,
+  isStationReconnecting,
+  isStationDisconnected,
+  getKnownStationSerials,
   recoverUnresponsiveStation,
   recordStationWakeTimeout,
   noteStationActivity,

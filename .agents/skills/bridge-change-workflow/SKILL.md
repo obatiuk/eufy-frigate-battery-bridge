@@ -1,9 +1,10 @@
 ---
 name: bridge-change-workflow
 description: >-
-  Use before changing src/, test/, docs/, or CHANGELOG.md in the Eufy Frigate bridge, or when writing or updating
-  acceptance criteria and acceptance tests. Gives the step-by-step procedures for a code change, a bug fix with a
-  regression entry, an acceptance criterion change, and backlog updates, plus which documents to read for which files.
+  Use before investigating behavior or changing src/, test/, docs/, or CHANGELOG.md in the Eufy Frigate bridge, or when
+  writing or updating acceptance criteria and acceptance tests. Gives the step-by-step procedures for a code change, a
+  bug fix with a regression entry, an acceptance criterion change, and backlog updates, plus which documents to read for
+  which files.
 ---
 
 # Bridge Change Workflow
@@ -16,8 +17,9 @@ The always-on rules and the doc map are in `AGENTS.md`. This skill is the checkl
    for your files and subsystem concern.
 2. Read the `docs/` documents from the doc map that match the topic (for example `docs/stream-lifecycle.md` for wake
    or backfill logic).
-3. Red: add or update a test in `test/*.test.js` (start the body with `// Verify ...` or `// Regression: ...`). Run
-   `make test` and confirm it fails for the expected reason.
+3. Verify validity and Red (`tdd-workflow`): reproduce the `TODO` or expected behavior in `test/*.test.js` (derived
+   from the task, not the code; starting with `// Verify ...` or `// Regression: ...`) and run `make test` to confirm
+   the issue still exists and fails before changing `src/`.
 4. Green: change `src/` without editing the Red test. Run `make check` until it passes.
 5. If config keys, defaults, or bounds changed, sync `src/config.js`, `deploy/config.schema.json`,
    `deploy/config.example.*.yaml`, and `README.md` (`test/config.test.js` checks schema defaults). If user-visible

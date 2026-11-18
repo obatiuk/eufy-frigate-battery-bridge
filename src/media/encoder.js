@@ -27,7 +27,7 @@ const {
   ACTIVE_HWACCEL,
   HWACCEL_DEVICE,
 } = require('../config');
-const {log, maskSecrets, formatLocalHm} = require('../logger');
+const {log, formatLocalHm, formatErrorMessage, extractFfmpegStderrLines} = require('../logger');
 const {renderLiveFrameWithCard} = require('../overlay/card-renderer');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
@@ -223,8 +223,8 @@ class FfmpegArgsBuilder {
     }
     return Object.freeze({
       getRaw: () => stderrWindow,
-      getSummary: () => maskSecrets(stderrWindow.trim()).split(/\r?\n/).join(' | '),
-      getLastLine: () => maskSecrets(stderrWindow.trim()).split(/\r?\n/).pop() || 'no stderr output',
+      getSummary: () => extractFfmpegStderrLines(stderrWindow).join(' | '),
+      getLastLine: () => extractFfmpegStderrLines(stderrWindow).pop() || 'no stderr output',
     });
   }
 }
@@ -655,7 +655,7 @@ function startEncoder(cam, allowOfflineSeed = false) {
       stdio: ['pipe', 'ignore', 'pipe', AUDIO ? 'pipe' : 'ignore'],
     });
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
+    const msg = formatErrorMessage(err);
     const delayMs = scheduleEncoderRestartBackoff(cam, false);
     log.error(cam, 'encoder process error: ' + msg + ' - restarting in ' + Math.round(delayMs / MS_PER_SECOND) + ' s');
     return;
@@ -708,7 +708,7 @@ function startEncoder(cam, allowOfflineSeed = false) {
         'encoder exited (code=' +
           code +
           ') ' +
-          errSummary +
+          (errSummary || 'no stderr output') +
           ' - restarting in ' +
           Math.round(delayMs / MS_PER_SECOND) +
           ' s'
@@ -721,7 +721,7 @@ function startEncoder(cam, allowOfflineSeed = false) {
 
   const ignoreEncoderPipeError = () => {};
   enc.on('error', (e) => {
-    log.error(cam, 'encoder process error: ' + e.message);
+    log.error(cam, 'encoder process error: ' + formatErrorMessage(e));
     handleEncoderTerminated(null, e);
   });
   if (enc.stdin) {
@@ -741,7 +741,7 @@ function startEncoder(cam, allowOfflineSeed = false) {
     handleEncoderTerminated(exitCode, null);
   });
 
-  const codecLabel = hwMode ? 'h264_' + hwMode : 'libx264';
+  const codecLabel = cam.resolveEncoderCodec(ACTIVE_HWACCEL);
   const resumeSuffix = wasPausedForOffline ? ' (resumed after offline recovery)' : '';
   log.info(cam, 'encoder (' + codecLabel + ') publishing to go2rtc' + resumeSuffix);
 }

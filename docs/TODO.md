@@ -5,14 +5,14 @@
 Work order inside each section is suggested priority (standard backlog first, then `(post-v0.0.2)` and `(low)`). Follow
 strict TDD (`Red -> Green -> make check`) for every code item and never weaken a locked `AT-*` test.
 
-- [A. Reliability and runtime bugs](#a-reliability-and-runtime-bugs) - Frigate/Eufy error recovery, trigger expiry,
-  WebSocket keepalive, clean shutdown, snapshot timeouts, and FFmpeg resilience
+- [A. Reliability and runtime bugs](#a-reliability-and-runtime-bugs) - Frigate/Eufy error recovery, WebSocket keepalive,
+  clean shutdown, snapshot timeouts, and FFmpeg resilience
 - [B. Configuration and validation](#b-configuration-and-validation) - startup type, URL scheme, and identity checks,
   plus dedicated clamp bounds
 - [C. Security, logging, and error handling](#c-security-logging-and-error-handling) - HTTP body/timeout limits,
   swallowed errors, floating promises, and HTTP auth
-- [D. Domain, backfill, and status card cleanups](#d-domain-backfill-and-status-card-cleanups) - clip timestamps, FSM
-  transition guards, and command/query separation
+- [D. Domain and status card cleanups](#d-domain-and-status-card-cleanups) - `Camera` FSM transition logging and
+  command/query separation
 - [E. Tests, docs, and structure](#e-tests-docs-and-structure) - deterministic timer tests, `Camera` decomposition, and
   minor cleanups
 
@@ -23,11 +23,6 @@ strict TDD (`Red -> Green -> make check`) for every code item and never weaken a
     `evaluateActiveHoldExtension()` (`stream-orchestrator.js` ~196-247) extends holds to `stream_max_secs` during
     outages. Return tri-state (`idle`, `active`, `unknown`), skip extension/confirmation on `unknown`, and test `500`,
     timeout, and invalid JSON.
-- [ ] Expire stale Eufy trigger state when a clear event is lost
-  - `activeTriggerEvents` (`camera.js`) only clears on `state: false`, non-`DOWNLOAD` session end (~1597), or
-    `clearPendingBackfill()` (~2520-2530), sticking `hasActiveHardwareTriggers()` `true` if `state: false` is lost.
-    Track start timestamps in a `Map`, expire past max clip length + margin, clear on WS close
-    (`handleStationDisconnected()` ~4180-4187) and offline, and test clock expiry.
 - [ ] Roll back Frigate event filing when it fails, and keep card suppression exception-safe
   - `frigateEvent()` (`frigate-client.js` ~479-582) runs `enableCleanSnapshotCardSuppression()` (~520) and
     `completeFrigateEventFiling()` (~525) before `POST` outside `try/finally` (sticking triggers in `COOLDOWN` on
@@ -102,38 +97,30 @@ cam.getName())` (~549), and `stopEncoderProcess()` (`camera.js` ~5220-5230) send
   - `readJsonBody()` (`http-server.js` ~181-250) waits for `end` after `totalBytes > MAX_JSON_BODY_BYTES` (`16384`) and
     lacks a body timeout, while `stopHttpServer()` (~615-625) omits `closeAllConnections()`. Return `413` immediately
     with `Connection: close`, add a read timeout, and close sockets on shutdown.
-- [ ] Log swallowed service-layer errors, handle floating promises, and validate `maxSchemaVersion`
-  - Empty catches / unchecked RPCs / floating promises exist in `pollViewers()` (`frigate-client.js` ~750-752),
-    `stream-orchestrator.js` (`wakeCameraExternal()` offline refresh ~343-351, backfill queries ~783-796, `stop()`
-    ~946-994), and `eufy-client.js` (~915-918 `Math.min(m.maxSchemaVersion, 21)` `NaN`, ~1027-1038 message JSON/async);
-    `unhandledRejection` in `app.js` (~164-166) omits `reason.stack`. Log stacks/errors, add `.catch` handlers, check
-    RPC results, and validate `maxSchemaVersion`.
+- [ ] Handle remaining floating promises, unchecked background RPCs, and `maxSchemaVersion` validation
+  - Unchecked background RPCs / floating promises remain in `stream-orchestrator.js` (`wakeCameraExternal()` offline
+    refresh ~343-351, post-stop `device.get_properties` ~1065-1070) and `eufy-client.js` (~958
+    `Math.min(m.maxSchemaVersion, 21)` `NaN`, async `message` listener). Add `.catch` handlers, check RPC results, and
+    validate `maxSchemaVersion`.
 - [ ] Document and decide on the unauthenticated HTTP API
   - `http-server.js` listens on `0.0.0.0` without auth, allows `GET /api/wake/...`, and exposes serials on
     `GET /api/config` to containers on the `frigate` network. Document exposure in `README.md`, add optional
     `BRIDGE_HTTP_TOKEN` Bearer auth, and make `GET /api/wake` opt-in or `POST`-only.
 
-### D. Domain, backfill, and status card cleanups
+### D. Domain and status card cleanups
 
-- [ ] Reject timestamp-less backfill clips and verify timezone handling in `parseClipTimestampMs()`
-  - `matchesCandidate()` (`backfill-job.js` ~413-421) accepts any candidate with `!candidate.clipMs`, and
-    `parseClipTimestampMs()` (~120-137) uses container-local `TZ`. Reject candidates missing a parsed timestamp (except
-    synthetic urgent test jobs) and test clip matching across two `TZ` values.
-- [ ] Guard state-machine transitions and log refused transitions across `BackfillJob` and `Camera`
-  - `BackfillJob.upgradeEvent()` (~270-278) mutates `recordingActive` and `clearedAt` before `transitionTo()`, and
-    `BackfillJob` / `Camera` transition helpers (~228-239, ~1352-1420) silently ignore disallowed transitions. Guard
-    `upgradeEvent()` by state, tighten transition maps, and log refused transitions at debug level.
-- [ ] Use monomorphic options objects and separate state-mutating commands from `is*` / `should*` / `get*` queries
-  - `BackfillJob.upgradeEvent()` (~254-293) overloads arguments, `applyMotionTrigger()` / `applyViewTrigger()` take 8
-    positional args, and `isReadyToQuery()`, `isExpired()`, `evaluateExternalLivestreamStop()`, `getSessionState()`,
-    `getFrigateEventState()`, `shouldEnableRtspProperty()`, `shouldDisableRtspProperty()`,
+- [ ] Log refused state-machine transitions across `Camera` FSM helpers
+  - `Camera` transition helpers (`transitionTo()`, `_transitionDecoderTo()`, and `_transitionFrigateEventTo()` in
+    `camera.js` ~1355-1420) silently ignore disallowed transitions instead of logging refused transitions at debug
+    level.
+- [ ] Use monomorphic options objects and separate commands from `is*` / `should*` / `get*` queries on `Camera` and
+      `Telemetry`
+  - `applyMotionTrigger()` / `applyViewTrigger()` take 8 positional args, and `evaluateExternalLivestreamStop()`,
+    `getSessionState()`, `getFrigateEventState()`, `shouldEnableRtspProperty()`, `shouldDisableRtspProperty()`,
     `evaluateUnexpectedRtspStart()`, `shouldTurnOffStuckIdleLight()`, `shouldPollFrigateForHoldOrBackfill()`,
     `checkEarlySleepDue()`, `shouldStopUnsolicitedVideo()`, `completeStartupProbeIfReady()`, and
     `Telemetry.shouldRefreshLowBatteryOnView()` mutate state. Use options objects and split pure predicates from
     explicit commands.
-- [ ] Make `isUrgentBackfillProtectedFrom` check `this.isBackfillPlayback()` directly (low)
-  - `Camera.isUrgentBackfillProtectedFrom()` (`camera.js` ~3930-3932) only checks `!candidateCam.isInMotion(now)`.
-    Guard with `this.isBackfillPlayback()` inside the method and test on an idle camera.
 
 ### E. Tests, docs, and structure
 

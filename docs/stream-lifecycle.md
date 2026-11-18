@@ -48,9 +48,12 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
     early; `isReadyToQuery` waits `4s` (`BACKFILL_POST_CLEAR_SETTLE_MS`) after **all** active trigger properties clear
     (`markRecordingCleared`, or up to `Math.max(35000, holdMs + 4000)`, hard-capped at `124s` /
     `BACKFILL_MAX_TOTAL_RECORDING_WAIT_MS` = Eufy's `120s` max hardware clip length `+ 4s` settle from initial trigger
-    `this.at`). Station P2P idle and `backfill_delay_secs` (`2s`) cooldown checks are scoped per station across non-RTSP
-    P2P cameras (`isStationIdleForBackfill`). The post-viewer cooldown (`view_cooldown_secs`) only guards pure viewer
-    re-wakes and is bypassed whenever a Eufy hardware trigger is active.
+    `this.at`). `processBackfillQueue` serializes queue steps per canonical HomeBase station (`scheduleStationBackfill`,
+    `resolveStationBackfillKey`) so multiple HomeBase stations query and download in parallel while pacing database
+    queries at `4s` (`BACKFILL_QUERY_COOLDOWN_MS`) across sibling cameras with equal-priority round-robin tie-breaking
+    (`compareBackfillPriority`), and scoping station P2P idle and `backfill_delay_secs` (`2s`) cooldown checks per
+    station (`isStationIdleForBackfill`). The post-viewer cooldown (`view_cooldown_secs`) only guards pure viewer
+    re-wakes and is bypassed whenever an unexpired Eufy hardware trigger (`<= 130s`) is active.
   - **Chronological Multi-Clip Query & Paced Playback:** Connects via `station.connect`, queries
     `station.database_query_by_date` and `station.database_query_latest_info` (via `needsLatestInfoBackfillQuery()`, up
     to `10` attempts / `BACKFILL_MAX_QUERY_ATTEMPTS`, including in the background while a previous clip is draining from
@@ -63,11 +66,16 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
     (`BACKFILL_SNAP_DELAY_MS`) after `firstFrameAt` before filing the Frigate event, flushes the decoder
     (`flushDecoderInput`) on `'download finished'`, holds the final frame for `2.5s`
     (`DEFAULT_DOWNLOAD_POST_PLAYBACK_HOLD_MS`, or `0ms` while preserving the final frame across back-to-back clip
-    continuation handshakes), and scales Frigate's event `duration` (`getEffectiveEventDurationSecs`). Any live `P2P`
-    motion/event request immediately preempts an active in-transfer download (`!downloadFinished`,
-    `initiator = 'bridge-arbitrator/live-over-download'`), whereas viewer-only wakes never preempt an active backfill
-    download (`isUrgentBackfillProtectedFrom`), and once the `HomeBase 3` transfer completes (`downloadFinished: true`,
-    draining from RAM), the camera releases the station `P2P` channel (`isOccupyingStationP2pChannel() === false`).
+    continuation handshakes), and scales Frigate's event `duration` (`getEffectiveEventDurationSecs`, preserving the
+    matched clip's hardware event label and recognized person via `getBackfillEventLabel` / `getBackfillEventPerson` on
+    `'download finished'`). Any live `P2P`
+    motion/event request on **another** camera sharing the HomeBase immediately preempts an active in-transfer download
+    (`!downloadFinished`, `initiator = 'bridge-arbitrator/live-over-download'`), whereas viewer-only wakes
+    (`isUrgentBackfillProtectedFrom`) and same-camera triggers or `/api/wake` requests never preempt an active backfill
+    download (preserving strict chronological event order by queuing a follow-on `BackfillJob` or deferring a live wake
+    via `schedulePostBackfillWake` / `status: "scheduled"` until playback completes), and once the `HomeBase 3` transfer
+    completes (`downloadFinished: true`, draining from RAM), the camera releases the station `P2P` channel
+    (`isOccupyingStationP2pChannel() === false`).
 - **Camera & Event Priority Tiers (`getEffectivePriority`):** Combines per-camera `priority` from `config.yaml` with
   built-in `EVENT_PRIORITIES` (`ring`: `+1000`, `identity person`: `+300`, `person`/`stranger`/`loitering`: `+200`,
   `package`: `+150`, `vehicle`/`pet`/`dog`: `+100`, `crying`/`sound`: `+50`, `radar`/`motion`: `+10`, plus optional
@@ -90,8 +98,10 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
 - **Immediate Snapshot Persistence (`lastFrame`, `/config/cache`):** `cam.lastFrame` and `cam.telemetry.lastSeen` update
   in RAM on the first decoded frame of every live/backfill session (`lastFrame` also updates after `2s` on first-boot
   `startup_snapshot` probes). Clean un-overlayed `JPEG` frames are persisted to
-  `/config/cache/last_<name>_<serial>.jpg` when a session that decoded video (or is not a passive `rtsp-direct-probe`
-  without video) stops (`stop()`, falling back to `os.tmpdir()` / `TMPDIR` if `BRIDGE_CACHE_DIR` is unwritable)
+  `/config/cache/last_<name>.jpg` when `serial === name` (or `last_<name>_<serial>.jpg` when they differ, automatically
+  migrating legacy `last_<name>_<name>.jpg` files) when a session that decoded video (or is not a passive
+  `rtsp-direct-probe` without video) stops (`stop()`, falling back to `os.tmpdir()` / `TMPDIR` if `BRIDGE_CACHE_DIR` is
+  unwritable)
   so container restarts never need to wake cameras that already have a cached snapshot. While
   `cam.active && cam.gotVideo`, the encoder holds `cam.frame || cam.lastFrame` so preempted or stopping streams never
   flash the pre-stream `waking` card.
@@ -106,9 +116,12 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
   lists, validating URL encoding, JSON bodies `<= 16 KB`, `duration`/`create_event`/`reason`, HTTP methods `405`, and
   shutdown/WS/all-offline `503` states, with `RTSP`-first ordering, `2500ms` per-station pacing, burst coalescing, and
   `create_event: true` by default), `GET/HEAD /api/config` (`buildConfigPayload` exposing build `version`, Git `commit`,
-  and sanitized effective runtime config with `null` for inapplicable fields), and `GET/HEAD /health` + `/healthz`
-  (container `HEALTHCHECK` liveness probe returning `200` when running and not shutting down, with `ws_connected`
-  reported in the payload for diagnostics rather than triggering restarts on external service outages).
+  and sanitized effective runtime config with `null` for inapplicable fields), `GET/HEAD /api/status`
+  (`buildStatusPayload` exposing upstream service connectivity, `HomeBase` station `P2P` slot health, aggregate camera
+  counts, and every configured camera's live session, encoder, viewer, event, backfill, trigger, and sensor telemetry
+  state), and `GET/HEAD /health` + `/healthz` (extra-minimal container `HEALTHCHECK` liveness probe returning `200` when
+  running and not shutting down without scanning camera arrays, with `ws_connected` and `uptime_secs` reported in the
+  payload rather than triggering restarts on external service outages).
 - **HomeBase Reboot & Wi-Fi Outage Self-Healing:** On initial `start_listening`, the bridge verifies `driver` and
   `station` connectivity (`driver.is_connected`, `station.is_connected`) and dispatches `driver.connect` and
   `station.connect` whenever disconnected. `onEvent` handles `source === 'station'` events (`close`, `connection error`,

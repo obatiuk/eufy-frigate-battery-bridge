@@ -20,9 +20,17 @@ process.env.TMPDIR = TEST_TMP_DIR;
 process.env.BRIDGE_CACHE_DIR = TEST_CACHE_DIR;
 
 const {FRAME, CACHE_DIR, IDLE_FPS, LIVE_FPS} = require('../src/config');
+const {log} = require('../src/logger');
 const {DOWNLOAD_FRAME_HIGH_WATERMARK, DOWNLOAD_FRAME_LOW_WATERMARK, Camera} = require('../src/domain/camera');
 const {renderCameraCards} = require('../src/overlay/card-renderer');
-const {buildDecodeJpegArgs, buildEncodeJpegArgs, getCacheFilePath} = require('../src/overlay/snapshot-cache');
+const {
+  buildDecodeJpegArgs,
+  buildEncodeJpegArgs,
+  getCacheFilePath,
+  migrateLegacyDuplicateCacheFile,
+  loadCachedFrame,
+  saveCachedFrame,
+} = require('../src/overlay/snapshot-cache');
 const {
   FfmpegArgsBuilder,
   configureEncoderHooks,
@@ -39,6 +47,7 @@ const {extractBlurredRegion} = require('../src/overlay/yuv-canvas');
 const {
   configureDecoderHooks,
   setDecoderStopHandler,
+  setRtspDropHandler,
   buildScaleFilter,
   buildP2pDecoderArgs,
   buildRtspDecoderArgs,
@@ -443,9 +452,36 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
   });
 
   it('builds deterministic JPEG snapshot cache paths and FFmpeg decode/encode CLI arguments', () => {
+    // Verify cache paths keep last_<name>_<serial>.jpg when name !== serial, collapse to last_<name>.jpg when
+    // serial === name, and migrate legacy last_<name>_<name>.jpg files in place
     const cam = new Camera({serial: 'T8161T0000000000', name: 'front_yard'});
     const cachePath = getCacheFilePath(cam);
     assert.equal(cachePath, path.join(CACHE_DIR, 'last_front_yard_T8161T0000000000.jpg'));
+
+    const serialOnlyCam = new Camera({serial: 'T8161T0000000000'});
+    assert.equal(getCacheFilePath(serialOnlyCam), path.join(CACHE_DIR, 'last_T8161T0000000000.jpg'));
+
+    const directCam = new Camera({name: 'nursery_cam', rtsp_url: 'rtsp://192.0.2.10/live0'});
+    assert.equal(getCacheFilePath(directCam), path.join(CACHE_DIR, 'last_nursery_cam.jpg'));
+
+    const migDir = fs.mkdtempSync(path.join(CACHE_DIR, 'mig-'));
+    try {
+      const legacyDup = path.join(migDir, 'last_nursery_cam_nursery_cam.jpg');
+      const dedupTarget = path.join(migDir, 'last_nursery_cam.jpg');
+      fs.writeFileSync(legacyDup, 'jpeg-bytes-1');
+      migrateLegacyDuplicateCacheFile(directCam, migDir);
+      assert.equal(fs.existsSync(legacyDup), false);
+      assert.equal(fs.readFileSync(dedupTarget, 'utf8'), 'jpeg-bytes-1');
+
+      // When the deduplicated file already exists, any leftover duplicate file is removed cleanly
+      fs.writeFileSync(dedupTarget, 'jpeg-bytes-fresh');
+      fs.writeFileSync(legacyDup, 'jpeg-bytes-stale');
+      migrateLegacyDuplicateCacheFile(directCam, migDir);
+      assert.equal(fs.existsSync(legacyDup), false);
+      assert.equal(fs.readFileSync(dedupTarget, 'utf8'), 'jpeg-bytes-fresh');
+    } finally {
+      fs.rmSync(migDir, {recursive: true, force: true});
+    }
 
     const decArgs = buildDecodeJpegArgs(cachePath);
     assert.ok(decArgs.includes(cachePath));
@@ -1595,4 +1631,221 @@ describe('FFmpeg P2P/RTSP Decoder & Annex-B NAL Parser (src/media/decoder.js)', 
     assert.equal(summary.includes('rtsp://***@10.0.0.5:8554/cam'), true);
     assert.equal(lastLine, 'Connection refused from rtsp://***@10.0.0.5:8554/cam');
   });
+
+  it('defers backfill decoder detach on exit until flowing stdout closes so tail frames are not dropped', () => {
+    // Regression: when FFmpeg exits at EOF while dec.stdout is in flowing mode (!decoderStdoutPaused &&
+    // readableLength === 0), handleP2pDecoderExit must wait for dec.stdout "close" before detaching cam.dec
+    // so tail frames arriving from the OS pipe between process "exit" and stdout "close" are decoded.
+    const EventEmitter = require('node:events');
+    const cam = new Camera({serial: 'T8214T7777777771', name: 'tail_drain_cam', mode: 'backfill'});
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/tail_test.zxvideo',
+        cipherId: 1,
+        clipMs: 10000,
+        event: 'motion detected',
+        personName: '',
+        reason: 'motion detected',
+      },
+      false,
+      20000
+    );
+    const sid = cam.getSessionId();
+    const stdoutEmitter = Object.assign(new EventEmitter(), {
+      readableEnded: false,
+      closed: false,
+      readableLength: 0,
+      pause() {},
+      resume() {},
+    });
+    const mockDec = {
+      stdin: {writable: false, end() {}},
+      stdout: stdoutEmitter,
+      stderr: new EventEmitter(),
+      stdio: [null, stdoutEmitter, null, null, null],
+    };
+    cam.attachDecoder(mockDec);
+    const decodedCount = [];
+    attachDecoderStreams(cam, /** @type {*} */ (mockDec), sid, (frameBuf, now) => {
+      handleDecodedP2pFrame(cam, frameBuf, now);
+      decodedCount.push(frameBuf[0]);
+    });
+
+    const frame0 = Buffer.alloc(FRAME, 0xaa);
+    stdoutEmitter.emit('data', frame0);
+    assert.equal(decodedCount.length, 1);
+    assert.equal(cam.decoderStdoutPaused, false);
+
+    // FFmpeg process exits while final frame is still in the OS pipe (readableLength === 0 in flowing mode)
+    handleP2pDecoderExit(cam, mockDec, sid, 0);
+    assert.equal(
+      cam.hasDecoderProcess(),
+      true,
+      'Must keep cam.dec attached until flowing dec.stdout emits close so tail frames are not discarded'
+    );
+
+    const finalTailFrame = Buffer.alloc(FRAME, 0xbb);
+    stdoutEmitter.emit('data', finalTailFrame);
+    assert.equal(decodedCount.length, 2, 'Tail frame arriving after process exit but before stdout close must decode');
+    assert.equal(cam.downloadFrames.length, 1);
+
+    stdoutEmitter.closed = true;
+    stdoutEmitter.emit('close');
+    assert.equal(cam.hasDecoderProcess(), false, 'Detaches cam.dec once dec.stdout emits close');
+  });
+
+  it(
+    'preserves root-cause FFmpeg stderr lines instead of overriding with FFmpeg 7/8 exit footers ' +
+      'or truncating at 500 chars',
+    (t) => {
+      // Regression: FFmpeg 7/8 appends generic "Error opening input file ...", "Error opening input files: ...",
+      // and "Conversion failed!" footers after protocol/muxer root-cause lines, STDERR_TAIL_MAX_CHARS=500 truncated
+      // multi-line bursts, and snapshot-cache hid decode/save FFmpeg root causes.
+      const EventEmitter = require('node:events');
+      const childProcess = require('node:child_process');
+
+      // 1. >600-char RTSP DESCRIBE failure burst with FFmpeg 7/8 exit footers and embedded credentials
+      const mockProc = new EventEmitter();
+      mockProc.stderr = new EventEmitter();
+      const collector = FfmpegArgsBuilder.attachStderrTailCollector(mockProc);
+      const longPass = 's3cr3t_password_padding_' + 'x'.repeat(220);
+      mockProc.stderr.emit(
+        'data',
+        Buffer.from(
+          '[rtsp @ 0x7fcd8729a980] method DESCRIBE failed: 453 Not Enough Bandwidth\r\n' +
+            '[in#0 @ 0x7fcd8729a800] Error opening input: ' +
+            'Server returned 4XX Client Error, but not one of 40{0,1,3,4}\r\n' +
+            'Error opening input file rtsp://admin:' +
+            longPass +
+            '@192.0.2.50:554/live0.\r\n' +
+            'Error opening input files: Server returned 4XX Client Error, but not one of 40{0,1,3,4}\r\n'
+        )
+      );
+
+      assert.equal(collector.getLastLine().includes('method DESCRIBE failed: 453 Not Enough Bandwidth'), true);
+      assert.equal(collector.getLastLine().includes('Error opening input files:'), false);
+      assert.equal(collector.getSummary().includes('method DESCRIBE failed: 453 Not Enough Bandwidth'), true);
+      assert.equal(collector.getSummary().includes('Error opening input files:'), false);
+      assert.equal(collector.getSummary().includes('s3cr3t_password_padding_'), false);
+
+      // 2. Multi-line RTSP handshake failure in startRtspDecoder before gotVideo preserves all root-cause lines
+      const directCam = new Camera({
+        name: 'nursery_direct_cam',
+        mode: 'rtsp',
+        rtsp_url: 'rtsp://viewer:pw@192.0.2.55:554/live0',
+      });
+      directCam.beginRtspDirectProbeSession(10000);
+      const spawnedProcs = [];
+      const dropEvents = [];
+      configureDecoderHooks({
+        spawn: /** @type {*} */ (
+          () => {
+            const p = Object.assign(new EventEmitter(), {
+              pid: 4242,
+              stdout: new EventEmitter(),
+              stderr: new EventEmitter(),
+              stdio: [null, new EventEmitter(), new EventEmitter(), null, new EventEmitter()],
+              kill() {},
+            });
+            spawnedProcs.push(p);
+            return p;
+          }
+        ),
+      });
+      setRtspDropHandler((cam, code, reasonText) => {
+        dropEvents.push({cam, code, reasonText});
+      });
+      try {
+        startRtspDecoder(directCam);
+        assert.equal(spawnedProcs.length, 1);
+        spawnedProcs[0].stderr.emit(
+          'data',
+          Buffer.from(
+            '[rtsp @ 0x7f11] Nonmatching transport in server reply\n' +
+              '[rtsp @ 0x7f11] method SETUP failed: 461 Unsupported Transport\n' +
+              '[in#0 @ 0x7f00] Error opening input: Invalid data found when processing input\n' +
+              'Error opening input file rtsp://viewer:pw@192.0.2.55:554/live0.\n' +
+              'Error opening input files: Invalid data found when processing input\n'
+          )
+        );
+        spawnedProcs[0].emit('exit', 1);
+
+        assert.equal(dropEvents.length, 1);
+        assert.equal(dropEvents[0].reasonText.includes('Nonmatching transport in server reply'), true);
+        assert.equal(dropEvents[0].reasonText.includes('method SETUP failed: 461 Unsupported Transport'), true);
+        assert.equal(dropEvents[0].reasonText.includes('Error opening input files:'), false);
+      } finally {
+        configureDecoderHooks({spawn: null});
+        setRtspDropHandler(null);
+      }
+
+      // 3. Snapshot cache decode & save failures preserve real FFmpeg / OS error instead of "Conversion failed!"
+      const snapCam = new Camera({serial: 'T8161T0000009991', name: 'snap_diag_cam'});
+      const snapFile = getCacheFilePath(snapCam);
+      fs.writeFileSync(snapFile, Buffer.from('corrupt-jpeg'));
+      const capturedWarns = [];
+      const origWarn = log.warn;
+      log.warn = (scope, ...args) => {
+        capturedWarns.push(args.join(' '));
+      };
+      t.mock.method(childProcess, 'spawnSync', (_cmd, args) => {
+        const isDecode = Array.isArray(args) && args.includes('rawvideo') && args[args.length - 1] === 'pipe:1';
+        if (isDecode) {
+          return {
+            status: 1,
+            signal: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.from(
+              '[mjpeg @ 0x7f22] No JPEG data found in image\n' +
+                '[in#0 @ 0x7f20] Error decodingframes\n' +
+                'Conversion failed!\n'
+            ),
+            error: undefined,
+          };
+        }
+        return {
+          status: 1,
+          signal: null,
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from(
+            "[image2 @ 0x7f33] Could not open file '/config/cache/last_snap_diag_cam.jpg': Read-only file system\n" +
+              '[vost#0:0/mjpeg @ 0x7f34] Error submitting a packet to the muxer: Read-only file system\n' +
+              '[out#0/image2 @ 0x7f35] Error muxing a packet\n' +
+              '[out#0/image2 @ 0x7f35] video:24KiB audio:0KiB subtitle:0KiB other streams:0KiB ' +
+              'global headers:0KiB muxing overhead: unknown\n' +
+              'Conversion failed!\n'
+          ),
+          error: undefined,
+        };
+      });
+      try {
+        const loaded = loadCachedFrame(snapCam);
+        assert.equal(loaded.frame, null);
+        assert.equal(
+          capturedWarns.some(
+            (w) => w.includes('failed to decode cached snapshot') && w.includes('No JPEG data found in image')
+          ),
+          true,
+          'loadCachedFrame must include the underlying FFmpeg decode error'
+        );
+
+        capturedWarns.length = 0;
+        snapCam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
+        saveCachedFrame(snapCam);
+        assert.equal(
+          capturedWarns.some(
+            (w) =>
+              w.includes('failed to save cached snapshot:') &&
+              w.includes('Read-only file system') &&
+              !w.endsWith('Conversion failed!')
+          ),
+          true,
+          'saveCachedFrame must preserve the root-cause mux/open error instead of overriding with Conversion failed!'
+        );
+      } finally {
+        log.warn = origWarn;
+        fs.rmSync(snapFile, {force: true});
+      }
+    }
+  );
 });

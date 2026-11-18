@@ -1677,6 +1677,94 @@ describe('BackfillJob Event-End Aware Settlement & Clip Matching', () => {
       assert.equal(job.isExpired(tTrigger + DEFAULT_BACKFILL_MAX_AGE_MS + 1), true);
     }
   );
+
+  it('rejects timestamp-less backfill candidates on normal jobs and parses clip timestamps across TZ values', () => {
+    // Verify normal BackfillJobs reject candidates with missing clipMs (0), synthetic SIGUSR1 test jobs still
+    // accept them, and extractDatabaseRecordCandidate handles ISO, epoch, and local-path timestamps across two TZs.
+    const tTrigger = Date.parse('2026-11-05T20:07:09Z');
+    const normalJob = new BackfillJob({
+      at: tTrigger,
+      event: 'motion detected',
+      reason: 'motion detected',
+      priority: 100,
+    });
+    const urgentJob = BackfillJob.createSigUsr1TestJob(tTrigger, 'doorbell');
+    const noTsCandidate = extractDatabaseRecordCandidate({
+      device_sn: 'SN0000000001',
+      storage_path: '/media/mmcblk0p1/video/corrupt_no_ts.zxvideo',
+      cipher_id: 3,
+    });
+    assert.ok(noTsCandidate);
+    assert.equal(noTsCandidate.clipMs, 0);
+    assert.equal(
+      normalJob.matchesCandidate(noTsCandidate, new Set()),
+      false,
+      'Normal BackfillJob must reject timestamp-less candidates instead of matching arbitrary clips'
+    );
+    assert.equal(
+      urgentJob.matchesCandidate(noTsCandidate, new Set()),
+      true,
+      'Synthetic SIGUSR1 urgent test job still accepts timestamp-less candidates'
+    );
+
+    const prevTz = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      const utcIsoCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/20261105200709.zxvideo',
+        start_time: '2026-11-05T20:07:09Z',
+      });
+      const utcEpochSecCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/epoch_sec.zxvideo',
+        start_time: Math.floor(tTrigger / 1000),
+      });
+      const utcPathOnlyCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/20261105200709.zxvideo',
+      });
+      assert.equal(utcIsoCand?.clipMs, tTrigger);
+      assert.equal(utcEpochSecCand?.clipMs, tTrigger);
+      assert.equal(utcPathOnlyCand?.clipMs, tTrigger);
+      assert.equal(normalJob.matchesCandidate(utcPathOnlyCand, new Set()), true);
+
+      process.env.TZ = 'America/New_York';
+      const nyIsoCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/20261105150709.zxvideo',
+        start_time: '2026-11-05T15:07:09-05:00',
+      });
+      const nyEpochSecCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/epoch_sec.zxvideo',
+        start_time: String(Math.floor(tTrigger / 1000)),
+      });
+      const nyPathOnlyCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/20261105150709.zxvideo',
+      });
+      const nyMismatchedUtcPathCand = extractDatabaseRecordCandidate({
+        device_sn: 'SN0000000001',
+        storage_path: '/media/mmcblk0p1/video/20261105200709.zxvideo',
+      });
+      assert.equal(nyIsoCand?.clipMs, tTrigger);
+      assert.equal(nyEpochSecCand?.clipMs, tTrigger);
+      assert.equal(nyPathOnlyCand?.clipMs, tTrigger);
+      assert.equal(normalJob.matchesCandidate(nyPathOnlyCand, new Set()), true);
+      assert.equal(
+        normalJob.matchesCandidate(nyMismatchedUtcPathCand, new Set()),
+        false,
+        'Path-only timestamp is interpreted in container TZ (5h offset in America/New_York)'
+      );
+    } finally {
+      if (prevTz === undefined) {
+        process.env.TZ = '';
+      } else {
+        process.env.TZ = prevTz;
+      }
+    }
+  });
 });
 
 describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
@@ -2349,13 +2437,29 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
 
       // 2. BackfillJob strict FSM transitions: RECORDING -> SETTLING -> RECORDING -> SETTLING ->
       // READY_TO_QUERY -> MATCHED -> DOWNLOADING -> COMPLETED | EXPIRED
+      // Verify tightened transition map, refused-transition debug logs, monomorphic upgradeEvent(opts),
+      // pure isReadyToQuery/isExpired predicates vs explicit commands, and isUrgentBackfillProtectedFrom on IDLE.
       assert.ok(Object.isFrozen(BACKFILL_STATES));
       assert.ok(Object.isFrozen(ALLOWED_BACKFILL_TRANSITIONS));
       assert.equal(canTransitionBackfill(BACKFILL_STATES.RECORDING, BACKFILL_STATES.SETTLING), true);
       assert.equal(canTransitionBackfill(BACKFILL_STATES.RECORDING, BACKFILL_STATES.DOWNLOADING), false);
+      assert.equal(canTransitionBackfill(BACKFILL_STATES.READY_TO_QUERY, BACKFILL_STATES.RECORDING), false);
+      assert.equal(canTransitionBackfill(BACKFILL_STATES.READY_TO_QUERY, BACKFILL_STATES.SETTLING), false);
+      assert.equal(canTransitionBackfill(BACKFILL_STATES.MATCHED, BACKFILL_STATES.RECORDING), false);
+      assert.equal(canTransitionBackfill(BACKFILL_STATES.MATCHED, BACKFILL_STATES.SETTLING), false);
+      assert.equal(canTransitionBackfill(BACKFILL_STATES.MATCHED, BACKFILL_STATES.READY_TO_QUERY), false);
+
+      const viewerCandidate = new Camera({serial: 'SN0000000099', name: 'viewer_only', mode: 'p2p'});
+      viewerCandidate.viewUntil = 50000;
+      assert.equal(
+        cam.isUrgentBackfillProtectedFrom(viewerCandidate, 1000),
+        false,
+        'Idle camera must not report urgent backfill protection against viewer wakes'
+      );
 
       const t0 = 100000;
       const job = new BackfillJob({
+        name: 'doorbell',
         at: t0,
         event: 'motion detected',
         personName: '',
@@ -2363,10 +2467,34 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
         priority: 100,
       });
       assert.equal(job.state, BACKFILL_STATES.RECORDING);
+      assert.throws(
+        () => job.upgradeEvent(/** @type {*} */ ('person detected')),
+        TypeError,
+        'upgradeEvent must require a monomorphic options object'
+      );
+
+      const refusedDebugLines = [];
+      const prevLog = console.log;
+      initLogger('debug');
+      console.log = (line) => refusedDebugLines.push(line);
+      try {
+        assert.equal(job.transitionTo(BACKFILL_STATES.DOWNLOADING, 'illegal skip'), BACKFILL_STATES.RECORDING);
+      } finally {
+        console.log = prevLog;
+        initLogger('error');
+      }
+      assert.equal(
+        refusedDebugLines.some((line) =>
+          line.includes('refused backfill state: recording -> downloading (illegal skip)')
+        ),
+        true,
+        'Disallowed BackfillJob transition must log a refused debug message'
+      );
+
       job.markRecordingCleared(t0 + 10000, 'motion detected');
       assert.equal(job.state, BACKFILL_STATES.SETTLING);
 
-      // Companion event re-activates recording
+      // Companion event re-activates recording from SETTLING
       job.upgradeEvent({
         at: t0 + 11000,
         event: 'person detected',
@@ -2378,9 +2506,24 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
       job.markRecordingCleared(t0 + 20000, 'person detected');
       assert.equal(job.state, BACKFILL_STATES.SETTLING);
 
-      // Settle window elapses -> READY_TO_QUERY
+      // Pure predicate isReadyToQuery must not mutate state; markReadyToQueryIfSettled performs transition
       assert.equal(job.isReadyToQuery(t0 + 20000 + BACKFILL_POST_CLEAR_SETTLE_MS, 65000), true);
+      assert.equal(job.state, BACKFILL_STATES.SETTLING, 'Pure isReadyToQuery must not mutate BackfillJob state');
+      assert.equal(job.markReadyToQueryIfSettled(t0 + 20000 + BACKFILL_POST_CLEAR_SETTLE_MS, 65000), true);
       assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY);
+
+      // Once READY_TO_QUERY, upgradeEvent with recordingActive=true upgrades metadata without regressing to RECORDING
+      job.upgradeEvent({
+        at: t0 + 24500,
+        event: 'rings',
+        personName: 'Alice',
+        reason: 'rings',
+        priority: 1000,
+        recordingActive: true,
+      });
+      assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY);
+      assert.equal(job.recordingActive, false);
+      assert.equal(job.event, 'rings');
 
       const candidate = {
         devSn: 'T8161T0000000000',
@@ -2411,8 +2554,28 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
       // Follow-up query transitions DOWNLOADING -> READY_TO_QUERY
       assert.equal(job.prepareFollowUpQuery(t0 + 25000), true);
       assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY);
-      assert.equal(job.isExpired(t0 + 25000 + DEFAULT_BACKFILL_MAX_AGE_MS + 1000), true);
+
+      // Pure predicate isExpired must not mutate state; expireIfNeeded transitions to EXPIRED
+      const expiredAt = t0 + 25000 + DEFAULT_BACKFILL_MAX_AGE_MS + 1000;
+      assert.equal(job.isExpired(expiredAt), true);
+      assert.equal(job.state, BACKFILL_STATES.READY_TO_QUERY, 'Pure isExpired must not mutate BackfillJob state');
+      assert.equal(job.expireIfNeeded(expiredAt), true);
       assert.equal(job.state, BACKFILL_STATES.EXPIRED);
+
+      // Terminal EXPIRED job ignores subsequent upgradeEvent mutations
+      assert.equal(
+        job.upgradeEvent({
+          at: expiredAt + 1000,
+          event: 'identity person detected',
+          personName: 'Bob',
+          reason: 'identity person detected (Bob)',
+          priority: 5000,
+          recordingActive: true,
+        }),
+        false
+      );
+      assert.equal(job.personName, 'Alice');
+      assert.equal(job.recordingActive, false);
 
       // 3. Frigate Event Lifecycle FSM: IDLE -> QUEUED -> WAITING_SNAPSHOT -> COOLDOWN -> IDLE
       assert.ok(Object.isFrozen(FRIGATE_EVENT_STATES));
@@ -2474,7 +2637,8 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
         const logCam = new Camera({serial: 'T8214T2222222222', name: 'doorbell', mode: 'backfill'});
         logCam.queueEventBackfill(t0, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
         logCam.recordMotionCleared(t0 + 5000, 5000, 10000, 'person detected');
-        logCam.canQueryBackfill(t0 + 10000, 8000, 12000);
+        assert.equal(logCam.canQueryBackfill(t0 + 10000, 8000, 12000), true);
+        logCam.beginBackfillDatabaseQuery(t0 + 10000);
         logCam.tryMatchBackfillCandidate({
           devSn: 'T8214T2222222222',
           storagePath: '/zx/clip_log.zxvideo',
@@ -2926,6 +3090,7 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
       t0
     );
     p2pCam.gotVideo = true;
+    p2pCam.firstFrameAt = t0 + 500;
     p2pCam.lastVideoAt = t0 + 5000;
     p2pCam.markDownloadFinished(t0 + 5000);
     p2pCam.backfillClipQueue = [
@@ -3140,6 +3305,17 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
         true,
         'Returns true if backfill decoder exits with non-zero code'
       );
+      // 2. isBlockingStationBackfill & isStationIdleForBackfill predicates
+      assert.equal(
+        cam.isBlockingStationBackfill('T8030P0000000000', t0 + 1500, 5000, false),
+        true,
+        'Active P2P or in-transfer download session blocks station backfill'
+      );
+      assert.equal(
+        cam.isBlockingStationBackfill('OTHER_STATION', t0 + 1500, 5000, false),
+        false,
+        'Different station never blocks'
+      );
       cam.markDownloadFinished(t0 + 2000);
       assert.equal(
         cam.shouldLogUnexpectedDecoderExit(activeSid, 0),
@@ -3151,17 +3327,10 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
         true,
         'Returns true on non-zero exitCode even after downloadFinished'
       );
-
-      // 2. isBlockingStationBackfill & isStationIdleForBackfill predicates
       assert.equal(
         cam.isBlockingStationBackfill('T8030P0000000000', t0 + 3000, 5000, false),
-        true,
-        'Active P2P/download session blocks station backfill'
-      );
-      assert.equal(
-        cam.isBlockingStationBackfill('OTHER_STATION', t0 + 3000, 5000, false),
         false,
-        'Different station never blocks'
+        'RAM-draining backfill tail after downloadFinished unblocks station backfill'
       );
       cam.endSession(t0 + 3000, true, false, 'download');
       otherCam.sleptAt = t0 + 3000;
@@ -4671,4 +4840,958 @@ describe('API Wake Timer Replacement (Camera.scheduleApiWake)', () => {
     assert.equal(res.hasPending, true);
     assert.equal(res.isInfo, false, 'Activity cleared for queued backfill must log at debug level, not info');
   });
+
+  it('preserves settled Clip 1 queries, follow-up retry budgets, and frame drains in back-to-back backfill', () => {
+    // Regression: when Clip 1 has already cleared and elapsed its 4s settle window (or already matched a clip),
+    // a new state=true trigger for Clip 2 must not regress Job 1 back to RECORDING or overwrite Job 2 when
+    // starting a queued clip download.
+    const cam = new Camera(
+      {serial: 'T8214T6666666669', name: 'doorbell_b2b', mode: 'backfill', station_serial: 'T8030P0000000001'},
+      {frame: Buffer.alloc(FRAME, 0x22), lastSeen: '10:00'},
+      renderCameraCards
+    );
+    const t0 = 500000;
+    cam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+    cam.recordMotionCleared(t0 + 10000, 4000, 10000, 'motion detected');
+    assert.equal(cam.canQueryBackfill(t0 + 14500, 4000, 4000), true);
+    assert.equal(cam.pendingBackfill.state, BACKFILL_STATES.SETTLING);
+    assert.equal(cam.pendingBackfill.markReadyToQueryIfSettled(t0 + 14500, 4000), true);
+    assert.equal(cam.pendingBackfill.state, BACKFILL_STATES.READY_TO_QUERY);
+
+    // Trailing state=false for another property must not reset clearedAt or regress READY_TO_QUERY back to SETTLING
+    cam.recordMotionCleared(t0 + 15000, 4000, 10000, 'person detected');
+    assert.equal(cam.pendingBackfill.state, BACKFILL_STATES.READY_TO_QUERY);
+    assert.equal(cam.pendingBackfill.clearedAt, t0 + 10000);
+    assert.equal(cam.canQueryBackfill(t0 + 15500, 4000, 4000), true);
+
+    // A new trigger arriving after Clip 1 settled (t0 + 16s) keeps Job 1 ready to query Clip 1 while queuing Job 2
+    cam.queueEventBackfill(t0 + 16000, 'person detected', 'Alice', 'person detected (Alice)', 300, true);
+    assert.equal(
+      cam.canQueryBackfill(t0 + 16500, 4000, 4000),
+      true,
+      'Settled Job 1 must remain ready to query Clip 1 on HomeBase 3 even after Clip 2 trigger starts'
+    );
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T6666666669',
+        storagePath: '/zx/clip2_incomplete.zxvideo',
+        cipherId: 2,
+        clipMs: t0 + 16000,
+      }),
+      false,
+      'Settled Job 1 must not match Clip 2 while Clip 2 is still actively recording'
+    );
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T6666666669',
+        storagePath: '/zx/clip1_complete.zxvideo',
+        cipherId: 1,
+        clipMs: t0 + 1000,
+      }),
+      true
+    );
+
+    // Starting Clip 1 promotes Job 1 to activeBackfillJob and shifts Job 2 into pendingBackfill
+    cam.beginBackfillDownload(cam.backfillClip, false, t0 + 17000);
+    assert.equal(cam.activeBackfillJob?.at, t0);
+    assert.equal(cam.pendingBackfill?.at, t0 + 16000);
+    assert.equal(cam.pendingBackfill?.recordingActive, true);
+
+    // Clip 2 clears while Clip 1 is playing -> settles and becomes queryable while Clip 1 drains
+    cam.recordMotionCleared(t0 + 25000, 4000, 10000, 'person detected');
+    assert.equal(cam.pendingBackfill?.recordingActive, false);
+    assert.equal(cam.activeBackfillJob?.state, BACKFILL_STATES.DOWNLOADING);
+
+    const frame1 = Buffer.alloc(FRAME, 0x77);
+    cam.markP2pVideoPacketReceived(t0 + 17400);
+    cam.recordDecodedFrame(frame1, frame1, t0 + 17500, '10:01');
+    assert.equal(cam.lastVideoAt, t0 + 17500, 'recordDecodedFrame must update lastVideoAt on Frame 0');
+    cam.markDownloadFinished(t0 + 18000);
+    cam.detachDecoder();
+
+    // While frameNew is true on an attached writable encoder, isDownloadComplete waits for the final frame write
+    cam.attachEncoder({stdin: {writable: true, writableNeedDrain: false, write() {}}}, t0);
+    cam.frameNew = true;
+    assert.equal(
+      cam.isDownloadComplete(t0 + 29500, 3000, 2500, 4500),
+      false,
+      'Must not complete download before the final decoded frame (frameNew=true) is written to encoder stdin'
+    );
+    cam.frameNew = false;
+
+    // While pendingVideoPackets remain un-decoded, isDownloadComplete must never complete via idleCompleteMs
+    cam.pendingVideoPackets.push(Buffer.from([1, 2, 3]));
+    assert.equal(
+      cam.isDownloadComplete(t0 + 29500, 3000, 2500, 4500),
+      false,
+      'Must not complete download while pendingVideoPackets remain queued'
+    );
+    cam.pendingVideoPackets.length = 0;
+    assert.equal(cam.isDownloadComplete(t0 + 29500, 3000, 2500, 4500), true);
+
+    // Ending Clip 1 while Job 2 is waiting to query holds Clip 1's final frame (isStreamingLive=true, marker='B')
+    cam.terminateSession(t0 + 29500, 'post-event clip download stream completed', false, 'eufy/download-finished');
+    assert.equal(cam.backfillContinuation, true);
+    assert.equal(
+      cam.isStreamingLive(t0 + 29600, 2000),
+      true,
+      'Must keep holding Clip 1 final frame while waiting to query/start Clip 2 in back-to-back continuation'
+    );
+    assert.equal(cam.getFrameMarker(), FRAME_STAGE_MARKERS.BACKFILL);
+
+    // Follow-up split-clip queries must be immediately ready to query (no 4s stall) with a full retry budget
+    // (attempts=0) and support 3+ split clips in a long visit
+    const splitCam = new Camera({serial: 'T8214T6666666670', name: 'doorbell_split', mode: 'backfill'});
+    splitCam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+    splitCam.queueEventBackfill(t0 + 40000, 'person detected', '', 'person detected', 200, true);
+    splitCam.recordMotionCleared(t0 + 45000, 4000, 10000);
+    splitCam.canQueryBackfill(t0 + 50000, 4000, 4000);
+    splitCam.beginBackfillDatabaseQuery(t0 + 50000);
+    splitCam.tryMatchBackfillCandidate({
+      devSn: 'T8214T6666666670',
+      storagePath: '/zx/split1.zxvideo',
+      cipherId: 1,
+      clipMs: t0 + 1000,
+    });
+    splitCam.beginBackfillDownload(splitCam.backfillClip, false, t0 + 51000);
+    splitCam.endSession(t0 + 60000, true, false, 'download');
+    assert.equal(splitCam.pendingBackfill?.followUpQueried, true);
+    assert.equal(
+      splitCam.pendingBackfill?.attempts,
+      0,
+      'prepareFollowUpQuery must reset attempts to 0 so Clip 2 gets a full query retry budget'
+    );
+    assert.equal(
+      splitCam.canQueryBackfill(t0 + 60000, 4000, 4000),
+      true,
+      'prepareFollowUpQuery must be immediately ready to query at endSession without a redundant 4s delay'
+    );
+    assert.equal(
+      splitCam.tryMatchBackfillCandidate({
+        devSn: 'T8214T6666666670',
+        storagePath: '/zx/split2.zxvideo',
+        cipherId: 2,
+        clipMs: t0 + 21000,
+      }),
+      true
+    );
+    splitCam.beginBackfillDownload(splitCam.backfillClip, false, t0 + 61000);
+    splitCam.endSession(t0 + 70000, true, false, 'download');
+    assert.equal(
+      splitCam.pendingBackfill?.followUpQueried,
+      true,
+      'When activity extends >= 15s past Clip 2 as well, a follow-up query for Clip 3 must be scheduled'
+    );
+
+    // View max duration and early sleep must never trigger during STREAM_MODES.DOWNLOAD, and Frigate event duration
+    // must account for packets already written to decoder stdin
+    const p2pDlCam = new Camera({
+      serial: 'T8214T6666666671',
+      name: 'p2p_dl_cam',
+      mode: 'p2p',
+      view_linger_secs: 10,
+      view_max_secs: 15,
+      idle_timeout_secs: 10,
+      frigate_event_secs: 20,
+    });
+    p2pDlCam.beginBackfillDownload(
+      {
+        storagePath: '/zx/p2p_dl.zxvideo',
+        cipherId: 1,
+        clipMs: t0,
+        event: 'motion detected',
+        personName: '',
+        reason: 'motion detected',
+      },
+      false,
+      t0
+    );
+    p2pDlCam.gotVideo = true;
+    p2pDlCam.firstVideoAt = t0 + 500;
+    p2pDlCam.downloadVideoPackets = 600;
+    p2pDlCam.downloadDecodedFrames = 30;
+    p2pDlCam.downloadPlayedFrames = 15;
+    p2pDlCam.downloadFrames = new Array(15);
+    p2pDlCam.pendingVideoPackets = [];
+    assert.equal(
+      p2pDlCam.getEffectiveEventDurationSecs(15, t0 + 1500),
+      39 + DOWNLOAD_EVENT_DURATION_MARGIN_SECS,
+      'getEffectiveEventDurationSecs must account for received downloadVideoPackets already written to dec.stdin'
+    );
+    assert.equal(
+      p2pDlCam.hasReachedViewMaxDuration(t0 + 20000),
+      false,
+      'view_max_secs must never terminate a backfill download session'
+    );
+    p2pDlCam.applyMotionTrigger(t0 + 2000, 'motion detected', 60000, 'eufy-event', 10);
+    assert.equal(
+      p2pDlCam.isMotionOnlyActiveSession(t0 + 15000),
+      false,
+      'isMotionOnlyActiveSession must be false during backfill download so early-sleep never kills playback'
+    );
+  });
+
+  it('expires stale Eufy hardware triggers past max clip length and clears them on disconnect or offline', () => {
+    // Regression: when a state=false clear event is lost on a backfill camera, activeTriggerEvents previously
+    // stayed populated after DOWNLOAD endSession(), sticking hasActiveHardwareTriggers(), /api/wake routing,
+    // and subsequent BackfillJob.activeEvents indefinitely.
+    const cam = new Camera({serial: 'SN0000000072', name: 'doorbell_stale_trig', mode: 'backfill'});
+    const t0 = 1000000;
+    cam.lastMotionAt = t0;
+    cam.queueEventBackfill(t0, 'person detected', '', 'person detected', 200, true);
+    assert.equal(cam.hasActiveHardwareTriggers(t0 + 5000), true);
+
+    // Complete Clip 1 backfill download without ever receiving state=false for 'person detected'
+    cam.beginBackfillDatabaseQuery(t0 + 40000);
+    cam.tryMatchBackfillCandidate({
+      devSn: 'SN0000000072',
+      storagePath: '/zx/lost_clear_clip.zxvideo',
+      cipherId: 1,
+      clipMs: t0 + 1000,
+    });
+    cam.beginBackfillDownload(cam.backfillClip, false, t0 + 41000);
+    cam.endSession(t0 + 55000, true, false, 'download');
+
+    // Within max clip window (120s), un-cleared trigger is still considered active
+    assert.equal(cam.hasActiveHardwareTriggers(t0 + 60000), true);
+
+    // Past max clip length + margin (> 130s), stale trigger expires by clock
+    const tAfterExpiry = t0 + 131000;
+    assert.equal(
+      cam.hasActiveHardwareTriggers(tAfterExpiry),
+      false,
+      'Stale hardware trigger must expire past Eufy max clip length + margin when state=false is lost'
+    );
+    assert.equal(
+      cam.shouldBackfillOnlyOnApiWake(tAfterExpiry),
+      false,
+      'Expired hardware trigger must not force /api/wake into backfill-only mode'
+    );
+    assert.equal(
+      cam.canPiggybackExternalP2pInBackfill(tAfterExpiry),
+      true,
+      'Expired hardware trigger must allow external Eufy app P2P piggybacking again'
+    );
+
+    // A fresh motion event at t0 + 200s must not inherit the expired 'person detected' in activeEvents
+    const tFresh = t0 + 200000;
+    cam.lastMotionAt = tFresh;
+    cam.queueEventBackfill(tFresh, 'motion detected', '', 'motion detected', 10, true);
+    cam.recordMotionCleared(tFresh + 5000, 4000, 10000, 'motion detected');
+    assert.equal(
+      cam.pendingBackfill?.state,
+      BACKFILL_STATES.SETTLING,
+      'Clearing the fresh trigger must transition BackfillJob to SETTLING without stalling on expired triggers'
+    );
+    cam.clearPendingBackfill();
+
+    // Station / WebSocket disconnect clears active hardware triggers immediately
+    const tDisc = t0 + 300000;
+    cam.lastMotionAt = tDisc;
+    cam.queueEventBackfill(tDisc, 'rings', '', 'rings', 1000, true);
+    assert.equal(cam.hasActiveHardwareTriggers(tDisc + 1000), true);
+    cam.handleStationDisconnected('ws_disconnected');
+    assert.equal(
+      cam.hasActiveHardwareTriggers(tDisc + 1000),
+      false,
+      'handleStationDisconnected must clear active hardware triggers on WS/station close'
+    );
+    cam.clearPendingBackfill();
+
+    // Camera going offline clears active hardware triggers immediately
+    const tOff = t0 + 400000;
+    cam.lastMotionAt = tOff;
+    cam.queueEventBackfill(tOff, 'motion detected', '', 'motion detected', 10, true);
+    assert.equal(cam.hasActiveHardwareTriggers(tOff + 1000), true);
+    cam.applyTelemetryProperties({battery: 0, chargingStatus: 2}, true, tOff + 2000);
+    assert.equal(cam.isDeviceOffline(), true);
+    assert.equal(
+      cam.hasActiveHardwareTriggers(tOff + 2000),
+      false,
+      'Device offline transition must clear active hardware triggers'
+    );
+  });
+
+  it('defers post-backfill live wakes in chronological order across clip drains, PIR upgrades, and disconnects', () => {
+    // Regression: same-camera /api/wake during STREAM_MODES.DOWNLOAD was wiped by endSession zeroing motionUntil
+    // or decayed while Event 1 drained. Verify full-duration promotion after Event 1 (and any earlier Job 2).
+    const cam = new Camera({
+      serial: 'T8161T0000000095',
+      name: 'garage_seq',
+      mode: 'auto',
+      station_serial: 'T8030P0000000095',
+    });
+    cam.updateDiscoveredRtspConfig('T8030P0000000095', 'rtsp://192.0.2.10/live0');
+
+    const t0 = 100000;
+    cam.reason = 'event 1 clip';
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/ev1.zxvideo',
+        cipherId: 1,
+        clipMs: t0 - 15000,
+        event: 'motion detected',
+        personName: '',
+        reason: 'event 1 clip',
+      },
+      false,
+      t0
+    );
+
+    // Coalesce view + motion deferred wakes: motion wins createEvent, max duration (25s), and highest priority (250)
+    cam.schedulePostBackfillWake(
+      WakeRequest.view('viewer peek', 15000).withInitiator('api-wake').withCreateEvent(false).build(),
+      t0 + 1000
+    );
+    const coalescedDur = cam.schedulePostBackfillWake(
+      WakeRequest.motion('driveway beam', 25000)
+        .withInitiator('api-wake')
+        .withPriority(250)
+        .withCreateEvent(true)
+        .build(),
+      t0 + 2000
+    );
+    assert.equal(coalescedDur, 25000);
+    assert.equal(cam.getReason(), 'backfill: event 1 clip', 'Deferred wake must not overwrite active backfill reason');
+
+    // Finish Event 1 40s later (> 25s requested duration): deferred wake starts fresh 25s hold at t0 + 40000!
+    cam.endSession(t0 + 40000, true, false, 'download');
+    assert.equal(cam.wantsRtspWake(t0 + 40000), true);
+    assert.equal(cam.motionUntil, t0 + 65000, 'Deferred wake must grant full 25s duration starting after Event 1 ends');
+    assert.equal(cam.getReason(), 'driveway beam');
+
+    // Case 2: /api/wake at t+1s followed by Eufy PIR at t+3s during DOWNLOAD -> absorbed into Job 2 BackfillJob
+    const t2 = 300000;
+    cam.motionUntil = 0;
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/ev1_b.zxvideo',
+        cipherId: 2,
+        clipMs: t2 - 15000,
+        event: 'motion detected',
+        personName: '',
+        reason: 'ev1_b',
+      },
+      false,
+      t2
+    );
+    cam.schedulePostBackfillWake(
+      WakeRequest.motion('gate sensor', 30000)
+        .withInitiator('api-wake')
+        .withPriority(250)
+        .withCreateEvent(true)
+        .build(),
+      t2 + 1000
+    );
+    cam.queueEventBackfill(t2 + 3000, 'person detected', 'Bob', 'person detected (Bob)', 200, true);
+    assert.equal(cam.pendingBackfill?.priority, 250, 'PIR Job 2 absorbs higher priority from preceding deferred wake');
+    assert.equal(cam.pendingBackfill?.personName, 'Bob');
+    cam.recordMotionCleared(t2 + 8000, 4000, 10000, 'person detected');
+
+    // Case 3: A later /api/wake at t+20s (after Job 2 settled at t+8s) waits behind Job 2 (1 -> 2 -> 3)!
+    cam.schedulePostBackfillWake(
+      WakeRequest.motion('late sensor', 20000)
+        .withInitiator('api-wake')
+        .withPriority(250)
+        .withCreateEvent(true)
+        .build(),
+      t2 + 20000
+    );
+    cam.endSession(t2 + 21000, true, false, 'download');
+    assert.equal(
+      cam.wantsWake(t2 + 21000),
+      false,
+      'Event 3 deferred wake must wait behind Event 2 pendingBackfill to preserve 1 -> 2 -> 3 order'
+    );
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8161T0000000095',
+        storagePath: '/zx/ev2_b.zxvideo',
+        cipherId: 3,
+        clipMs: t2 + 3500,
+      }),
+      true
+    );
+    cam.beginBackfillDownload(cam.backfillClip, false, t2 + 22000);
+    cam.endSession(t2 + 30000, true, false, 'download');
+    assert.equal(
+      cam.wantsRtspWake(t2 + 30000),
+      true,
+      'Event 3 deferred wake promotes immediately once Event 2 backfill finishes'
+    );
+    assert.equal(cam.motionUntil, t2 + 50000);
+
+    // Station disconnect, offline transition, and shutdown clear any pending deferred wake
+    cam.motionUntil = 0;
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/ev1_c.zxvideo',
+        cipherId: 4,
+        clipMs: t2 + 60000,
+        event: 'motion detected',
+        personName: '',
+        reason: 'ev1_c',
+      },
+      false,
+      t2 + 70000
+    );
+    cam.schedulePostBackfillWake(
+      WakeRequest.motion('disc wake', 20000).withInitiator('api-wake').withCreateEvent(true).build(),
+      t2 + 71000
+    );
+    cam.handleStationDisconnected('ws_closed');
+    cam.endSession(t2 + 72000, false, false, 'download');
+    cam.clearPendingBackfill();
+    assert.equal(cam.wantsWake(t2 + 72000), false, 'Station disconnect clears deferred post-backfill wake');
+
+    cam.schedulePostBackfillWake(
+      WakeRequest.motion('shutdown wake', 20000).withInitiator('api-wake').withCreateEvent(true).build(),
+      t2 + 80000
+    );
+    cam.prepareForShutdown();
+    cam.endSession(t2 + 81000, true, false, 'download');
+    assert.equal(cam.wantsWake(t2 + 81000), false, 'Shutdown clears deferred post-backfill wake');
+  });
+
+  it('requires decoded Frame 0 before treating backfill downloads as complete or suppressing timeout', () => {
+    // Regression: markP2pVideoPacketReceived set gotVideo=true on the first raw compressed packet before FFmpeg's
+    // 32 KB probe decoded Frame 0, causing truncated/stalled transfers to bypass hasDownloadTimedOut and finish
+    // via isDownloadComplete after 3s without retrying.
+    const cam = new Camera({serial: 'T8214T0000000098', name: 'doorbell_probe', mode: 'backfill'});
+    const t0 = 500000;
+    cam.queueEventBackfill(t0, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+    cam.recordMotionCleared(t0 + 4000, 4000, 10000, 'person detected');
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T0000000098',
+        storagePath: '/zx/truncated.zxvideo',
+        cipherId: 9,
+        clipMs: t0 + 500,
+      }),
+      true
+    );
+
+    cam.beginBackfillDownload(cam.backfillClip, false, t0 + 10000);
+    cam.markP2pVideoPacketReceived(t0 + 10250);
+    assert.equal(cam.gotVideo, true);
+    assert.equal(cam.hasDecodedFrame(), false);
+    assert.equal(
+      cam.isDownloadComplete(t0 + 14000, 3000, 2500, 0),
+      false,
+      'Must not treat raw-packet-only download as complete after 3s idleCompleteMs without Frame 0'
+    );
+    assert.equal(cam.hasDownloadTimedOut(t0 + 25250, 15000), false);
+    assert.equal(
+      cam.hasDownloadTimedOut(t0 + 25251, 15000),
+      true,
+      'Stalled download that never decoded Frame 0 must time out past timeoutMs after last packet'
+    );
+
+    // Even if downloadFinished arrives on a corrupt 0-frame clip, completion stays false and termination re-queues it
+    cam.markDownloadFinished(t0 + 25251);
+    assert.equal(cam.isDownloadComplete(t0 + 30000, 3000, 2500, 0), false);
+    const term = cam.terminateSession(
+      t0 + 30000,
+      'post-event clip download timed out',
+      false,
+      'eufy/download-finished'
+    );
+    assert.equal(term.shouldPersistSnapshot, false, 'Must not persist snapshot on a 0-decoded-frame download');
+    assert.ok(term.sleepMsg.includes('gotVideo=false'), 'SLEEP log must report gotVideo=false when 0 frames decoded');
+    assert.equal(cam.gotVideo, false, 'Failed 0-frame download must clear gotVideo on session end');
+    assert.equal(cam.downloadedPaths.has('/zx/truncated.zxvideo'), false);
+    assert.equal(cam.backfillClip?.storagePath, '/zx/truncated.zxvideo');
+    assert.equal(cam.isReadyForBackfillDownload(t0 + 32000), false);
+    assert.equal(cam.isReadyForBackfillDownload(t0 + 34001), true);
+
+    // Retry succeeds once Frame 0 decodes via recordDecodedFrame
+    cam.beginBackfillDownload(cam.backfillClip, false, t0 + 34500);
+    const frame0 = Buffer.alloc(FRAME, 0x66);
+    cam.recordDecodedFrame(frame0, frame0, t0 + 34700, '12:05');
+    assert.equal(cam.hasDecodedFrame(), true);
+    assert.equal(cam.gotVideo, true);
+    cam.frameNew = false;
+    cam.markDownloadFinished(t0 + 35000);
+    assert.equal(cam.isDownloadComplete(t0 + 38000, 3000, 2500, 0), true);
+    const okTerm = cam.terminateSession(
+      t0 + 38000,
+      'post-event clip download stream completed',
+      false,
+      'eufy/download-finished'
+    );
+    assert.ok(okTerm.sleepMsg.includes('gotVideo=true'));
+    assert.equal(cam.downloadedPaths.has('/zx/truncated.zxvideo'), true);
+    assert.equal(cam.backfillClip, null);
+  });
+
+  it('exempts STREAM_MODES.DOWNLOAD clip playback from stream_max_secs duration caps', () => {
+    // Regression: hasReachedMaxDuration checked this.active instead of this.isActiveLiveSession(), causing
+    // stream_max_secs < 120 to cut off 90s-120s HomeBase clips mid-playback with bridge-max-limit.
+    const cam = new Camera({
+      serial: 'T8214T0000000099',
+      name: 'doorbell_max_secs',
+      mode: 'backfill',
+      hold_secs: 30,
+      stream_max_secs: 60,
+    });
+    const t0 = 800000;
+    cam.beginBackfillDownload(
+      {
+        storagePath: '/zx/long_clip_120s.zxvideo',
+        cipherId: 10,
+        clipMs: t0 - 120000,
+        event: 'person detected',
+        personName: '',
+        reason: 'person detected',
+      },
+      false,
+      t0
+    );
+    const frame0 = Buffer.alloc(FRAME, 0x77);
+    cam.recordDecodedFrame(frame0, frame0, t0 + 300, '12:10');
+    assert.equal(cam.hasReachedMaxDuration(t0 + 60000), false);
+    assert.equal(cam.hasReachedMaxDuration(t0 + 119000), false);
+    assert.equal(cam.expireMaxDurationHold(t0 + 119000), '');
+    cam.endSession(t0 + 122000, true, false, 'download');
+
+    // Live P2P/RTSP sessions on the same camera remain hard-capped at stream_max_secs (60s)
+    cam.beginSession('p2p', t0 + 130000, true);
+    assert.equal(cam.hasReachedMaxDuration(t0 + 189999), false);
+    assert.equal(cam.hasReachedMaxDuration(t0 + 190000), true);
+    assert.equal(cam.expireMaxDurationHold(t0 + 190000), 'reached max_secs limit (1m)');
+  });
+
+  it('unblocks sibling HomeBase backfill queries and downloads while a camera drains tail frames from RAM', () => {
+    // Regression: isBlockingStationBackfill checked usesP2pSlot() instead of isOccupyingStationP2pChannel(),
+    // blocking other cameras on the same HomeBase from querying or downloading clips during DRAINING_BACKFILL_TAIL.
+    const camA = new Camera({
+      serial: 'T8214T0000000101',
+      name: 'doorbell_a',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000050',
+    });
+    const camB = new Camera({
+      serial: 'T8160T0000000102',
+      name: 'porch_b',
+      mode: 'p2p',
+      station_serial: 'T8030P0000000050',
+    });
+    const allCams = [camA, camB];
+    const t0 = 900000;
+
+    camB.queueEventBackfill(t0, 'person detected', '', 'person detected', 200, true);
+    camB.recordMotionCleared(t0 + 5000, 4000, 10000, 'person detected');
+
+    // Simulate camA having a recent sleptAt (< 2s ago) before starting its backfill download
+    camA.sleptAt = t0 + 19000;
+    camA.beginBackfillDownload(
+      {
+        storagePath: '/zx/cam_a_clip1.zxvideo',
+        cipherId: 1,
+        clipMs: t0 - 10000,
+        event: 'rings',
+        personName: '',
+        reason: 'rings',
+      },
+      false,
+      t0 + 19500
+    );
+    const frame0 = Buffer.alloc(FRAME, 0x88);
+    camA.recordDecodedFrame(frame0, frame0, t0 + 19700, '12:20');
+    camA.bufferDownloadFrame(frame0, 1800);
+
+    // While camA is actively transferring over HomeBase P2P (!downloadFinished), sibling camB is blocked
+    assert.equal(camA.isBlockingStationBackfill('T8030P0000000050', t0 + 20000, 2000), true);
+    assert.equal(camB.canQueryBackfillNow(allCams, t0 + 20000, 4000, 12000, 2000), false);
+
+    // Once camA reaches DRAINING_BACKFILL_TAIL (downloadFinished=true), HomeBase P2P channel is free for camB
+    camA.markDownloadFinished(t0 + 20100);
+    assert.equal(camA.sessionState, SESSION_STATES.DRAINING_BACKFILL_TAIL);
+    assert.equal(camA.isBlockingStationBackfill('T8030P0000000050', t0 + 20200, 2000), false);
+    assert.equal(camB.canQueryBackfillNow(allCams, t0 + 20200, 4000, 12000, 2000), true);
+
+    assert.equal(
+      camB.tryMatchBackfillCandidate({
+        devSn: 'T8160T0000000102',
+        storagePath: '/zx/cam_b_clip1.zxvideo',
+        cipherId: 2,
+        clipMs: t0 + 1000,
+      }),
+      true
+    );
+    assert.equal(camB.canStartBackfillDownloadNow(allCams, t0 + 20300, 2000), true);
+    assert.equal(
+      camA.canStartBackfillDownloadNow(allCams, t0 + 20300, 2000),
+      false,
+      'Draining camA itself must not start a second download until its active clip finishes draining'
+    );
+  });
+
+  it('preserves queuedBackfillJob and active downloads when pendingBackfill expires or exhausts query attempts', () => {
+    // Regression: expirePendingBackfillIfNeeded and beginBackfillDatabaseQuery called clearPendingBackfill(),
+    // wiping queuedBackfillJob, activeBackfillJob, activeBackfillClip, and backfillClipQueue whenever Job 1
+    // yielded no HomeBase clip or expired during active playback.
+    const cam = new Camera({
+      serial: 'T8214T0000000105',
+      name: 'doorbell_queue_keep',
+      mode: 'backfill',
+      priority: 100,
+    });
+    const t0 = 1200000;
+
+    // 1. Job 1 settles -> Job 2 arrives into queuedBackfillJob -> /api/wake upgrades queuedBackfillJob ->
+    //    Job 1 exhausts all 10 query attempts -> Job 2 promotes into pendingBackfill without losing trigger state
+    cam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+    cam.recordMotionCleared(t0 + 4000, 4000, 10000, 'motion detected');
+    assert.equal(cam.beginBackfillDatabaseQuery(t0 + 9000, 10).allowed, true);
+
+    const tJob2 = t0 + 15000;
+    cam.queueEventBackfill(tJob2, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+    assert.ok(cam.queuedBackfillJob, 'Job 2 is isolated in queuedBackfillJob while Job 1 is querying');
+    assert.equal(cam.queueOrUpgradeApiWakeBackfill(tJob2 + 500, 'porch doorbell automation', {evPriority: 250}), true);
+    assert.equal(cam.queuedBackfillJob?.priority, 350, '/api/wake upgrades queuedBackfillJob priority in place');
+    assert.equal(cam.queuedBackfillJob?.reason, 'porch doorbell automation');
+    assert.equal(cam.queuedBackfillJob?.personName, 'Alice');
+
+    for (let attempt = 2; attempt <= 10; attempt++) {
+      assert.equal(cam.beginBackfillDatabaseQuery(tJob2 + attempt * 12000, 10).allowed, true);
+    }
+    const exhausted = cam.beginBackfillDatabaseQuery(tJob2 + 132000, 10);
+    assert.equal(exhausted.allowed, false);
+    assert.equal(
+      cam.pendingBackfill?.at,
+      tJob2,
+      'Exhausting Job 1 query attempts must promote queuedBackfillJob (Job 2) into pendingBackfill'
+    );
+    assert.equal(cam.queuedBackfillJob, null);
+    assert.equal(cam.lastBackfillQueryAt, 0, 'Promoted Job 2 must not inherit a 12s cooldown from exhausted Job 1');
+    assert.equal(cam.hasActiveHardwareTriggers(tJob2 + 100000), true);
+
+    // 2. While Clip 1 (activeBackfillJob + activeBackfillClip + queued Clip 1b) is actively playing in DOWNLOAD,
+    //    expiring pendingBackfill (Job 2) promotes Job 3 without wiping Clip 1, Clip 1b, or activeBackfillJob
+    const tPlay = 2000000;
+    cam.clearPendingBackfill();
+    cam.queueEventBackfill(tPlay, 'person detected', '', 'person detected', 200, true);
+    cam.recordMotionCleared(tPlay + 5000, 4000, 10000, 'person detected');
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T0000000105',
+        storagePath: '/zx/job1_part1.zxvideo',
+        cipherId: 1,
+        clipMs: tPlay + 1000,
+      }),
+      true
+    );
+    assert.equal(
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T0000000105',
+        storagePath: '/zx/job1_part2.zxvideo',
+        cipherId: 2,
+        clipMs: tPlay + 20000,
+      }),
+      true
+    );
+    const staleJob2 = new BackfillJob({
+      name: cam.getName(),
+      at: tPlay - 285000,
+      lastActivityAt: tPlay - 285000,
+      event: 'rings',
+      personName: '',
+      reason: 'stale job 2',
+      priority: 1200,
+      attempts: 1,
+      recordingActive: false,
+      clearedAt: tPlay - 280000,
+    });
+    cam.queuedBackfillJob = staleJob2;
+    cam.beginBackfillDownload(cam.backfillClip, false, tPlay + 10000);
+    assert.equal(cam.pendingBackfill, staleJob2);
+    assert.equal(cam.backfillClip?.storagePath, '/zx/job1_part2.zxvideo');
+
+    // Queue fresh Job 3 behind staleJob2 while Clip 1 is playing
+    const tJob3 = tPlay + 12000;
+    cam.queueEventBackfill(tJob3, 'rings', '', 'rings', 1000, true);
+    cam.recordMotionCleared(tJob3 + 3000, 4000, 10000, 'rings');
+    assert.equal(cam.queuedBackfillJob?.at, tJob3);
+
+    // Advance past staleJob2's 300s max age while Clip 1 is still active -> staleJob2 expires, Job 3 promotes,
+    // and activeBackfillJob + activeBackfillClip + backfillClipQueue ('/zx/job1_part2.zxvideo') remain intact!
+    const expiredReason = cam.expirePendingBackfillIfNeeded(tPlay + 20000, 4000);
+    assert.equal(expiredReason, 'stale job 2');
+    assert.ok(cam.activeBackfillJob, 'Active download BackfillJob must remain intact when pendingBackfill expires');
+    assert.equal(
+      cam.activeBackfillClip?.storagePath,
+      '/zx/job1_part1.zxvideo',
+      'Active download clip must remain intact so interrupted transfers can still re-queue'
+    );
+    assert.equal(
+      cam.backfillClip?.storagePath,
+      '/zx/job1_part2.zxvideo',
+      'Remaining matched split clip in backfillClipQueue must remain intact when pendingBackfill expires'
+    );
+    assert.equal(
+      cam.pendingBackfill?.at,
+      tJob3,
+      'Expiring pendingBackfill must promote queuedBackfillJob (Job 3) into pendingBackfill'
+    );
+    assert.equal(cam.queuedBackfillJob, null);
+  });
+
+  it('paces backfill queries across sibling cameras on the same HomeBase while isolating other stations', () => {
+    // Regression: tracking lastBackfillQueryAt only per camera let sibling cameras on the same HomeBase hammer
+    // station.connect + database_query_* back-to-back within the 4s cooldown and starved equal-priority siblings.
+    const t0 = 5000000;
+    const camA = new Camera({
+      serial: 'T8214T0000000201',
+      name: 'hb1_doorbell',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000201',
+    });
+    const camB = new Camera({
+      serial: 'T8160T0000000202',
+      name: 'hb1_yard',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000201',
+    });
+    const camOtherStation = new Camera({
+      serial: 'T8160T0000000203',
+      name: 'hb2_garage',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000202',
+    });
+    const allCams = [camA, camB, camOtherStation];
+
+    for (const c of allCams) {
+      c.queueEventBackfill(t0 - 20000, 'person detected', '', 'person detected', 200, true);
+      c.recordMotionCleared(t0 - 15000, 4000, 10000, 'person detected');
+    }
+
+    assert.equal(camA.canQueryBackfillNow(allCams, t0, 4000, 4000, 2000), true);
+    assert.equal(camB.canQueryBackfillNow(allCams, t0, 4000, 4000, 2000), true);
+
+    // camA queries HomeBase 1 at t0
+    assert.equal(camA.beginBackfillDatabaseQuery(t0, 10).allowed, true);
+    assert.equal(camB.lastBackfillQueryAt, 0);
+
+    // Within 4000ms of camA's query, sibling camB on HomeBase 1 is paced, while HomeBase 2 is unaffected
+    assert.equal(
+      camB.canQueryBackfillNow(allCams, t0 + 1000, 4000, 4000, 2000),
+      false,
+      'Sibling camera on same HomeBase must wait for the 4000ms station query cooldown'
+    );
+    assert.equal(camB.canQueryBackfillNow(allCams, t0 + 3999, 4000, 4000, 2000), false);
+    assert.equal(
+      camOtherStation.canQueryBackfillNow(allCams, t0 + 1000, 4000, 4000, 2000),
+      true,
+      'Camera on a different HomeBase station must not be paced by HomeBase 1 query cooldown'
+    );
+
+    // At t0 + 4000ms, both camA and camB are eligible again, and equal-priority round-robin picks camB next
+    assert.equal(camB.canQueryBackfillNow(allCams, t0 + 4000, 4000, 4000, 2000), true);
+    const ordered = [camA, camB].sort(Camera.compareBackfillPriority);
+    assert.equal(ordered[0], camB, 'Equal-priority cameras must round-robin by oldest lastBackfillQueryAt');
+
+    // Urgent SIGUSR1 test backfill bypasses sibling query pacing
+    camB.prepareSigUsr1BackfillTest(t0 + 4100);
+    assert.equal(camA.beginBackfillDatabaseQuery(t0 + 4100, 10).allowed, true);
+    assert.equal(camB.canQueryBackfillNow(allCams, t0 + 4200, 4000, 4000, 2000), true);
+  });
+
+  it(
+    'distinguishes direct RTSP handshake/protocol failures from network unreachability ' +
+      'in evaluateRtspDirectDrop()',
+    () => {
+      // Regression: evaluateRtspDirectDrop() reported "direct RTSP endpoint unreachable (Error opening input files:
+      // Invalid data found when processing input)" even when TCP connected and the camera closed or rejected the RTSP
+      // handshake; must explain closed/invalid RTSP replies and distinguish handshake rejections from unreachable IPs.
+      const cam = new Camera({
+        name: 'kids_room_camera',
+        mode: 'rtsp',
+        rtsp_url: 'rtsp://viewer:secret@192.0.2.77:554/live0',
+      });
+
+      // 1. Bare FFmpeg AVERROR_INVALIDDATA on RTSP open (camera accepted TCP then closed/reset before valid RTSP reply)
+      cam.beginRtspDirectProbeSession(1000);
+      const eofDrop = cam.evaluateRtspDirectDrop(
+        1,
+        '[in#0 @ 0x55c2] Error opening input: Invalid data found when processing input'
+      );
+      assert.equal(eofDrop.isReachableStandby, false);
+      assert.equal(eofDrop.disruptionChanged, true);
+      assert.equal(eofDrop.statusLog.includes('direct RTSP handshake failed'), true);
+      assert.equal(eofDrop.statusLog.includes('RTSP server closed connection or sent invalid reply'), true);
+      assert.equal(eofDrop.statusLog.includes('endpoint unreachable'), false);
+      assert.equal(eofDrop.statusLog.includes('-> Disconnected'), true);
+
+      // 2. Restore connected health, then test explicit RTSP 453 / 401 protocol rejection
+      cam.markRtspFrameReceived(2000);
+      cam.endSession(3000, true, false, 'rtsp');
+      cam.beginRtspDirectProbeSession(8000);
+      const protoDrop = cam.evaluateRtspDirectDrop(
+        1,
+        '[rtsp @ 0x7f12] method DESCRIBE failed: 453 Not Enough Bandwidth'
+      );
+      assert.equal(protoDrop.isReachableStandby, false);
+      assert.equal(protoDrop.disruptionChanged, true);
+      assert.equal(
+        protoDrop.statusLog,
+        'direct RTSP handshake failed ' +
+          '([rtsp @ 0x7f12] method DESCRIBE failed: 453 Not Enough Bandwidth) -> Disconnected'
+      );
+
+      // 3. Restore connected health, then test genuine network unreachability (Connection refused / timeout)
+      cam.markRtspFrameReceived(9000);
+      cam.endSession(10000, true, false, 'rtsp');
+      cam.beginRtspDirectProbeSession(15000);
+      const netDrop = cam.evaluateRtspDirectDrop(
+        1,
+        '[tcp @ 0x7f12] Connection to tcp://192.0.2.77:554 failed: Connection refused'
+      );
+      assert.equal(netDrop.isReachableStandby, false);
+      assert.equal(netDrop.disruptionChanged, true);
+      assert.equal(
+        netDrop.statusLog,
+        'direct RTSP endpoint unreachable ([tcp @ 0x7f12] Connection to tcp://192.0.2.77:554 failed: Connection refused) -> Disconnected'
+      );
+
+      // 4. Standby 404 Not Found transitions back to Asleep
+      const standbyDrop = cam.evaluateRtspDirectDrop(1, '[rtsp @ 0x7f12] method DESCRIBE failed: 404 Not Found');
+      assert.equal(standbyDrop.isReachableStandby, true);
+      assert.equal(standbyDrop.disruptionChanged, true);
+      assert.equal(standbyDrop.statusLog, 'direct RTSP endpoint reachable in standby (404 Not Found) -> Asleep');
+    }
+  );
+
+  it(
+    'builds immutable per-camera runtime status summaries for direct rtsp_url and Eufy battery ' +
+      'cameras without mutating FSM state',
+    () => {
+      // Verify Camera.toStatusSummary() exposes full runtime state, live telemetry, encoder codec/fallback,
+      // reachability, and null-filtered Eufy fields on direct rtsp_url cameras without mutating cooldown FSMs.
+      const t0 = 100000;
+      const directCam = new Camera(
+        {
+          name: 'play_mat_camera',
+          title: 'Play Mat Camera',
+          mode: 'rtsp',
+          rtsp_url: 'rtsp://viewer:secret@192.0.2.51/live0',
+        },
+        {frame: Buffer.alloc(FRAME, 0x10), lastSeen: '19:27'}
+      );
+
+      // 1. Direct rtsp_url camera streaming live video
+      directCam.beginSession('rtsp', t0, true);
+      directCam.wakeInitiator = 'viewer';
+      directCam.reason = 'rtsp direct stream';
+      directCam.markRtspFrameReceived(t0 + 400);
+      directCam.videoCodec = 'h264';
+      directCam.videoWidth = 1920;
+      directCam.videoHeight = 1080;
+
+      const directLive = directCam.toStatusSummary(t0 + 5000);
+      assert.equal(Object.isFrozen(directLive), true);
+      assert.equal(directLive.name, 'play_mat_camera');
+      assert.equal(directLive.serial, null);
+      assert.equal(directLive.title, 'Play Mat Camera');
+      assert.equal(directLive.station_serial, null);
+      assert.equal(directLive.rtsp_direct, true);
+      assert.equal(directLive.rtsp_url, 'rtsp://***@192.0.2.51/live0');
+      assert.equal(directLive.status, 'live');
+      assert.equal(directLive.session_state, 'streaming_live');
+      assert.equal(directLive.reachable, true);
+      assert.equal(directLive.disrupted, false);
+      assert.equal(directLive.offline, false);
+      assert.equal(directLive.offline_reason, null);
+      assert.equal(directLive.last_seen, '19:27');
+      assert.equal(directLive.services.ws_connected, null);
+      assert.equal(directLive.services.station_connected, null);
+      assert.equal(directLive.services.endpoint_reachable, true);
+      assert.equal(directLive.session.active_mode, 'rtsp');
+      assert.equal(directLive.session.hold_remaining_secs, null);
+      assert.equal(directLive.session.resolution, '1920x1080');
+      assert.equal(directLive.session.video_codec, 'h264');
+      assert.equal(directLive.telemetry, null);
+      assert.equal(directLive.backfill, null);
+      assert.equal(directLive.triggers, null);
+
+      // 2. Unreachable direct rtsp_url camera stays disconnected even during passive 5s probe
+      directCam.endSession(t0 + 6000, true, false, 'rtsp');
+      directCam.recordRtspDirectProbeFailure('Connection refused');
+      directCam.beginRtspDirectProbeSession(t0 + 11000);
+      const directProbe = directCam.toStatusSummary(t0 + 11500);
+      assert.equal(directProbe.passive_probe, true);
+      assert.equal(directProbe.status, 'disconnected');
+      assert.equal(directProbe.reachable, false);
+      assert.equal(directProbe.disrupted, true);
+      assert.equal(directProbe.services.endpoint_reachable, false);
+
+      // 3. Eufy battery camera preserves model/firmware/telemetry even with card_theme="minimal"
+      const eufyCam = new Camera({
+        serial: 'T8161T0000000088',
+        name: 'storage_cam',
+        title: 'Storage Room Camera',
+        station_serial: 'T8030T0000000088',
+        mode: 'auto',
+        card_theme: 'minimal',
+      });
+      eufyCam.updateDiscoveredRtspConfig('T8030T0000000088', 'rtsp://admin:pw@192.0.2.187/live1');
+      eufyCam.applyTelemetryProperties(
+        {
+          state: 1,
+          model: 'T8161',
+          softwareVersion: '3.4.3.0',
+          battery: 25,
+          chargingStatus: 2,
+          wifiSignalLevel: 2,
+          wifiRssi: -74,
+          temperature: 18,
+          light: false,
+          powerWorkingMode: 2,
+          recordingClipLength: 60,
+          recordingEndClipMotionStops: false,
+          videoStreamingQuality: 7,
+        },
+        false,
+        t0
+      );
+
+      const eufyEco = eufyCam.toStatusSummary(t0 + 1000);
+      assert.equal(eufyEco.status, 'low_battery');
+      assert.equal(eufyEco.reachable, true);
+      assert.equal(eufyEco.disrupted, false);
+      assert.equal(eufyEco.rtsp_url, 'rtsp://***@192.0.2.187/live1');
+      assert.equal(eufyEco.services.ws_connected, true);
+      assert.equal(eufyEco.services.station_connected, true);
+      assert.equal(eufyEco.services.endpoint_reachable, null);
+      assert.equal(eufyEco.telemetry.model, 'T8161');
+      assert.equal(eufyEco.telemetry.firmware, '3.4.3.0');
+      assert.equal(eufyEco.telemetry.battery_pct, 25);
+      assert.equal(eufyEco.telemetry.charging, false);
+      assert.equal(eufyEco.telemetry.power_source, 'battery');
+      assert.equal(eufyEco.telemetry.low_battery, true);
+      assert.equal(eufyEco.telemetry.critical_battery, false);
+      assert.equal(eufyEco.telemetry.wifi_signal, 2);
+      assert.equal(eufyEco.telemetry.rssi_dbm, -74);
+      assert.equal(eufyEco.telemetry.temperature_c, 18);
+      assert.equal(eufyEco.telemetry.hardware_settings.power_working_mode, 2);
+      assert.equal(eufyEco.telemetry.hardware_settings.streaming_quality, 7);
+
+      // 4. Cooldown expiry in toStatusSummary() is pure (does not mutate sessionState or evState)
+      eufyCam.beginSession('rtsp', t0 + 2000, true);
+      eufyCam.markRtspFrameReceived(t0 + 2500);
+      eufyCam.endSession(t0 + 4000, true, false, 'rtsp');
+      eufyCam.evState = 'cooldown';
+      eufyCam.evUntil = t0 + 5000;
+      assert.equal(eufyCam.sessionState, 'cooldown');
+      const postCooldown = eufyCam.toStatusSummary(t0 + 20000);
+      assert.equal(postCooldown.session_state, 'idle');
+      assert.equal(postCooldown.frigate_event.state, 'idle');
+      assert.equal(eufyCam.sessionState, 'cooldown', 'toStatusSummary must not mutate sessionState');
+      assert.equal(eufyCam.evState, 'cooldown', 'toStatusSummary must not mutate evState');
+
+      // 5. Encoder hwaccel fallback reporting
+      eufyCam.disableHwaccel();
+      assert.equal(eufyCam.toStatusSummary(t0 + 20000).encoder.codec, 'libx264');
+    }
+  );
 });

@@ -20,7 +20,7 @@ const {
   STREAM_MODES,
   sleep,
 } = require('../config');
-const {log} = require('../logger');
+const {log, formatErrorMessage} = require('../logger');
 const {WAKE_KINDS} = require('../domain/camera');
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {OFFLINE_SNAPSHOT_SEED_MS, pushFrameToEncoder, seedOfflineCameraSnapshots} = require('../media/encoder');
@@ -43,7 +43,7 @@ const MIN_SNAPSHOT_WAIT_LOOPS = 125;
 
 const CLEAN_SNAPSHOT_INJECT_DELAY_MS = 450;
 const REVIEW_LOOKUP_DELAY_MS = 1500;
-const ERROR_SNIPPET_MAX_CHARS = 200;
+const ERROR_SNIPPET_MAX_CHARS = 1024;
 const REVIEW_QUERY_LIMIT = 5;
 const ACTIVE_EVENTS_QUERY_LIMIT = 10;
 const INTERNAL_RECORDER_USER_AGENT_REGEX = /FFmpeg Frigate|^go2rtc/i;
@@ -61,6 +61,9 @@ let frigateApiDown = false;
 let go2rtcApiDown = false;
 let lastMaskCheckAt = Date.now();
 let isPollingViewers = false;
+
+const isFrigateConnected = () => !frigateApiDown;
+const isGo2rtcConnected = () => !go2rtcApiDown;
 
 /**
  * Updates upstream service connectivity flags on all cameras and re-renders sleeping cards when changed.
@@ -162,7 +165,7 @@ function isFrigateMaskIntact(maskEntry, expectedPoly) {
 function resolveFrigateEventLabel(ev, labelMap = LABELS) {
   const text = String(ev || '');
   for (const [keyword, mappedLabel] of labelMap) {
-    if (text.includes(keyword)) {
+    if (text === mappedLabel || text.includes(keyword)) {
       return mappedLabel;
     }
   }
@@ -189,6 +192,22 @@ function computeRequiredSnapshotDelay(
 }
 
 /**
+ * Reads a bounded diagnostic body snippet from a failed HTTP Response when available.
+ *
+ * @param {{ status: number, text?: () => Promise<string> }} res - Fetch response object.
+ * @returns {Promise<string>}
+ */
+async function readHttpErrorSnippet(res) {
+  if (!res || typeof res.text !== 'function') {
+    return '';
+  }
+  const raw = await res.text().catch(() => '');
+  return String(raw || '')
+    .trim()
+    .slice(0, ERROR_SNIPPET_MAX_CHARS);
+}
+
+/**
  * Deletes the bridge-created eufy_bridge_card mask entry from a single Frigate camera section.
  *
  * @param {Camera} cam - Camera state object.
@@ -206,13 +225,13 @@ async function deleteFrigateMaskSection(cam, section, frigateUrl = cfg.frigate_u
       body: JSON.stringify(deletePayload),
     });
     if (!res.ok) {
-      const errText = (await res.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
+      const errText = await readHttpErrorSnippet(res);
       log.warn(cam, 'could not delete Frigate ' + section + '.mask (HTTP ' + res.status + '): ' + errText);
       return 'failed';
     }
     return 'deleted';
   } catch (err) {
-    log.warn(cam, 'failed to delete Frigate ' + section + '.mask: ' + err.message);
+    log.warn(cam, 'failed to delete Frigate ' + section + '.mask: ' + formatErrorMessage(err));
     return 'failed';
   }
 }
@@ -261,6 +280,7 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly, frigateU
     if (putRes.ok) {
       return 'applied';
     }
+    const errText = await readHttpErrorSnippet(putRes);
 
     const legacyUrl =
       frigateUrl +
@@ -270,15 +290,22 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly, frigateU
       section +
       '.mask=' +
       encodeURIComponent(poly);
-    const legRes = await fetch(legacyUrl, {
-      method: 'PUT',
-      signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
-    });
-    if (legRes.ok) {
-      return 'applied';
+    let legacyFailureSuffix = '';
+    try {
+      const legRes = await fetch(legacyUrl, {
+        method: 'PUT',
+        signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
+      });
+      if (legRes.ok) {
+        return 'applied';
+      }
+      if (legRes.status !== putRes.status) {
+        legacyFailureSuffix = '; legacy fallback HTTP ' + legRes.status;
+      }
+    } catch (legErr) {
+      legacyFailureSuffix = '; legacy fallback failed: ' + formatErrorMessage(legErr);
     }
 
-    const errText = (await putRes.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
     log.warn(
       cam,
       'could not auto-apply Frigate ' +
@@ -287,13 +314,14 @@ async function syncSingleFrigateMaskSection(cam, camCfg, section, poly, frigateU
         putRes.status +
         '): ' +
         errText +
+        legacyFailureSuffix +
         ' (calculated mask=' +
         poly +
         ')'
     );
     return 'failed';
   } catch (err) {
-    log.warn(cam, 'error syncing Frigate ' + section + '.mask (' + poly + '): ' + err.message);
+    log.warn(cam, 'error syncing Frigate ' + section + '.mask (' + poly + '): ' + formatErrorMessage(err));
     return 'failed';
   }
 }
@@ -342,12 +370,13 @@ async function syncFrigateMotionMasks(cams, forceResync = false, shuttingDown = 
     try {
       const r = await fetch(frigateUrl + '/api/config', {signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS)});
       if (!r.ok) {
-        markFrigateApiDown('HTTP ' + r.status);
+        const snippet = await readHttpErrorSnippet(r);
+        markFrigateApiDown('HTTP ' + r.status + (snippet ? ': ' + snippet : ''));
         return;
       }
       frigateCfg = await r.json();
     } catch (err) {
-      markFrigateApiDown(err && err.message ? err.message : String(err));
+      markFrigateApiDown(formatErrorMessage(err));
       return;
     }
 
@@ -482,6 +511,35 @@ async function lookupFrigateReviewId(cameraName, eventId) {
 }
 
 /**
+ * Polls until the camera has decoded sustained video (or the wait loop elapses while still active),
+ * returning `{ aborted: true, noVideo: true }` if the pending event was aborted when the session ended without video.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @param {number} waitId - Frigate event wait token captured when queued.
+ * @returns {Promise<{ aborted: boolean, noVideo: boolean }>}
+ */
+async function waitForFrigateEventSnapshot(cam, waitId) {
+  const requiredDelayMs = computeRequiredSnapshotDelay(cam.getActiveMode());
+  const needsWait = () =>
+    cam.shouldWaitForEventSnapshot(Date.now(), requiredDelayMs, FRESH_LIVE_FRAME_MS, RECENT_VIDEO_FALLBACK_MS);
+  const maxWaitLoops = Math.max(
+    MIN_SNAPSHOT_WAIT_LOOPS,
+    Math.ceil((SNAP_DELAY_MS + SNAPSHOT_EXTRA_WAIT_MS) / SNAPSHOT_POLL_INTERVAL_MS)
+  );
+  for (
+    let i = 0;
+    i < maxWaitLoops && cam.isFrigateSnapshotWaitActive(waitId) && cam.isSessionActive() && needsWait();
+    i++
+  ) {
+    await sleep(SNAPSHOT_POLL_INTERVAL_MS);
+  }
+  if (!cam.isFrigateSnapshotWaitActive(waitId)) {
+    return {aborted: true, noVideo: true};
+  }
+  return {aborted: false, noVideo: needsWait()};
+}
+
+/**
  * Files an external detection event in Frigate via its HTTP API and notifies Home Assistant.
  *
  * @param {Camera} cam - Camera state object.
@@ -510,34 +568,31 @@ function frigateEvent(cam, ev, personName = '') {
     default:
       break;
   }
+  const waitId = cam.getFrigateEventWaitId();
   const timer = setTimeout(async () => {
-    cam.beginFrigateSnapshotWait();
+    if (!cam.beginFrigateSnapshotWait(waitId)) {
+      return;
+    }
     void notifyHA(cam);
 
-    const requiredDelayMs = computeRequiredSnapshotDelay(cam.getActiveMode());
-    const needsWait = () =>
-      cam.shouldWaitForEventSnapshot(Date.now(), requiredDelayMs, FRESH_LIVE_FRAME_MS, RECENT_VIDEO_FALLBACK_MS);
-
-    const maxWaitLoops = Math.max(
-      MIN_SNAPSHOT_WAIT_LOOPS,
-      Math.ceil((SNAP_DELAY_MS + SNAPSHOT_EXTRA_WAIT_MS) / SNAPSHOT_POLL_INTERVAL_MS)
-    );
-    for (let i = 0; i < maxWaitLoops && cam.isSessionActive() && needsWait(); i++) {
-      await sleep(SNAPSHOT_POLL_INTERVAL_MS);
+    const {aborted, noVideo} = await waitForFrigateEventSnapshot(cam, waitId);
+    if (aborted) {
+      return;
     }
-
-    const noVideo = needsWait();
     let injectedCleanSnapshot = false;
-    if (cam.canInjectCleanEventSnapshot(noVideo)) {
-      cam.enableCleanSnapshotCardSuppression(Date.now(), KEYFRAME_BURST_MS);
-      injectedCleanSnapshot = true;
-      pushFrameToEncoder(cam, Date.now());
-      await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
-    }
-    const {finalLabel, finalPerson, subLabel, durationSecs} = cam.completeFrigateEventFiling(Date.now(), LIVE_FPS);
-    const camName = cam.getName();
 
     try {
+      if (cam.canInjectCleanEventSnapshot(noVideo)) {
+        cam.enableCleanSnapshotCardSuppression(Date.now(), KEYFRAME_BURST_MS);
+        injectedCleanSnapshot = true;
+        pushFrameToEncoder(cam, Date.now());
+        await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
+        if (!cam.isFrigateSnapshotWaitActive(waitId)) {
+          return;
+        }
+      }
+      const {finalLabel, finalPerson, subLabel, durationSecs} = cam.completeFrigateEventFiling(Date.now(), LIVE_FPS);
+      const camName = cam.getName();
       const createUrl = cfg.frigate_url + '/api/events/' + camName + '/' + finalLabel + '/create';
       const createBody = {
         source_type: 'api',
@@ -552,8 +607,11 @@ function frigateEvent(cam, ev, personName = '') {
         body: JSON.stringify(createBody),
       });
       if (!r.ok) {
-        const errBody = (await r.text()).slice(0, ERROR_SNIPPET_MAX_CHARS);
-        log.error(cam, 'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + ' ' + errBody + ')');
+        const errBody = await readHttpErrorSnippet(r);
+        log.error(
+          cam,
+          'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + (errBody ? ' ' + errBody : '') + ')'
+        );
         return;
       }
       const resJson = await r.json();
@@ -579,7 +637,7 @@ function frigateEvent(cam, ev, personName = '') {
       const reviewId = await lookupFrigateReviewId(camName, eventId);
       notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
-      log.error(cam, 'Frigate event failed: ' + err.message);
+      log.error(cam, 'Frigate event failed: ' + formatErrorMessage(err));
     } finally {
       if (injectedCleanSnapshot) {
         cam.disableCleanSnapshotCardSuppression();
@@ -715,12 +773,15 @@ async function pollViewers(cams, hooks) {
 
     let anyPollOk = false;
     let allPollsFailed = true;
+    let lastPollError = '';
     for (const cam of cams) {
       try {
         const r = await fetch(cfg.go2rtc_url + '/api/streams?src=' + cam.getName(), {
           signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS),
         });
         if (!r.ok) {
+          const snippet = await readHttpErrorSnippet(r);
+          lastPollError = 'HTTP ' + r.status + (snippet ? ': ' + snippet : '');
           continue;
         }
         allPollsFailed = false;
@@ -760,15 +821,21 @@ async function pollViewers(cams, hooks) {
           );
         }
       } catch (err) {
-        // Ignore transient errors while go2rtc/Frigate is restarting.
+        lastPollError = formatErrorMessage(err);
       }
     }
     if (allPollsFailed && cams.length > 0) {
       const wasGo2rtcApiDown = go2rtcApiDown;
       go2rtcApiDown = true;
       syncServiceHealthFlags(cams, {go2rtcConnected: false});
+      const reasonSuffix = lastPollError ? ', ' + lastPollError : '';
       if (!wasGo2rtcApiDown) {
-        log.warn('bridge', 'go2rtc API unreachable (' + cfg.go2rtc_url + '), keeping encoders running and retrying');
+        log.warn(
+          'bridge',
+          'go2rtc API unreachable (' + cfg.go2rtc_url + reasonSuffix + '), keeping encoders running and retrying'
+        );
+      } else {
+        log.debug('bridge', 'go2rtc API still unreachable (' + cfg.go2rtc_url + reasonSuffix + ')');
       }
     } else if (anyPollOk) {
       const wasGo2rtcApiDown = go2rtcApiDown;
@@ -865,6 +932,8 @@ async function pollViewers(cams, hooks) {
 
 module.exports = {
   BACKFILL_SNAP_DELAY_MS,
+  isFrigateConnected,
+  isGo2rtcConnected,
   buildFrigateMaskPayload,
   buildFrigateMaskDeletePayload,
   isFrigateMaskIntact,

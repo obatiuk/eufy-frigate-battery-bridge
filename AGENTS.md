@@ -8,15 +8,16 @@ Global skills apply (`tdd-workflow`, `nodejs-development`, `markdown`, `git-comm
 `project-docs-hygiene`). This file holds only what is specific to this project. Step-by-step procedures live in the
 project skill `bridge-change-workflow` (`.agents/skills/`). Always capitalize Eufy in prose.
 
-## Before You Change Code
+## Before You Change or Verify Code
 
 1. Read `docs/ACCEPTANCE.md` sections 1 (mode matrix) and 3 (file and concern maps), then every
    `docs/acceptance/AT-NN.md` listed for the files and concern you change. `make check` runs all 19 locked acceptance
    tests regardless.
 2. Never edit, weaken, skip, or delete a test in `test/acceptance.test.js` unless the user explicitly asks to change
    that requirement. A requirement change edits `docs/acceptance/AT-NN.md` and its test together.
-3. Work test first: Red, verify Red, Green, then `make check` (`tsc`, `knip`, `eslint`, docs check, `node --check`,
-   and `node --test`). Use the `tdd-workflow` skill.
+3. When verifying behavior during development or investigating a request, check whether a test covers that logic; if
+   not, write one from the expected behavior (never from the code) and run it to verify the code fits the test, never
+   the reverse. Work test first (`tdd-workflow`): Red, verify Red, Green, then `make check`.
 4. If your change touches a topic in the doc map below, read that document before editing.
 
 ## Doc Map (Read When)
@@ -72,3 +73,5 @@ Do not add reference text to this file. Route it:
 - `make format-docs`: align Markdown tables and wrapping with `prettier`.
 - `make docker-build`, `make publish`: image build and publish (see `docs/operations.md`).
 - `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/healthz`: readiness probe.
+- `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/status | jq`: runtime status.
+- `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/config | jq`: active config.

@@ -63,7 +63,15 @@ const {
   buildConfigPayload,
   createHttpRequestHandler,
 } = require('../src/services/http-server');
-const {initOrchestrator, onEvent, trigger, stop, wakeCameraExternal} = require('../src/services/stream-orchestrator');
+const {
+  initOrchestrator,
+  onEvent,
+  trigger,
+  stop,
+  arbitrate,
+  runHousekeepingTick,
+  wakeCameraExternal,
+} = require('../src/services/stream-orchestrator');
 
 /**
  * Installs a mock eufy-security-ws WebSocket harness that records all outbound RPC commands
@@ -243,6 +251,32 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         false,
         'AT-01: Piggybacked Eufy app stream in backfill mode must stop immediately on "livestream stopped"'
       );
+
+      // 4. Stale hardware trigger without state=false expires after 130s or station/WS disconnect
+      const tStale = 500000;
+      garageRtspBf.lastMotionAt = tStale;
+      garageRtspBf.motionClearedAt = 0;
+      garageRtspBf.queueEventBackfill(tStale, 'motion detected', '', 'motion detected', 10, true);
+      garageRtspBf.pendingBackfill = null;
+      assert.equal(
+        garageRtspBf.shouldBackfillOnlyOnApiWake(tStale + 130000),
+        true,
+        'AT-01: Unexpired hardware trigger (<= 130s) keeps /api/wake in backfill-only mode'
+      );
+      assert.equal(
+        garageRtspBf.shouldBackfillOnlyOnApiWake(tStale + 130001),
+        false,
+        'AT-01: Stale hardware trigger (> 130s without state=false) expires so /api/wake is not stuck in backfill'
+      );
+      garageRtspBf.lastMotionAt = tStale + 200000;
+      garageRtspBf.queueEventBackfill(tStale + 200000, 'person detected', '', 'person detected', 200, true);
+      garageRtspBf.pendingBackfill = null;
+      garageRtspBf.handleStationDisconnected('ws_closed');
+      assert.equal(
+        garageRtspBf.shouldBackfillOnlyOnApiWake(tStale + 201000),
+        false,
+        'AT-01: Station/WebSocket disconnect clears active hardware triggers'
+      );
     }
   );
 
@@ -334,6 +368,24 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         doorbellBf.isSessionActive(),
         false,
         'AT-02: Piggybacked Eufy app stream on doorbell in backfill mode must stop immediately on "livestream stopped"'
+      );
+
+      // 3. Stale hardware trigger without state=false expires after 130s or device offline transition
+      const tStale = 600000;
+      doorbellBf.lastMotionAt = tStale;
+      doorbellBf.motionClearedAt = 0;
+      doorbellBf.queueEventBackfill(tStale, 'rings', '', 'rings', 1000, true);
+      doorbellBf.pendingBackfill = null;
+      assert.equal(doorbellBf.shouldBackfillOnlyOnApiWake(tStale + 130000), true);
+      assert.equal(doorbellBf.shouldBackfillOnlyOnApiWake(tStale + 130001), false);
+      doorbellBf.lastMotionAt = tStale + 200000;
+      doorbellBf.queueEventBackfill(tStale + 200000, 'rings', '', 'rings', 1000, true);
+      doorbellBf.pendingBackfill = null;
+      doorbellBf.applyTelemetryProperties({state: 3, battery: 2, chargingStatus: 2, wifiRssi: -100}, false);
+      assert.equal(
+        doorbellBf.shouldBackfillOnlyOnApiWake(tStale + 201000),
+        false,
+        'AT-02: Device offline transition clears active hardware triggers'
       );
     }
   );
@@ -1029,6 +1081,35 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       true,
       'AT-09: Viewer wake must proceed immediately during cooldown when an Eufy hardware trigger is active'
     );
+
+    const tStale = t0 + 50000;
+    p2pCam.activeTriggerEvents.clear();
+    p2pCam.lastMotionAt = tStale;
+    p2pCam.motionClearedAt = 0;
+    p2pCam.queueEventBackfill(tStale, 'person detected', '', 'person detected', 200, true);
+    p2pCam.sleptAt = tStale + 128000;
+    assert.equal(
+      p2pCam.isInViewerCooldown(tStale + 130000),
+      false,
+      'AT-09: Unexpired hardware trigger (<= 130s) bypasses post-viewer cooldown'
+    );
+    assert.equal(
+      p2pCam.isInViewerCooldown(tStale + 130001),
+      true,
+      'AT-09: Stale hardware trigger (> 130s) expires so post-viewer cooldown guards pure viewer wakes again'
+    );
+    const tDisc = tStale + 200000;
+    p2pCam.lastMotionAt = tDisc;
+    p2pCam.motionClearedAt = 0;
+    p2pCam.queueEventBackfill(tDisc, 'person detected', '', 'person detected', 200, true);
+    p2pCam.sleptAt = tDisc - 2000;
+    assert.equal(p2pCam.isInViewerCooldown(tDisc), false);
+    p2pCam.handleStationDisconnected('ws_closed');
+    assert.equal(
+      p2pCam.isInViewerCooldown(tDisc),
+      true,
+      'AT-09: Station/WebSocket disconnect clears hardware triggers and restores post-viewer cooldown'
+    );
   });
 
   it(
@@ -1295,6 +1376,42 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       // Once 60s hold_secs has elapsed since lastMotionAt and no triggers/objects are active -> sleeps cleanly!
       fullHoldCam.motionUntil = t0 + 90000;
       assert.equal(fullHoldCam.shouldRewakeRtspOnDrop(t0 + 65000), false);
+      assert.equal(fullHoldCam.hasReachedMaxDuration(t0 + 119999), false);
+      assert.equal(
+        fullHoldCam.hasReachedMaxDuration(t0 + 120000),
+        true,
+        'AT-12: Live session reaches stream_max_secs (120s) hard cap at 120000ms'
+      );
+
+      // STREAM_MODES.DOWNLOAD backfill playback must never be cut off by stream_max_secs or view_max_secs
+      const backfillCapCam = new Camera({
+        serial: 'T8214T0000000097',
+        name: 'backfill_cap_check',
+        mode: 'backfill',
+        hold_secs: 30,
+        stream_max_secs: 60,
+        view_max_secs: 45,
+      });
+      backfillCapCam.beginBackfillDownload(
+        {
+          storagePath: '/zx/long_120s.zxvideo',
+          cipherId: 1,
+          clipMs: t0 - 120000,
+          event: 'person detected',
+          personName: '',
+          reason: 'person detected',
+        },
+        false,
+        t0
+      );
+      assert.equal(
+        backfillCapCam.hasReachedMaxDuration(t0 + 115000),
+        false,
+        'AT-12: stream_max_secs (60s) must never truncate active STREAM_MODES.DOWNLOAD playback at 115s'
+      );
+      assert.equal(backfillCapCam.expireMaxDurationHold(t0 + 115000), '');
+      assert.equal(backfillCapCam.hasReachedViewMaxDuration(t0 + 115000), false);
+      backfillCapCam.endSession(t0 + 120000, true, false, 'download');
 
       // When end_early=true: motion clearing after >=10s video shortens motionUntil to now + 5s
       // and marks clean Eufy end
@@ -1454,12 +1571,48 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         false,
         'AT-13: Motion/event wake can still preempt an in-transfer backfill download'
       );
+      const siblingBfCam = new Camera({
+        serial: 'T8214T0000000098',
+        name: 'sibling_backfill_cam',
+        mode: 'backfill',
+        station_serial: 'T8030P0000000001',
+      });
+      siblingBfCam.queueEventBackfill(t0 + 10000, 'person detected', '', 'person detected', 200, true);
+      siblingBfCam.recordMotionCleared(t0 + 15000, 4000, 10000, 'person detected');
+      assert.equal(
+        siblingBfCam.canQueryBackfillNow([lowCam, siblingBfCam], t0 + 31000, 4000, 12000, 2000),
+        false,
+        'AT-13: Sibling HomeBase backfill query must wait while lowCam is actively transferring over P2P'
+      );
+      lowCam.markP2pVideoPacketReceived(t0 + 31500);
+      lowCam.recordDecodedFrame(frameBuf, frameBuf, t0 + 31500, '12:01');
+      lowCam.bufferDownloadFrame(frameBuf, 1800);
       lowCam.markDownloadFinished(t0 + 32000);
+      assert.equal(lowCam.sessionState, 'draining_backfill_tail');
       assert.equal(
         lowCam.isOccupyingStationP2pChannel(),
         false,
         'AT-13: Once HomeBase clip transfer finishes (downloadFinished=true, draining from RAM), station P2P ' +
           'channel is released'
+      );
+      assert.equal(
+        siblingBfCam.canQueryBackfillNow([lowCam, siblingBfCam], t0 + 32500, 4000, 12000, 2000),
+        true,
+        'AT-13: Sibling camera on same HomeBase can query backfill while lowCam drains buffered frames in RAM'
+      );
+      assert.equal(
+        siblingBfCam.tryMatchBackfillCandidate({
+          devSn: 'T8214T0000000098',
+          storagePath: '/zx/sibling_clip.zxvideo',
+          cipherId: 2,
+          clipMs: t0 + 11000,
+        }),
+        true
+      );
+      assert.equal(
+        siblingBfCam.canStartBackfillDownloadNow([lowCam, siblingBfCam], t0 + 32600, 2000),
+        true,
+        'AT-13: Sibling camera on same HomeBase can start backfill download while lowCam drains tail frames in RAM'
       );
       lowCam.endSession(t0 + 33000, true, false, 'download');
 
@@ -1540,6 +1693,47 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
           'AT-13: Fresh preemption START command must still pace subsequent external /api/wake'
         );
         assert.ok(wakeAfterPreempt.delay_ms > 0);
+
+        // Verify same-camera Eufy triggers during STREAM_MODES.DOWNLOAD never self-preempt Event 1
+        switchCamC.clearApiWakeTimer();
+        stop(switchCamB, 'reset before same-cam download check', false, 'bridge-timer');
+        switchCamB.clearP2pStopInFlight();
+        const tDl = Date.now();
+        switchCamA.reason = 'clip1 motion';
+        switchCamA.beginBackfillDownload(
+          {
+            storagePath: '/zx/camA_ev1.zxvideo',
+            cipherId: 11,
+            clipMs: tDl - 20000,
+            event: 'motion detected',
+            personName: '',
+            reason: 'clip1 motion',
+          },
+          false,
+          tDl
+        );
+        onEvent({
+          source: 'device',
+          event: 'person detected',
+          serialNumber: switchCamA.getSerial(),
+          state: true,
+        });
+        assert.equal(
+          switchCamA.activeMode,
+          'download',
+          'AT-13: Same-camera motion must never self-preempt an active backfill download'
+        );
+        assert.equal(
+          switchCamA.getReason(),
+          'backfill: clip1 motion',
+          'AT-13: Same-camera motion during backfill download must keep Event 1 reason intact'
+        );
+        assert.equal(
+          switchCamA.hasPendingBackfill(),
+          true,
+          'AT-13: Same-camera motion during backfill download queues Event 2 BackfillJob behind Event 1'
+        );
+        switchCamA.clearPendingBackfill();
       } finally {
         switchCamB.clearApiWakeTimer();
         switchCamC.clearApiWakeTimer();
@@ -1891,6 +2085,60 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       clearJob.markRecordingCleared(t0 + 5000);
       assert.equal(clearJob.isReadyToQuery(t0 + 8999, 34000), false);
       assert.equal(clearJob.isReadyToQuery(t0 + 9000, 34000), true);
+
+      // 3. Default 2s (2000ms) station P2P slot idle delay, 35s minimum fallback, and back-to-back job isolation
+      const builtCfg = new BridgeConfigBuilder({
+        cameras: [{serial: 'T8214T0000000099', name: 'doorbell'}],
+      }).build();
+      assert.equal(builtCfg.backfillDelayMs, 2000, 'AT-15: Default backfill_delay_secs is 2s (2000ms)');
+
+      const bfCam = new Camera({
+        serial: 'T8214T0000000091',
+        name: 'bf_cam',
+        mode: 'backfill',
+        hold_secs: 20,
+        station_serial: 'T8030P0000000015',
+      });
+      const p2pSibling = new Camera({
+        serial: 'T8214T0000000092',
+        name: 'p2p_sib',
+        mode: 'p2p',
+        station_serial: 'T8030P0000000015',
+      });
+      bfCam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+      assert.equal(
+        bfCam.canQueryBackfill(t0 + 34999, 4000, 12000),
+        false,
+        'AT-15: Missing state=false fallback honors 35s minimum wait when hold_secs + 4s < 35s'
+      );
+      assert.equal(bfCam.canQueryBackfill(t0 + 35000, 4000, 12000), true);
+
+      p2pSibling.sleptAt = t0 + 34000;
+      assert.equal(
+        bfCam.canQueryBackfillNow([bfCam, p2pSibling], t0 + 35999, 4000, 12000, 2000),
+        false,
+        'AT-15: Waits 2s (2000ms) after sibling P2P stream sleeps before querying HomeBase'
+      );
+      assert.equal(bfCam.canQueryBackfillNow([bfCam, p2pSibling], t0 + 36000, 4000, 12000, 2000), true);
+
+      // Settled Job 1 stays queryable when a back-to-back state=true trigger arrives for Job 2
+      const b2bCam = new Camera({
+        serial: 'T8214T0000000093',
+        name: 'b2b_cam',
+        mode: 'backfill',
+        station_serial: 'T8030P0000000015',
+      });
+      b2bCam.queueEventBackfill(t0, 'motion detected', '', 'motion detected', 10, true);
+      b2bCam.recordMotionCleared(t0 + 3000, 4000, 10000);
+      assert.equal(b2bCam.canQueryBackfill(t0 + 7000, 4000, 12000), true);
+      b2bCam.queueEventBackfill(t0 + 8000, 'person detected', '', 'person detected', 200, true);
+      assert.equal(
+        b2bCam.canQueryBackfill(t0 + 8000, 4000, 12000),
+        true,
+        'AT-15: Settled BackfillJob must remain queryable when a back-to-back state=true trigger arrives'
+      );
+      assert.equal(b2bCam.pendingBackfill?.at, t0);
+      assert.equal(b2bCam.queuedBackfillJob?.at, t0 + 8000);
     }
   );
 
@@ -1928,8 +2176,24 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         true
       );
       assert.equal(cam.pendingBackfill.personName, 'Alice');
+      assert.equal(
+        cam.canMatchDatabaseQueryResult(t0 + 2500, 4000),
+        false,
+        'AT-16: Camera actively recording must ignore station-wide database query rows before settle/timeout'
+      );
       cam.recordMotionCleared(t0 + 5000, 4000, 10000);
       assert.equal(cam.canQueryBackfill(t0 + 10000, 8000, 12000), true);
+      assert.equal(cam.canMatchDatabaseQueryResult(t0 + 10000, 4000), true);
+      assert.equal(
+        cam.tryMatchBackfillCandidate({
+          devSn: 'T8214T0000000028',
+          storagePath: '/zx/missing-ts.zxvideo',
+          cipherId: 99,
+          clipMs: 0,
+        }),
+        false,
+        'AT-16: Normal BackfillJob must reject timestamp-less database candidates (clipMs <= 0)'
+      );
 
       // Match two clips out of order -> sorted chronologically (oldest -> newest)
       cam.tryMatchBackfillCandidate({
@@ -2074,6 +2338,7 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
 
       cam.beginBackfillDownload(cam.backfillClip, false, t3 + 10000);
       cam.markP2pVideoPacketReceived(t3 + 10100);
+      handleDecodedP2pFrame(cam, scratch, t3 + 10100);
       cam.terminateSession(t3 + 10200, 'Station P2P disconnected/restarting', false, 'error/station-disconnect');
       assert.equal(
         cam.downloadedPaths.has('/zx/clip3.zxvideo'),
@@ -2096,15 +2361,64 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       // An interruption on every attempt gives up after 3 attempts like a failed start
       cam.beginBackfillDownload(cam.backfillClip, false, t3 + 14300);
       cam.markP2pVideoPacketReceived(t3 + 14400);
+      handleDecodedP2pFrame(cam, scratch, t3 + 14400);
       cam.terminateSession(t3 + 14500, 'Station P2P disconnected/restarting', false, 'error/station-disconnect');
       assert.equal(cam.backfillClip?.storagePath, '/zx/clip3.zxvideo');
       cam.beginBackfillDownload(cam.backfillClip, false, t3 + 19000);
       cam.markP2pVideoPacketReceived(t3 + 19100);
+      handleDecodedP2pFrame(cam, scratch, t3 + 19100);
       cam.terminateSession(t3 + 19200, 'Station P2P disconnected/restarting', false, 'error/station-disconnect');
       assert.equal(cam.backfillClip, null, 'AT-16: Gives up on an interrupted clip after 3 attempts');
 
-      // A finished transfer, or a completed playback that never saw the 'download finished' event, is complete
-      const t4 = t3 + 30000;
+      // A raw-packet-only transfer that never decodes Frame 0 (firstFrameAt === 0) must NOT complete after 3s idle or
+      // 'download finished', must time out after 15s, and must re-queue the clip for retry
+      const tRaw = t3 + 22000;
+      cam.queueEventBackfill(tRaw, 'motion detected', '', 'motion detected', 10, true);
+      cam.recordMotionCleared(tRaw + 5000, 4000, 10000);
+      cam.tryMatchBackfillCandidate({
+        devSn: 'T8214T0000000028',
+        storagePath: '/zx/clip0frame.zxvideo',
+        cipherId: 39,
+        clipMs: tRaw + 1000,
+      });
+      cam.beginBackfillDownload(cam.backfillClip, false, tRaw + 10000);
+      cam.markP2pVideoPacketReceived(tRaw + 10200);
+      assert.equal(
+        cam.isDownloadComplete(tRaw + 14000, 3000, 2500, 0),
+        false,
+        'AT-16: Raw compressed packets without decoded Frame 0 must not complete via 3s idle fallback'
+      );
+      assert.equal(
+        cam.hasDownloadTimedOut(tRaw + 25200, 15000),
+        false,
+        'AT-16: Download timeout waits full 15s from last packet while waiting for Frame 0'
+      );
+      assert.equal(
+        cam.hasDownloadTimedOut(tRaw + 25201, 15000),
+        true,
+        'AT-16: Stalled download without decoded Frame 0 times out after 15s even if raw packets arrived'
+      );
+      cam.markDownloadFinished(tRaw + 25201);
+      assert.equal(
+        cam.isDownloadComplete(tRaw + 29000, 3000, 2500, 0),
+        false,
+        'AT-16: downloadFinished without decoded Frame 0 must not mark playback complete'
+      );
+      cam.terminateSession(tRaw + 29000, 'post-event clip download timed out', false, 'eufy/download-finished');
+      assert.equal(
+        cam.downloadedPaths.has('/zx/clip0frame.zxvideo'),
+        false,
+        'AT-16: 0-decoded-frame transfer removes storagePath from downloadedPaths'
+      );
+      assert.equal(
+        cam.backfillClip?.storagePath,
+        '/zx/clip0frame.zxvideo',
+        'AT-16: 0-decoded-frame transfer re-queues the clip at the front of backfillClipQueue'
+      );
+      cam.clearPendingBackfill();
+
+      // Once Frame 0 has decoded, a finished transfer or 3s idle-fallback playback is complete and stays downloaded
+      const t4 = t3 + 60000;
       cam.queueEventBackfill(t4, 'motion detected', '', 'motion detected', 10, true);
       cam.recordMotionCleared(t4 + 5000, 4000, 10000);
       cam.tryMatchBackfillCandidate({
@@ -2115,6 +2429,8 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       });
       cam.beginBackfillDownload(cam.backfillClip, false, t4 + 10000);
       cam.markP2pVideoPacketReceived(t4 + 10100);
+      handleDecodedP2pFrame(cam, scratch, t4 + 10100);
+      pushFrameToEncoder(cam, t4 + 10150);
       cam.markDownloadFinished(t4 + 10200);
       cam.terminateSession(t4 + 12000, 'post-event clip download stream completed', false, 'eufy/download-finished');
       assert.equal(cam.downloadedPaths.has('/zx/clip4.zxvideo'), true, 'AT-16: Finished transfer stays downloaded');
@@ -2131,6 +2447,8 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       });
       cam.beginBackfillDownload(cam.backfillClip, false, t5 + 10000);
       cam.markP2pVideoPacketReceived(t5 + 10100);
+      handleDecodedP2pFrame(cam, scratch, t5 + 10100);
+      pushFrameToEncoder(cam, t5 + 10150);
       cam.terminateSession(t5 + 14000, 'post-event clip download stream completed', false, 'eufy/download-finished');
       assert.equal(
         cam.downloadedPaths.has('/zx/clip5.zxvideo'),
@@ -2138,6 +2456,180 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         'AT-16: Idle-fallback completion stays downloaded'
       );
       assert.equal(cam.backfillClip, null, 'AT-16: Idle-fallback completion is not re-queued');
+
+      // Split-clip follow-up queries reset the 10-attempt budget across 3+ clips without a redundant 4s settle wait
+      const tSplit = t5 + 30000;
+      cam.queueEventBackfill(tSplit, 'motion detected', '', 'motion detected', 10, true);
+      cam.queueEventBackfill(tSplit + 40000, 'person detected', '', 'person detected', 200, true);
+      cam.recordMotionCleared(tSplit + 42000, 4000, 10000);
+      for (let attempt = 1; attempt <= 9; attempt++) {
+        assert.equal(cam.beginBackfillDatabaseQuery(tSplit + 46000 + attempt * 12000, 10).allowed, true);
+      }
+      assert.equal(
+        cam.tryMatchBackfillCandidate({
+          devSn: 'T8214T0000000028',
+          storagePath: '/zx/split1.zxvideo',
+          cipherId: 6,
+          clipMs: tSplit + 1000,
+        }),
+        true
+      );
+      const tSplitPlay1 = tSplit + 170000;
+      cam.beginBackfillDownload(cam.backfillClip, false, tSplitPlay1);
+      cam.markP2pVideoPacketReceived(tSplitPlay1 + 100);
+      handleDecodedP2pFrame(cam, scratch, tSplitPlay1 + 100);
+      pushFrameToEncoder(cam, tSplitPlay1 + 200);
+      cam.markDownloadFinished(tSplitPlay1 + 300);
+      cam.endSession(tSplitPlay1 + 400, true, false, 'download');
+      assert.equal(
+        cam.canQueryBackfill(tSplitPlay1 + 400, 4000, 12000),
+        true,
+        'AT-16: Follow-up split-clip query is ready immediately without a redundant 4s settle stall'
+      );
+      assert.equal(
+        cam.pendingBackfill?.attempts,
+        0,
+        'AT-16: Follow-up split-clip query resets the 10-attempt query budget'
+      );
+      assert.equal(
+        cam.tryMatchBackfillCandidate({
+          devSn: 'T8214T0000000028',
+          storagePath: '/zx/split2.zxvideo',
+          cipherId: 7,
+          clipMs: tSplit + 20000,
+        }),
+        true
+      );
+      const tSplitPlay2 = tSplitPlay1 + 5000;
+      cam.beginBackfillDownload(cam.backfillClip, false, tSplitPlay2);
+      cam.markP2pVideoPacketReceived(tSplitPlay2 + 100);
+      handleDecodedP2pFrame(cam, scratch, tSplitPlay2 + 100);
+      pushFrameToEncoder(cam, tSplitPlay2 + 200);
+      cam.markDownloadFinished(tSplitPlay2 + 300);
+      cam.endSession(tSplitPlay2 + 400, true, false, 'download');
+      assert.equal(
+        cam.canQueryBackfill(tSplitPlay2 + 400, 4000, 12000),
+        true,
+        'AT-16: Matching Clip 2 resets followUpQueried so a 3rd split clip is also queried'
+      );
+      cam.clearPendingBackfill();
+
+      // Inter-job continuation holds Clip 1's final frame with 0s post-playback hold while Job 2 settles
+      const tCont = tSplitPlay2 + 30000;
+      const contFrame = Buffer.alloc(1382400, 0xa5);
+      cam.queueEventBackfill(tCont, 'motion detected', '', 'motion detected', 10, true);
+      cam.recordMotionCleared(tCont + 3000, 4000, 10000);
+      assert.equal(
+        cam.tryMatchBackfillCandidate({
+          devSn: 'T8214T0000000028',
+          storagePath: '/zx/cont1.zxvideo',
+          cipherId: 8,
+          clipMs: tCont + 1000,
+        }),
+        true
+      );
+      cam.beginBackfillDownload(cam.backfillClip, false, tCont + 8000);
+      cam.markP2pVideoPacketReceived(tCont + 8100);
+      handleDecodedP2pFrame(cam, contFrame, tCont + 8100);
+      pushFrameToEncoder(cam, tCont + 8200);
+      // Back-to-back Event 2 triggers while Clip 1 is playing -> queued in pendingBackfill/queuedBackfillJob
+      cam.queueEventBackfill(tCont + 8300, 'person detected', '', 'person detected', 200, true);
+      cam.markDownloadFinished(tCont + 8400);
+      assert.equal(
+        cam.isDownloadComplete(tCont + 8500, 3000, 2500, 0),
+        true,
+        'AT-16: Skips 2.5s post-playback hold when a back-to-back BackfillJob is pending'
+      );
+      cam.endSession(tCont + 8500, true, false, 'download');
+      const heldBetweenJobs = selectEncoderFrame(cam, tCont + 9000);
+      assert.notEqual(
+        heldBetweenJobs.frame,
+        cam.card.sleep,
+        'AT-16: Holds final video frame instead of flashing Asleep card while Job 2 settles'
+      );
+      assert.notEqual(
+        heldBetweenJobs.frame,
+        cam.card.busy,
+        'AT-16: Holds final video frame instead of flashing Waiting card while Job 2 settles'
+      );
+
+      // Verify auto/rtsp camera in STREAM_MODES.DOWNLOAD queues BackfillJob on hardware 'rtsp livestream started'
+      const autoDlCam = new Camera({
+        serial: 'T8161T0000000094',
+        name: 'auto_dl_cam',
+        mode: 'auto',
+        station_serial: 'T8030P0000000028',
+      });
+      autoDlCam.updateDiscoveredRtspConfig('T8030P0000000028', 'rtsp://192.0.2.10/live0');
+      initOrchestrator([autoDlCam], new Map([[autoDlCam.getSerial(), autoDlCam]]), () => false);
+      const tAutoDl = Date.now();
+      autoDlCam.beginBackfillDownload(
+        {
+          storagePath: '/zx/auto_ev1.zxvideo',
+          cipherId: 9,
+          clipMs: tAutoDl - 15000,
+          event: 'motion detected',
+          personName: '',
+          reason: 'motion detected',
+        },
+        false,
+        tAutoDl
+      );
+      onEvent({
+        source: 'device',
+        event: 'rtsp livestream started',
+        serialNumber: autoDlCam.getSerial(),
+      });
+      assert.equal(
+        autoDlCam.activeMode,
+        'download',
+        'AT-16: Hardware RTSP start on auto/rtsp camera must not interrupt active backfill download'
+      );
+      assert.equal(
+        autoDlCam.hasPendingBackfill(),
+        true,
+        'AT-16: Hardware RTSP start on auto/rtsp camera during backfill download queues Event 2 BackfillJob'
+      );
+      autoDlCam.clearPendingBackfill();
+      autoDlCam.endSession(tAutoDl + 1000, true, false, 'download');
+
+      // A 90s-120s HomeBase clip draining from RAM at 15 fps must play to completion without being terminated by
+      // runHousekeepingTick when stream_max_secs < 120 (e.g., stream_max_secs: 60)
+      const maxClipCam = new Camera({
+        serial: 'T8214T0000000096',
+        name: 'doorbell_long_clip',
+        mode: 'backfill',
+        hold_secs: 30,
+        stream_max_secs: 60,
+        station_serial: 'T8030P0000000028',
+      });
+      initOrchestrator([maxClipCam], new Map([[maxClipCam.getSerial(), maxClipCam]]), () => false);
+      const tLong = 2000000;
+      maxClipCam.beginBackfillDownload(
+        {
+          storagePath: '/zx/clip_120s.zxvideo',
+          cipherId: 12,
+          clipMs: tLong - 120000,
+          event: 'person detected',
+          personName: '',
+          reason: 'person detected',
+        },
+        false,
+        tLong
+      );
+      maxClipCam.markP2pVideoPacketReceived(tLong + 200);
+      handleDecodedP2pFrame(maxClipCam, scratch, tLong + 200);
+      handleDecodedP2pFrame(maxClipCam, scratch, tLong + 250);
+      maxClipCam.markDownloadFinished(tLong + 4000);
+      runHousekeepingTick(tLong + 95000);
+      assert.equal(
+        maxClipCam.activeMode,
+        'download',
+        'AT-16: 95s into a 120s backfill clip, runHousekeepingTick must not cut off playback at stream_max_secs (60s)'
+      );
+      assert.equal(maxClipCam.downloadedPaths.has('/zx/clip_120s.zxvideo'), true);
+      assert.equal(maxClipCam.backfillClip, null);
+      maxClipCam.endSession(tLong + 122500, true, false, 'download');
     }
   );
 
@@ -2348,6 +2840,92 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
         assert.equal(allWakeHttp.json.ok, true);
         assert.equal(allWakeHttp.json.results.find((r) => r.camera === 'nursery').status, 'unsupported');
         assert.equal(directCam.isSessionActive(), false);
+
+        // Verify /api/wake during STREAM_MODES.DOWNLOAD on rtsp/p2p cameras preserves chronological order
+        stop(rtspCam, 'reset before download wake test', false, 'bridge-test');
+        stop(p2pCam, 'reset before download wake test', false, 'bridge-test');
+        rtspCam.clearApiWakeTimer();
+        p2pCam.clearApiWakeTimer();
+        const tDlWake = Date.now();
+        rtspCam.beginSession('download', tDlWake - 100, true);
+        stop(rtspCam, 'clear station pacing before download wake test', false, 'eufy/download-finished');
+        rtspCam.beginBackfillDownload(
+          {
+            storagePath: '/zx/rtsp_ev1.zxvideo',
+            cipherId: 21,
+            clipMs: tDlWake - 20000,
+            event: 'motion detected',
+            personName: '',
+            reason: 'ev1 clip',
+          },
+          false,
+          tDlWake
+        );
+        const deferredHttp = await callWakeEndpoint(
+          'POST',
+          '/api/wake/driveway',
+          '{"duration": 20, "reason": "driveway beam", "create_event": true}'
+        );
+        assert.equal(deferredHttp.status, 200);
+        assert.equal(
+          deferredHttp.json.results[0].status,
+          'scheduled',
+          'AT-17: /api/wake on rtsp/p2p camera in backfill download without hardware trigger returns scheduled'
+        );
+        assert.equal(
+          rtspCam.activeMode,
+          'download',
+          'AT-17: /api/wake must let Event 1 backfill download finish first'
+        );
+        assert.equal(rtspCam.getReason(), 'backfill: ev1 clip');
+        // Finish Event 1 30s later (> 20s requested duration) -> Event 2 wakes live RTSP for full 20s!
+        const dlFrame = Buffer.alloc(1382400, 0x33);
+        rtspCam.markP2pVideoPacketReceived(tDlWake + 500);
+        rtspCam.recordDecodedFrame(dlFrame, dlFrame, tDlWake + 500, '12:00');
+        rtspCam.markDownloadFinished(tDlWake + 1000);
+        stop(rtspCam, 'post-event clip download stream completed', false, 'eufy/download-finished');
+        arbitrate(Date.now());
+        assert.equal(
+          rtspCam.activeMode,
+          'rtsp',
+          'AT-17: Deferred /api/wake wakes live RTSP immediately after Event 1 backfill finishes'
+        );
+        assert.equal(rtspCam.getReason(), 'driveway beam');
+        stop(rtspCam, 'cleanup deferred rtsp wake', false, 'bridge-test');
+
+        // When an unexpired Eufy hardware trigger IS recording Event 2 during DOWNLOAD, /api/wake upgrades BackfillJob
+        const tDlTrig = Date.now();
+        p2pCam.beginBackfillDownload(
+          {
+            storagePath: '/zx/p2p_ev1.zxvideo',
+            cipherId: 22,
+            clipMs: tDlTrig - 20000,
+            event: 'motion detected',
+            personName: '',
+            reason: 'ev1 doorbell',
+          },
+          false,
+          tDlTrig
+        );
+        onEvent({
+          source: 'device',
+          event: 'person detected',
+          serialNumber: p2pCam.getSerial(),
+          state: true,
+        });
+        const bfUpgradeHttp = await callWakeEndpoint(
+          'POST',
+          '/api/wake/doorbell',
+          '{"duration": 30, "reason": "porch beam", "create_event": true}'
+        );
+        assert.equal(bfUpgradeHttp.status, 200);
+        assert.equal(
+          bfUpgradeHttp.json.results[0].status,
+          'backfill',
+          'AT-17: /api/wake during backfill download with active Eufy hardware trigger stays in backfill mode'
+        );
+        assert.equal(p2pCam.pendingBackfill?.reason, 'porch beam');
+        p2pCam.clearPendingBackfill();
       } finally {
         p2pCam.clearApiWakeTimer();
         stop(rtspCam, 'cleanup', false, 'bridge-test');
@@ -2524,12 +3102,16 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       cam.frameNew = true;
       assert.equal(shouldWriteEncoderFrame(cam, true, false, false, t0 + 66), true);
 
-      // 5. Startup snapshot probe eligibility
+      // 5. Per-camera snapshot cache filename isolation (deduplicated when serial === name) and startup probe
+      assert.equal(cam.getCacheFileName(), 'last_doorbell_T8214T0000000032.jpg');
       const probeCam = new Camera(
         {serial: 'T8161T0000000033', sleep_screen: 'snapshot', startup_snapshot: true},
         {frame: null, lastSeen: ''}
       );
+      assert.equal(probeCam.getCacheFileName(), 'last_T8161T0000000033.jpg');
       assert.equal(probeCam.needsStartupSnapshot, true);
+      const directSnapCam = new Camera({name: 'nursery', rtsp_url: 'rtsp://192.0.2.10/live0'});
+      assert.equal(directSnapCam.getCacheFileName(), 'last_nursery.jpg');
     }
   );
 

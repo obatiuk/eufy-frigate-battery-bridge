@@ -22,7 +22,7 @@ const {
   STREAM_MODES,
   stripRtspUrlFragment,
 } = require('../config');
-const {log, formatLocalHm} = require('../logger');
+const {log, formatLocalHm, formatErrorMessage} = require('../logger');
 const {Camera} = require('../domain/camera');
 const {pushFrameToEncoder, FfmpegArgsBuilder} = require('./encoder');
 
@@ -402,7 +402,7 @@ const ignorePipeWriteError = () => {};
  * @param {import("child_process").ChildProcess} decoderProcess - Spawned FFmpeg decoder.
  * @param {number} sessionId - Session identifier.
  * @param {(buf: Uint8Array, now: number) => void} onCompleteFrame - Callback invoked for each complete YUV420p frame.
- * @returns {() => string} Getter returning the last line of stderr output.
+ * @returns {(includeAllLines?: boolean) => string} Getter returning cleaned stderr diagnostic line(s).
  */
 function attachDecoderStreams(cam, decoderProcess, sessionId, onCompleteFrame) {
   const frameScratchBuffer = cam.acquireDecoderReadBuffer();
@@ -439,7 +439,8 @@ function attachDecoderStreams(cam, decoderProcess, sessionId, onCompleteFrame) {
   }
 
   const stderrCollector = FfmpegArgsBuilder.attachStderrTailCollector(decoderProcess, STDERR_TAIL_MAX_CHARS);
-  return () => stderrCollector.getLastLine();
+  return (includeAllLines = false) =>
+    includeAllLines ? stderrCollector.getSummary() || stderrCollector.getLastLine() : stderrCollector.getLastLine();
 }
 
 /**
@@ -450,7 +451,7 @@ function attachDecoderStreams(cam, decoderProcess, sessionId, onCompleteFrame) {
  * @param {*} dec - Exiting FFmpeg decoder process.
  * @param {number} mySession - Session identifier.
  * @param {number|null} code - Process exit code.
- * @param {() => string} [getLastStderrLine=() => ''] - Callback returning last stderr line.
+ * @param {(includeAllLines?: boolean) => string} [getLastStderrLine=() => ''] - Callback returning stderr diagnostic.
  */
 function handleP2pDecoderExit(cam, dec, mySession, code, getLastStderrLine = () => '') {
   if (cam.shouldDeferDecoderDetachOnExit(dec)) {
@@ -479,7 +480,7 @@ function handleP2pDecoderExit(cam, dec, mySession, code, getLastStderrLine = () 
           ', session=' +
           mySession +
           '): ' +
-          getLastStderrLine()
+          getLastStderrLine(!cam.gotVideo)
       );
     }
   }
@@ -522,8 +523,7 @@ function startDecoder(cam, codec = cam.getVideoCodec()) {
       stdio: ['pipe', 'pipe', 'pipe', AUDIO ? 'pipe' : 'ignore', AUDIO ? 'pipe' : 'ignore'],
     });
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    log.error(cam, 'decoder process error: ' + msg);
+    log.error(cam, 'decoder process error: ' + formatErrorMessage(err));
     if (cam.isCurrentSession(mySession)) {
       const delayMs = recordP2pDecoderSpawnFailure(cam, mySession);
       scheduleP2pDecoderSpawnRetry(cam, mySession, delayMs);
@@ -535,7 +535,7 @@ function startDecoder(cam, codec = cam.getVideoCodec()) {
 
   let settled = false;
   decoderProcess.on('error', (e) => {
-    log.error(cam, 'decoder process error: ' + e.message);
+    log.error(cam, 'decoder process error: ' + formatErrorMessage(e));
     if (settled) {
       return;
     }
@@ -605,8 +605,7 @@ function startRtspDecoder(cam) {
       stdio: ['ignore', 'pipe', 'pipe', 'ignore', AUDIO ? 'pipe' : 'ignore'],
     });
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    log.error(cam, 'RTSP decoder process error: ' + msg);
+    log.error(cam, 'RTSP decoder process error: ' + formatErrorMessage(err));
     if (cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
       const delayMs = computeRtspDecoderRetryDelay(cam, mySession, true);
       scheduleRtspRetryForSession(cam, mySession, delayMs);
@@ -622,7 +621,7 @@ function startRtspDecoder(cam) {
 
   let settled = false;
   rtspProcess.on('error', (e) => {
-    log.error(cam, 'RTSP decoder process error: ' + e.message);
+    log.error(cam, 'RTSP decoder process error: ' + formatErrorMessage(e));
     if (settled) {
       return;
     }
@@ -639,7 +638,7 @@ function startRtspDecoder(cam) {
     }
     settled = true;
     if (cam.detachDecoderIfMatch(rtspProcess, true) && cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
-      const lastLine = getLastStderrLine();
+      const lastLine = getLastStderrLine(!cam.gotVideo);
       if ((cam.isEstablishedRtspStream() || cam.isRtspDirect()) && rtspDropCallback) {
         rtspDropCallback(cam, exitCode, lastLine);
         return;

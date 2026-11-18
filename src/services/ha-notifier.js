@@ -9,11 +9,12 @@
 'use strict';
 
 const {cfg} = require('../config');
-const {log} = require('../logger');
+const {log, formatErrorMessage} = require('../logger');
 
 /** @typedef {import("../domain/camera").Camera} Camera */
 
 const HA_WEBHOOK_TIMEOUT_MS = 5000;
+const HA_ERROR_SNIPPET_MAX_CHARS = 1024;
 
 /**
  * Sends an optional webhook POST notification to Home Assistant when an event starts and once
@@ -37,13 +38,16 @@ async function notifyHA(cam, extra = {}, webhookUrl = cfg.ha_webhook_url) {
       body: bodyJson,
     });
     if (!response.ok) {
-      log.warn(cam, 'HA webhook failed (HTTP ' + response.status + ')');
+      const rawBody = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
+      const snippet = String(rawBody || '')
+        .trim()
+        .slice(0, HA_ERROR_SNIPPET_MAX_CHARS);
+      log.warn(cam, 'HA webhook failed (HTTP ' + response.status + (snippet ? ': ' + snippet : '') + ')');
       return false;
     }
     return true;
   } catch (err) {
-    const errMsg = err && err.message ? err.message : String(err);
-    log.warn(cam, 'HA webhook failed: ' + errMsg);
+    log.warn(cam, 'HA webhook failed: ' + formatErrorMessage(err));
     return false;
   }
 }

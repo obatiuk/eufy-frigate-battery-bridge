@@ -2,6 +2,39 @@
 
 Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
+## dev
+
+- Expose full upstream service, `HomeBase` station, stream session, encoder, viewer, backfill, and live sensor telemetry
+  details on `GET /api/status` while keeping `GET /healthz` lightweight for frequent container probes
+- Surface root-cause `ffmpeg`, `RTSP` handshake, snapshot cache, `HTTP`, `WebSocket`, and `Eufy` command errors in logs
+  instead of masking them behind generic `ffmpeg` exit footers, bare `fetch failed` or blank dual-stack socket errors,
+  truncated validation responses, or generic stop reasons
+- Deduplicate snapshot cache filenames to `last_<name>.jpg` whenever a camera's `serial` matches its `name`, and
+  automatically migrate existing duplicated cache files on startup
+- Preserve the matched clip's hardware detection label and recognized person when extending long backfill `Frigate`
+  events after transfer completion, even when an external wake request customized the event reason
+- Serialize `HomeBase` backfill queue steps and pace database lookups per station across sibling cameras while allowing
+  multiple `HomeBase` stations to query and download clips independently
+- Abort in-flight `Frigate` event snapshot waits when a backfill download or live wake ends without decoded video so
+  failed or preempted attempts do not post duplicate stale-snapshot events
+- Preserve queued follow-on backfill jobs and active clip playback when an earlier backfill query expires or exhausts
+  its database lookup attempts
+- Allow sibling cameras on the same `HomeBase` to query and download backfill clips as soon as an earlier clip finishes
+  transferring and is draining buffered frames from memory
+- Allow `HomeBase` backfill clips up to `120s` to play to completion without being cut off by shorter live stream
+  maximum duration caps
+- Require at least one decoded video frame before treating a `HomeBase` backfill clip download as completed, timing out
+  and retrying truncated or stalled transfers that only deliver un-decodable packets
+- Preserve chronological event ordering across all camera modes when motion, hardware `RTSP` starts, or external wake
+  requests arrive during active clip backfill playback, queuing follow-on clips or deferring full-duration live wakes
+  until the current clip finishes
+- Preserve settled clip queries, follow-up split-clip retry budgets, and flowing decoder tail frames across
+  back-to-back `P2P` backfill downloads without matching incomplete in-progress recordings
+- Expire stale hardware trigger state when clear events are lost or connections drop, reject timestamp-less clip
+  records across timezones, tighten backfill state transitions, and log failed backfill query and cancel commands
+- Enforce immutable released changelog sections, a post-release `dev` heading, and builder-stage container test
+  isolation
+
 ## v0.0.2
 
 - **BREAKING:** Detach the project from the original fork into a standalone codebase following a full code redesign

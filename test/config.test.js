@@ -1225,6 +1225,12 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
       assert.equal(CameraConfig.resolveScopeName({}), 'bridge');
       assert.equal(CameraConfig.resolveCacheFileName(camSlice), 'last_driveway_T8161T0000000000.jpg');
       assert.equal(CameraConfig.resolveCacheFileName(cam), 'last_driveway_T8161T0000000000.jpg');
+      assert.equal(CameraConfig.resolveCacheFileName(unnamedRaw), 'last_T8214T2222222222.jpg');
+      const directUnnamedSerialCfg = new BridgeConfigBuilder({
+        cameras: [{name: 'nursery_cam', mode: 'rtsp', rtsp_url: 'rtsp://192.0.2.10/live0'}],
+      }).build();
+      assert.equal(directUnnamedSerialCfg.cameras[0].getCacheFileName(), 'last_nursery_cam.jpg');
+      assert.equal(CameraConfig.resolveCacheFileName(directUnnamedSerialCfg.cameras[0]), 'last_nursery_cam.jpg');
       assert.equal(CameraConfig.hasValidIdentity({}), false);
       assert.equal(CameraConfig.hasValidIdentity(null), false);
     }
@@ -1803,6 +1809,163 @@ describe('Environment Variable Expansion (${ENV_VAR} in config.yaml)', () => {
     const emptyErrors = [];
     checkChangelogReleaseTag('v0.0.2', '# Changelog\n\n## v0.0.2\n\n## v0.0.1\n\n- Initial release\n', emptyErrors);
     assert.ok(emptyErrors.length > 0);
+  });
+
+  it('enforces post-release ## dev section and immutable tagged sections in scripts/check-docs.js', () => {
+    // Verify post-release CHANGELOG.md edits must go under ## dev above the latest tag and never mutate tagged sections
+    const checkDocsPath = path.join(REPO_ROOT, 'scripts/check-docs.js');
+    if (!fs.existsSync(checkDocsPath)) {
+      return;
+    }
+    const {checkChangelogPostRelease} = require(checkDocsPath);
+    assert.equal(typeof checkChangelogPostRelease, 'function');
+
+    const taggedV002 =
+      '# Changelog\n\nFinished work, newest first.\n\n## v0.0.2\n\n- Ship v0.0.2\n\n## v0.0.1\n\n- Initial release\n';
+
+    // 1. Unchanged CHANGELOG.md before recording new entry passes
+    const unchangedErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, taggedV002, '0.0.2', unchangedErrs);
+    assert.deepEqual(unchangedErrs, []);
+
+    // 2. Modifying an existing released section (## v0.0.2) fails
+    const mutatedRelease =
+      '# Changelog\n\nFinished work, newest first.\n\n## v0.0.2\n\n- Ship v0.0.2 and sneak in post-release fix\n\n' +
+      '## v0.0.1\n\n- Initial release\n';
+    const mutatedErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, mutatedRelease, '0.0.2', mutatedErrs);
+    assert.ok(
+      mutatedErrs.some((e) => e.includes('## v0.0.2') && e.includes('## dev')),
+      'Mutating a released ## v0.0.2 section after tagging must fail'
+    );
+
+    // 3. Recording new changes under ## dev above untouched ## v0.0.2 passes
+    const validDev =
+      '# Changelog\n\nFinished work, newest first.\n\n## dev\n\n- Fix backfill clip preservation\n\n' +
+      '## v0.0.2\n\n- Ship v0.0.2\n\n## v0.0.1\n\n- Initial release\n';
+    const devOkErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, validDev, '0.0.2', devOkErrs);
+    assert.deepEqual(devOkErrs, []);
+
+    // 4. Empty ## dev section fails
+    const emptyDev =
+      '# Changelog\n\nFinished work, newest first.\n\n## dev\n\n' +
+      '## v0.0.2\n\n- Ship v0.0.2\n\n## v0.0.1\n\n- Initial release\n';
+    const emptyDevErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, emptyDev, '0.0.2', emptyDevErrs);
+    assert.ok(emptyDevErrs.some((e) => e.includes('## dev')));
+
+    // 5. Stamping next release ## v0.0.3 passes only when package.json version is bumped to 0.0.3
+    const nextRelease =
+      '# Changelog\n\nFinished work, newest first.\n\n## v0.0.3\n\n- Fix backfill clip preservation\n\n' +
+      '## v0.0.2\n\n- Ship v0.0.2\n\n## v0.0.1\n\n- Initial release\n';
+    const nextUnbumpedErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, nextRelease, '0.0.2', nextUnbumpedErrs);
+    assert.ok(nextUnbumpedErrs.length > 0, 'Next release heading without package.json bump must fail');
+
+    const nextBumpedErrs = [];
+    checkChangelogPostRelease('v0.0.2', taggedV002, nextRelease, '0.0.3', nextBumpedErrs);
+    assert.deepEqual(nextBumpedErrs, []);
+  });
+
+  it('passes inside an isolated deploy/Dockerfile builder-stage layout with .dockerignore files excluded', () => {
+    // Regression: deploy/Dockerfile runs node --test in a builder stage where .dockerignore excludes scripts/,
+    // docs/, Makefile, .gitignore, .dockerignore, and *.md; tests must never fail when those files are absent
+    const dockerignorePath = path.join(REPO_ROOT, '.dockerignore');
+    if (process.env.DOCKER_BUILDER_SIM === '1' || !fs.existsSync(dockerignorePath)) {
+      return;
+    }
+
+    const ignorePatterns = fs
+      .readFileSync(dockerignorePath, 'utf8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'));
+
+    const isDockerIgnored = (relPosix) =>
+      ignorePatterns.some((pat) => {
+        if (pat.endsWith('/')) {
+          return relPosix === pat.slice(0, -1) || relPosix.startsWith(pat);
+        }
+        if (pat.startsWith('*.')) {
+          return path.posix.basename(relPosix).endsWith(pat.slice(1));
+        }
+        return relPosix === pat;
+      });
+
+    const copyFiltered = (srcAbs, dstAbs, relPosix) => {
+      if (isDockerIgnored(relPosix)) {
+        return;
+      }
+      const stat = fs.statSync(srcAbs);
+      if (stat.isDirectory()) {
+        fs.mkdirSync(dstAbs, {recursive: true});
+        for (const entry of fs.readdirSync(srcAbs)) {
+          const childRel = relPosix ? relPosix + '/' + entry : entry;
+          copyFiltered(path.join(srcAbs, entry), path.join(dstAbs, entry), childRel);
+        }
+        return;
+      }
+      fs.mkdirSync(path.dirname(dstAbs), {recursive: true});
+      fs.copyFileSync(srcAbs, dstAbs);
+    };
+
+    const dockerfileText = fs.readFileSync(path.join(REPO_ROOT, 'deploy/Dockerfile'), 'utf8');
+    const builderStage = dockerfileText.split(/^FROM\s+/m)[1] || '';
+    const simRoot = path.join(TEST_TMP_DIR, 'docker-builder-sim-' + process.pid);
+    fs.rmSync(simRoot, {recursive: true, force: true});
+
+    try {
+      for (const match of builderStage.matchAll(/^COPY\s+(?!--from=)(.+)\s+(\S+)\s*$/gm)) {
+        const sources = match[1].trim().split(/\s+/);
+        const destRaw = match[2].trim().replace(/^\/app\/?/, '');
+        for (const srcToken of sources) {
+          const cleanSrc = srcToken.replace(/\/+$/, '');
+          const srcAbs = path.join(REPO_ROOT, cleanSrc);
+          if (!fs.existsSync(srcAbs)) {
+            continue;
+          }
+          const srcIsDir = fs.statSync(srcAbs).isDirectory();
+          const dstAbs = srcIsDir
+            ? path.join(simRoot, destRaw || cleanSrc)
+            : destRaw && !match[2].endsWith('/')
+              ? path.join(simRoot, destRaw)
+              : path.join(simRoot, destRaw, path.basename(cleanSrc));
+          copyFiltered(srcAbs, dstAbs, cleanSrc);
+        }
+      }
+
+      assert.equal(fs.existsSync(path.join(simRoot, 'scripts')), false);
+      assert.equal(fs.existsSync(path.join(simRoot, 'docs')), false);
+
+      const simTmp = path.join(simRoot, '.tmp');
+      const simCache = path.join(simTmp, 'cache');
+      fs.mkdirSync(simCache, {recursive: true});
+      const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT'));
+      const {execFileSync} = require('node:child_process');
+      const simOut = execFileSync(
+        process.execPath,
+        [
+          '--test',
+          '--test-reporter=' + path.join(simRoot, 'test/reporter.js'),
+          path.join(simRoot, 'test/config.test.js'),
+        ],
+        {
+          cwd: simRoot,
+          env: {
+            ...cleanEnv,
+            DOCKER_BUILDER_SIM: '1',
+            TMPDIR: simTmp,
+            BRIDGE_CACHE_DIR: simCache,
+          },
+          encoding: 'utf8',
+          stdio: 'pipe',
+        }
+      );
+      assert.match(simOut, /^Tests passed: \d+\/\d+/m);
+    } finally {
+      fs.rmSync(simRoot, {recursive: true, force: true});
+    }
   });
 
   it(

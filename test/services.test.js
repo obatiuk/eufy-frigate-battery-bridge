@@ -42,6 +42,7 @@ const {
   classifyViewerAction,
   syncSingleFrigateMaskSection,
   syncFrigateMotionMasks,
+  frigateEvent,
   pollViewers,
 } = require('../src/services/frigate-client');
 const {notifyHA} = require('../src/services/ha-notifier');
@@ -52,6 +53,7 @@ const {
   canServeWakeRequest,
   buildConfigPayload,
   buildHealthPayload,
+  buildStatusPayload,
   createHttpRequestHandler,
 } = require('../src/services/http-server');
 const {
@@ -74,6 +76,7 @@ const {
   handleRtspStreamDropped,
   trigger,
   stop,
+  arbitrate,
   onEvent,
 } = require('../src/services/stream-orchestrator');
 const {handleDecodedRtspFrame} = require('../src/media/decoder');
@@ -1062,6 +1065,199 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
           wsHandlers.get('close')();
         }
       }
+    }
+  );
+
+  it(
+    'keeps /healthz minimal for frequent container probes and exposes full runtime details on ' +
+      'GET/HEAD /api/status',
+    async () => {
+      // Verify /healthz omits camera arrays to minimize per-probe overhead, while /api/status
+      // exposes upstream services, stations, summary counts, and every configured camera's state/telemetry.
+      const {PassThrough} = require('node:stream');
+      const t0 = 200000;
+
+      const directLiveCam = new Camera(
+        {
+          name: 'play_mat_camera',
+          title: 'Play Mat Camera',
+          mode: 'rtsp',
+          rtsp_url: 'rtsp://user:pass@192.0.2.51/live0',
+        },
+        {frame: Buffer.alloc(FRAME, 0x11), lastSeen: '19:27'}
+      );
+      directLiveCam.beginSession('rtsp', t0 - 20000, true);
+      directLiveCam.markRtspFrameReceived(t0 - 19500);
+
+      const directDownCam = new Camera({
+        name: 'kids_room_camera',
+        title: 'Kids Room Camera',
+        mode: 'rtsp',
+        rtsp_url: 'rtsp://user:pass@192.0.2.52/live0',
+      });
+      directDownCam.recordRtspDirectProbeFailure('Connection refused');
+
+      const sleepingEufyCam = new Camera({
+        serial: 'T8161T0000000031',
+        name: 'storage_cam',
+        title: 'Storage Room Camera',
+        station_serial: 'T8030T0000000030',
+        mode: 'auto',
+      });
+      sleepingEufyCam.applyTelemetryProperties(
+        {
+          state: 1,
+          model: 'T8161',
+          softwareVersion: '3.4.3.0',
+          battery: 96,
+          chargingStatus: 2,
+          wifiSignalLevel: 3,
+          wifiRssi: -70,
+          temperature: 20,
+        },
+        false,
+        t0 - 10000
+      );
+
+      const waitingBfCam = new Camera({
+        serial: 'T8214T0000000032',
+        name: 'front_doorbell',
+        title: 'Front Doorbell',
+        station_serial: 'T8030T0000000030',
+        mode: 'backfill',
+      });
+      waitingBfCam.applyTelemetryProperties(
+        {state: 1, model: 'T8214', softwareVersion: '3.2.7.2', battery: 22, chargingStatus: 2},
+        false,
+        t0 - 10000
+      );
+      waitingBfCam.queueEventBackfill(t0 - 5000, 'person detected', '', 'person', 100, true);
+
+      const offlineEufyCam = new Camera({
+        serial: 'T8161T0000000033',
+        name: 'shed_cam',
+        title: 'Shed Camera',
+        station_serial: 'T8030T0000000030',
+        mode: 'p2p',
+      });
+      offlineEufyCam.applyTelemetryProperties({state: 3, battery: 1, chargingStatus: 2}, false, t0 - 10000);
+
+      const cams = [directLiveCam, directDownCam, sleepingEufyCam, waitingBfCam, offlineEufyCam];
+
+      // 1. /healthz payload is minimal (only ok, ws_connected, uptime_secs; no camera arrays)
+      const minHealth = buildHealthPayload(cams, false, t0 - 1028000, t0);
+      assert.deepEqual(Object.keys(minHealth), ['ok', 'ws_connected', 'uptime_secs']);
+      assert.equal(minHealth.ok, true);
+      assert.equal(minHealth.uptime_secs, 1028);
+      assert.equal('active_cameras' in minHealth, false);
+      assert.equal('offline_cameras' in minHealth, false);
+
+      // 2. buildStatusPayload includes services, stations, summary counts, and all 5 cameras
+      const status = buildStatusPayload(cams, {shuttingDown: false, startMs: t0 - 60000, now: t0});
+      assert.equal(status.ok, true);
+      assert.equal(status.shutting_down, false);
+      assert.equal(typeof status.version, 'string');
+      assert.equal(typeof status.commit, 'string');
+      assert.equal(status.uptime_secs, 60);
+      assert.equal(typeof status.services.ws_connected, 'boolean');
+      assert.equal(typeof status.services.initial_telemetry_loaded, 'boolean');
+      assert.equal(status.services.frigate_connected, true);
+      assert.equal(status.services.go2rtc_connected, true);
+      assert.equal(status.stations.length, 1);
+      assert.equal(status.stations[0].serial, 'T8030T0000000030');
+      assert.deepEqual(status.stations[0].cameras, ['storage_cam', 'front_doorbell', 'shed_cam']);
+      assert.equal(status.stations[0].p2p_busy, false);
+      assert.equal(status.stations[0].active_p2p_camera, null);
+
+      assert.equal(status.summary.total_cameras, 5);
+      assert.equal(status.summary.streaming_cameras, 1);
+      assert.equal(status.summary.waiting_cameras, 1);
+      assert.equal(status.summary.sleeping_cameras, 1);
+      assert.equal(status.summary.offline_cameras, 1);
+      assert.equal(status.summary.low_battery_cameras, 1);
+      assert.equal(status.summary.pending_backfills, 1);
+      assert.equal(status.cameras.length, 5);
+      assert.deepEqual(
+        status.cameras.map((c) => [c.name, c.status]),
+        [
+          ['play_mat_camera', 'live'],
+          ['kids_room_camera', 'disconnected'],
+          ['storage_cam', 'asleep'],
+          ['front_doorbell', 'waiting'],
+          ['shed_cam', 'disconnected'],
+        ]
+      );
+      assert.equal(status.cameras[0].rtsp_url, 'rtsp://***@192.0.2.51/live0');
+      assert.equal(status.cameras[2].telemetry.battery_pct, 96);
+      assert.equal(status.cameras[4].offline, true);
+      assert.equal(status.cameras[4].offline_reason, 'offline (low battery)');
+
+      // 3. Direct-RTSP-only configuration sets ws_connected/initial_telemetry_loaded to null and stations to []
+      const directOnlyStatus = buildStatusPayload([directLiveCam], {shuttingDown: false, startMs: t0 - 5000, now: t0});
+      assert.equal(directOnlyStatus.services.ws_connected, null);
+      assert.equal(directOnlyStatus.services.initial_telemetry_loaded, null);
+      assert.deepEqual(directOnlyStatus.stations, []);
+
+      // 4. HTTP handler serves GET/HEAD /api/status, HEAD /healthz (empty body), 405 on POST, and 503 on shutdown
+      let shuttingDown = false;
+      const handler = createHttpRequestHandler(cams, {
+        wakeCameraExternal: () => ({}),
+        isShuttingDown: () => shuttingDown,
+      });
+
+      const invokeRaw = async (method, url) => {
+        const req = Object.assign(new PassThrough(), {method, url});
+        const resHeaders = {};
+        let statusCode = 0;
+        let rawBody = '';
+        const done = new Promise((resolve) => {
+          const res = {
+            setHeader(k, v) {
+              resHeaders[String(k).toLowerCase()] = v;
+            },
+            writeHead(code, hdrs = {}) {
+              statusCode = code;
+              for (const [k, v] of Object.entries(hdrs)) {
+                resHeaders[String(k).toLowerCase()] = v;
+              }
+            },
+            end(chunk = '') {
+              rawBody += String(chunk || '');
+              resolve();
+            },
+          };
+          void handler(req, res);
+        });
+        req.end();
+        await done;
+        return {status: statusCode, headers: resHeaders, body: rawBody};
+      };
+
+      const getStatusRes = await invokeRaw('GET', '/api/status');
+      assert.equal(getStatusRes.status, 200);
+      const parsedStatus = JSON.parse(getStatusRes.body);
+      assert.equal(parsedStatus.ok, true);
+      assert.equal(parsedStatus.cameras.length, 5);
+
+      const headStatusRes = await invokeRaw('HEAD', '/api/status');
+      assert.equal(headStatusRes.status, 200);
+      assert.equal(headStatusRes.body, '');
+
+      const headHealthRes = await invokeRaw('HEAD', '/healthz');
+      assert.equal(headHealthRes.status, 200);
+      assert.equal(headHealthRes.body, '');
+
+      const postStatusRes = await invokeRaw('POST', '/api/status');
+      assert.equal(postStatusRes.status, 405);
+      assert.equal(postStatusRes.headers.allow, 'GET, HEAD');
+      assert.equal(JSON.parse(postStatusRes.body).error_code, 'METHOD_NOT_ALLOWED');
+
+      shuttingDown = true;
+      const downStatusRes = await invokeRaw('GET', '/api/status');
+      assert.equal(downStatusRes.status, 503);
+      const parsedDown = JSON.parse(downStatusRes.body);
+      assert.equal(parsedDown.ok, false);
+      assert.equal(parsedDown.shutting_down, true);
     }
   );
 
@@ -3911,4 +4107,1234 @@ describe('Structured Alloy/Loki Logger & ICU-Free Timestamps (src/logger.js)', (
       '2026-11-05 08:04:09 - [WARN ] - [cam\\nspoof] opening rtsp://***@192.168.1.50:554/live0\\r\\nFAKE [ERROR]'
     );
   });
+
+  it('ignores in-progress recording cameras when a station-wide database query latest response arrives', () => {
+    // Regression: station.database_query_latest_info returns rows for all cameras on the HomeBase station,
+    // and HomeBase 3 creates crop_local_path at t=0 when recording starts. A camera whose BackfillJob is
+    // still in RECORDING or SETTLING must not match and download its own incomplete file from another
+    // camera's query response.
+    const camReady = new Camera({
+      serial: 'T8214T8888888881',
+      name: 'ready_doorbell',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000001',
+    });
+    const camRecording = new Camera({
+      serial: 'T8214T8888888882',
+      name: 'recording_cam',
+      mode: 'backfill',
+      station_serial: 'T8030P0000000001',
+    });
+    const now = Date.now();
+    camReady.queueEventBackfill(now - 25000, 'person detected', '', 'person detected', 200, true);
+    camReady.recordMotionCleared(now - 10000, 4000, 10000, 'person detected');
+    assert.equal(camReady.canQueryBackfill(now, 4000, 4000), true);
+
+    camRecording.queueEventBackfill(now - 2000, 'motion detected', '', 'motion detected', 10, true);
+    assert.equal(camRecording.pendingBackfill?.recordingActive, true);
+
+    initOrchestrator(
+      [camReady, camRecording],
+      new Map([
+        [camReady.getSerial(), camReady],
+        [camRecording.getSerial(), camRecording],
+      ]),
+      () => false
+    );
+
+    onEvent({
+      source: 'station',
+      event: 'database query latest',
+      serialNumber: 'T8030P0000000001',
+      returnCode: 0,
+      data: [
+        {
+          device_sn: camReady.getSerial(),
+          crop_local_path: '/zx/hdd_data0/Camera01/202611/20261117010000/pic20261117010000.jpg',
+          create_time: new Date(now - 24000).toISOString(),
+        },
+        {
+          device_sn: camRecording.getSerial(),
+          crop_local_path: '/zx/hdd_data0/Camera02/202611/20261117010023/pic20261117010023.jpg',
+          create_time: new Date(now - 2000).toISOString(),
+        },
+      ],
+    });
+
+    assert.equal(
+      camReady.backfillClip?.storagePath,
+      '/zx/hdd_data0/Camera01/202611/20261117010000/20261117010000.zxvideo'
+    );
+    assert.equal(
+      camRecording.backfillClip,
+      null,
+      'Camera still actively recording must not match its incomplete clip from a station-wide query result'
+    );
+  });
+
+  it('logs failed backfill query and cancel_download RPCs and catches processBackfillQueue exceptions', async () => {
+    // Verify backfill database query RPC failures warn, unexpected cancel_download RPC errors log at debug,
+    // and thrown exceptions inside processBackfillQueue are caught and logged at error level instead of rejecting.
+    const bfCam = new Camera({
+      serial: 'SN0000000091',
+      name: 'bf_err_cam',
+      mode: 'backfill',
+      station_serial: 'SN0000000090',
+    });
+
+    class FailingBackfillWs {
+      constructor() {
+        this.readyState = 1;
+        this.handlers = new Map();
+      }
+      on(ev, fn) {
+        this.handlers.set(ev, fn);
+      }
+      send(raw, cb) {
+        const msg = JSON.parse(raw);
+        if (cb) cb();
+        const msgHandler = this.handlers.get('message');
+        if (!msgHandler) return;
+        queueMicrotask(() => {
+          if (msg.command === 'set_api_schema' || msg.command === 'start_listening') {
+            msgHandler(
+              JSON.stringify({
+                type: 'result',
+                messageId: msg.messageId,
+                success: true,
+                result: {
+                  state: {
+                    driver: {connected: true},
+                    stations: [{serialNumber: 'SN0000000090', connected: true}],
+                    devices: [],
+                  },
+                },
+              })
+            );
+            return;
+          }
+          msgHandler(
+            JSON.stringify({
+              type: 'result',
+              messageId: msg.messageId,
+              success: false,
+              errorCode: msg.command === 'device.cancel_download' ? 'command_failed' : 'station_not_connected',
+            })
+          );
+        });
+      }
+    }
+
+    let wsInstance = null;
+    configureEufyClientHooks({
+      cams: [bfCam],
+      bySerial: new Map([[bfCam.getSerial(), bfCam]]),
+      isShuttingDown: () => false,
+      WebSocket: function MockWs() {
+        wsInstance = new FailingBackfillWs();
+        return wsInstance;
+      },
+    });
+    connectWs();
+    configureEufyClientHooks({isShuttingDown: () => true});
+    await wsInstance.handlers.get('message')(JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    initOrchestrator([bfCam], new Map([[bfCam.getSerial(), bfCam]]), () => false);
+
+    const warns = [];
+    const debugs = [];
+    const errors = [];
+    const origWarn = log.warn;
+    const origDebug = log.debug;
+    const origError = log.error;
+    log.warn = (_scope, msg) => warns.push(String(msg));
+    log.debug = (_scope, msg) => debugs.push(String(msg));
+    log.error = (_scope, msg) => errors.push(String(msg));
+
+    try {
+      const now = Date.now();
+      bfCam.queueEventBackfill(now - 20000, 'person detected', '', 'person detected', 200, true);
+      bfCam.recordMotionCleared(now - 10000, 4000, 10000, 'person detected');
+      await processBackfillQueue(now);
+
+      assert.equal(
+        warns.some((m) => m.includes('station.database_query_by_date failed') && m.includes('station_not_connected')),
+        true,
+        'Failed station.database_query_by_date RPC must log a warning with errorCode'
+      );
+      assert.equal(
+        warns.some(
+          (m) => m.includes('station.database_query_latest_info failed') && m.includes('station_not_connected')
+        ),
+        true,
+        'Failed station.database_query_latest_info RPC must log a warning with errorCode'
+      );
+
+      bfCam.beginBackfillDownload(
+        {
+          storagePath: '/zx/cancel_err.zxvideo',
+          cipherId: 1,
+          clipMs: now - 15000,
+          event: 'person detected',
+          personName: '',
+          reason: 'person detected',
+        },
+        false,
+        now
+      );
+      stop(bfCam, 'preempted download test', false, 'bridge-arbitrator/live-over-download');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        debugs.some((m) => m.includes('device.cancel_download returned errorCode=command_failed')),
+        true,
+        'Unexpected device.cancel_download failure must be logged at debug level'
+      );
+
+      const throwingCam = Object.create(bfCam);
+      throwingCam.expirePendingBackfillIfNeeded = () => {
+        throw new Error('synthetic_backfill_tick_boom');
+      };
+      initOrchestrator([throwingCam], new Map([[bfCam.getSerial(), throwingCam]]), () => false);
+      await assert.doesNotReject(() => processBackfillQueue(now + 5000));
+      assert.equal(
+        errors.some((m) => m.includes('synthetic_backfill_tick_boom')),
+        true,
+        'processBackfillQueue must catch thrown exceptions and log the error stack/message'
+      );
+    } finally {
+      log.warn = origWarn;
+      log.debug = origDebug;
+      log.error = origError;
+    }
+  });
+
+  it(
+    'preserves chronological event order on p2p/rtsp/auto cameras when motion or ' +
+      '/api/wake arrives during DOWNLOAD',
+    async () => {
+      // Regression: on non-"backfill" cameras in STREAM_MODES.DOWNLOAD, Eufy motion logged "already live" and mutated
+      // Event 1's reason, 'rtsp livestream started' was dropped, and /api/wake was wiped by endSession.
+      const p2pNoBf = new Camera({
+        serial: 'T8214T0000000096',
+        name: 'doorbell_nobf',
+        mode: 'custom',
+        use_rtsp: false,
+        backfill_enabled: false,
+        station_serial: 'T8030P0000000096',
+      });
+      const autoCam = new Camera({
+        serial: 'T8161T0000000097',
+        name: 'yard_auto',
+        mode: 'auto',
+        station_serial: 'T8030P0000000096',
+      });
+      autoCam.updateDiscoveredRtspConfig('T8030P0000000096', 'rtsp://192.0.2.10/live1');
+
+      const infos = [];
+      const origInfo = log.info;
+      log.info = (_scope, msg) => {
+        infos.push(String(msg));
+      };
+
+      try {
+        class MockSeqWs {
+          constructor() {
+            this.readyState = 1;
+            this.handlers = new Map();
+          }
+          on(ev, fn) {
+            this.handlers.set(ev, fn);
+          }
+          send(raw, cb) {
+            const msg = JSON.parse(raw);
+            if (cb) cb();
+            const h = this.handlers.get('message');
+            if (h) {
+              queueMicrotask(() => {
+                h(JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+              });
+            }
+          }
+        }
+        let wsInst = null;
+        const cams = [p2pNoBf, autoCam];
+        const bySn = new Map(cams.map((c) => [c.getSerial(), c]));
+        initOrchestrator(cams, bySn, () => false);
+        configureEufyClientHooks({
+          cams,
+          bySerial: bySn,
+          isShuttingDown: () => false,
+          WebSocket: function SeqWs() {
+            wsInst = new MockSeqWs();
+            return wsInst;
+          },
+        });
+        connectWs();
+        await wsInst.handlers.get('message')(JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+        configureEufyClientHooks({isShuttingDown: () => false, wsReadyAt: Date.now() - 10000});
+
+        // 1. autoCam in DOWNLOAD: Eufy motion queues Job 2 without logging "already live" or mutating Event 1 reason
+        const now = Date.now();
+        autoCam.reason = 'ev1 clip';
+        autoCam.beginBackfillDownload(
+          {
+            storagePath: '/zx/auto_seq1.zxvideo',
+            cipherId: 1,
+            clipMs: now - 15000,
+            event: 'motion detected',
+            personName: '',
+            reason: 'ev1 clip',
+          },
+          false,
+          now
+        );
+        infos.length = 0;
+        onEvent({
+          source: 'device',
+          event: 'person detected',
+          serialNumber: autoCam.getSerial(),
+          state: true,
+        });
+        assert.equal(autoCam.activeMode, 'download');
+        assert.equal(autoCam.getReason(), 'backfill: ev1 clip');
+        assert.equal(autoCam.hasPendingBackfill(), true);
+        assert.equal(
+          infos.some((m) => m.includes('already live')),
+          false,
+          'Eufy trigger during DOWNLOAD must not log misleading "already live" message'
+        );
+
+        // If Job 2 later exhausts 10 query attempts while a subsequent /api/wake (Event 3) is deferred behind it,
+        // processBackfillQueue promotes Event 3 immediately so it is not stranded!
+        onEvent({
+          source: 'device',
+          event: 'person detected',
+          serialNumber: autoCam.getSerial(),
+          state: false,
+        });
+        const tSettled = now + 10000;
+        const wakeEv3 = wakeCameraExternal(autoCam, {
+          durationMs: 25000,
+          reason: 'yard sensor ev3',
+          createEvent: true,
+          delayMs: 0,
+        });
+        assert.equal(wakeEv3.status, 'scheduled');
+        const dlFrame = Buffer.alloc(1382400, 0x44);
+        autoCam.markP2pVideoPacketReceived(now + 500);
+        autoCam.recordDecodedFrame(dlFrame, dlFrame, now + 500, '12:00');
+        autoCam.markDownloadFinished(now + 1000);
+        stop(autoCam, 'post-event clip download stream completed', false, 'eufy/download-finished');
+        for (let i = 1; i <= 10; i++) {
+          autoCam.beginBackfillDatabaseQuery(tSettled + i * 13000, 10);
+        }
+        await processBackfillQueue(tSettled + 150000);
+        assert.equal(
+          autoCam.activeMode,
+          'rtsp',
+          'Exhausting Job 2 query attempts must promote and wake deferred Event 3 live'
+        );
+        stop(autoCam, 'cleanup autoCam', false, 'bridge-test');
+
+        // 2. backfill_enabled: false camera in SIGUSR1 DOWNLOAD defers motion until DOWNLOAD ends
+        const tNoBf = Date.now();
+        p2pNoBf.reason = 'sigusr1 test clip';
+        p2pNoBf.beginBackfillDownload(
+          {
+            storagePath: '/zx/sigusr1.zxvideo',
+            cipherId: 2,
+            clipMs: tNoBf - 10000,
+            event: 'backfill test',
+            personName: '',
+            reason: 'sigusr1 test clip',
+          },
+          true,
+          tNoBf
+        );
+        onEvent({
+          source: 'device',
+          event: 'rings',
+          serialNumber: p2pNoBf.getSerial(),
+          state: true,
+        });
+        assert.equal(p2pNoBf.activeMode, 'download', 'SIGUSR1 backfill finishes before deferred live ring wake');
+        p2pNoBf.markP2pVideoPacketReceived(tNoBf + 500);
+        p2pNoBf.recordDecodedFrame(dlFrame, dlFrame, tNoBf + 500, '12:00');
+        p2pNoBf.markDownloadFinished(tNoBf + 1000);
+        stop(p2pNoBf, 'post-event clip download stream completed', false, 'eufy/download-finished');
+        arbitrate(Date.now());
+        assert.equal(
+          p2pNoBf.activeMode,
+          'p2p',
+          'backfill_enabled: false camera wakes live P2P immediately after SIGUSR1 download completes'
+        );
+        stop(p2pNoBf, 'cleanup p2pNoBf', false, 'bridge-test');
+      } finally {
+        log.info = origInfo;
+        configureEufyClientHooks({isShuttingDown: () => true});
+      }
+    }
+  );
+
+  it(
+    'aborts in-flight WAITING_SNAPSHOT Frigate event filing when a backfill or ' + 'live session ends without video',
+    async (t) => {
+      // Regression: once the 600ms evTimer fired into WAITING_SNAPSHOT, if start_download failed or a session was
+      // preempted before decoding Frame 0, the snapshot-wait loop exited on !cam.isSessionActive() and still POSTed
+      // a stale-snapshot Frigate event before the 4s backfill retry filed a second event.
+      t.mock.timers.enable({apis: ['setTimeout', 'Date'], now: 1000000});
+
+      const advanceFakeClock = async (totalMs, stepMs = 100) => {
+        for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) {
+          t.mock.timers.tick(Math.min(stepMs, totalMs - elapsed));
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+      };
+
+      const cachedSnap = Buffer.alloc(FRAME, 0x42);
+      const cam = new Camera(
+        {serial: 'T8214T0000000108', name: 'doorbell_abort_ev', mode: 'backfill'},
+        {frame: cachedSnap, lastSeen: '11:30'}
+      );
+      const createdEvents = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts = {}) => {
+        const u = String(url);
+        if (u.includes('/api/events/')) {
+          createdEvents.push({url: u, body: JSON.parse(opts.body)});
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {event_id: 'ev-' + createdEvents.length};
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return [];
+          },
+          async text() {
+            return '';
+          },
+        };
+      };
+
+      try {
+        // 1. Backfill download attempt 1 enters WAITING_SNAPSHOT at 600ms, then fails before Frame 0 at 900ms
+        cam.queueEventBackfill(Date.now() - 15000, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+        cam.recordMotionCleared(Date.now() - 10000, 4000, 10000, 'person detected');
+        assert.equal(
+          cam.tryMatchBackfillCandidate({
+            devSn: 'T8214T0000000108',
+            storagePath: '/zx/abort_snap.zxvideo',
+            cipherId: 1,
+            clipMs: Date.now() - 14000,
+          }),
+          true
+        );
+
+        cam.beginBackfillDownload(cam.backfillClip, false, Date.now());
+        frigateEvent(cam, 'person detected', 'Alice');
+        assert.equal(cam.getFrigateEventState(Date.now()), 'queued');
+
+        await advanceFakeClock(700);
+        assert.equal(cam.getFrigateEventState(Date.now()), 'waiting_snapshot');
+
+        cam.terminateSession(Date.now(), 'start_download RPC failed', false, 'error/download-failed');
+        assert.equal(
+          cam.getFrigateEventState(Date.now()),
+          'idle',
+          'Ending session without video must reset WAITING_SNAPSHOT back to IDLE'
+        );
+
+        await advanceFakeClock(2000);
+        assert.equal(
+          createdEvents.length,
+          0,
+          'Aborted 0-frame backfill attempt must NOT POST a stale-snapshot Frigate event'
+        );
+        assert.equal(cam.card.suppressLiveCard, false);
+
+        // 4s retry succeeds and decodes Frame 0 -> files exactly one real Frigate event
+        await advanceFakeClock(3000);
+        assert.equal(cam.isReadyForBackfillDownload(Date.now()), true);
+        cam.beginBackfillDownload(cam.backfillClip, false, Date.now());
+        frigateEvent(cam, 'person detected', 'Alice');
+        const realFrame = Buffer.alloc(FRAME, 0x99);
+        cam.recordDecodedFrame(realFrame, realFrame, Date.now() + 100, '11:31');
+        await advanceFakeClock(2000);
+        assert.equal(createdEvents.length, 1, 'Successful retry files the single real Frigate event');
+        assert.equal(createdEvents[0].url.endsWith('/api/events/doorbell_abort_ev/person/create'), true);
+        assert.equal(createdEvents[0].body.sub_label, 'Alice');
+        cam.terminateSession(Date.now(), 'post-event clip download stream completed', false, 'eufy/download-finished');
+        await advanceFakeClock(40000);
+
+        // 2. Preempted live P2P session without video in WAITING_SNAPSHOT also aborts cleanly
+        createdEvents.length = 0;
+        cam.beginSession('p2p', Date.now(), true);
+        frigateEvent(cam, 'motion detected', '');
+        await advanceFakeClock(700);
+        assert.equal(cam.getFrigateEventState(Date.now()), 'waiting_snapshot');
+        cam.terminateSession(Date.now(), 'preempted before video', false, 'bridge-arbitrator/higher-priority-event');
+        assert.equal(cam.getFrigateEventState(Date.now()), 'idle');
+        await advanceFakeClock(2000);
+        assert.equal(createdEvents.length, 0, 'Preempted 0-frame live session must not file stale-snapshot event');
+
+        // 3. Control (AT-17.3): an active wake session that stays active past the snapshot wait window without video
+        //    still injects the clean cached snapshot and files the fallback Frigate event
+        cam.beginSession('rtsp', Date.now(), true);
+        frigateEvent(cam, 'motion detected', '');
+        await advanceFakeClock(27000, 200);
+        assert.equal(
+          createdEvents.length,
+          1,
+          'Active wake timing out on snapshot wait still files clean-snapshot fallback event'
+        );
+        cam.endSession(Date.now(), false, false, 'rtsp');
+        await advanceFakeClock(2000, 200);
+      } finally {
+        global.fetch = origFetch;
+      }
+    }
+  );
+
+  it(
+    'serializes processBackfillQueue steps per HomeBase station and paces queries ' +
+      'across sibling cameras without blocking other stations',
+    async () => {
+      // Regression: processBackfillQueue lacked a per-station in-flight guard and tracked lastBackfillQueryAt per
+      // camera rather than per station, allowing overlapping station.connect, database_query_*, and start_download
+      // RPCs on the same HomeBase when housekeeping ticks or database query events arrived mid-step.
+      const hb1Sn = 'T8030P0000000211';
+      const hb2Sn = 'T8030P0000000212';
+      const camA = new Camera({
+        serial: 'T8214T0000000211',
+        name: 'hb1_cam_a',
+        mode: 'backfill',
+        station_serial: hb1Sn,
+      });
+      const camB = new Camera({
+        serial: 'T8160T0000000212',
+        name: 'hb1_cam_b',
+        mode: 'backfill',
+        station_serial: hb1Sn,
+      });
+      const camC = new Camera({
+        serial: 'T8160T0000000213',
+        name: 'hb2_cam_c',
+        mode: 'backfill',
+        station_serial: hb2Sn,
+      });
+
+      const hb1PendingRpcs = [];
+      const rpcLog = [];
+      let holdHb1Rpcs = false;
+
+      class ControlledBackfillWs {
+        constructor() {
+          this.readyState = 1;
+          this.handlers = new Map();
+        }
+        on(ev, fn) {
+          this.handlers.set(ev, fn);
+        }
+        send(raw, cb) {
+          const msg = JSON.parse(raw);
+          if (cb) cb();
+          const h = this.handlers.get('message');
+          if (!h) return;
+          if (msg.command === 'set_api_schema' || msg.command === 'start_listening') {
+            queueMicrotask(() => {
+              h(
+                JSON.stringify({
+                  type: 'result',
+                  messageId: msg.messageId,
+                  success: true,
+                  result: {
+                    state: {
+                      driver: {connected: true},
+                      stations: [
+                        {serialNumber: hb1Sn, connected: true},
+                        {serialNumber: hb2Sn, connected: true},
+                      ],
+                      devices: [],
+                    },
+                  },
+                })
+              );
+            });
+            return;
+          }
+          const targetStation =
+            msg.serialNumber === hb1Sn || msg.serialNumber === camA.getSerial() || msg.serialNumber === camB.getSerial()
+              ? hb1Sn
+              : hb2Sn;
+          rpcLog.push({
+            station: targetStation,
+            command: msg.command,
+            serialNumber: msg.serialNumber,
+            serialNumbers: msg.serialNumbers || null,
+          });
+          if (targetStation === hb1Sn && holdHb1Rpcs) {
+            hb1PendingRpcs.push({
+              msg,
+              resolve: (success = true) => {
+                h(JSON.stringify({type: 'result', messageId: msg.messageId, success, result: {}}));
+              },
+            });
+            return;
+          }
+          queueMicrotask(() => {
+            h(JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+          });
+        }
+      }
+
+      let wsInst = null;
+      const testCams = [camA, camB, camC];
+      const testBySn = new Map(testCams.map((c) => [c.getSerial(), c]));
+      const origFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return {event_id: 'ev-bf-serial'};
+        },
+        async text() {
+          return '';
+        },
+      });
+
+      try {
+        initOrchestrator(testCams, testBySn, () => false);
+        configureEufyClientHooks({
+          cams: testCams,
+          bySerial: testBySn,
+          isShuttingDown: () => false,
+          WebSocket: function MockWs() {
+            wsInst = new ControlledBackfillWs();
+            return wsInst;
+          },
+        });
+        connectWs();
+        await wsInst.handlers.get('message')(JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+        await new Promise((resolve) => setImmediate(resolve));
+        configureEufyClientHooks({isShuttingDown: () => false, wsReadyAt: Date.now() - 10000});
+
+        const t0 = Date.now();
+        for (const c of testCams) {
+          c.queueEventBackfill(t0 - 20000, 'person detected', '', 'person detected', 200, true);
+          c.recordMotionCleared(t0 - 15000, 4000, 10000, 'person detected');
+        }
+        rpcLog.length = 0;
+        holdHb1Rpcs = true;
+
+        // 1. Launch processBackfillQueue(t0): HomeBase 1 holds station.connect in flight while HomeBase 2 runs freely
+        const p1 = processBackfillQueue(t0);
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const hb2InitialCmds = rpcLog.filter((r) => r.station === hb2Sn).map((r) => r.command);
+        assert.deepEqual(
+          hb2InitialCmds,
+          ['station.connect', 'station.database_query_by_date', 'station.database_query_latest_info'],
+          'HomeBase 2 must query independently without waiting for slow HomeBase 1 RPCs'
+        );
+        assert.deepEqual(
+          rpcLog.filter((r) => r.station === hb1Sn).map((r) => r.command),
+          ['station.connect'],
+          'HomeBase 1 must have only its single station.connect in flight'
+        );
+
+        // 2. Overlapping housekeeping calls while station.connect is in flight must NOT start a second query on HB1
+        const p2 = processBackfillQueue(t0 + 500);
+        const p3 = processBackfillQueue(t0 + 1000);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.deepEqual(
+          rpcLog.filter((r) => r.station === hb1Sn).map((r) => r.command),
+          ['station.connect'],
+          'Concurrent processBackfillQueue calls must not dispatch overlapping HomeBase 1 RPCs'
+        );
+
+        // 3. Advance HB1 to database_query_by_date, then emit mid-query clip match for camB (triggers re-entrant call)
+        assert.equal(hb1PendingRpcs.length, 1);
+        hb1PendingRpcs.shift().resolve(true);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.deepEqual(
+          rpcLog.filter((r) => r.station === hb1Sn).map((r) => r.command),
+          ['station.connect', 'station.database_query_by_date']
+        );
+
+        onEvent({
+          source: 'station',
+          serialNumber: hb1Sn,
+          event: 'database query local',
+          returnCode: 0,
+          data: [
+            {
+              device_sn: camB.getSerial(),
+              storage_path: '/zx/hb1_cam_b_clip.zxvideo',
+              cipher_id: 7,
+              start_time: Math.floor((t0 - 18000) / 1000),
+            },
+          ],
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(camB.backfillClip?.storagePath, '/zx/hb1_cam_b_clip.zxvideo');
+        assert.equal(
+          rpcLog.some((r) => r.station === hb1Sn && r.command === 'device.start_download'),
+          false,
+          'Mid-query clip match must NOT dispatch device.start_download while database_query_by_date is in flight'
+        );
+
+        // Resolve database_query_by_date -> database_query_latest_info runs next -> still no start_download yet
+        assert.equal(hb1PendingRpcs.length, 1);
+        hb1PendingRpcs.shift().resolve(true);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.deepEqual(
+          rpcLog.filter((r) => r.station === hb1Sn).map((r) => r.command),
+          ['station.connect', 'station.database_query_by_date', 'station.database_query_latest_info'],
+          'database_query_latest_info must run before any coalesced start_download step'
+        );
+
+        // Resolve database_query_latest_info and let coalesced follow-up step dispatch device.start_download cleanly
+        holdHb1Rpcs = false;
+        assert.equal(hb1PendingRpcs.length, 1);
+        hb1PendingRpcs.shift().resolve(true);
+        await Promise.all([p1, p2, p3]);
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.deepEqual(
+          rpcLog.filter((r) => r.station === hb1Sn).map((r) => r.command),
+          [
+            'station.connect',
+            'station.database_query_by_date',
+            'station.database_query_latest_info',
+            'device.start_download',
+          ],
+          'Coalesced follow-up step must start_download strictly after database query RPCs complete'
+        );
+        assert.equal(camB.activeMode, 'download');
+
+        // Finish camB's download cleanly so HomeBase 1 P2P slot is idle again before t0 + 4000ms
+        const dlFrame = Buffer.alloc(FRAME, 0x55);
+        camB.markP2pVideoPacketReceived(t0 + 1200);
+        camB.recordDecodedFrame(dlFrame, dlFrame, t0 + 1200, '12:30');
+        camB.markDownloadFinished(t0 + 1400);
+        stop(camB, 'post-event clip download stream completed', false, 'eufy/download-finished');
+        await new Promise((resolve) => setImmediate(resolve));
+
+        // 4. Per-station query pacing: queue a fresh settled job on camB (camB.lastBackfillQueryAt === 0),
+        //    while HomeBase 1 queried at t0 -> < 4000ms dispatches zero HB1 queries, >= 4000ms allows one!
+        camB.queueEventBackfill(t0 - 10000, 'motion detected', '', 'motion detected', 200, true);
+        camB.recordMotionCleared(t0 - 5000, 4000, 10000, 'motion detected');
+        assert.equal(camB.lastBackfillQueryAt, 0);
+        rpcLog.length = 0;
+
+        await processBackfillQueue(t0 + 2500);
+        await processBackfillQueue(t0 + 3999);
+        assert.equal(
+          rpcLog.filter((r) => r.station === hb1Sn).length,
+          0,
+          'Station query cooldown (4000ms) must block sibling camB from querying HomeBase 1 early'
+        );
+
+        await processBackfillQueue(t0 + 4000);
+        const hb1AfterCooldown = rpcLog.filter((r) => r.station === hb1Sn);
+        assert.deepEqual(
+          hb1AfterCooldown.map((r) => r.command),
+          ['station.connect', 'station.database_query_by_date', 'station.database_query_latest_info'],
+          'Once 4000ms elapses, HomeBase 1 allows exactly one paced query sequence'
+        );
+        assert.deepEqual(
+          hb1AfterCooldown[1].serialNumbers,
+          [camB.getSerial()],
+          'Equal-priority round-robin selects sibling camB after camA queried at t0'
+        );
+      } finally {
+        holdHb1Rpcs = false;
+        while (hb1PendingRpcs.length > 0) {
+          hb1PendingRpcs.shift().resolve(false);
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+        global.fetch = origFetch;
+        for (const c of testCams) {
+          if (c.evTimer) {
+            clearTimeout(c.evTimer);
+            c.evTimer = null;
+          }
+          c.clearPendingBackfill();
+          stop(c, 'cleanup', false, 'bridge-test');
+        }
+        configureEufyClientHooks({isShuttingDown: () => true});
+      }
+    }
+  );
+
+  it(
+    'preserves the matched clip hardware event label when extending Frigate events on ' +
+      'download finished after an /api/wake reason override',
+    async (t) => {
+      // Regression: handleDownloadFinishedEvent passed cam.getReason() ("backfill: <reason>") instead of
+      // activeBackfillClip.event / evLabel into frigateEvent(), downgrading person/vehicle backfill clips to
+      // "motion" when an /api/wake reason override was present and evUntil elapsed before download finished.
+      t.mock.timers.enable({apis: ['setTimeout', 'Date'], now: 2000000});
+
+      const advanceFakeClock = async (totalMs, stepMs = 200) => {
+        for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) {
+          t.mock.timers.tick(Math.min(stepMs, totalMs - elapsed));
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+      };
+
+      const stationSn = 'T8030P0000000221';
+      const cam = new Camera({
+        serial: 'T8214T0000000221',
+        name: 'doorbell_dl_ext',
+        mode: 'backfill',
+        station_serial: stationSn,
+      });
+
+      class InstantMockWs {
+        constructor() {
+          this.readyState = 1;
+          this.handlers = new Map();
+        }
+        on(ev, fn) {
+          this.handlers.set(ev, fn);
+        }
+        send(raw, cb) {
+          const msg = JSON.parse(raw);
+          if (cb) cb();
+          const h = this.handlers.get('message');
+          if (!h) return;
+          queueMicrotask(() => {
+            h(JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+          });
+        }
+      }
+
+      let wsInst = null;
+      const testCams = [cam];
+      const testBySn = new Map([[cam.getSerial(), cam]]);
+      const createdEvents = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts = {}) => {
+        const u = String(url);
+        if (u.includes('/api/events/')) {
+          createdEvents.push({url: u, body: JSON.parse(opts.body)});
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {event_id: 'ev-dl-ext-' + createdEvents.length};
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return [];
+          },
+          async text() {
+            return '';
+          },
+        };
+      };
+
+      try {
+        initOrchestrator(testCams, testBySn, () => false);
+        configureEufyClientHooks({
+          cams: testCams,
+          bySerial: testBySn,
+          isShuttingDown: () => false,
+          WebSocket: function MockWs() {
+            wsInst = new InstantMockWs();
+            return wsInst;
+          },
+        });
+        connectWs();
+        wsInst.handlers.get('message')(JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        configureEufyClientHooks({isShuttingDown: () => false, wsReadyAt: Date.now() - 10000});
+
+        // 1. Eufy "person detected" (Alice) upgraded with /api/wake reason="driveway sensor"
+        const t0 = Date.now();
+        cam.queueEventBackfill(t0 - 20000, 'person detected', 'Alice', 'person detected (Alice)', 200, true);
+        const wakeRes = wakeCameraExternal(cam, {
+          durationMs: 30000,
+          reason: 'driveway sensor',
+          createEvent: true,
+          delayMs: 0,
+        });
+        assert.equal(wakeRes.status, 'backfill');
+        assert.equal(cam.pendingBackfill?.event, 'person detected');
+        assert.equal(cam.pendingBackfill?.reason, 'driveway sensor');
+
+        cam.recordMotionCleared(t0 - 15000, 4000, 10000, 'person detected');
+        assert.equal(
+          cam.tryMatchBackfillCandidate({
+            devSn: cam.getSerial(),
+            storagePath: '/zx/person_long.zxvideo',
+            cipherId: 1,
+            clipMs: t0 - 19000,
+          }),
+          true
+        );
+
+        await processBackfillQueue(Date.now());
+        assert.equal(cam.activeMode, 'download');
+        assert.equal(cam.getReason(), 'backfill: driveway sensor');
+
+        const frameBuf = Buffer.alloc(FRAME, 0x77);
+        cam.markP2pVideoPacketReceived(Date.now() + 100);
+        cam.recordDecodedFrame(frameBuf, frameBuf, Date.now() + 100, '13:00');
+        await advanceFakeClock(2500);
+        assert.equal(createdEvents.length, 1, 'Initial backfill Frigate event must be filed');
+        assert.equal(createdEvents[0].url.endsWith('/api/events/doorbell_dl_ext/person/create'), true);
+        assert.equal(createdEvents[0].body.sub_label, 'Alice');
+
+        // Advance past initial 36s evUntil window during a long clip transfer, then emit 'download finished'
+        await advanceFakeClock(40000, 1000);
+        assert.equal(cam.getFrigateEventState(Date.now()), 'idle');
+        for (let i = 0; i < 300; i++) {
+          cam.bufferDownloadFrame(frameBuf, 1800);
+        }
+        cam.recordDecodedFrame(frameBuf, frameBuf, Date.now(), '13:01');
+        onEvent({
+          source: 'device',
+          event: 'download finished',
+          serialNumber: cam.getSerial(),
+        });
+        await advanceFakeClock(2500);
+
+        assert.equal(createdEvents.length, 2, 'Long buffered clip on download finished must extend Frigate event');
+        assert.equal(
+          createdEvents[1].url.endsWith('/api/events/doorbell_dl_ext/person/create'),
+          true,
+          'Extended Frigate event on download finished must preserve "person" label instead of downgrading to "motion"'
+        );
+        assert.equal(createdEvents[1].body.sub_label, 'Alice');
+
+        stop(cam, 'post-event clip download stream completed', false, 'eufy/download-finished');
+        await advanceFakeClock(60000, 1000);
+
+        // 2. Upgraded non-motion evLabel ("car" from "vehicle detected") on a "motion detected" clip is also preserved
+        createdEvents.length = 0;
+        cam.beginBackfillDownload(
+          {
+            storagePath: '/zx/vehicle_upgrade.zxvideo',
+            cipherId: 2,
+            clipMs: Date.now() - 15000,
+            event: 'motion detected',
+            personName: '',
+            reason: 'gate beam',
+          },
+          false,
+          Date.now()
+        );
+        frigateEvent(cam, 'motion detected', '');
+        frigateEvent(cam, 'vehicle detected', '');
+        cam.markP2pVideoPacketReceived(Date.now() + 100);
+        cam.recordDecodedFrame(frameBuf, frameBuf, Date.now() + 100, '13:02');
+        await advanceFakeClock(2500);
+        assert.equal(createdEvents.length, 1);
+        assert.equal(createdEvents[0].url.endsWith('/api/events/doorbell_dl_ext/car/create'), true);
+
+        await advanceFakeClock(40000, 1000);
+        for (let i = 0; i < 300; i++) {
+          cam.bufferDownloadFrame(frameBuf, 1800);
+        }
+        cam.recordDecodedFrame(frameBuf, frameBuf, Date.now(), '13:03');
+        onEvent({
+          source: 'device',
+          event: 'download finished',
+          serialNumber: cam.getSerial(),
+        });
+        await advanceFakeClock(2500);
+
+        assert.equal(createdEvents.length, 2);
+        assert.equal(
+          createdEvents[1].url.endsWith('/api/events/doorbell_dl_ext/car/create'),
+          true,
+          'Extended Frigate event on download finished must preserve upgraded "car" label'
+        );
+      } finally {
+        global.fetch = origFetch;
+        if (cam.evTimer) {
+          clearTimeout(cam.evTimer);
+          cam.evTimer = null;
+        }
+        cam.clearPendingBackfill();
+        stop(cam, 'cleanup', false, 'bridge-test');
+        await advanceFakeClock(1000);
+        configureEufyClientHooks({isShuttingDown: () => true});
+      }
+    }
+  );
+
+  it(
+    'preserves underlying fetch causes, AggregateError sub-errors, full HTTP error bodies, and Eufy RPC messages ' +
+      'across service logs',
+    async () => {
+      // Regression: Node 22 fetch TypeError("fetch failed", {cause}) and dual-stack AggregateError("") hid real
+      // socket errors, syncSingleFrigateMaskSection truncated >200-char errors and let legacy fallback exceptions
+      // override PUT validation errors, pollViewers/notifyHA dropped HTTP failure details, and Eufy RPC failures
+      // omitted res.message and overrode start_download stop reasons.
+      const EventEmitter = require('node:events');
+      const loggerMod = require('../src/logger');
+      assert.equal(typeof loggerMod.formatErrorMessage, 'function', 'logger.js must export formatErrorMessage');
+
+      // 1. formatErrorMessage unwraps fetch cause + dual-stack AggregateError("") with sub-errors
+      const dualStackAgg = new AggregateError([
+        Object.assign(new Error('connect ECONNREFUSED ::1:5000'), {code: 'ECONNREFUSED'}),
+        Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5000'), {code: 'ECONNREFUSED'}),
+      ]);
+      dualStackAgg.code = 'ECONNREFUSED';
+      const fetchErr = new TypeError('fetch failed', {cause: dualStackAgg});
+      const formattedFetchErr = loggerMod.formatErrorMessage(fetchErr);
+      assert.equal(formattedFetchErr.includes('fetch failed'), true);
+      assert.equal(formattedFetchErr.includes('connect ECONNREFUSED ::1:5000'), true);
+      assert.equal(formattedFetchErr.includes('connect ECONNREFUSED 127.0.0.1:5000'), true);
+
+      const warnings = [];
+      const errors = [];
+      const origWarn = log.warn;
+      const origError = log.error;
+      const origFetch = global.fetch;
+      log.warn = (scope, ...args) => {
+        warnings.push((typeof scope === 'object' && scope ? scope.name : String(scope)) + ': ' + args.join(' '));
+      };
+      log.error = (scope, ...args) => {
+        errors.push((typeof scope === 'object' && scope ? scope.name : String(scope)) + ': ' + args.join(' '));
+      };
+
+      const diagCam = new Camera({
+        serial: 'T8214T0000008881',
+        name: 'diag_error_cam',
+        mode: 'backfill',
+        station_serial: 'T8030P0000008880',
+        card_theme: 'glance',
+        card_position: 'bottom-left',
+        auto_frigate_mask: true,
+      });
+
+      try {
+        // 2. syncSingleFrigateMaskSection preserves >200-char PUT error body even if legacy fallback throws
+        const longValidationMsg =
+          '{"detail":[{"loc":["body","config_data","cameras","diag_error_cam","motion","mask"],' +
+          '"padding":"' +
+          'x'.repeat(160) +
+          '","msg":"Invalid polygon coordinate count in mask definition"}]}';
+        let maskCallIdx = 0;
+        global.fetch = async () => {
+          maskCallIdx++;
+          if (maskCallIdx === 1) {
+            return {
+              ok: false,
+              status: 422,
+              async text() {
+                return longValidationMsg;
+              },
+            };
+          }
+          throw new Error('The operation was aborted due to timeout');
+        };
+        const maskRes = await syncSingleFrigateMaskSection(
+          diagCam,
+          {motion: {mask: {}}},
+          'motion',
+          diagCam.computeMaskPolygon(),
+          'http://frigate.local:5000'
+        );
+        assert.equal(maskRes, 'failed');
+        assert.equal(
+          warnings.some(
+            (w) => w.includes('HTTP 422') && w.includes('Invalid polygon coordinate count in mask definition')
+          ),
+          true,
+          'syncSingleFrigateMaskSection must preserve full >200-char PUT HTTP 422 body even when legacy fallback throws'
+        );
+
+        // 3. pollViewers surfaces go2rtc HTTP/network failure reason and notifyHA surfaces non-2xx body + fetch cause
+        // Reset go2rtcApiDown first with one 200 OK poll
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          async json() {
+            return {consumers: []};
+          },
+        });
+        await pollViewers([diagCam], {
+          isShuttingDown: () => false,
+          fetchAllCameraTelemetry: () => {},
+          stopCam: () => {},
+          triggerCam: () => {},
+        });
+        warnings.length = 0;
+
+        global.fetch = async () => {
+          throw fetchErr;
+        };
+        await pollViewers([diagCam], {
+          isShuttingDown: () => false,
+          fetchAllCameraTelemetry: () => {},
+          stopCam: () => {},
+          triggerCam: () => {},
+        });
+        assert.equal(
+          warnings.some(
+            (w) => w.includes('go2rtc API unreachable') && w.includes('connect ECONNREFUSED 127.0.0.1:5000')
+          ),
+          true,
+          'pollViewers outage warning must surface underlying fetch cause instead of dropping error'
+        );
+
+        warnings.length = 0;
+        global.fetch = async () => ({
+          ok: false,
+          status: 400,
+          async text() {
+            return 'Webhook invalid payload schema';
+          },
+        });
+        const haOk = await notifyHA(diagCam, {}, 'http://homeassistant.local:8123/api/webhook/test');
+        assert.equal(haOk, false);
+        assert.equal(
+          warnings.some((w) => w.includes('HTTP 400') && w.includes('Webhook invalid payload schema')),
+          true,
+          'notifyHA must include non-2xx response body details'
+        );
+
+        // 4. WebSocket dual-stack AggregateError("") on socket error and RPC res.message on start_download failure
+        errors.length = 0;
+        warnings.length = 0;
+        let activeWs = null;
+        class MockDiagWs extends EventEmitter {
+          constructor() {
+            super();
+            this.readyState = 1;
+            activeWs = this;
+          }
+          send(raw, cb) {
+            if (cb) cb(null);
+            const msg = JSON.parse(raw);
+            if (msg.command === 'set_api_schema' || msg.command === 'start_listening') {
+              setImmediate(() =>
+                this.emit(
+                  'message',
+                  JSON.stringify({
+                    type: 'result',
+                    messageId: msg.messageId,
+                    success: true,
+                    result: {state: {driver: {connected: true}, stations: [], devices: []}},
+                  })
+                )
+              );
+            } else if (msg.command === 'device.get_properties') {
+              setImmediate(() =>
+                this.emit(
+                  'message',
+                  JSON.stringify({
+                    type: 'result',
+                    messageId: msg.messageId,
+                    success: true,
+                    result: {properties: {state: 1, battery: 85}},
+                  })
+                )
+              );
+            } else if (msg.command === 'device.start_download') {
+              setImmediate(() =>
+                this.emit(
+                  'message',
+                  JSON.stringify({
+                    type: 'result',
+                    messageId: msg.messageId,
+                    success: false,
+                    errorCode: 'unknown_error',
+                    message: 'Station P2P transfer channel busy',
+                  })
+                )
+              );
+            }
+          }
+          close() {}
+        }
+
+        const camMap = new Map([[diagCam.getSerial(), diagCam]]);
+        initOrchestrator([diagCam], camMap, () => false);
+        configureEufyClientHooks({
+          cams: [diagCam],
+          bySerial: camMap,
+          isShuttingDown: () => false,
+          onEvent,
+          WebSocket: MockDiagWs,
+        });
+        connectWs();
+        assert.ok(activeWs);
+        activeWs.emit('error', dualStackAgg);
+        assert.equal(
+          errors.some(
+            (e) => e.includes('eufy-security-ws error:') && e.includes('connect ECONNREFUSED 127.0.0.1:5000')
+          ),
+          true,
+          'eufy-security-ws socket error must render AggregateError sub-errors instead of blank err.message'
+        );
+
+        activeWs.emit('message', JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+        await new Promise((r) => setTimeout(r, 30));
+
+        const nowMs = Date.now();
+        diagCam.queueEventBackfill(nowMs - 20000, 'person detected', '', 'person detected', 200, true);
+        diagCam.recordMotionCleared(nowMs - 15000, 4000, 10000, 'person detected');
+        diagCam.tryMatchBackfillCandidate({
+          devSn: diagCam.getSerial(),
+          storagePath: '/zx/diag_fail.zxvideo',
+          cipherId: 9,
+          clipMs: nowMs - 19000,
+          eventLabel: 'person detected',
+          personName: '',
+        });
+        errors.length = 0;
+        warnings.length = 0;
+        await processBackfillQueue(nowMs);
+        await new Promise((r) => setTimeout(r, 20));
+
+        assert.equal(
+          warnings.some(
+            (w) => w.includes('device.start_download failed') && w.includes('Station P2P transfer channel busy')
+          ),
+          true,
+          'device.start_download warning must include eufy-security-ws error message'
+        );
+        assert.equal(
+          errors.some(
+            (e) =>
+              e.includes('initiator=error/download-failed') &&
+              e.includes('unknown_error') &&
+              e.includes('Station P2P transfer channel busy')
+          ),
+          true,
+          'SLEEP error/download-failed reason must preserve RPC error details instead of bare ' +
+            '"start_download RPC failed"'
+        );
+      } finally {
+        log.warn = origWarn;
+        log.error = origError;
+        global.fetch = origFetch;
+        diagCam.clearPendingBackfill();
+        configureEufyClientHooks({isShuttingDown: () => true});
+      }
+    }
+  );
 });

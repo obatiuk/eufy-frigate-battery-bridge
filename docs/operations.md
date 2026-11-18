@@ -33,6 +33,9 @@ Read when: you need a build, test, publish, health check, or signal-driven diagn
 - **Check Bridge Readiness:**
   `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/healthz` (`GET`/`HEAD /healthz` or `/health`;
   or `curl -s http://127.0.0.1:8080/healthz` if port `8080` is published to the host)
+- **Check Full Bridge Runtime Status & Telemetry:**
+  `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/status` (`GET`/`HEAD /api/status`; or
+  `curl -s http://127.0.0.1:8080/api/status` if port `8080` is published to the host)
 - **Check Bridge Build Version, Commit & Runtime Config:**
   `podman exec eufy-frigate-battery-bridge wget -qO- http://127.0.0.1:8080/api/config` (`GET`/`HEAD /api/config`; or
   `curl -s http://127.0.0.1:8080/api/config` if port `8080` is published to the host)

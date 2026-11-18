@@ -21,8 +21,12 @@ const BACKFILL_MAX_TOTAL_RECORDING_WAIT_MS = 124000;
 const INITIAL_COMPANION_ACTIVITY_WINDOW_MS = 5000;
 const DEFAULT_MIN_EVENT_AGE_MS = 8000;
 const BACKFILL_FOLLOWUP_ACTIVITY_MS = 15000;
+const BACKFILL_DATE_WINDOW_MS = 86400000;
 const TEST_BACKFILL_OFFSET_MS = 10000;
 const TEST_BACKFILL_PRIORITY = 9999;
+const MS_PER_SECOND = 1000;
+const EPOCH_MS_THRESHOLD = 100000000000;
+const NUMERIC_TIMESTAMP_REGEX = /^\d+(?:\.\d+)?$/;
 const STORAGE_PATH_TIMESTAMP_REGEX = /(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/;
 const CROP_LOCAL_PATH_REGEX = /^(.*\/(\d{14}))\/[^/]+$/;
 
@@ -52,6 +56,9 @@ const PRE_DOWNLOAD_BACKFILL_STATES = Object.freeze(
   ])
 );
 
+/** @type {ReadonlySet<string>} */
+const TERMINAL_BACKFILL_STATES = Object.freeze(new Set([BACKFILL_STATES.COMPLETED, BACKFILL_STATES.EXPIRED]));
+
 /**
  * Validated transition map for the BackfillJob finite state machine.
  *
@@ -77,23 +84,10 @@ const ALLOWED_BACKFILL_TRANSITIONS = Object.freeze({
     ])
   ),
   [BACKFILL_STATES.READY_TO_QUERY]: Object.freeze(
-    new Set([
-      BACKFILL_STATES.RECORDING,
-      BACKFILL_STATES.SETTLING,
-      BACKFILL_STATES.READY_TO_QUERY,
-      BACKFILL_STATES.MATCHED,
-      BACKFILL_STATES.EXPIRED,
-    ])
+    new Set([BACKFILL_STATES.READY_TO_QUERY, BACKFILL_STATES.MATCHED, BACKFILL_STATES.EXPIRED])
   ),
   [BACKFILL_STATES.MATCHED]: Object.freeze(
-    new Set([
-      BACKFILL_STATES.RECORDING,
-      BACKFILL_STATES.SETTLING,
-      BACKFILL_STATES.READY_TO_QUERY,
-      BACKFILL_STATES.MATCHED,
-      BACKFILL_STATES.DOWNLOADING,
-      BACKFILL_STATES.EXPIRED,
-    ])
+    new Set([BACKFILL_STATES.MATCHED, BACKFILL_STATES.DOWNLOADING, BACKFILL_STATES.EXPIRED])
   ),
   [BACKFILL_STATES.DOWNLOADING]: Object.freeze(
     new Set([
@@ -123,13 +117,23 @@ function canTransitionBackfill(fromState, toState) {
 /**
  * Parses the recording timestamp (ms) from a HomeBase database record's start_time or storage_path.
  *
- * @param {string} startStr - ISO or timestamp string from the database record.
+ * @param {string|number} startVal - ISO string or numeric epoch timestamp from the database record.
  * @param {string} storagePath - HomeBase internal storage path containing YYYYMMDDHHMMSS.
  * @returns {number}
  */
-function parseClipTimestampMs(startStr, storagePath) {
-  const parsedDirect = startStr ? new Date(startStr).getTime() : 0;
-  if (parsedDirect && !Number.isNaN(parsedDirect)) {
+function parseClipTimestampMs(startVal, storagePath) {
+  if (typeof startVal === 'number' && Number.isFinite(startVal) && startVal > 0) {
+    return startVal < EPOCH_MS_THRESHOLD ? Math.round(startVal * MS_PER_SECOND) : Math.round(startVal);
+  }
+  const trimmedStart = typeof startVal === 'string' ? startVal.trim() : '';
+  if (trimmedStart && NUMERIC_TIMESTAMP_REGEX.test(trimmedStart)) {
+    const numTs = Number(trimmedStart);
+    if (Number.isFinite(numTs) && numTs > 0) {
+      return numTs < EPOCH_MS_THRESHOLD ? Math.round(numTs * MS_PER_SECOND) : Math.round(numTs);
+    }
+  }
+  const parsedDirect = trimmedStart ? Date.parse(trimmedStart) : 0;
+  if (parsedDirect > 0 && !Number.isNaN(parsedDirect)) {
     return parsedDirect;
   }
   const tm = STORAGE_PATH_TIMESTAMP_REGEX.exec(String(storagePath || ''));
@@ -229,7 +233,8 @@ class BackfillJob {
   }
 
   /**
-   * Validates and executes a state transition on this BackfillJob, logging a DEBUG transition line.
+   * Validates and executes a state transition on this BackfillJob, logging accepted and refused
+   * transitions at DEBUG level.
    *
    * @param {string} nextState - Target BACKFILL_STATES value.
    * @param {string} [reason=''] - Human-readable reason for the transition.
@@ -237,12 +242,13 @@ class BackfillJob {
    */
   transitionTo(nextState, reason = '') {
     const prevState = this.state;
+    const suffix = reason ? ' (' + reason + ')' : '';
     if (!canTransitionBackfill(prevState, nextState)) {
+      log.debug(this, 'refused backfill state: ' + prevState + ' -> ' + nextState + suffix);
       return prevState;
     }
     this.state = nextState;
     if (prevState && prevState !== nextState) {
-      const suffix = reason ? ' (' + reason + ')' : '';
       log.debug(this, 'backfill state: ' + prevState + ' -> ' + nextState + suffix);
     }
     return this.state;
@@ -251,49 +257,50 @@ class BackfillJob {
   /**
    * Upgrades this backfill job in-place when a higher- or equal-priority companion event
    * arrives during the same motion window while preserving the original start timestamp
-   * and re-asserting active recording state. Accepts either an options object or positional args.
+   * and re-asserting active recording state when permitted by the FSM.
    *
-   * @param {string|Record<string, *>} eventNameOrOpts - New Eufy event string or options object.
-   * @param {string} [personName=''] - Optional recognized person name.
-   * @param {string} [reason=''] - Formatted trigger description.
-   * @param {number} [nextPriority=DEFAULT_EVENT_PRIORITY] - Combined camera + event priority score.
-   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {boolean} [recordingActive=true] - Whether the trigger indicates active recording.
+   * @param {{
+   *   event?: string,
+   *   personName?: string,
+   *   reason?: string,
+   *   priority?: number,
+   *   at?: number,
+   *   now?: number,
+   *   recordingActive?: boolean
+   * }} opts - Companion event upgrade options.
    * @returns {boolean} True if event/priority or personName was upgraded.
    */
-  upgradeEvent(
-    eventNameOrOpts,
-    personName = '',
-    reason = '',
-    nextPriority = DEFAULT_EVENT_PRIORITY,
-    now = Date.now(),
-    recordingActive = true
-  ) {
-    const opts = typeof eventNameOrOpts === 'object' && eventNameOrOpts !== null ? eventNameOrOpts : null;
-    const evName = opts ? String(opts.event || this.event) : String(eventNameOrOpts || '');
-    const pName = opts ? String(opts.personName || '') : personName;
-    const rsn = opts ? String(opts.reason || evName) : reason || evName;
-    const prio = opts ? Number(opts.priority ?? this.priority) : nextPriority;
-    const ts = opts ? Number(opts.at ?? opts.now ?? Date.now()) : now;
-    const recActive = opts && opts.recordingActive !== undefined ? Boolean(opts.recordingActive) : recordingActive;
+  upgradeEvent(opts) {
+    if (typeof opts !== 'object' || opts === null) {
+      throw new TypeError('BackfillJob.upgradeEvent requires an options object');
+    }
+    if (TERMINAL_BACKFILL_STATES.has(this.state)) {
+      return false;
+    }
+    const evName = String(opts.event || this.event);
+    const pName = String(opts.personName || '');
+    const rsn = String(opts.reason || evName);
+    const prio = Number(opts.priority ?? this.priority);
+    const ts = Number(opts.at ?? opts.now ?? Date.now());
+    const recActive = opts.recordingActive !== undefined ? Boolean(opts.recordingActive) : true;
 
-    this.lastActivityAt = Math.max(this.lastActivityAt || this.at, ts);
-    if (recActive && !this.ignoreTimeWindow) {
-      if (evName) {
-        this.activeEvents.add(evName.toLowerCase());
+    if (recActive && !this.ignoreTimeWindow && canTransitionBackfill(this.state, BACKFILL_STATES.RECORDING)) {
+      this.lastActivityAt = Math.max(this.lastActivityAt || this.at, ts);
+      const next = this.transitionTo(BACKFILL_STATES.RECORDING, 'companion event re-triggered recording');
+      if (next === BACKFILL_STATES.RECORDING) {
+        if (evName) {
+          this.activeEvents.add(evName.toLowerCase());
+        }
+        this.recordingActive = true;
+        this.clearedAt = 0;
       }
-      this.recordingActive = true;
-      this.clearedAt = 0;
-      this.transitionTo(BACKFILL_STATES.RECORDING, 'companion event re-triggered recording');
     }
     let changed = false;
-    if (prio >= this.priority) {
-      if (this.event !== evName || this.reason !== rsn || this.priority !== prio) {
-        this.event = evName;
-        this.reason = rsn;
-        this.priority = prio;
-        changed = true;
-      }
+    if (prio >= this.priority && (this.event !== evName || this.reason !== rsn || this.priority !== prio)) {
+      this.event = evName;
+      this.reason = rsn;
+      this.priority = prio;
+      changed = true;
     }
     if (pName && !this.personName) {
       this.personName = pName;
@@ -311,18 +318,28 @@ class BackfillJob {
    * @returns {boolean} True if all active triggers have cleared and recording is now settling.
    */
   markRecordingCleared(now = Date.now(), eventName = '') {
-    this.lastActivityAt = Math.max(this.lastActivityAt || this.at, now);
+    if (TERMINAL_BACKFILL_STATES.has(this.state)) {
+      return false;
+    }
     if (eventName) {
       this.activeEvents.delete(String(eventName).toLowerCase());
     } else {
       this.activeEvents.clear();
     }
+    if (!this.recordingActive && this.clearedAt > 0) {
+      return true;
+    }
+    this.lastActivityAt = Math.max(this.lastActivityAt || this.at, now);
     if (this.activeEvents.size > 0) {
       return false;
     }
     this.recordingActive = false;
-    this.clearedAt = now;
-    this.transitionTo(BACKFILL_STATES.SETTLING, 'all triggers cleared');
+    if (this.state === BACKFILL_STATES.RECORDING) {
+      this.clearedAt = now;
+      this.transitionTo(BACKFILL_STATES.SETTLING, 'all triggers cleared');
+    } else if (this.clearedAt <= 0) {
+      this.clearedAt = Math.max(1, now - BACKFILL_POST_CLEAR_SETTLE_MS);
+    }
     return true;
   }
 
@@ -350,8 +367,23 @@ class BackfillJob {
   }
 
   /**
-   * Returns true if enough time has elapsed (or Eufy reported all activity cleared + 4s settle)
-   * to query the HomeBase local database for the recorded clip, transitioning to READY_TO_QUERY.
+   * Resolves the effective maximum recording wait duration in milliseconds.
+   *
+   * @param {number} minEventAgeMs - Fallback minimum event age in milliseconds.
+   * @param {number} [maxRecordingWaitMs] - Optional explicit maximum wait while recordingActive is true.
+   * @returns {number}
+   */
+  resolveMaxRecordingWaitMs(minEventAgeMs, maxRecordingWaitMs) {
+    return maxRecordingWaitMs !== undefined
+      ? maxRecordingWaitMs
+      : minEventAgeMs > DEFAULT_MIN_EVENT_AGE_MS
+        ? minEventAgeMs
+        : BACKFILL_RECORDING_WAIT_CAP_MS;
+  }
+
+  /**
+   * Pure predicate returning true if enough time has elapsed (or Eufy reported all activity
+   * cleared + 4s settle) to query the HomeBase local database for the recorded clip.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    * @param {number} [minEventAgeMs=DEFAULT_MIN_EVENT_AGE_MS] - Fallback minimum event age in milliseconds.
@@ -359,13 +391,27 @@ class BackfillJob {
    * @returns {boolean}
    */
   isReadyToQuery(now = Date.now(), minEventAgeMs = DEFAULT_MIN_EVENT_AGE_MS, maxRecordingWaitMs = undefined) {
-    const effectiveRecordingWaitMs =
-      maxRecordingWaitMs !== undefined
-        ? maxRecordingWaitMs
-        : minEventAgeMs > DEFAULT_MIN_EVENT_AGE_MS
-          ? minEventAgeMs
-          : BACKFILL_RECORDING_WAIT_CAP_MS;
-    const ready = this.hasElapsedQuerySettleWindow(now, minEventAgeMs, effectiveRecordingWaitMs);
+    return this.hasElapsedQuerySettleWindow(
+      now,
+      minEventAgeMs,
+      this.resolveMaxRecordingWaitMs(minEventAgeMs, maxRecordingWaitMs)
+    );
+  }
+
+  /**
+   * Evaluates readiness via isReadyToQuery() and transitions RECORDING or SETTLING jobs to READY_TO_QUERY.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @param {number} [minEventAgeMs=DEFAULT_MIN_EVENT_AGE_MS] - Fallback minimum event age in milliseconds.
+   * @param {number} [maxRecordingWaitMs] - Maximum wait while recordingActive is true.
+   * @returns {boolean}
+   */
+  markReadyToQueryIfSettled(
+    now = Date.now(),
+    minEventAgeMs = DEFAULT_MIN_EVENT_AGE_MS,
+    maxRecordingWaitMs = undefined
+  ) {
+    const ready = this.isReadyToQuery(now, minEventAgeMs, maxRecordingWaitMs);
     if (ready && (this.state === BACKFILL_STATES.RECORDING || this.state === BACKFILL_STATES.SETTLING)) {
       this.transitionTo(BACKFILL_STATES.READY_TO_QUERY, 'settle window elapsed');
     }
@@ -373,16 +419,26 @@ class BackfillJob {
   }
 
   /**
-   * Returns true if this backfill request is older than maxAgeMs (default 5 minutes),
-   * transitioning the FSM to EXPIRED when true.
+   * Pure predicate returning true if this backfill request is older than maxAgeMs (default 5 minutes).
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp.
    * @param {number} [maxAgeMs=300000] - Maximum age in milliseconds.
    * @returns {boolean}
    */
   isExpired(now = Date.now(), maxAgeMs = DEFAULT_BACKFILL_MAX_AGE_MS) {
-    const expired = now - Math.max(this.at, this.lastActivityAt || this.at) > maxAgeMs;
-    if (expired) {
+    return now - Math.max(this.at, this.lastActivityAt || this.at) > maxAgeMs;
+  }
+
+  /**
+   * Evaluates expiry via isExpired() and transitions pre-terminal jobs to EXPIRED when maxAgeMs has elapsed.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp.
+   * @param {number} [maxAgeMs=300000] - Maximum age in milliseconds.
+   * @returns {boolean}
+   */
+  expireIfNeeded(now = Date.now(), maxAgeMs = DEFAULT_BACKFILL_MAX_AGE_MS) {
+    const expired = this.isExpired(now, maxAgeMs);
+    if (expired && canTransitionBackfill(this.state, BACKFILL_STATES.EXPIRED)) {
       this.transitionTo(BACKFILL_STATES.EXPIRED, 'max age exceeded');
     }
     return expired;
@@ -407,7 +463,7 @@ class BackfillJob {
   consumeQueryAttempt(maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
     this.attempts += 1;
     const allowed = this.attempts <= maxAttempts;
-    if (!allowed) {
+    if (!allowed && canTransitionBackfill(this.state, BACKFILL_STATES.EXPIRED)) {
       this.transitionTo(BACKFILL_STATES.EXPIRED, 'max query attempts exhausted');
     }
     return allowed;
@@ -424,8 +480,8 @@ class BackfillJob {
     const endRef = Math.max(this.at, this.lastActivityAt || this.at, this.clearedAt || 0);
     return candidate && !downloadedPaths.has(candidate.storagePath)
       ? this.isUrgentTest() ||
-          !candidate.clipMs ||
-          (candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS &&
+          (candidate.clipMs > 0 &&
+            candidate.clipMs >= this.at - BACKFILL_MATCH_LOOKBACK_MS &&
             candidate.clipMs <= endRef + BACKFILL_MATCH_LOOKAHEAD_MS)
       : false;
   }
@@ -475,6 +531,9 @@ class BackfillJob {
       return false;
     }
     this.matchedClips.push(this.toMatchedClip(candidate));
+    if (this.followUpQueried && candidate.clipMs > 0) {
+      this.followUpQueried = false;
+    }
     if (this.matchedClips.length > 1) {
       this.matchedClips.sort((a, b) => (a.clipMs || 0) - (b.clipMs || 0));
     }
@@ -533,17 +592,19 @@ class BackfillJob {
   }
 
   /**
-   * Prepares this job for a single post-download follow-up database query to catch split clips.
+   * Prepares this job for a post-download follow-up database query to catch split clips.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [maxAttempts=BACKFILL_MAX_QUERY_ATTEMPTS] - Maximum allowed query attempts.
+   * @param {number} [_maxAttempts=BACKFILL_MAX_QUERY_ATTEMPTS] - Maximum allowed query attempts.
    * @returns {boolean} True once transitioned to READY_TO_QUERY.
    */
-  prepareFollowUpQuery(now = Date.now(), maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
+  prepareFollowUpQuery(now = Date.now(), _maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
     this.followUpQueried = true;
     this.recordingActive = false;
-    this.clearedAt = now;
-    this.attempts = Math.max(0, maxAttempts - 1);
+    if (this.clearedAt <= 0 || now - this.clearedAt < BACKFILL_POST_CLEAR_SETTLE_MS) {
+      this.clearedAt = Math.max(1, now - BACKFILL_POST_CLEAR_SETTLE_MS);
+    }
+    this.attempts = 0;
     this.transitionTo(BACKFILL_STATES.READY_TO_QUERY, 'follow-up query scheduled');
     return true;
   }
@@ -569,6 +630,59 @@ class BackfillJob {
   }
 }
 
+/**
+ * Formats a Date instance as a local YYYYMMDD string for HomeBase database_query_by_date RPCs.
+ *
+ * @param {Date} d - Date to format.
+ * @returns {string}
+ */
+function formatLocalYmd(d) {
+  return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+}
+
+/**
+ * Builds the +/- 24-hour local YYYYMMDD date range window around now for HomeBase clip lookups.
+ *
+ * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+ * @returns {Readonly<{ startDate: string, endDate: string }>}
+ */
+function formatBackfillQueryDateRange(now = Date.now()) {
+  return Object.freeze({
+    startDate: formatLocalYmd(new Date(now - BACKFILL_DATE_WINDOW_MS)),
+    endDate: formatLocalYmd(new Date(now + BACKFILL_DATE_WINDOW_MS)),
+  });
+}
+
+/**
+ * Parses a HomeBase "database query local" / "database query latest" station event into a debug
+ * log line and newest-first candidate clip descriptors.
+ *
+ * @param {Record<string, *>} e - Station event payload from eufy-security-ws.
+ * @returns {Readonly<{
+ *   eventLog: string,
+ *   candidates: Array<{ devSn: string, storagePath: string, cipherId: number, clipMs: number }>,
+ * }>}
+ */
+function parseDatabaseQueryEvent(e) {
+  const rows = Array.isArray(e.data) ? e.data : [];
+  const eventLog =
+    'received HomeBase (' +
+    (e.serialNumber || 'station') +
+    ') event "' +
+    e.event +
+    '" (returnCode=' +
+    (e.returnCode ?? 'n/a') +
+    ', records=' +
+    rows.length +
+    ')';
+  if (rows.length === 0) {
+    return Object.freeze({eventLog, candidates: []});
+  }
+  const candidates = rows.map(extractDatabaseRecordCandidate).filter(Boolean);
+  candidates.sort((a, b) => b.clipMs - a.clipMs);
+  return Object.freeze({eventLog, candidates});
+}
+
 module.exports = {
   BACKFILL_STATES,
   ALLOWED_BACKFILL_TRANSITIONS,
@@ -579,4 +693,6 @@ module.exports = {
   BACKFILL_RECORDING_WAIT_CAP_MS,
   BackfillJob,
   extractDatabaseRecordCandidate,
+  formatBackfillQueryDateRange,
+  parseDatabaseQueryEvent,
 };

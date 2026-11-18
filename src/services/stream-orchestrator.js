@@ -17,9 +17,13 @@ const {
   sleep,
   getEventPriority,
 } = require('../config');
-const {log} = require('../logger');
+const {log, formatErrorMessage} = require('../logger');
 const {Camera, WakeRequest, WAKE_KINDS, API_WAKE_STATUSES, DOWNLOAD_COMPLETED_INITIATOR} = require('../domain/camera');
-const {BACKFILL_MAX_QUERY_ATTEMPTS, extractDatabaseRecordCandidate} = require('../domain/backfill-job');
+const {
+  BACKFILL_MAX_QUERY_ATTEMPTS,
+  formatBackfillQueryDateRange,
+  parseDatabaseQueryEvent,
+} = require('../domain/backfill-job');
 const {renderCameraCards} = require('../overlay/card-renderer');
 const {saveCachedFrame} = require('../overlay/snapshot-cache');
 const {pushFrameToEncoder, startEncoder, stopEncoder} = require('../media/encoder');
@@ -33,6 +37,7 @@ const {
 } = require('../media/decoder');
 const {frigateEvent, isFrigateCameraIdle, checkPeriodicMaskSync} = require('./frigate-client');
 const {
+  formatRpcError,
   call,
   setCameraProperty,
   isWsReady,
@@ -94,7 +99,6 @@ const RTSP_RECENT_START_RETRY_DELAY_MS = 750;
 // HomeBase clip backfill queue and download health thresholds.
 const BACKFILL_MIN_EVENT_AGE_MS = 4000;
 const BACKFILL_QUERY_COOLDOWN_MS = 4000;
-const BACKFILL_DATE_WINDOW_MS = 86400000;
 const DOWNLOAD_NO_VIDEO_TIMEOUT_MS = 10000;
 
 // Housekeeping loop and startup snapshot probe intervals.
@@ -108,7 +112,8 @@ const STOP_INITIATORS = Object.freeze({
   VIEW_LIMIT: 'bridge-view-limit',
 });
 const ALREADY_RUNNING_ERROR_REGEX = /already_running/i;
-const EXPECTED_STOP_ERROR_REGEX = /ws_closed|not_running/i;
+const EXPECTED_STOP_ERROR_REGEX = /ws_closed|not_running|not_downloading/i;
+const EXPECTED_STATION_CONNECT_ERROR_REGEX = /already_connected|ws_closed/i;
 const UNRESPONSIVE_WAKE_RPC_REGEX = /^(?:no_reply|station_not_connected)$/i;
 
 /** @type {Camera[]} */
@@ -119,6 +124,12 @@ let isShuttingDownFn = () => false;
 
 const stationTransitions = new Map();
 const stationNextWakeAt = new Map();
+/** @type {Map<string, Promise<void>>} */
+const stationBackfillPromises = new Map();
+/** @type {Map<string, number>} */
+const stationBackfillPendingAt = new Map();
+/** @type {Map<string, number>} */
+const stationLastBackfillQueryAt = new Map();
 const getActiveStationTransitionCount = () => stationTransitions.size;
 const getStationTransition = (cam) => stationTransitions.get(cam.getStationKey()) || Promise.resolve();
 const setStationTransition = (cam, p) => {
@@ -142,6 +153,9 @@ function initOrchestrator(cameraList, serialMap, shuttingDownGetter) {
   isShuttingDownFn = shuttingDownGetter;
   stationTransitions.clear();
   stationNextWakeAt.clear();
+  stationBackfillPromises.clear();
+  stationBackfillPendingAt.clear();
+  stationLastBackfillQueryAt.clear();
   setRtspDropHandler(handleRtspStreamDropped);
 }
 
@@ -207,7 +221,7 @@ async function evaluateActiveHoldExtension(cam, clockNow) {
       return;
     }
     const extNow = clockNow === undefined ? Date.now() : clockNow;
-    const hwActive = cam.hasActiveHardwareTriggers();
+    const hwActive = cam.hasActiveHardwareTriggers(extNow);
     if (!frigateIdle) {
       cam.confirmFrigateObjectDetected(extNow);
     }
@@ -341,8 +355,9 @@ function wakeCameraExternal(cam, opts) {
       );
       void Promise.resolve(fetchAllCameraTelemetry(true)).then(() => {
         if (!cam.isDeviceOffline() && !isShuttingDownFn()) {
-          if (cam.shouldBackfillOnlyOnApiWake()) {
-            queueApiWakeBackfill(cam, reason, Date.now());
+          const refreshedNow = Date.now();
+          if (cam.shouldBackfillOnlyOnApiWake(refreshedNow)) {
+            queueApiWakeBackfill(cam, reason, refreshedNow);
           } else {
             applyWakeTrigger(reason, durationMs, createEvent);
           }
@@ -355,7 +370,7 @@ function wakeCameraExternal(cam, opts) {
     );
   }
 
-  if (cam.shouldBackfillOnlyOnApiWake()) {
+  if (cam.shouldBackfillOnlyOnApiWake(now)) {
     cam.clearApiWakeTimer();
     if (queueApiWakeBackfill(cam, reason, now)) {
       log.info(
@@ -369,6 +384,11 @@ function wakeCameraExternal(cam, opts) {
       );
     }
     return cam.toApiWakeResponse(API_WAKE_STATUSES.BACKFILL, durationMs, 0);
+  }
+
+  if (cam.isBackfillPlayback()) {
+    log.info(cam, 'api-wake "' + reason + '" scheduled after active backfill playback completes');
+    return cam.deferApiWakeDuringBackfill({reason, durationMs, createEvent, evPriority: API_WAKE_EVENT_PRIORITY}, now);
   }
 
   if (cam.hasPendingApiWakeTimer()) {
@@ -635,7 +655,10 @@ async function startRtspStream(cam, now = Date.now()) {
   const r = await call({command: 'device.start_rtsp_livestream', serialNumber: serial});
   if (!r.success && r.errorCode && !ALREADY_RUNNING_ERROR_REGEX.test(r.errorCode)) {
     maybeRecoverStationOnWakeRpcFailure(stationSn, 'start_rtsp_livestream', r.errorCode);
-    log.debug(cam, 'device.start_rtsp_livestream returned ' + r.errorCode + ' (relying on rtspStream property wake)');
+    log.debug(
+      cam,
+      'device.start_rtsp_livestream returned ' + formatRpcError(r) + ' (relying on rtspStream property wake)'
+    );
   }
   await ensureRtspUrlAfterWakeStart(cam, mySession, stationSn);
   if (cam.canSpawnRtspDecoder(mySession)) {
@@ -659,81 +682,83 @@ async function startRtspStream(cam, now = Date.now()) {
  * @param {Record<string, *>} e - Station event payload from eufy-security-ws.
  */
 function handleDatabaseQueryResult(e) {
-  const rows = Array.isArray(e.data) ? e.data : [];
-  log.debug(
-    'bridge',
-    'received HomeBase (' +
-      (e.serialNumber || 'station') +
-      ') event "' +
-      e.event +
-      '" (returnCode=' +
-      (e.returnCode ?? 'n/a') +
-      ', records=' +
-      rows.length +
-      ')'
-  );
-  if (!rows.length) {
-    return;
-  }
+  const {eventLog, candidates} = parseDatabaseQueryEvent(e);
+  log.debug('bridge', eventLog);
+  if (!candidates.length) return;
 
-  const candidates = rows.map(extractDatabaseRecordCandidate).filter(Boolean);
-  candidates.sort((a, b) => b.clipMs - a.clipMs);
-
+  const now = Date.now();
   let matchedAny = false;
   for (const cand of candidates) {
     const cam = bySerial.get(cand.devSn);
-    if (cam && cam.tryMatchBackfillCandidate(cand)) {
+    if (cam && cam.canMatchDatabaseQueryResult(now) && cam.tryMatchBackfillCandidate(cand)) {
       matchedAny = true;
       log.debug(cam, cam.formatBackfillClipMatchLog(cand));
     }
   }
+  if (matchedAny) void processBackfillQueue(now);
+}
 
-  if (matchedAny) {
-    void processBackfillQueue(Date.now());
+/**
+ * Connects to the HomeBase station and dispatches date-range and latest-info clip queries,
+ * logging any unexpected RPC failures.
+ *
+ * @param {Camera} queryCam - Camera querying HomeBase for backfill clips.
+ * @param {string} stationSn - HomeBase station serial number.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ */
+async function dispatchBackfillDatabaseQueries(queryCam, stationSn, now) {
+  const {startDate, endDate} = formatBackfillQueryDateRange(now);
+  const connRes = await call({command: 'station.connect', serialNumber: stationSn});
+  if (!connRes.success && connRes.errorCode && !EXPECTED_STATION_CONNECT_ERROR_REGEX.test(connRes.errorCode)) {
+    log.warn(queryCam, 'station.connect failed before backfill query (errorCode=' + formatRpcError(connRes) + ')');
+  }
+  const byDateRes = await call({
+    command: 'station.database_query_by_date',
+    serialNumber: stationSn,
+    serialNumbers: [queryCam.getSerial()],
+    startDate,
+    endDate,
+  });
+  if (!byDateRes.success) {
+    log.warn(queryCam, 'station.database_query_by_date failed (errorCode=' + formatRpcError(byDateRes) + ')');
+  }
+  if (queryCam.needsLatestInfoBackfillQuery()) {
+    const latestRes = await call({command: 'station.database_query_latest_info', serialNumber: stationSn});
+    if (!latestRes.success) {
+      log.warn(queryCam, 'station.database_query_latest_info failed (errorCode=' + formatRpcError(latestRes) + ')');
+    }
   }
 }
 
 /**
- * Queries the HomeBase local database and starts downloading a missed event clip when the P2P slot is idle.
+ * Executes one serialized backfill expiry, download start, or HomeBase database query step
+ * for all cameras attached to stationKey.
  *
- * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+ * @param {string} stationKey - Canonical HomeBase backfill station key.
+ * @param {number} now - Current epoch timestamp in milliseconds.
  */
-async function processBackfillQueue(now = Date.now()) {
-  if (!isWsReady() || isShuttingDownFn()) {
-    return;
-  }
+async function runStationBackfillStep(stationKey, now) {
+  if (!isWsReady() || isShuttingDownFn()) return;
+  const stationCams = cams.filter((c) => c.isStationBackfillMember(stationKey, cams));
+  if (!stationCams.length) return;
 
-  for (const c of cams) {
-    const expiredReason = c.expirePendingBackfillIfNeeded(now);
+  for (const c of stationCams) {
+    const expiredReason = c.expirePendingBackfillIfNeeded(now, BACKFILL_MIN_EVENT_AGE_MS);
     if (expiredReason) {
       pushFrameToEncoder(c, now);
       log.debug(c, 'expired unfulfilled backfill request (' + expiredReason + ')');
+      if (c.wantsWake(now)) arbitrate(now);
     }
   }
 
-  const readyCam = cams
-    .filter((c) => c.canStartBackfillDownloadNow(cams, now, BACKFILL_DELAY_MS))
-    .sort(Camera.compareBackfillPriority)[0];
-
+  const readyCam = Camera.selectReadyBackfillCam(stationCams, cams, {now, delayMs: BACKFILL_DELAY_MS});
   if (readyCam) {
-    const {clip, sessionId: mySession} = readyCam.startNextBackfillDownload(now);
-
-    log.info(
-      readyCam,
-      'WAKE [BACKFILL DOWNLOAD] (initiator=bridge-backfill, reason="' +
-        clip.reason +
-        '", path="' +
-        clip.storagePath +
-        '", session=' +
-        mySession +
-        ')'
-    );
+    const {clip, sessionId: mySession, wakeLog} = readyCam.startNextBackfillDownload(now);
+    log.info(readyCam, wakeLog);
     frigateEvent(readyCam, clip.event || 'motion detected', clip.personName || '');
 
     await getStationTransition(readyCam);
-    if (!readyCam.isCurrentSession(mySession, STREAM_MODES.DOWNLOAD)) {
-      return;
-    }
+    if (!readyCam.isCurrentSession(mySession, STREAM_MODES.DOWNLOAD)) return;
 
     const res = await call({
       command: 'device.start_download',
@@ -742,21 +767,23 @@ async function processBackfillQueue(now = Date.now()) {
       cipherId: clip.cipherId,
     });
     if (!res.success && readyCam.isCurrentSession(mySession, STREAM_MODES.DOWNLOAD)) {
-      log.warn(readyCam, 'device.start_download failed (errorCode=' + (res.errorCode || 'unknown') + ')');
-      stop(readyCam, 'start_download RPC failed', false, 'error/download-failed');
+      const rpcErr = formatRpcError(res);
+      log.warn(readyCam, 'device.start_download failed (errorCode=' + rpcErr + ')');
+      stop(readyCam, 'start_download RPC failed (' + rpcErr + ')', false, 'error/download-failed');
+      arbitrate(now);
     }
     return;
   }
 
-  const queryCam = cams
-    .filter((c) =>
-      c.canQueryBackfillNow(cams, now, BACKFILL_MIN_EVENT_AGE_MS, BACKFILL_QUERY_COOLDOWN_MS, BACKFILL_DELAY_MS)
-    )
-    .sort(Camera.compareBackfillPriority)[0];
+  const queryCam = Camera.selectQueryableBackfillCam(stationCams, cams, {
+    now,
+    minEventAgeMs: BACKFILL_MIN_EVENT_AGE_MS,
+    queryCooldownMs: BACKFILL_QUERY_COOLDOWN_MS,
+    delayMs: BACKFILL_DELAY_MS,
+    stationLastQueryAt: stationLastBackfillQueryAt.get(stationKey) || 0,
+  });
+  if (!queryCam) return;
 
-  if (!queryCam) {
-    return;
-  }
   const queryState = queryCam.beginBackfillDatabaseQuery(now, BACKFILL_MAX_QUERY_ATTEMPTS);
   if (!queryState.allowed) {
     pushFrameToEncoder(queryCam, now);
@@ -764,6 +791,7 @@ async function processBackfillQueue(now = Date.now()) {
       queryCam,
       'giving up on backfill query after ' + BACKFILL_MAX_QUERY_ATTEMPTS + ' attempts (' + queryState.reason + ')'
     );
+    if (queryCam.wantsWake(now)) arbitrate(now);
     return;
   }
 
@@ -773,36 +801,66 @@ async function processBackfillQueue(now = Date.now()) {
     return;
   }
 
-  const dStart = new Date(now - BACKFILL_DATE_WINDOW_MS);
-  const dEnd = new Date(now + BACKFILL_DATE_WINDOW_MS);
-  const fmtYmd = (d) =>
-    d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+  stationLastBackfillQueryAt.set(stationKey, now);
+  log.debug(queryCam, queryCam.formatBackfillQueryAttemptLog(stationSn, queryState));
+  await dispatchBackfillDatabaseQueries(queryCam, stationSn, now);
+}
 
-  log.debug(
-    queryCam,
-    'querying HomeBase (' +
-      stationSn +
-      ') local database for missed event clip (attempt=' +
-      queryState.attempts +
-      '/' +
-      queryState.maxAttempts +
-      ', reason="' +
-      queryState.reason +
-      '")'
-  );
-  await call({command: 'station.connect', serialNumber: stationSn});
-  await call({
-    command: 'station.database_query_by_date',
-    serialNumber: stationSn,
-    serialNumbers: [queryCam.getSerial()],
-    startDate: fmtYmd(dStart),
-    endDate: fmtYmd(dEnd),
+/**
+ * Serializes backfill processing for a single HomeBase station key, coalescing any re-entrant
+ * requests that arrive while an RPC step is already in flight so they run sequentially afterward.
+ *
+ * @param {string} stationKey - Canonical HomeBase backfill station key.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {Promise<void>}
+ */
+function scheduleStationBackfill(stationKey, now) {
+  const existing = stationBackfillPromises.get(stationKey);
+  if (existing) {
+    const prevNow = stationBackfillPendingAt.get(stationKey) || 0;
+    stationBackfillPendingAt.set(stationKey, Math.max(prevNow, now));
+    return existing;
+  }
+
+  const runDrain = Promise.resolve().then(async () => {
+    let stepNow = now;
+    try {
+      for (;;) {
+        await runStationBackfillStep(stationKey, stepNow);
+        if (!stationBackfillPendingAt.has(stationKey)) {
+          break;
+        }
+        stepNow = stationBackfillPendingAt.get(stationKey) ?? Date.now();
+        stationBackfillPendingAt.delete(stationKey);
+      }
+    } catch (err) {
+      log.error('bridge', 'backfill queue processing failed: ' + formatErrorMessage(err, true));
+    } finally {
+      stationBackfillPendingAt.delete(stationKey);
+      if (stationBackfillPromises.get(stationKey) === runDrain) {
+        stationBackfillPromises.delete(stationKey);
+      }
+    }
   });
-  if (queryCam.needsLatestInfoBackfillQuery()) {
-    await call({
-      command: 'station.database_query_latest_info',
-      serialNumber: stationSn,
-    });
+
+  stationBackfillPromises.set(stationKey, runDrain);
+  return runDrain;
+}
+
+/**
+ * Queries HomeBase local databases and starts downloading missed event clips when station P2P slots are idle.
+ *
+ * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+ */
+async function processBackfillQueue(now = Date.now()) {
+  if (!isWsReady() || isShuttingDownFn()) {
+    return;
+  }
+  try {
+    const stationKeys = Camera.collectStationBackfillKeys(cams);
+    await Promise.all(stationKeys.map((stationKey) => scheduleStationBackfill(stationKey, now)));
+  } catch (err) {
+    log.error('bridge', 'backfill queue processing failed: ' + formatErrorMessage(err, true));
   }
 }
 
@@ -868,7 +926,7 @@ async function startLivestream(targetCam) {
         log.warn(
           cam,
           'eufy-security-ws reports stale livestream (errorCode=' +
-            r.errorCode +
+            formatRpcError(r) +
             '), forcing stop and restart (initiator=bridge/eufy-ws, session=' +
             mySession +
             ')'
@@ -899,11 +957,7 @@ async function startLivestream(targetCam) {
         maybeRecoverStationOnWakeRpcFailure(stationSn, 'start_livestream', r.errorCode);
         log.error(
           cam,
-          'start_livestream failed (initiator=eufy-ws, errorCode=' +
-            (r.errorCode || 'unknown') +
-            ', session=' +
-            mySession +
-            ')'
+          'start_livestream failed (initiator=eufy-ws, errorCode=' + formatRpcError(r) + ', session=' + mySession + ')'
         );
         cam.applyFailedStartBackoff(mySession, Date.now(), FAILED_START_BACKOFF_MS);
       }
@@ -940,6 +994,9 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
 
   // Clear station wake pacing when a P2P/download session ends so back-to-back switching starts immediately.
   if (closedMode !== STREAM_MODES.RTSP) stationNextWakeAt.delete(cam.getStationKey());
+  if (cam.shouldClearStationQueryCooldownAfterStop(closedMode)) {
+    stationLastBackfillQueryAt.delete(cam.resolveStationBackfillKey(cams));
+  }
 
   const sleepLogFn = initiator.startsWith('error/')
     ? log.error
@@ -964,7 +1021,10 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
               break;
             case STREAM_MODES.DOWNLOAD:
               if (!hadDownloadFinished) {
-                await call({command: 'device.cancel_download', serialNumber: serial});
+                const cancelRes = await call({command: 'device.cancel_download', serialNumber: serial});
+                if (!cancelRes.success && cancelRes.errorCode && !EXPECTED_STOP_ERROR_REGEX.test(cancelRes.errorCode)) {
+                  log.debug(cam, 'device.cancel_download returned errorCode=' + formatRpcError(cancelRes));
+                }
                 await sleep(P2P_STOP_SETTLE_MS);
               }
               break;
@@ -972,7 +1032,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
               try {
                 const res = await call({command: 'device.stop_livestream', serialNumber: serial});
                 if (!res.success && res.errorCode && !EXPECTED_STOP_ERROR_REGEX.test(res.errorCode)) {
-                  log.debug(cam, 'device.stop_livestream returned errorCode=' + res.errorCode);
+                  log.debug(cam, 'device.stop_livestream returned errorCode=' + formatRpcError(res));
                 }
                 if (hadUnexpectedRtsp) await call({command: 'device.stop_rtsp_livestream', serialNumber: serial});
                 await sleep(P2P_STOP_SETTLE_MS);
@@ -983,7 +1043,7 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
             }
           }
         })
-        .catch(() => {})
+        .catch((err) => log.debug(cam, 'station teardown error: ' + formatErrorMessage(err)))
     );
   }
 
@@ -991,7 +1051,10 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
   renderCameraCards(cam);
   if (cam.isDeviceOffline()) {
     stopEncoder(cam);
-  } else if (!(closedMode === STREAM_MODES.DOWNLOAD && cam.isReadyForBackfillDownload())) {
+  } else if (!(
+    closedMode === STREAM_MODES.DOWNLOAD &&
+    (cam.isReadyForBackfillDownload() || cam.backfillContinuation)
+  )) {
     pushFrameToEncoder(cam);
   }
 
@@ -1001,6 +1064,8 @@ function stop(cam, why, preemptedByViewer = false, initiator = 'bridge') {
         applyDeviceProperties(cam, res.result.properties, false);
       }
     });
+  } else if (closedMode === STREAM_MODES.DOWNLOAD && cam.wantsWake()) {
+    arbitrate();
   }
 }
 
@@ -1079,9 +1144,10 @@ function handleDownloadFinishedEvent(cam) {
   const now = Date.now();
   const bufferedCount = cam.markDownloadFinished(now);
   stationNextWakeAt.delete(cam.getStationKey());
-  arbitrate();
+  arbitrate(now);
+  void processBackfillQueue(now);
   if (cam.shouldExtendFrigateEvent(now, LIVE_FPS)) {
-    frigateEvent(cam, cam.getReason(), cam.getEventPerson());
+    frigateEvent(cam, cam.getBackfillEventLabel(), cam.getBackfillEventPerson());
   }
   if (bufferedCount > 0) {
     log.debug(cam, cam.formatBackfillTransferCompleteLog(bufferedCount, LIVE_FPS));
@@ -1172,6 +1238,11 @@ function handleTriggerEvent(cam, e) {
           triggerDesc +
           '" queued for HomeBase clip backfill (backfill_only=true, skipping live wake to conserve battery)'
       );
+      return;
+    }
+    if (cam.isBackfillPlayback()) {
+      const route = cam.routeHardwareTriggerDuringBackfill(triggerDesc, evPrio, now);
+      log.info(cam, 'event trigger "' + triggerDesc + '" ' + route + ' while active backfill playback finishes');
       return;
     }
     const holdDuration = cam.getEventHoldMs();
@@ -1310,6 +1381,36 @@ function forceStopWedgedP2pRadio(cam) {
 }
 
 /**
+ * Handles an 'rtsp livestream started' event while the camera is not in an active live session,
+ * queuing a BackfillJob or deferring a live wake during backfill playback and adopting idle wakes.
+ *
+ * @param {Camera} cam - Camera domain instance.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {boolean} True if the event was handled without falling through to unexpected-RTSP stop.
+ */
+function handleNonLiveRtspStreamStarted(cam, now) {
+  if (cam.isWithinPostSleepGuard(now, EXTERNAL_WAKE_GUARD_MS)) {
+    return true;
+  }
+  const extPrio = getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT);
+  if (cam.shouldBackfillOnlyOnEvent() || cam.isBackfillPlayback()) {
+    cam.queueEventBackfill(now, 'rtsp livestream started', '', 'rtsp livestream started', extPrio, true);
+    if (!cam.isSessionActive()) {
+      pushFrameToEncoder(cam, now);
+    } else {
+      cam.routeHardwareTriggerDuringBackfill('rtsp livestream started', extPrio, now);
+    }
+    log.debug(cam, 'rtsp livestream started while idle/backfilling, queued/deferred follow-on event');
+    return true;
+  }
+  if (!cam.isSessionActive() && tryAdoptExternalRtspWake(cam, now)) {
+    log.debug(cam, 'eufy RTSP livestream started (session=' + cam.getSessionId() + ')');
+    return true;
+  }
+  return false;
+}
+
+/**
  * Handles incoming event notifications from eufy-security-ws.
  *
  * @param {Record<string, *>} eventPayload - Event object from eufy-security-ws.
@@ -1415,30 +1516,8 @@ function onEvent(eventPayload) {
           handleStreamStartedOrRetriggered(cam, 'eufy RTSP livestream');
         }
       } else {
-        if (!cam.isActiveLiveSession()) {
-          const now = Date.now();
-          if (cam.isWithinPostSleepGuard(now, EXTERNAL_WAKE_GUARD_MS)) {
-            return;
-          }
-          if (cam.shouldBackfillOnlyOnEvent()) {
-            cam.queueEventBackfill(
-              now,
-              'rtsp livestream started',
-              '',
-              'rtsp livestream started',
-              getEventPriority(DEFAULT_EXTERNAL_WAKE_EVENT),
-              true
-            );
-            if (!cam.isSessionActive()) {
-              pushFrameToEncoder(cam, now);
-            }
-            log.debug(cam, 'rtsp livestream started while idle in backfill mode, queued/extended BackfillJob');
-            return;
-          }
-          if (!cam.isSessionActive() && tryAdoptExternalRtspWake(cam, now)) {
-            log.debug(cam, 'eufy RTSP livestream started (session=' + cam.getSessionId() + ')');
-            return;
-          }
+        if (!cam.isActiveLiveSession() && handleNonLiveRtspStreamStarted(cam, Date.now())) {
+          return;
         }
         const {shouldStopRtsp, shouldDisableRtspProp, shouldRestartP2p} = cam.evaluateUnexpectedRtspStart();
         if (shouldDisableRtspProp) {
@@ -1572,7 +1651,11 @@ function handleRtspStreamDropped(cam, code, reasonText) {
     return;
   }
   if (!cam.shouldRewakeRtspOnDrop(now)) {
-    stop(cam, 'eufy ended RTSP livestream', false, 'eufy/rtsp-end');
+    const endWhy =
+      reasonText && reasonText !== 'rtsp livestream stopped event'
+        ? 'eufy ended RTSP livestream (code=' + code + ', info="' + reasonText + '")'
+        : 'eufy ended RTSP livestream';
+    stop(cam, endWhy, false, 'eufy/rtsp-end');
     arbitrate();
     return;
   }
@@ -1645,7 +1728,7 @@ function checkRtspSessionHealth(cam, now) {
 function checkDownloadSessionHealth(cam, now) {
   if (cam.isDownloadComplete(now)) {
     stop(cam, 'post-event clip download stream completed', false, DOWNLOAD_COMPLETED_INITIATOR);
-    arbitrate();
+    arbitrate(now);
     void processBackfillQueue(now);
     return;
   }
@@ -1657,7 +1740,7 @@ function checkDownloadSessionHealth(cam, now) {
         's'
     );
     stop(cam, 'post-event clip download timed out', false, 'error/download-timeout');
-    arbitrate();
+    arbitrate(now);
   }
 }
 
@@ -1790,6 +1873,7 @@ module.exports = {
   wakeCameraExternal,
   trigger,
   stop,
+  arbitrate,
   onEvent,
   handleRtspStreamDropped,
   processBackfillQueue,
