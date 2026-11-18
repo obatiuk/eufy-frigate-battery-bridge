@@ -814,10 +814,12 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
     assert.deepEqual(resolveTargetCameras('front-driveway,doorbell,driveway', cams), [cam1, cam2]);
     assert.deepEqual(resolveTargetCameras('nonexistent_cam', cams), []);
 
-    const health = buildHealthPayload(cams, false, 1000, 5000);
+    const health = buildHealthPayload(false);
+    assert.deepEqual(health, {ok: true});
+    assert.equal('ws_connected' in health, false);
+    assert.equal('uptime_secs' in health, false);
     assert.equal('version' in health, false);
     assert.equal('commit' in health, false);
-    assert.equal(health.uptime_secs, 4);
 
     cam1.updateDiscoveredRtspConfig('T8030P0000000000', 'rtsp://admin:secret@192.168.1.50/live0');
     const cfgPayload = buildConfigPayload(cams);
@@ -982,13 +984,16 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       assert.equal(directRes.json.results[0].status, 'unsupported');
       assert.equal(dispatchCalls.length, 0);
 
-      // 6. External outages keep /healthz 200 (ok=true, ws_connected=false), while /api/wake on a
-      //    Eufy target returns 503 WS_DISCONNECTED
+      // 6. External outages keep /healthz 200 ({ok: true}, without ws_connected or external status), while
+      //    /api/wake on a Eufy target returns 503 WS_DISCONNECTED
       eufyCam.updateServiceHealth({frigateConnected: false, go2rtcConnected: false});
       const wsDownHealthRes = await invokeHttp('GET', '/healthz');
       assert.equal(wsDownHealthRes.status, 200);
-      assert.equal(wsDownHealthRes.json.ok, true);
-      assert.equal(wsDownHealthRes.json.ws_connected, false);
+      assert.deepEqual(wsDownHealthRes.json, {ok: true});
+      assert.equal('ws_connected' in wsDownHealthRes.json, false);
+      assert.equal(wsDownHealthRes.headers['content-length'], '11');
+      assert.equal(wsDownHealthRes.headers['cache-control'], 'no-store');
+      assert.equal(wsDownHealthRes.headers.connection, 'close');
       const wsDownRes = await invokeHttp('POST', '/api/wake/garage', '{}');
       assert.equal(wsDownRes.status, 503);
       assert.equal(wsDownRes.json.error_code, 'WS_DISCONNECTED');
@@ -1144,11 +1149,13 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
 
       const cams = [directLiveCam, directDownCam, sleepingEufyCam, waitingBfCam, offlineEufyCam];
 
-      // 1. /healthz payload is minimal (only ok, ws_connected, uptime_secs; no camera arrays)
-      const minHealth = buildHealthPayload(cams, false, t0 - 1028000, t0);
-      assert.deepEqual(Object.keys(minHealth), ['ok', 'ws_connected', 'uptime_secs']);
-      assert.equal(minHealth.ok, true);
-      assert.equal(minHealth.uptime_secs, 1028);
+      // 1. /healthz payload is strictly {ok: true}/{ok: false} with zero external dependency or camera fields
+      const minHealth = buildHealthPayload(false);
+      assert.deepEqual(Object.keys(minHealth), ['ok']);
+      assert.deepEqual(minHealth, {ok: true});
+      assert.deepEqual(buildHealthPayload(true), {ok: false});
+      assert.equal('ws_connected' in minHealth, false);
+      assert.equal('uptime_secs' in minHealth, false);
       assert.equal('active_cameras' in minHealth, false);
       assert.equal('offline_cameras' in minHealth, false);
 
@@ -1246,6 +1253,17 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       const headHealthRes = await invokeRaw('HEAD', '/healthz');
       assert.equal(headHealthRes.status, 200);
       assert.equal(headHealthRes.body, '');
+      assert.equal(headHealthRes.headers['content-length'], '11');
+      assert.equal(headHealthRes.headers.connection, 'close');
+
+      const aliasHealthRes = await invokeRaw('GET', '/health?probe=1');
+      assert.equal(aliasHealthRes.status, 200);
+      assert.equal(aliasHealthRes.body, '{"ok":true}');
+
+      const postHealthRes = await invokeRaw('POST', '/healthz');
+      assert.equal(postHealthRes.status, 405);
+      assert.equal(postHealthRes.headers.allow, 'GET, HEAD');
+      assert.equal(JSON.parse(postHealthRes.body).error_code, 'METHOD_NOT_ALLOWED');
 
       const postStatusRes = await invokeRaw('POST', '/api/status');
       assert.equal(postStatusRes.status, 405);
@@ -1258,6 +1276,86 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       const parsedDown = JSON.parse(downStatusRes.body);
       assert.equal(parsedDown.ok, false);
       assert.equal(parsedDown.shutting_down, true);
+    }
+  );
+
+  it(
+    'serves dependency-free fixed-length /healthz responses immediately on startup without ' +
+      'exposing ws_connected or waiting for camera initialization',
+    async () => {
+      // Regression: /healthz must reply immediately with fixed-length {"ok":true} (Connection: close)
+      // even before cameras finish initializing and must omit ws_connected regardless of WS state
+      const {PassThrough} = require('node:stream');
+      /** @type {Camera[]} */
+      const bootstrapCams = [];
+      let shuttingDown = false;
+      const handler = createHttpRequestHandler(bootstrapCams, {
+        wakeCameraExternal: () => ({}),
+        isShuttingDown: () => shuttingDown,
+      });
+
+      const sendProbe = async (method, url) => {
+        const req = Object.assign(new PassThrough(), {method, url});
+        const headers = {};
+        let status = 0;
+        let body = '';
+        const done = new Promise((resolve) => {
+          const res = {
+            setHeader(k, v) {
+              headers[String(k).toLowerCase()] = String(v);
+            },
+            writeHead(code, hdrs = {}) {
+              status = code;
+              for (const [k, v] of Object.entries(hdrs)) {
+                headers[String(k).toLowerCase()] = String(v);
+              }
+            },
+            end(chunk = '') {
+              body += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk || '');
+              resolve();
+            },
+          };
+          void handler(req, res);
+        });
+        req.end();
+        await done;
+        return {status, headers, body};
+      };
+
+      const earlyProbe = await sendProbe('GET', '/healthz');
+      assert.equal(earlyProbe.status, 200);
+      assert.equal(earlyProbe.body, '{"ok":true}');
+      assert.equal(earlyProbe.headers['content-type'], 'application/json');
+      assert.equal(earlyProbe.headers['content-length'], '11');
+      assert.equal(earlyProbe.headers['cache-control'], 'no-store');
+      assert.equal(earlyProbe.headers.connection, 'close');
+
+      const absUriProbe = await sendProbe('GET', 'http://127.0.0.1:8080/healthz');
+      assert.equal(absUriProbe.status, 200);
+      assert.equal(absUriProbe.body, '{"ok":true}');
+
+      shuttingDown = true;
+      const shutdownProbe = await sendProbe('GET', '/healthz');
+      assert.equal(shutdownProbe.status, 503);
+      assert.equal(shutdownProbe.body, '{"ok":false}');
+      assert.equal(shutdownProbe.headers['content-length'], '12');
+      assert.equal(shutdownProbe.headers.connection, 'close');
+
+      const shutdownHeadProbe = await sendProbe('HEAD', '/health');
+      assert.equal(shutdownHeadProbe.status, 503);
+      assert.equal(shutdownHeadProbe.body, '');
+      assert.equal(shutdownHeadProbe.headers['content-length'], '12');
+
+      const appSource = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'app.js'), 'utf8');
+      const mainBodyMatch = appSource.match(/function main\(\)\s*\{([\s\S]*?)\n\}/);
+      assert.ok(mainBodyMatch, 'src/app.js must define main()');
+      const mainBody = mainBodyMatch[1];
+      const httpStartIdx = mainBody.indexOf('startHttpServer(');
+      const camInitIdx = mainBody.search(/initCameras\(|createCameras\(/);
+      assert.ok(
+        httpStartIdx !== -1 && camInitIdx !== -1 && httpStartIdx < camInitIdx,
+        'main() must bind startHttpServer() before synchronous camera snapshot decoding'
+      );
     }
   );
 
@@ -3579,7 +3677,7 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
       configureEufyClientHooks({isShuttingDown: () => true});
       sockets[0].handlers.get('close')();
       assert.equal(isWsReady(), false);
-      assert.equal(buildHealthPayload(testCams, false, 1000, 5000).ok, true);
+      assert.deepEqual(buildHealthPayload(false), {ok: true});
       assert.equal(
         warnings.filter((m) => m.includes('eufy-security-ws connection closed, retrying in 10 s')).length,
         1
@@ -3898,8 +3996,8 @@ describe('HTTP Wake Target Resolution & Eufy RPC Helpers (src/services/http-serv
 
         // 1. /healthz reports ok=true when all cameras specify rtsp_url even if WS is not
         // connected, and /api/wake target gating requires WS and excludes direct rtsp_url cameras
-        const health = buildHealthPayload(cams, false, fakeNow - 5000, fakeNow);
-        assert.equal(health.ok, true);
+        const health = buildHealthPayload(false);
+        assert.deepEqual(health, {ok: true});
         const eufyOnlyCam = new Camera({serial: 'T8161T0000000099', name: 'patio_eufy', mode: 'rtsp'});
         assert.equal(
           canServeWakeRequest([babyCam], false),

@@ -977,17 +977,17 @@ describe('Core System Acceptance Criteria (ACCEPTANCE.md AT-01 .. AT-19)', () =>
       assert.equal(sentCommands.includes('station.disconnect'), false);
       assert.equal(sentCommands.includes('device.cancel_download'), false);
 
-      // 4. Service disruption resilience: ws_closed terminates active sessions, keeps /healthz ok=true
-      //    (ws_connected=false) during external outages, returns ok=false only on shutdown, and marks camera
-      //    serviceDisrupted until reconnected
+      // 4. Service disruption resilience: ws_closed terminates active sessions, keeps /healthz strictly {ok: true}
+      //    (omitting ws_connected and all external service fields) during external outages, returns {ok: false} only
+      //    on shutdown, and marks camera serviceDisrupted until reconnected
       cam.beginSession('p2p', t0, true);
       assert.equal(cam.isSessionActive(), true);
       wsInstance.handlers.get('close')();
       assert.equal(cam.isSessionActive(), false);
-      const degradedHealth = buildHealthPayload([cam], false, t0 - 10000, t0);
-      assert.equal(degradedHealth.ok, true);
-      assert.equal(degradedHealth.ws_connected, false);
-      assert.equal(buildHealthPayload([cam], true, t0 - 10000, t0).ok, false);
+      const degradedHealth = buildHealthPayload(false);
+      assert.deepEqual(degradedHealth, {ok: true});
+      assert.equal('ws_connected' in degradedHealth, false);
+      assert.deepEqual(buildHealthPayload(true), {ok: false});
       assert.equal(cam.hasServiceDisruption(), true);
       cam.updateServiceHealth({wsConnected: true});
       assert.equal(cam.hasServiceDisruption(), false);

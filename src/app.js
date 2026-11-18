@@ -9,8 +9,10 @@
  */
 'use strict';
 
+const fs = require('node:fs');
 const {
   cfg,
+  READY_MARKER_FILE,
   BRIDGE_VERSION,
   BRIDGE_COMMIT,
   ACTIVE_HWACCEL,
@@ -58,14 +60,39 @@ let bridgeShuttingDown = false;
 const isShuttingDown = () => bridgeShuttingDown;
 
 /**
- * Instantiates all configured Camera domain objects and loads their cached snapshots.
- *
- * @returns {{ cams: Camera[], bySerial: Map<string, Camera> }}
+ * Records the live bridge PID after startup configuration validation succeeds (used by HEALTHCHECK
+ * when BRIDGE_HTTP_PORT=0 disables the HTTP listener).
  */
-function createCameras() {
-  const cams = cfg.cameras.map((rawCam) => new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards));
-  const bySerial = new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
-  return {cams, bySerial};
+function markBridgeReady() {
+  try {
+    fs.writeFileSync(READY_MARKER_FILE, String(process.pid), 'utf8');
+  } catch (err) {
+    // Ignore read-only temp directory errors when HTTP healthcheck is active.
+  }
+}
+
+/**
+ * Removes the readiness PID marker during shutdown or process exit.
+ */
+function clearBridgeReady() {
+  try {
+    fs.rmSync(READY_MARKER_FILE, {force: true});
+  } catch (err) {
+    // Ignore cleanup errors on exit.
+  }
+}
+
+/**
+ * Instantiates all configured Camera domain objects into `cams` and loads their cached snapshots.
+ *
+ * @param {Camera[]} cams - Active camera collection populated in place during bootstrap.
+ * @returns {Map<string, Camera>} Lookup map by hardware serial number.
+ */
+function initCameras(cams) {
+  for (const rawCam of cfg.cameras) {
+    cams.push(new Camera(rawCam, loadCachedFrame(rawCam), renderCameraCards));
+  }
+  return new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
 }
 
 /**
@@ -131,6 +158,7 @@ function shutdownBridge(cams) {
     return;
   }
   bridgeShuttingDown = true;
+  clearBridgeReady();
   stopHttpServer();
   log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
 
@@ -156,6 +184,7 @@ function registerSignalHandlers(cams) {
   process.on(PROCESS_SIGNALS.SIGUSR1, () => handleSigUsr1BackfillTest(cams));
   process.on(PROCESS_SIGNALS.SIGTERM, () => shutdownBridge(cams));
   process.on(PROCESS_SIGNALS.SIGINT, () => shutdownBridge(cams));
+  process.on('exit', clearBridgeReady);
 
   process.on('uncaughtException', (err) => {
     log.error('bridge', 'uncaught exception (service continuing): ' + formatErrorMessage(err, true));
@@ -209,21 +238,24 @@ function startServices(cams) {
 
   startHousekeepingLoop();
   startTelemetryPoller();
-
-  startHttpServer(cams, {
-    wakeCameraExternal,
-    isShuttingDown: () => bridgeShuttingDown,
-  });
   connectWs();
 }
 
 /**
- * Application bootstrap entrypoint.
+ * Application bootstrap entrypoint. Binds the HTTP listener immediately after configuration
+ * validation so container /healthz probes succeed without waiting on snapshot decodes or external services.
  */
 function main() {
-  const {cams, bySerial} = createCameras();
-  wireServices(cams, bySerial);
+  /** @type {Camera[]} */
+  const cams = [];
   registerSignalHandlers(cams);
+  startHttpServer(cams, {
+    wakeCameraExternal,
+    isShuttingDown: () => bridgeShuttingDown,
+  });
+  markBridgeReady();
+  const bySerial = initCameras(cams);
+  wireServices(cams, bySerial);
   startServices(cams);
 }
 

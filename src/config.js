@@ -20,7 +20,10 @@ const DEFAULT_CACHE_DIR = '/config/cache';
 const DEFAULT_HWACCEL_DEVICE = '/dev/dri/renderD128';
 const DEFAULT_CONTAINER_CONFIG_PATH = '/config/config.yaml';
 const DEFAULT_LOCAL_CONFIG_PATH = 'config.yaml';
+const READY_MARKER_FILENAME = 'eufy-bridge-ready.pid';
 const MS_PER_SECOND = 1000;
+const MIN_STREAMING_QUALITY = 1;
+const MAX_STREAMING_QUALITY = 10;
 
 const DEFAULT_PACKAGE_VERSION = (() => {
   const candidatePaths = [path.resolve(__dirname, '../package.json'), path.resolve(__dirname, 'package.json')];
@@ -315,6 +318,69 @@ const SUPPORTED_HWACCEL_MODES = new Set([
   HWACCEL_MODES.V4L2M2M,
 ]);
 
+const DISABLED_HWACCEL_TOKENS = new Set(['false', 'none', 'off', '0', 'software']);
+const SUPPORTED_LOG_LEVELS = new Set(['debug', 'info', 'warn', 'warning', 'error']);
+const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
+const WS_PROTOCOLS = new Set(['ws:', 'wss:']);
+const RTSP_PROTOCOLS = new Set(['rtsp:', 'rtsps:']);
+const SAFE_IDENTITY_TOKEN_REGEX = /^[A-Za-z0-9._-]+$/;
+const FULL_ENV_PLACEHOLDER_REGEX = /^\$\{[^}]+\}$/;
+const INLINE_ENV_PLACEHOLDER_REGEX = /\$\{[^}]+\}/g;
+
+const BOOLEAN_CONFIG_KEYS = new Set([
+  'audio',
+  'card_show_on_live',
+  'auto_frigate_mask',
+  'preserve_aspect_ratio',
+  'instant_event_snapshot',
+  'end_early',
+  'use_rtsp',
+  'backfill_enabled',
+  'backfill_only',
+  'sync_power',
+  'track_stuck_spotlight',
+  'low_battery_wake_on_view',
+  'forward_face_names',
+  'recording_end_early',
+]);
+
+const INTEGER_CONFIG_KEYS = new Set([
+  'width',
+  'height',
+  'live_fps',
+  'idle_fps',
+  'low_battery_threshold',
+  'critical_battery_threshold',
+  'telemetry_poll_secs',
+  'priority',
+  'power_working_mode',
+  'recording_clip_length',
+  'recording_retrigger_interval',
+]);
+
+const FLOAT_CONFIG_KEYS = new Set([
+  'snapshot_capture_delay_secs',
+  'hold_secs',
+  'stream_max_secs',
+  'frigate_event_secs',
+  'idle_timeout_secs',
+  'view_linger_secs',
+  'view_max_secs',
+  'view_cooldown_secs',
+  'backfill_delay_secs',
+  'low_battery_hold_secs',
+]);
+
+const ALLOWED_TELEMETRY_KEYS = new Set([
+  'enabled',
+  'battery',
+  'power_source',
+  'wifi',
+  'rssi',
+  'temperature',
+  'last_seen',
+]);
+
 const TRIGGER_EVENT_ALIASES = Object.freeze({
   motion: ['motion detected', 'radar motion detected'],
   radar: ['radar motion detected'],
@@ -405,8 +471,14 @@ const COLOR_PURPLE = Object.freeze([232, 121, 249]);
  * @returns {number}
  */
 function clampNum(val, min, max, fallback) {
-  const numeric = Number(val ?? fallback);
-  if (Number.isNaN(numeric)) {
+  if (val === undefined || val === null || typeof val === 'boolean' || typeof val === 'object') {
+    return fallback;
+  }
+  if (typeof val === 'string' && !val.trim()) {
+    return fallback;
+  }
+  const numeric = Number(val);
+  if (!Number.isFinite(numeric)) {
     return fallback;
   }
   return Math.min(max, Math.max(min, numeric));
@@ -738,6 +810,29 @@ function parseEnvPort(env, envKey, {minPort, fallbackPort}) {
 }
 
 /**
+ * Validates that an explicit endpoint environment variable parses as a URL with one of the allowed schemes.
+ *
+ * @param {string} envKey - Environment variable name.
+ * @param {string} candidateUrl - Candidate URL string to parse.
+ * @param {Set<string>} allowedProtocols - Allowed URL protocols (e.g. 'http:', 'ws:', 'rtsp:').
+ */
+function validateEndpointUrlScheme(envKey, candidateUrl, allowedProtocols) {
+  if (!candidateUrl) {
+    return;
+  }
+  let parsed;
+  try {
+    parsed = new URL(candidateUrl);
+  } catch (err) {
+    throw new Error(envKey + ' must be a valid URL, got "' + candidateUrl + '"', {cause: err});
+  }
+  if (!allowedProtocols.has(parsed.protocol) || !parsed.hostname) {
+    const schemes = [...allowedProtocols].map((p) => p.replace(':', '://')).join(' or ');
+    throw new Error(envKey + ' must start with ' + schemes + ' and include a host, got "' + candidateUrl + '"');
+  }
+}
+
+/**
  * Resolves external service endpoints from hybrid-prefixed environment variables
  * (EUFY_WS_*, FRIGATE_*, GO2RTC_*, and HA_WEBHOOK_URL).
  *
@@ -752,6 +847,7 @@ function parseEnvPort(env, envKey, {minPort, fallbackPort}) {
  */
 function resolveServiceEndpoints(env = process.env) {
   const eufyOverride = readEnvString(env, 'EUFY_WS_URL').replace(TRAILING_SLASHES_REGEX, '');
+  validateEndpointUrlScheme('EUFY_WS_URL', eufyOverride, WS_PROTOCOLS);
   const eufyHost = formatHostForUrl(readEnvString(env, 'EUFY_WS_HOST') || DEFAULT_EUFY_WS_HOST);
   const eufyPort = parseEnvPort(env, 'EUFY_WS_PORT', {
     minPort: MIN_TCP_PORT,
@@ -760,6 +856,7 @@ function resolveServiceEndpoints(env = process.env) {
   const eufySecurityWsUrl = eufyOverride || DEFAULT_WS_PROTOCOL + '//' + eufyHost + ':' + eufyPort;
 
   const frigateOverride = normalizeBaseHttpUrl(readEnvString(env, 'FRIGATE_URL'));
+  validateEndpointUrlScheme('FRIGATE_URL', frigateOverride, HTTP_PROTOCOLS);
   const frigateHost = formatHostForUrl(readEnvString(env, 'FRIGATE_HOST') || DEFAULT_FRIGATE_HOST);
   const frigatePort = parseEnvPort(env, 'FRIGATE_PORT', {
     minPort: MIN_TCP_PORT,
@@ -769,6 +866,7 @@ function resolveServiceEndpoints(env = process.env) {
 
   const derivedFromFrigate = extractUrlProtocolAndHost(frigateUrl);
   const go2rtcOverride = normalizeBaseHttpUrl(readEnvString(env, 'GO2RTC_URL'));
+  validateEndpointUrlScheme('GO2RTC_URL', go2rtcOverride, HTTP_PROTOCOLS);
   const explicitGo2rtcHost = readEnvString(env, 'GO2RTC_HOST');
   const go2rtcHost = explicitGo2rtcHost ? formatHostForUrl(explicitGo2rtcHost) : derivedFromFrigate.host;
   const go2rtcProto = explicitGo2rtcHost ? DEFAULT_HTTP_PROTOCOL : derivedFromFrigate.protocol;
@@ -782,6 +880,11 @@ function resolveServiceEndpoints(env = process.env) {
   let rtspPublishUrl;
   if (rtspOverride) {
     rtspPublishUrl = normalizeRtspPublishOverride(rtspOverride);
+    validateEndpointUrlScheme(
+      'GO2RTC_RTSP_URL',
+      rtspPublishUrl.replace(RTSP_NAME_TEMPLATE_TOKEN, 'camera'),
+      RTSP_PROTOCOLS
+    );
   } else {
     const rtspHost = explicitGo2rtcHost
       ? formatHostForUrl(explicitGo2rtcHost)
@@ -798,17 +901,20 @@ function resolveServiceEndpoints(env = process.env) {
     rtspPublishUrl = 'rtsp://' + authPrefix + rtspHost + ':' + go2rtcRtspPort + '/' + RTSP_NAME_TEMPLATE_TOKEN;
   }
 
+  const haWebhookUrl = readEnvString(env, 'HA_WEBHOOK_URL');
+  validateEndpointUrlScheme('HA_WEBHOOK_URL', haWebhookUrl, HTTP_PROTOCOLS);
+
   return Object.freeze({
     eufy_security_ws_url: eufySecurityWsUrl,
     frigate_url: frigateUrl,
     go2rtc_url: go2rtcUrl,
     rtsp_publish_url: rtspPublishUrl,
-    ha_webhook_url: readEnvString(env, 'HA_WEBHOOK_URL'),
+    ha_webhook_url: haWebhookUrl,
   });
 }
 
 /**
- * Normalizes the requested hardware acceleration mode from BRIDGE_HWACCEL.
+ * Normalizes and validates the requested hardware acceleration mode from BRIDGE_HWACCEL.
  *
  * @param {*} rawHwaccel - Raw BRIDGE_HWACCEL string value.
  * @returns {string}
@@ -821,7 +927,30 @@ function parseHwaccelMode(rawHwaccel) {
     return HWACCEL_MODES.NONE;
   }
   const normalized = rawHwaccel.toLowerCase().trim();
-  return SUPPORTED_HWACCEL_MODES.has(normalized) ? normalized : HWACCEL_MODES.NONE;
+  if (!normalized || DISABLED_HWACCEL_TOKENS.has(normalized)) {
+    return HWACCEL_MODES.NONE;
+  }
+  if (SUPPORTED_HWACCEL_MODES.has(normalized)) {
+    return normalized;
+  }
+  throw new Error('BRIDGE_HWACCEL must be one of vaapi, qsv, nvenc, v4l2m2m, or false/none, got "' + rawHwaccel + '"');
+}
+
+/**
+ * Validates and normalizes BRIDGE_LOG_LEVEL when explicitly specified.
+ *
+ * @param {string} rawLevel - Trimmed BRIDGE_LOG_LEVEL string.
+ * @returns {string}
+ */
+function parseEnvLogLevel(rawLevel) {
+  if (!rawLevel) {
+    return DEFAULT_LOG_LEVEL;
+  }
+  const normalized = rawLevel.toLowerCase();
+  if (!SUPPORTED_LOG_LEVELS.has(normalized)) {
+    throw new Error('BRIDGE_LOG_LEVEL must be one of debug, info, warn, warning, or error, got "' + rawLevel + '"');
+  }
+  return normalized;
 }
 
 /**
@@ -839,7 +968,7 @@ function parseHwaccelMode(rawHwaccel) {
 function resolveRuntimeEnv(env = process.env) {
   const explicitHwDevice = readEnvString(env, 'BRIDGE_HWACCEL_DEVICE');
   return Object.freeze({
-    logLevel: readEnvString(env, 'BRIDGE_LOG_LEVEL') || DEFAULT_LOG_LEVEL,
+    logLevel: parseEnvLogLevel(readEnvString(env, 'BRIDGE_LOG_LEVEL')),
     httpPort: parseEnvPort(env, 'BRIDGE_HTTP_PORT', {
       minPort: MIN_HTTP_LISTEN_PORT,
       fallbackPort: DEFAULT_HTTP_PORT,
@@ -883,7 +1012,47 @@ function inspectConfigSchemaKeys(rawCfg) {
 }
 
 /**
- * Validates per-camera rtsp_url protocol syntax and rejects incompatible camera modes.
+ * Returns true if token is a safe camera/station identifier without path separators or traversal segments.
+ *
+ * @param {string} token - Trimmed identifier string.
+ * @returns {boolean}
+ */
+function isSafeIdentityToken(token) {
+  return token !== '.' && token !== '..' ? SAFE_IDENTITY_TOKEN_REGEX.test(token) : false;
+}
+
+/**
+ * Extracts the hostname from a candidate direct rtsp_url string, or '' when invalid.
+ *
+ * @param {string} directUrl - Trimmed rtsp_url string.
+ * @returns {string}
+ */
+function parseDirectRtspUrlHost(directUrl) {
+  if (!RTSP_URL_PROTOCOL_REGEX.test(directUrl)) {
+    return '';
+  }
+  const probeUrl = stripRtspUrlFragment(directUrl).replace(INLINE_ENV_PLACEHOLDER_REGEX, 'placeholder');
+  try {
+    const parsed = new URL(probeUrl);
+    return RTSP_PROTOCOLS.has(parsed.protocol) ? parsed.hostname : '';
+  } catch (err) {
+    return '';
+  }
+}
+
+/**
+ * Returns true if a direct rtsp_url string is a valid rtsp:// or rtsps:// URL with a host
+ * (allowing unexpanded ${ENV_VAR} placeholders when validateConfig is called directly).
+ *
+ * @param {string} directUrl - Trimmed rtsp_url string.
+ * @returns {boolean}
+ */
+function isValidDirectRtspUrl(directUrl) {
+  return FULL_ENV_PLACEHOLDER_REGEX.test(directUrl) ? true : Boolean(parseDirectRtspUrlHost(directUrl));
+}
+
+/**
+ * Validates per-camera rtsp_url protocol/host syntax and rejects incompatible camera modes.
  *
  * @param {*} cameras - Candidate rawCfg.cameras array.
  * @param {string[]} errors - Mutable validation error collector.
@@ -896,9 +1065,9 @@ function validateCameraRtspUrls(cameras, errors) {
     if (!cam || typeof cam !== 'object' || cam.rtsp_url === undefined) {
       return;
     }
-    const directUrl = String(cam.rtsp_url || '').trim();
-    if (!RTSP_URL_PROTOCOL_REGEX.test(directUrl)) {
-      errors.push('cameras[' + idx + '] "rtsp_url" must start with rtsp:// or rtsps://');
+    const directUrl = typeof cam.rtsp_url === 'string' ? cam.rtsp_url.trim() : '';
+    if (!isValidDirectRtspUrl(directUrl)) {
+      errors.push('cameras[' + idx + '] "rtsp_url" must start with rtsp:// or rtsps:// and include a host');
     }
     const rawMode = String(cam.mode || '')
       .trim()
@@ -916,8 +1085,126 @@ function validateCameraRtspUrls(cameras, errors) {
 }
 
 /**
+ * Validates telemetry block shape (boolean or plain mapping of known boolean toggles).
+ *
+ * @param {*} rawTel - Candidate telemetry value.
+ * @param {string} prefix - Scope prefix for error messages.
+ * @param {string[]} errors - Mutable validation error collector.
+ */
+function validateTelemetryOption(rawTel, prefix, errors) {
+  if (rawTel === undefined || typeof rawTel === 'boolean') {
+    return;
+  }
+  if (!rawTel || typeof rawTel !== 'object' || Array.isArray(rawTel)) {
+    errors.push(prefix + '"telemetry" must be a boolean or mapping');
+    return;
+  }
+  for (const [k, v] of Object.entries(rawTel)) {
+    if (!ALLOWED_TELEMETRY_KEYS.has(k)) {
+      errors.push('unknown telemetry key "' + prefix + 'telemetry.' + k + '"');
+    } else if (typeof v !== 'boolean') {
+      errors.push(prefix + '"telemetry.' + k + '" must be a boolean');
+    }
+  }
+}
+
+/**
+ * Validates shared boolean, numeric, startup_snapshot, streaming quality, trigger_events, and telemetry types.
+ *
+ * @param {Record<string, *>} node - Top-level or per-camera configuration mapping.
+ * @param {string} prefix - Scope prefix ('' or 'cameras[i] ').
+ * @param {string[]} errors - Mutable validation error collector.
+ */
+function validateCommonOptionTypes(node, prefix, errors) {
+  for (const [key, val] of Object.entries(node)) {
+    if (val === undefined) {
+      continue;
+    }
+    if (BOOLEAN_CONFIG_KEYS.has(key) && typeof val !== 'boolean') {
+      errors.push(prefix + '"' + key + '" must be a boolean');
+    } else if (INTEGER_CONFIG_KEYS.has(key) && !Number.isInteger(val)) {
+      errors.push(prefix + '"' + key + '" must be an integer');
+    } else if (FLOAT_CONFIG_KEYS.has(key) && (typeof val !== 'number' || !Number.isFinite(val))) {
+      errors.push(prefix + '"' + key + '" must be a finite number');
+    }
+  }
+  if (
+    node.startup_snapshot !== undefined &&
+    typeof node.startup_snapshot !== 'boolean' &&
+    node.startup_snapshot !== 'always'
+  ) {
+    errors.push(prefix + '"startup_snapshot" must be a boolean or "always"');
+  }
+  if (node.enforce_streaming_quality !== undefined) {
+    const q = node.enforce_streaming_quality;
+    const validQuality =
+      typeof q === 'boolean' || (Number.isInteger(q) && q >= MIN_STREAMING_QUALITY && q <= MAX_STREAMING_QUALITY);
+    if (!validQuality) {
+      errors.push(prefix + '"enforce_streaming_quality" must be a boolean or integer 1..10');
+    }
+  }
+  if (node.trigger_events !== undefined) {
+    const validTriggers =
+      Array.isArray(node.trigger_events) &&
+      node.trigger_events.length > 0 &&
+      node.trigger_events.every((item) => typeof item === 'string' && Boolean(item.trim()));
+    if (!validTriggers) {
+      errors.push(prefix + '"trigger_events" must be a non-empty array of strings');
+    }
+  }
+  validateTelemetryOption(node.telemetry, prefix, errors);
+}
+
+/**
+ * Validates per-camera safe identifier syntax and uniqueness across names and hardware serials.
+ *
+ * @param {*} cameras - Candidate rawCfg.cameras array.
+ * @param {string[]} errors - Mutable validation error collector.
+ */
+function validateCameraIdentities(cameras, errors) {
+  if (!Array.isArray(cameras)) {
+    return;
+  }
+  const seenNames = new Set();
+  const seenSerials = new Set();
+  cameras.forEach((cam, idx) => {
+    if (!cam || typeof cam !== 'object' || Array.isArray(cam)) {
+      return;
+    }
+    const {serial, name, explicitSerial} = CameraConfig.normalizeIdentity(cam);
+    if (name && !isSafeIdentityToken(name)) {
+      errors.push('cameras[' + idx + '] "name" contains unsafe characters: "' + name + '"');
+    }
+    if (explicitSerial && !isSafeIdentityToken(explicitSerial)) {
+      errors.push('cameras[' + idx + '] "serial" contains unsafe characters: "' + explicitSerial + '"');
+    }
+    if (cam.station_serial !== undefined) {
+      const st = typeof cam.station_serial === 'string' ? cam.station_serial.trim() : '';
+      if (!st || !isSafeIdentityToken(st)) {
+        errors.push('cameras[' + idx + '] "station_serial" must be a safe non-empty string');
+      }
+    }
+    if (name) {
+      const lowerName = name.toLowerCase();
+      if (seenNames.has(lowerName)) {
+        errors.push('duplicate camera name "' + name + '" at cameras[' + idx + ']');
+      }
+      seenNames.add(lowerName);
+    }
+    const serialKey = (explicitSerial || (!hasDirectRtspUrl(cam) ? serial : '')).toLowerCase();
+    if (serialKey) {
+      if (seenSerials.has(serialKey)) {
+        errors.push('duplicate camera serial "' + (explicitSerial || serial) + '" at cameras[' + idx + ']');
+      }
+      seenSerials.add(serialKey);
+    }
+    validateCommonOptionTypes(cam, 'cameras[' + idx + '] ', errors);
+  });
+}
+
+/**
  * Validates a parsed YAML camera configuration object in one pass and throws a combined error
- * listing all missing, invalid, or unknown keys at once.
+ * listing all missing, invalid, duplicate, or unknown keys at once.
  *
  * @param {Record<string, *>} rawCfg - Parsed YAML configuration object.
  */
@@ -938,6 +1225,22 @@ function validateConfig(rawCfg) {
     errors.push('"cameras" must list at least one {"serial"}');
   }
 
+  validateCommonOptionTypes(rawCfg, '', errors);
+  if (rawCfg.ring_label !== undefined && (typeof rawCfg.ring_label !== 'string' || !rawCfg.ring_label.trim())) {
+    errors.push('"ring_label" must be a non-empty string');
+  }
+  if (rawCfg.event_priorities !== undefined) {
+    const ep = rawCfg.event_priorities;
+    const validEp =
+      Boolean(ep) &&
+      typeof ep === 'object' &&
+      !Array.isArray(ep) &&
+      Object.values(ep).every((v) => typeof v === 'number' && Number.isFinite(v));
+    if (!validEp) {
+      errors.push('"event_priorities" must map event names to finite numbers');
+    }
+  }
+  validateCameraIdentities(rawCfg.cameras, errors);
   validateCameraRtspUrls(rawCfg.cameras, errors);
 
   for (const k of unknownTopKeys) {
@@ -1313,6 +1616,29 @@ function loadConfigFile(filePath, env = process.env) {
 }
 
 /**
+ * Resolves the temporary PID marker file path used by container HEALTHCHECK when BRIDGE_HTTP_PORT=0.
+ *
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ * @returns {string}
+ */
+function resolveReadyMarkerPath(env = process.env) {
+  return path.join(readEnvString(env, 'TMPDIR') || os.tmpdir(), READY_MARKER_FILENAME);
+}
+
+/**
+ * Deletes any pre-existing readiness marker file before startup configuration validation runs.
+ *
+ * @param {Record<string, string|undefined>} [env=process.env] - Environment dictionary.
+ */
+function clearReadyMarkerFile(env = process.env) {
+  try {
+    fs.rmSync(resolveReadyMarkerPath(env), {force: true});
+  } catch (err) {
+    // Ignore transient filesystem errors when clearing stale startup markers.
+  }
+}
+
+/**
  * Loads and validates the configuration object from BRIDGE_CONFIG, /config/config.yaml, or
  * ./config.yaml. Falls back to an in-memory default test configuration only in Node test runs;
  * in production, logs a structured [ERROR] line and exits(1) when the config file is missing or invalid.
@@ -1321,7 +1647,8 @@ function loadConfigFile(filePath, env = process.env) {
  * @returns {Record<string, *>}
  */
 function loadConfig(env = process.env) {
-  initLogger(readEnvString(env, 'BRIDGE_LOG_LEVEL') || DEFAULT_LOG_LEVEL);
+  clearReadyMarkerFile(env);
+  initLogger(DEFAULT_LOG_LEVEL);
   const targetPath = resolveConfigFilePath(env);
   const hasConfigFile = Boolean(readEnvString(env, 'BRIDGE_CONFIG')) || fs.existsSync(targetPath);
   try {
@@ -1347,6 +1674,7 @@ function loadConfig(env = process.env) {
   }
 }
 
+const READY_MARKER_FILE = resolveReadyMarkerPath(process.env);
 const rawLoadedCfg = loadConfig(process.env);
 const processRuntimeEnv = resolveRuntimeEnv(process.env);
 
@@ -2484,13 +2812,20 @@ class BridgeConfigBuilder {
   }
 }
 
-const cfg = new BridgeConfigBuilder(rawLoadedCfg, process.env)
-  .withEndpoints()
-  .withVideoAndAudio()
-  .withTimersAndArbitration()
-  .withEventsAndOverlays()
-  .withCameras()
-  .build();
+const cfg = (() => {
+  try {
+    return new BridgeConfigBuilder(rawLoadedCfg, process.env)
+      .withEndpoints()
+      .withVideoAndAudio()
+      .withTimersAndArbitration()
+      .withEventsAndOverlays()
+      .withCameras()
+      .build();
+  } catch (err) {
+    log.error('bridge', 'startup configuration error: ' + formatErrorMessage(err));
+    process.exit(1);
+  }
+})();
 
 const COOLDOWN_MS = cfg.cooldownMs;
 const SNAP_DELAY_MS = cfg.snapDelayMs;
@@ -2528,6 +2863,7 @@ const CACHE_DIR = cfg.cache_dir;
 
 module.exports = {
   cfg,
+  READY_MARKER_FILE,
   BRIDGE_VERSION,
   BRIDGE_COMMIT,
   resolveBuildInfo,

@@ -33,6 +33,14 @@ services:
       # HA_WEBHOOK_URL: http://homeassistant:8123/api/webhook/eufy_frigate_bridge
     ports:
       - '127.0.0.1:8080:8080'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - if [ "$${BRIDGE_HTTP_PORT:-8080}" = "0" ]; then pid=$$(cat "$${TMPDIR:-/tmp}/eufy-bridge-ready.pid" 2>/dev/null) && [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null || exit 1; else wget -q -T 2 -O- "http://127.0.0.1:$${BRIDGE_HTTP_PORT:-8080}/healthz" >/dev/null || exit 1; fi
+      interval: 5s
+      timeout: 2s
+      start_period: 5s
+      retries: 3
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       # Persists last camera frames across container restarts

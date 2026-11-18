@@ -61,6 +61,23 @@ const HTTP_STATUS_UNPROCESSABLE = 422;
 const HTTP_STATUS_INTERNAL_ERROR = 500;
 const HTTP_STATUS_SERVICE_UNAVAILABLE = 503;
 const CONTENT_TYPE_JSON = Object.freeze({'Content-Type': 'application/json'});
+const HEALTH_OK_PAYLOAD = Object.freeze({ok: true});
+const HEALTH_SHUTTING_DOWN_PAYLOAD = Object.freeze({ok: false});
+const HEALTH_OK_BODY = Buffer.from(JSON.stringify(HEALTH_OK_PAYLOAD));
+const HEALTH_SHUTTING_DOWN_BODY = Buffer.from(JSON.stringify(HEALTH_SHUTTING_DOWN_PAYLOAD));
+const HEALTH_OK_HEADERS = Object.freeze({
+  'Content-Type': 'application/json',
+  'Content-Length': String(HEALTH_OK_BODY.byteLength),
+  'Cache-Control': 'no-store',
+  Connection: 'close',
+});
+const HEALTH_SHUTTING_DOWN_HEADERS = Object.freeze({
+  'Content-Type': 'application/json',
+  'Content-Length': String(HEALTH_SHUTTING_DOWN_BODY.byteLength),
+  'Cache-Control': 'no-store',
+  Connection: 'close',
+});
+const HEALTH_PATHS = new Set(['/healthz', '/health']);
 const ALLOWED_WAKE_METHODS_HEADER = 'POST, GET';
 const ALLOWED_READONLY_METHODS_HEADER = 'GET, HEAD';
 const DEFAULT_WAKE_REASON = 'external api wake';
@@ -359,22 +376,67 @@ function buildConfigPayload(cams) {
 }
 
 /**
- * Builds the minimal JSON payload returned by GET /healthz (and /health) so frequent container
- * supervisor probes perform zero camera-array iterations or allocations. Reports healthy (200)
- * whenever the bridge process is running and not shutting down.
+ * Returns the static frozen JSON payload for GET /healthz (and /health).
+ * Reports healthy ({ok: true}) whenever the bridge process is running and not shutting down,
+ * with zero external-service dependencies or per-request allocations.
  *
- * @param {Camera[]} _cams - Configured Camera instances (unused; full camera status lives on /api/status).
- * @param {boolean} shuttingDown - Whether the bridge is shutting down.
- * @param {number} [startMs=startedAtMs] - Process start timestamp in milliseconds.
- * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
- * @returns {Readonly<Record<string, *>>}
+ * @param {boolean} [shuttingDown=false] - Whether the bridge is shutting down.
+ * @returns {Readonly<{ ok: boolean }>}
  */
-function buildHealthPayload(_cams, shuttingDown, startMs = startedAtMs, now = Date.now()) {
-  return Object.freeze({
-    ok: !shuttingDown,
-    ws_connected: isWsReady(),
-    uptime_secs: Math.max(0, Math.round((now - startMs) / MS_PER_SECOND)),
-  });
+function buildHealthPayload(shuttingDown = false) {
+  return shuttingDown ? HEALTH_SHUTTING_DOWN_PAYLOAD : HEALTH_OK_PAYLOAD;
+}
+
+/**
+ * Extracts the pathname from a standard origin-form HTTP request target without allocating a URL object.
+ *
+ * @param {string|undefined} rawUrl - Raw IncomingMessage url string.
+ * @returns {string}
+ */
+function extractFastPathname(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('/')) {
+    return '';
+  }
+  const queryIdx = rawUrl.indexOf('?');
+  return queryIdx === -1 ? rawUrl : rawUrl.slice(0, queryIdx);
+}
+
+/**
+ * Returns true if pathname matches a container liveness endpoint (/healthz or /health).
+ *
+ * @param {string} pathname - Normalized URL pathname.
+ * @returns {boolean}
+ */
+function isHealthPathname(pathname) {
+  return HEALTH_PATHS.has(pathname);
+}
+
+/**
+ * Writes an immediate, fixed-length, non-chunked liveness response with zero allocations.
+ *
+ * @param {http.IncomingMessage} req - Incoming HTTP request.
+ * @param {http.ServerResponse} res - Outgoing HTTP response.
+ * @param {Function|undefined} isShuttingDown - Callback returning true while the bridge is shutting down.
+ */
+function respondHealthCheck(req, res, isShuttingDown) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.setHeader('Allow', ALLOWED_READONLY_METHODS_HEADER);
+    sendJson(res, HTTP_STATUS_METHOD_NOT_ALLOWED, {
+      ok: false,
+      error_code: ERROR_CODES.METHOD_NOT_ALLOWED,
+      error: 'Method not allowed; use GET or HEAD /healthz',
+    });
+    return;
+  }
+  const shuttingDown = Boolean(isShuttingDown && isShuttingDown());
+  const statusCode = shuttingDown ? HTTP_STATUS_SERVICE_UNAVAILABLE : HTTP_STATUS_OK;
+  const headers = shuttingDown ? HEALTH_SHUTTING_DOWN_HEADERS : HEALTH_OK_HEADERS;
+  res.writeHead(statusCode, headers);
+  if (req.method === 'HEAD') {
+    res.end();
+  } else {
+    res.end(shuttingDown ? HEALTH_SHUTTING_DOWN_BODY : HEALTH_OK_BODY);
+  }
 }
 
 /**
@@ -679,15 +741,15 @@ async function handleWakeHttpRequest(req, res, {urlObj, cams, wakeCameraExternal
 }
 
 /**
- * Creates the HTTP request listener handling /api/config, /healthz, and /api/wake/:cameras.
+ * Creates the HTTP request listener handling /healthz, /api/config, /api/status, and /api/wake/:cameras.
  *
  * @param {Camera[]} cams - Configured Camera instances.
  * @param {Record<string, Function>} hooks - Callbacks into stream-orchestrator and shutdown state.
- * @returns {(req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>}
+ * @returns {(req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>|void}
  */
 function createHttpRequestHandler(cams, hooks) {
   const {wakeCameraExternal, isShuttingDown} = hooks;
-  return async (req, res) => {
+  const handleAsyncRequest = async (req, res) => {
     try {
       let urlObj;
       try {
@@ -702,6 +764,11 @@ function createHttpRequestHandler(cams, hooks) {
       }
       const pathname = urlObj.pathname;
       const isHead = req.method === 'HEAD';
+
+      if (isHealthPathname(pathname)) {
+        respondHealthCheck(req, res, isShuttingDown);
+        return;
+      }
 
       if ((req.method === 'GET' || isHead) && pathname === '/api/config') {
         if (isHead) {
@@ -728,17 +795,6 @@ function createHttpRequestHandler(cams, hooks) {
           sendJsonHead(res, statusCode);
         } else {
           sendJson(res, statusCode, buildStatusPayload(cams, {shuttingDown}));
-        }
-        return;
-      }
-
-      if ((req.method === 'GET' || isHead) && (pathname === '/healthz' || pathname === '/health')) {
-        const shuttingDown = Boolean(isShuttingDown && isShuttingDown());
-        const statusCode = shuttingDown ? HTTP_STATUS_SERVICE_UNAVAILABLE : HTTP_STATUS_OK;
-        if (isHead) {
-          sendJsonHead(res, statusCode);
-        } else {
-          sendJson(res, statusCode, buildHealthPayload(cams, shuttingDown));
         }
         return;
       }
@@ -771,10 +827,18 @@ function createHttpRequestHandler(cams, hooks) {
       });
     }
   };
+
+  return (req, res) => {
+    if (isHealthPathname(extractFastPathname(req.url))) {
+      respondHealthCheck(req, res, isShuttingDown);
+      return;
+    }
+    return handleAsyncRequest(req, res);
+  };
 }
 
 /**
- * Starts the HTTP server for /api/wake/:cameras, /api/config, and /healthz if HTTP_PORT > 0.
+ * Starts the HTTP server for /api/wake/:cameras, /api/config, /api/status, and /healthz if HTTP_PORT > 0.
  *
  * @param {Camera[]} cams - Configured Camera instances.
  * @param {Record<string, Function>} hooks - Callbacks into stream-orchestrator.
@@ -784,13 +848,18 @@ function startHttpServer(cams, hooks) {
     return;
   }
 
+  let serverListening = false;
   httpServer = http.createServer(createHttpRequestHandler(cams, hooks));
 
   httpServer.on('error', (err) => {
     log.error('bridge', 'HTTP server error on port ' + HTTP_PORT + ': ' + formatErrorMessage(err));
+    if (!serverListening) {
+      process.exit(1);
+    }
   });
 
   httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+    serverListening = true;
     log.info(
       'bridge',
       'HTTP server listening on 0.0.0.0:' + HTTP_PORT + ' (/api/wake/:cameras, /api/config, /api/status, /healthz)'

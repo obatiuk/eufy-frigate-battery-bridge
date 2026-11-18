@@ -42,6 +42,7 @@ const {
   CameraConfig,
   BridgeConfigBuilder,
   resolveCameraConfig,
+  clampNum,
   TRIGGERS,
   getEventPriority,
   validateConfig,
@@ -2129,19 +2130,202 @@ describe('Environment Variable Expansion (${ENV_VAR} in config.yaml)', () => {
         dockerfile.includes('find /app/node_modules') && dockerfile.includes('-empty -delete'),
         'deploy/Dockerfile builder must prune empty @scope dirs and docs from /app/node_modules'
       );
-      const healthMatch = dockerfile.match(/HEALTHCHECK[^\n]*\\\r?\n\s*CMD\s+(.+)/);
-      assert.ok(healthMatch, 'deploy/Dockerfile must declare a HEALTHCHECK CMD');
-      const {execFileSync} = require('node:child_process');
-      execFileSync('/bin/sh', ['-c', healthMatch[1].trim()], {
-        env: {BRIDGE_HTTP_PORT: '0'},
-        stdio: 'pipe',
-      });
+      const healthDirectiveMatch = dockerfile.match(/(HEALTHCHECK[^\n]*)\\\r?\n\s*CMD\s+(.+)/);
+      assert.ok(healthDirectiveMatch, 'deploy/Dockerfile must declare a HEALTHCHECK CMD');
+      const [, healthFlags, healthCmd] = healthDirectiveMatch;
+      assert.match(
+        healthFlags,
+        /--interval=5s/,
+        'deploy/Dockerfile HEALTHCHECK must probe every 5s so containers exit starting state promptly'
+      );
+      assert.match(healthFlags, /--timeout=2s/, 'deploy/Dockerfile HEALTHCHECK must bound probe timeout to 2s');
+      assert.match(
+        healthFlags,
+        /--start-period=5s/,
+        'deploy/Dockerfile HEALTHCHECK must keep start-period aligned with the 5s interval'
+      );
+      assert.equal(
+        healthFlags.includes('--start-interval'),
+        false,
+        'deploy/Dockerfile HEALTHCHECK must avoid --start-interval so Buildah < 1.37 builds cleanly'
+      );
+      const {execFileSync, spawnSync} = require('node:child_process');
+      const healthTmpDir = fs.mkdtempSync(path.join(TEST_TMP_DIR, 'health-port0-'));
+      try {
+        // Without a live ready marker (unstarted or failed config), BRIDGE_HTTP_PORT=0 must NOT report healthy
+        assert.throws(() => {
+          execFileSync('/bin/sh', ['-c', healthCmd.trim()], {
+            env: {BRIDGE_HTTP_PORT: '0', TMPDIR: healthTmpDir},
+            stdio: 'pipe',
+          });
+        });
+
+        // Once a live bridge process writes its PID after passing config validation, BRIDGE_HTTP_PORT=0 exits 0
+        const readyFile = path.join(healthTmpDir, 'eufy-bridge-ready.pid');
+        fs.writeFileSync(readyFile, String(process.pid), 'utf8');
+        execFileSync('/bin/sh', ['-c', healthCmd.trim()], {
+          env: {BRIDGE_HTTP_PORT: '0', TMPDIR: healthTmpDir},
+          stdio: 'pipe',
+        });
+
+        // Dead/exited PID in marker file must NOT report healthy
+        fs.writeFileSync(readyFile, '99999999', 'utf8');
+        assert.throws(() => {
+          execFileSync('/bin/sh', ['-c', healthCmd.trim()], {
+            env: {BRIDGE_HTTP_PORT: '0', TMPDIR: healthTmpDir},
+            stdio: 'pipe',
+          });
+        });
+      } finally {
+        fs.rmSync(healthTmpDir, {recursive: true, force: true});
+      }
+
       assert.throws(() => {
-        execFileSync('/bin/sh', ['-c', healthMatch[1].trim()], {
+        execFileSync('/bin/sh', ['-c', healthCmd.trim()], {
           env: {BRIDGE_HTTP_PORT: '1'},
           stdio: 'pipe',
         });
       });
+
+      // Regression: invalid configuration (YAML or env) must exit(1) cleanly before binding HTTP or marking
+      // ready, so HEALTHCHECK never returns healthy (0) on invalid config under any BRIDGE_HTTP_PORT
+      const invalidBootDir = fs.mkdtempSync(path.join(TEST_TMP_DIR, 'invalid-cfg-health-'));
+      try {
+        const missingYamlPath = path.join(invalidBootDir, 'does-not-exist.yaml');
+        const brokenSyntaxPath = path.join(invalidBootDir, 'broken-syntax.yaml');
+        fs.writeFileSync(brokenSyntaxPath, 'cameras:\n  - serial: [unclosed\n', 'utf8');
+        const badSchemaPath = path.join(invalidBootDir, 'bad-schema.yaml');
+        fs.writeFileSync(badSchemaPath, 'unknown_option: true\ncameras: []\n', 'utf8');
+        const dupCamPath = path.join(invalidBootDir, 'dup-cam.yaml');
+        fs.writeFileSync(
+          dupCamPath,
+          'cameras:\n  - serial: SN0000000001\n    name: front\n  - serial: SN0000000002\n    name: front\n',
+          'utf8'
+        );
+        const validYamlPath = path.join(invalidBootDir, 'valid.yaml');
+        fs.writeFileSync(validYamlPath, 'cameras:\n  - serial: SN0000000001\n    mode: rtsp\n', 'utf8');
+
+        const baseCleanEnv = Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([k]) =>
+              k !== 'NODE_TEST_CONTEXT' &&
+              !k.startsWith('BRIDGE_') &&
+              !k.startsWith('EUFY_WS_') &&
+              !k.startsWith('FRIGATE_') &&
+              !k.startsWith('GO2RTC_') &&
+              k !== 'HA_WEBHOOK_URL'
+          )
+        );
+
+        const invalidStartupCases = [
+          {label: 'missing config.yaml in production', env: {NODE_ENV: 'production', BRIDGE_CONFIG: missingYamlPath}},
+          {label: 'malformed YAML syntax', env: {NODE_ENV: 'production', BRIDGE_CONFIG: brokenSyntaxPath}},
+          {label: 'unknown key and empty cameras', env: {NODE_ENV: 'production', BRIDGE_CONFIG: badSchemaPath}},
+          {label: 'duplicate camera name', env: {NODE_ENV: 'production', BRIDGE_CONFIG: dupCamPath}},
+          {
+            label: 'invalid EUFY_WS_URL scheme on port 0',
+            env: {
+              NODE_ENV: 'production',
+              BRIDGE_CONFIG: validYamlPath,
+              BRIDGE_HTTP_PORT: '0',
+              EUFY_WS_URL: 'http://wrong-scheme:3000',
+            },
+          },
+          {
+            label: 'invalid FRIGATE_URL syntax',
+            env: {NODE_ENV: 'production', BRIDGE_CONFIG: validYamlPath, FRIGATE_URL: 'not-a-valid-url'},
+          },
+          {
+            label: 'unknown BRIDGE_HWACCEL mode',
+            env: {NODE_ENV: 'production', BRIDGE_CONFIG: validYamlPath, BRIDGE_HWACCEL: 'cuda_typo'},
+          },
+          {
+            label: 'unknown BRIDGE_LOG_LEVEL',
+            env: {NODE_ENV: 'production', BRIDGE_CONFIG: validYamlPath, BRIDGE_LOG_LEVEL: 'verbose_typo'},
+          },
+        ];
+
+        for (const tc of invalidStartupCases) {
+          const caseTmp = fs.mkdtempSync(path.join(invalidBootDir, 'case-'));
+          // Pre-seed a stale PID marker to verify failed startup clears it so port=0 healthcheck still fails
+          fs.writeFileSync(path.join(caseTmp, 'eufy-bridge-ready.pid'), String(process.pid), 'utf8');
+          const runEnv = {
+            ...baseCleanEnv,
+            TMPDIR: caseTmp,
+            BRIDGE_CACHE_DIR: path.join(caseTmp, 'cache'),
+            BRIDGE_HTTP_PORT: tc.env.BRIDGE_HTTP_PORT || '1',
+            ...tc.env,
+          };
+          const appRun = spawnSync(process.execPath, [path.join(REPO_ROOT, 'src/app.js')], {
+            env: runEnv,
+            encoding: 'utf8',
+            timeout: 5000,
+          });
+          assert.equal(appRun.status, 1, 'Expected exit code 1 for invalid config case: ' + tc.label);
+          const combinedLogs = (appRun.stdout || '') + (appRun.stderr || '');
+          assert.match(
+            combinedLogs,
+            /\[ERROR\] - \[bridge\] startup configuration error:/,
+            'Expected structured startup error log for: ' + tc.label
+          );
+          assert.equal(
+            combinedLogs.includes('\n    at '),
+            false,
+            'Startup configuration error must not print a stack trace for: ' + tc.label
+          );
+
+          const probeRun = spawnSync('/bin/sh', ['-c', healthCmd.trim()], {
+            env: runEnv,
+            encoding: 'utf8',
+            timeout: 5000,
+          });
+          assert.notEqual(
+            probeRun.status,
+            0,
+            'HEALTHCHECK must NEVER return 0 (healthy) when configuration is invalid: ' + tc.label
+          );
+        }
+      } finally {
+        fs.rmSync(invalidBootDir, {recursive: true, force: true});
+      }
+
+      assert.equal(clampNum('', 5, 60, 15), 15);
+      assert.equal(clampNum('   ', 5, 60, 15), 15);
+      assert.equal(clampNum([], 5, 60, 15), 15);
+      assert.equal(clampNum(true, 5, 60, 15), 15);
+      assert.equal(clampNum(Infinity, 5, 60, 15), 15);
+
+      // Direct unit checks for invalid YAML value types, non-integers, duplicates, unsafe names, and URLs
+      for (const badYamlCfg of [
+        {cameras: [{serial: 'SN0000000001'}, {serial: 'SN0000000001', name: 'cam_two'}]},
+        {cameras: [{serial: 'SN0000000001', name: '../escape'}]},
+        {cameras: [{serial: 'SN0000000001', name: 'bad/name'}]},
+        {cameras: [{name: 'rtsp_no_host', rtsp_url: 'rtsp://   '}]},
+        {hold_secs: 'sixty', cameras: [{serial: 'SN0000000001'}]},
+        {live_fps: 15.5, cameras: [{serial: 'SN0000000001'}]},
+        {cameras: [{serial: 'SN0000000001', priority: 1.5}]},
+        {audio: 'yes', cameras: [{serial: 'SN0000000001'}]},
+        {startup_snapshot: 'sometimes', cameras: [{serial: 'SN0000000001'}]},
+        {enforce_streaming_quality: 99, cameras: [{serial: 'SN0000000001'}]},
+        {telemetry: 'invalid', cameras: [{serial: 'SN0000000001'}]},
+        {telemetry: {unknown_toggle: true}, cameras: [{serial: 'SN0000000001'}]},
+        {trigger_events: [], cameras: [{serial: 'SN0000000001'}]},
+        {event_priorities: {ring: 'high'}, cameras: [{serial: 'SN0000000001'}]},
+        {ring_label: '', cameras: [{serial: 'SN0000000001'}]},
+      ]) {
+        assert.throws(() => validateConfig(badYamlCfg), /config\.yaml:/);
+      }
+
+      for (const badEndpointEnv of [
+        {EUFY_WS_URL: 'http://wrong:3000'},
+        {EUFY_WS_URL: 'ws://'},
+        {FRIGATE_URL: 'ws://wrong:5000'},
+        {GO2RTC_URL: 'rtsp://wrong:1984'},
+        {GO2RTC_RTSP_URL: 'http://wrong:8554'},
+        {HA_WEBHOOK_URL: 'ftp://wrong:8123/hook'},
+      ]) {
+        assert.throws(() => resolveServiceEndpoints(badEndpointEnv));
+      }
     }
   );
 });

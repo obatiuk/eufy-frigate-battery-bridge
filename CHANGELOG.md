@@ -4,6 +4,12 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Validate configuration value types, integer fields, service URL schemes, runtime log and hardware-acceleration modes,
+  and unique safe camera identities at startup, and require a live post-validation process marker when the `HTTP`
+  listener is disabled so invalid configurations never report healthy
+- Simplify container health checks to return an immediate, dependency-free liveness response as soon as the `HTTP`
+  listener binds on startup, removing `WebSocket` status from the health payload and shortening the container probe
+  interval so services exit the starting state promptly
 - Expose full upstream service, `HomeBase` station, stream session, encoder, viewer, backfill, and live sensor telemetry
   details on `GET /api/status` while keeping `GET /healthz` lightweight for frequent container probes
 - Surface root-cause `ffmpeg`, `RTSP` handshake, snapshot cache, `HTTP`, `WebSocket`, and `Eufy` command errors in logs

@@ -631,11 +631,12 @@ If something does not behave the way you expect after configuring your cameras, 
 ### Diagnostics & Health Checks
 
 - **How do I check if the bridge is healthy or inspect its runtime status and active config?**
-  - Run `curl http://127.0.0.1:8080/healthz` - lightweight container readiness probe returning `200` (`"ok": true`,
-    `"ws_connected"`, `"uptime_secs"`) whenever the bridge process is running with a valid configuration, and `503`
-    (`"ok": false`) only while shutting down. External service outages (`eufy-security-ws`, `Frigate`, `go2rtc`, or
-    offline cameras) do **not** mark `/healthz` unhealthy so container restart policies (`--health-on-failure=restart`,
-    `autoheal`) will not restart the bridge while it automatically logs disconnects and reconnects.
+  - Run `curl http://127.0.0.1:8080/healthz` - ultra-fast container liveness probe bound immediately on startup,
+    returning `200` (`{"ok":true}`) whenever the bridge process is running with a valid configuration, and `503`
+    (`{"ok":false}`) only while shutting down. Upstream service status (`eufy-security-ws`, `Frigate`, `go2rtc`, or
+    offline cameras) is completely excluded from `/healthz` (inspect `/api/status` for `services.ws_connected` and
+    `uptime_secs`) so container restart policies (`--health-on-failure=restart`, `autoheal`) never restart the bridge
+    during external service outages.
   - Run `curl http://127.0.0.1:8080/api/status` - returns full runtime status in `JSON`, including upstream service
     connectivity (`eufy-security-ws`, `Frigate`, `go2rtc`), `HomeBase` station `P2P` health and active slot state,
     summary camera counts, and every configured camera's live session/decoder state, encoder codec (`hwaccel` fallback

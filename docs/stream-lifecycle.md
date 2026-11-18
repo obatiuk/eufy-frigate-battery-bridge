@@ -119,9 +119,10 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
   and sanitized effective runtime config with `null` for inapplicable fields), `GET/HEAD /api/status`
   (`buildStatusPayload` exposing upstream service connectivity, `HomeBase` station `P2P` slot health, aggregate camera
   counts, and every configured camera's live session, encoder, viewer, event, backfill, trigger, and sensor telemetry
-  state), and `GET/HEAD /health` + `/healthz` (extra-minimal container `HEALTHCHECK` liveness probe returning `200` when
-  running and not shutting down without scanning camera arrays, with `ws_connected` and `uptime_secs` reported in the
-  payload rather than triggering restarts on external service outages).
+  state), and `GET/HEAD /health` + `/healthz` (dependency-free container `HEALTHCHECK` liveness fast-path bound
+  immediately on startup and returning fixed-length `200` `{"ok":true}` while running or `503` `{"ok":false}` only on
+  shutdown, with zero external service checks or camera scans; upstream `ws_connected` and `uptime_secs` live on
+  `GET /api/status`).
 - **HomeBase Reboot & Wi-Fi Outage Self-Healing:** On initial `start_listening`, the bridge verifies `driver` and
   `station` connectivity (`driver.is_connected`, `station.is_connected`) and dispatches `driver.connect` and
   `station.connect` whenever disconnected. `onEvent` handles `source === 'station'` events (`close`, `connection error`,

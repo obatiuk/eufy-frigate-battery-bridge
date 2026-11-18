@@ -7,8 +7,7 @@ strict TDD (`Red -> Green -> make check`) for every code item and never weaken a
 
 - [A. Reliability and runtime bugs](#a-reliability-and-runtime-bugs) - Frigate/Eufy error recovery, WebSocket keepalive,
   clean shutdown, snapshot timeouts, and FFmpeg resilience
-- [B. Configuration and validation](#b-configuration-and-validation) - startup type, URL scheme, and identity checks,
-  plus dedicated clamp bounds
+- [B. Configuration and validation](#b-configuration-and-validation) - dedicated clamp bounds and unified `cfg` usage
 - [C. Security, logging, and error handling](#c-security-logging-and-error-handling) - HTTP body/timeout limits,
   swallowed errors, floating promises, and HTTP auth
 - [D. Domain and status card cleanups](#d-domain-and-status-card-cleanups) - `Camera` FSM transition logging and
@@ -35,9 +34,9 @@ strict TDD (`Red -> Green -> make check`) for every code item and never weaken a
     keys, and one-shot flags / `clearLightOn()` commit before `setCameraProperty()` (~243-284) confirms RPC success.
     Sync recording mode only on full sets, return RPC success, commit after success, and test retries.
 - [ ] Detect a dead Eufy WebSocket connection with keepalive pings
-  - `eufy-client.js` (~975-1061) lacks `ping`/`pong`, inactivity timeouts, and `handshakeTimeout`, keeping `wsReady` and
-    `/healthz` green on half-open sockets. Add `ping` + pong/inactivity timeout, `handshakeTimeout`, jittered reconnect
-    backoff, and `try/catch` around `new WebSocket(url)`, with tests.
+  - `eufy-client.js` (~975-1061) lacks `ping`/`pong`, inactivity timeouts, and `handshakeTimeout`, keeping `wsReady`
+    `true` on half-open sockets. Add `ping` + pong/inactivity timeout, `handshakeTimeout`, jittered reconnect backoff,
+    and `try/catch` around `new WebSocket(url)`, with tests.
 - [ ] Wrap every housekeeping step in error handling
   - The 500ms `runHousekeepingTick()` (`stream-orchestrator.js` ~1706-1764) lacks `try/catch`, so one exception aborts
     later cameras. Wrap `arbitrate()`, `processBackfillQueue()`, and each per-camera tick in `try/catch` with scoped
@@ -82,10 +81,6 @@ cam.getName())` (~549), and `stopEncoderProcess()` (`camera.js` ~5220-5230) send
 
 ### B. Configuration and validation
 
-- [ ] Validate configuration value types, URL schemes, and camera identities in `validateConfig()` and env resolvers
-  - `clampNum()` (`config.js` ~404-410) coerces `""`, `[]`, and `true`; invalid `FRIGATE_URL` / `EUFY_WS_URL` schemes,
-    unknown `BRIDGE_HWACCEL`, invalid `startup_snapshot`, out-of-range `enforce_streaming_quality`, non-integers,
-    duplicate `name`/`serial`, and unsafe `name` characters pass silently. Validate all at startup.
 - [ ] Use dedicated clamp constants in `BridgeConfigBuilder` and unify `cfg` usage (low)
   - `BridgeConfigBuilder.withTimersAndArbitration()` (`config.js` ~2282-2328) reuses unrelated clamp constants;
     exported resolvers default `baseCfg` to `rawLoadedCfg` instead of `cfg`; and runtime modules mix `cfg.*` with

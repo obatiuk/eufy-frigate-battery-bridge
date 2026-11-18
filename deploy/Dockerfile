@@ -49,8 +49,8 @@ USER node
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD if [ "${BRIDGE_HTTP_PORT:-8080}" = "0" ]; then exit 0; fi; wget -qO- "http://127.0.0.1:${BRIDGE_HTTP_PORT:-8080}/healthz" >/dev/null || exit 1
+HEALTHCHECK --interval=5s --timeout=2s --start-period=5s --retries=3 \
+  CMD if [ "${BRIDGE_HTTP_PORT:-8080}" = "0" ]; then pid=$(cat "${TMPDIR:-/tmp}/eufy-bridge-ready.pid" 2>/dev/null) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || exit 1; else wget -q -T 2 -O- "http://127.0.0.1:${BRIDGE_HTTP_PORT:-8080}/healthz" >/dev/null || exit 1; fi
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "app.js"]
