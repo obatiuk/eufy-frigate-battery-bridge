@@ -10,7 +10,11 @@
 
 const {stations} = require('../domain/station');
 const {setRtspDropHandler} = require('../media/decoder');
-const {configureOrchestratorContext, getActiveStationTransitionCount} = require('./orchestrator/context');
+const {
+  configureOrchestratorContext,
+  getActiveStationTransitionCount,
+  waitForStationTransitions,
+} = require('./orchestrator/context');
 const {wakeCameraExternal, trigger, stop} = require('./orchestrator/wake');
 const {arbitrate} = require('./orchestrator/arbitration');
 const {processBackfillQueue} = require('./orchestrator/backfill-queue');
@@ -35,6 +39,7 @@ function initOrchestrator(cameraList, serialMap, shuttingDownGetter) {
 module.exports = {
   initOrchestrator,
   getActiveStationTransitionCount,
+  waitForStationTransitions,
   wakeCameraExternal,
   trigger,
   stop,

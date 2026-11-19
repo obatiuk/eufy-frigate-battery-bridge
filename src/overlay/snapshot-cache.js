@@ -25,8 +25,9 @@ const SNAPSHOT_TEMP_SUFFIX = '.tmp.jpg';
 const MAX_SNAPSHOT_STDERR_BYTES = 16384;
 const ENCODE_MAX_STDOUT_BYTES = 0;
 
-/** Cache files with an FFmpeg encode in flight, so repeated session stops never stack encodes of one snapshot. */
-const pendingSaveFiles = new Set();
+/** Cache files with an FFmpeg encode Promise in flight, preventing stacked saves and allowing shutdown drain. */
+/** @type {Map<string, Promise<void>>} */
+const pendingSaves = new Map();
 
 const ignoreError = () => {};
 
@@ -317,29 +318,43 @@ async function saveCachedFrame(cam) {
     return;
   }
   const targetFile = getCacheFilePath(cam);
-  if (pendingSaveFiles.has(targetFile)) {
+  if (pendingSaves.has(targetFile)) {
     log.debug(cam, 'skipping cached snapshot save, previous save still running');
     return;
   }
-  pendingSaveFiles.add(targetFile);
   const tempFile = targetFile + SNAPSHOT_TEMP_SUFFIX;
-  try {
-    // Copy before the first await: the live buffers are recycled once the session ends.
-    const frameCopy = Buffer.from(cam.getLastFrameBuffer());
-    const r = await runSnapshotFfmpeg(buildEncodeJpegArgs(tempFile), frameCopy, ENCODE_MAX_STDOUT_BYTES);
-    if (!r.error && r.status === 0) {
-      await fs.promises.rename(tempFile, targetFile);
-      migrateLegacyDuplicateCacheFile(cam, CACHE_DIR);
-      log.debug(cam, 'saved cached snapshot to ' + targetFile);
-    } else {
-      log.warn(cam, 'failed to save cached snapshot: ' + formatSnapshotFfmpegFailure(r));
+  const frameCopy = Buffer.from(cam.getLastFrameBuffer());
+  const saveTask = (async () => {
+    try {
+      const r = await runSnapshotFfmpeg(buildEncodeJpegArgs(tempFile), frameCopy, ENCODE_MAX_STDOUT_BYTES);
+      if (!r.error && r.status === 0) {
+        await fs.promises.rename(tempFile, targetFile);
+        migrateLegacyDuplicateCacheFile(cam, CACHE_DIR);
+        log.debug(cam, 'saved cached snapshot to ' + targetFile);
+      } else {
+        log.warn(cam, 'failed to save cached snapshot: ' + formatSnapshotFfmpegFailure(r));
+      }
+    } catch (err) {
+      log.warn(cam, 'error saving cached snapshot: ' + formatErrorMessage(err));
+    } finally {
+      pendingSaves.delete(targetFile);
+      await fs.promises.rm(tempFile, {force: true}).catch(ignoreError);
     }
-  } catch (err) {
-    log.warn(cam, 'error saving cached snapshot: ' + formatErrorMessage(err));
-  } finally {
-    pendingSaveFiles.delete(targetFile);
-    await fs.promises.rm(tempFile, {force: true}).catch(ignoreError);
+  })();
+  pendingSaves.set(targetFile, saveTask);
+  await saveTask;
+}
+
+/**
+ * Resolves once every currently in-flight snapshot FFmpeg encode and atomic file rename settles.
+ *
+ * @returns {Promise<void>}
+ */
+async function waitForPendingSnapshotSaves() {
+  if (pendingSaves.size === 0) {
+    return;
   }
+  await Promise.allSettled([...pendingSaves.values()]);
 }
 
 module.exports = {
@@ -349,4 +364,5 @@ module.exports = {
   migrateLegacyDuplicateCacheFile,
   loadCachedFrame,
   saveCachedFrame,
+  waitForPendingSnapshotSaves,
 };

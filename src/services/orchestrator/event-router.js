@@ -669,6 +669,9 @@ const DEVICE_EVENT_HANDLERS = Object.freeze({
  * @param {Record<string, *>} eventPayload - Event object from eufy-security-ws.
  */
 function onEvent(eventPayload) {
+  if (isShuttingDown()) {
+    return;
+  }
   const e = eventPayload;
   if (e.event === 'device added' && e.device && e.device.serialNumber) {
     const cam = findCameraBySerial(e.device.serialNumber);

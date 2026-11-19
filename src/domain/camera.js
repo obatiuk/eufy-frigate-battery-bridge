@@ -4117,10 +4117,12 @@ class Camera {
   }
 
   /**
-   * Resets motion hold state prior to graceful bridge shutdown.
+   * Resets motion and viewer hold timers plus pending wake queues prior to graceful bridge shutdown.
    */
   prepareForShutdown() {
     this.session.motionUntil = 0;
+    this.session.viewUntil = 0;
+    this.clearApiWakeTimer();
     this.clearDeferredLiveWake();
   }
 

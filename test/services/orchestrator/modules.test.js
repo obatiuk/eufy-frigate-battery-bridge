@@ -118,6 +118,7 @@ describe('src/services/orchestrator split modules', () => {
     assert.equal(orchestrator.processBackfillQueue, processBackfillQueue);
     assert.equal(orchestrator.runHousekeepingTick, runHousekeepingTick);
     assert.equal(orchestrator.startHousekeepingLoop, startHousekeepingLoop);
+    assert.equal(typeof orchestrator.waitForStationTransitions, 'function');
     assert.equal(typeof resetHousekeepingErrorState, 'function');
   });
 });

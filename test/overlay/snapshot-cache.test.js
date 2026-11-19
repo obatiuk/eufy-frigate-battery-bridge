@@ -24,6 +24,7 @@ const {
   buildEncodeJpegArgs,
   loadCachedFrame,
   saveCachedFrame,
+  waitForPendingSnapshotSaves,
 } = require('../../src/overlay/snapshot-cache');
 
 afterEach(() => {
@@ -189,6 +190,39 @@ describe('Snapshot Cache Event-Loop Safety (src/overlay/snapshot-cache.js)', () 
       assert.equal(spawned.length, 2, 'a save after the previous one finished must run again');
       finishFakeFfmpegProcess(spawned[1].proc, {status: 1});
       await third;
+    } finally {
+      fs.rmSync(finalFile, {force: true});
+    }
+  });
+
+  it('waits for all in-flight snapshot saves via waitForPendingSnapshotSaves', async (t) => {
+    // Verify: shutdown can await waitForPendingSnapshotSaves so un-awaited stop() snapshot encodes finish writing.
+    const childProcess = require('node:child_process');
+    const cam = new Camera({serial: 'T8161T0000009996', name: 'snap_drain_cam'});
+    cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x55), Buffer.alloc(FRAME, 0x55), 25000, '10:05');
+    const finalFile = getCacheFilePath(cam);
+    const spawned = [];
+    t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
+      const proc = createFakeFfmpegProcess();
+      spawned.push({cmd, args, opts, proc});
+      return proc;
+    });
+    try {
+      void saveCachedFrame(cam);
+      await waitUntil(() => spawned.length > 0);
+      let drained = false;
+      const draining = waitForPendingSnapshotSaves().then(() => {
+        drained = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(drained, false, 'waitForPendingSnapshotSaves must stay pending while FFmpeg encode runs');
+
+      const tempFile = spawned[0].args[spawned[0].args.length - 1];
+      fs.writeFileSync(tempFile, 'shutdown-final-jpeg');
+      finishFakeFfmpegProcess(spawned[0].proc, {status: 0});
+      await draining;
+      assert.equal(drained, true);
+      assert.equal(fs.readFileSync(finalFile, 'utf8'), 'shutdown-final-jpeg');
     } finally {
       fs.rmSync(finalFile, {force: true});
     }

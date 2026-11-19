@@ -26,12 +26,6 @@ classes, not line numbers (they drift); find them with `grep`.
   - `connectWs()` (`ws-transport.js`) lacks `ping`/`pong`, an inactivity timeout, and `handshakeTimeout`, keeping
     `wsReady` `true` on half-open sockets, and reconnects on a fixed 10s delay. Add `ping` + pong/inactivity timeout,
     `handshakeTimeout`, and jittered reconnect backoff, with tests.
-- [ ] Make shutdown wait for camera stops and ignore new triggers
-  - `shutdownBridge()` (`app.js`) stops background timers and exits 1.5s after un-awaited `stop()` calls, while
-    `trigger()` / `arbitrate()` / `onEvent` lack shutdown guards and `prepareForShutdown()` leaves `viewUntil` set.
-    Await pending station transitions (~5s cap), clear `viewUntil`, guard entrypoints with `isShuttingDown()`, and wait
-    for in-flight snapshot saves (`saveCachedFrame()` is async, so a save started by the shutdown `stop()` can be cut
-    off by `process.exit`; the previous snapshot stays intact).
 - [ ] Serialize telemetry polling and stop forcing HomeBase refreshes while a camera is offline
   - `fetchAllCameraTelemetry()` (`telemetry-sync.js`) has no in-flight guard although the poller, viewer joins, the
     initial retry timer, and offline recovery all call it (each run sleeps `POLL_REFRESH_SETTLE_MS`), and it sets

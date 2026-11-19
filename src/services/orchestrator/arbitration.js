@@ -14,7 +14,7 @@ const {stations} = require('../../domain/station');
 const {pushFrameToEncoder} = require('../../media/encoder');
 const {frigateEvent} = require('../frigate-client');
 const {isWsReady} = require('../eufy-client');
-const {STATION_WAKE_PACING_MS, STOP_INITIATORS, registerArbitrator, getCams} = require('./context');
+const {STATION_WAKE_PACING_MS, STOP_INITIATORS, registerArbitrator, getCams, isShuttingDown} = require('./context');
 const {startRtspStream, startLivestream, stop} = require('./wake');
 
 const P2P_WAKE_STALL_PREEMPT_MS = 8000;
@@ -119,6 +119,9 @@ function arbitrateStationP2pSlot(stationKey, now) {
  * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
  */
 function arbitrate(now = Date.now()) {
+  if (isShuttingDown()) {
+    return;
+  }
   const cams = getCams();
   for (const rCam of cams.filter((c) => c.isActiveRtspSession())) {
     if (rCam.hasExpiredLiveHold(now) && !rCam.isExtendCheckInFlight()) {

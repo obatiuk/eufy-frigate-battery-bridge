@@ -24,7 +24,7 @@ const {
 } = require('./config');
 const {log, formatErrorMessage} = require('./logger');
 const {Camera} = require('./domain/camera');
-const {loadCachedFrame} = require('./overlay/snapshot-cache');
+const {loadCachedFrame, waitForPendingSnapshotSaves} = require('./overlay/snapshot-cache');
 const {renderCameraCards} = require('./overlay/card-renderer');
 const {configureEncoderHooks, startEncoder, startMediaTickers, stopMediaTickers} = require('./media/encoder');
 const {setDecoderStopHandler} = require('./media/decoder');
@@ -45,6 +45,7 @@ const {
 } = require('./services/eufy-client');
 const {
   initOrchestrator,
+  waitForStationTransitions,
   wakeCameraExternal,
   trigger,
   stop,
@@ -58,6 +59,7 @@ const {verifyUpstreamServiceVersions, stopUpstreamVersionChecks} = require('./se
 
 const SIGUSR1_BACKFILL_DELAY_MS = 300;
 const SHUTDOWN_EXIT_DELAY_MS = 1500;
+const SHUTDOWN_MAX_DRAIN_MS = 5000;
 const VIEWER_POLL_INTERVAL_MS = 750;
 
 let bridgeShuttingDown = false;
@@ -179,14 +181,23 @@ function handleSigUsr1BackfillTest(cams) {
 }
 
 /**
- * Gracefully stops all active camera livestreams and terminates FFmpeg encoder processes.
+ * Resets module-level shutdown latch state between isolated unit/regression tests.
+ */
+function resetBridgeShutdownForTests() {
+  bridgeShuttingDown = false;
+}
+
+/**
+ * Gracefully stops all active camera livestreams, waits up to 5s for station teardown RPCs and
+ * in-flight async snapshot encodes to complete, terminates encoders, and exits.
  *
  * @param {Camera[]} cams - Active camera collection.
  * @param {number} [exitCode=0] - Process exit status code once teardown settles.
+ * @returns {Promise<void>}
  */
 function shutdownBridge(cams, exitCode = 0) {
   if (bridgeShuttingDown) {
-    return;
+    return Promise.resolve();
   }
   bridgeShuttingDown = true;
   clearBridgeReady();
@@ -210,13 +221,33 @@ function shutdownBridge(cams, exitCode = 0) {
     stop(cam, 'bridge container shutting down', {preemptedByViewer: false, initiator: 'system-shutdown'});
     cam.stopEncoderProcess();
   }
-  const exitTimer = setTimeout(() => {
-    stopWsClient();
-    process.exit(exitCode);
-  }, SHUTDOWN_EXIT_DELAY_MS);
-  if (exitTimer && typeof exitTimer.unref === 'function') {
-    exitTimer.unref();
-  }
+
+  const maxDrainMs = exitCode === 0 ? SHUTDOWN_MAX_DRAIN_MS : SHUTDOWN_EXIT_DELAY_MS;
+  return new Promise((resolve) => {
+    let finished = false;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    let maxExitTimer = null;
+    const finishExit = () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      if (maxExitTimer) {
+        clearTimeout(maxExitTimer);
+        maxExitTimer = null;
+      }
+      stopWsClient();
+      resolve();
+      process.exit(exitCode);
+    };
+    maxExitTimer = setTimeout(finishExit, maxDrainMs);
+    if (maxExitTimer && typeof maxExitTimer.unref === 'function') {
+      maxExitTimer.unref();
+    }
+    if (exitCode === 0) {
+      void Promise.allSettled([waitForStationTransitions(), waitForPendingSnapshotSaves()]).finally(finishExit);
+    }
+  });
 }
 
 /**
@@ -253,8 +284,8 @@ function registerSignalHandlers(cams) {
   });
 
   process.on(PROCESS_SIGNALS.SIGUSR1, () => handleSigUsr1BackfillTest(cams));
-  process.on(PROCESS_SIGNALS.SIGTERM, () => shutdownBridge(cams));
-  process.on(PROCESS_SIGNALS.SIGINT, () => shutdownBridge(cams));
+  process.on(PROCESS_SIGNALS.SIGTERM, () => void shutdownBridge(cams));
+  process.on(PROCESS_SIGNALS.SIGINT, () => void shutdownBridge(cams));
   process.on('exit', clearBridgeReady);
 
   process.on('uncaughtException', (err) => handleUncaughtException(cams, err));
@@ -345,5 +376,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  shutdownBridge,
   handleUncaughtException,
+  resetBridgeShutdownForTests,
 };

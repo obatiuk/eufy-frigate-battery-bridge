@@ -461,6 +461,23 @@ class StationRegistry {
   }
 
   /**
+   * Resolves once all currently active per-station stop/teardown transition promises settle.
+   *
+   * @returns {Promise<void>}
+   */
+  async waitForTransitions() {
+    const active = [];
+    for (const st of this._byKey.values()) {
+      if (st.hasActiveTransition()) {
+        active.push(st.getTransition());
+      }
+    }
+    if (active.length > 0) {
+      await Promise.allSettled(active);
+    }
+  }
+
+  /**
    * Resets WebSocket recovery flags and reconnect timers across all stations.
    */
   resetRecovery() {

@@ -49,7 +49,7 @@ let arbitrateFn = () => {};
 function configureOrchestratorContext(cameraList, serialMap, shuttingDownGetter) {
   cams = cameraList;
   bySerial = serialMap;
-  isShuttingDownFn = shuttingDownGetter;
+  isShuttingDownFn = typeof shuttingDownGetter === 'function' ? shuttingDownGetter : () => false;
 }
 
 /**
@@ -75,6 +75,7 @@ const getCams = () => cams;
 const findCameraBySerial = (serial) => bySerial.get(serial);
 const isShuttingDown = () => isShuttingDownFn();
 const getActiveStationTransitionCount = () => stations.activeTransitionCount();
+const waitForStationTransitions = () => stations.waitForTransitions();
 const getStationTransition = (cam) => stations.get(cam.getStationKey()).getTransition();
 const setStationTransition = (cam, p) => {
   stations.get(cam.getStationKey()).trackTransition(p);
@@ -113,6 +114,7 @@ module.exports = {
   findCameraBySerial,
   isShuttingDown,
   getActiveStationTransitionCount,
+  waitForStationTransitions,
   getStationTransition,
   setStationTransition,
   resumeOfflineCameraIfNeeded,

@@ -291,7 +291,7 @@ function wakeCameraExternal(cam, opts) {
  * }|string} opts - Trigger options object (or legacy reason string from locked acceptance tests).
  */
 function trigger(cam, opts) {
-  if (!isWsReady() && !cam.isRtspDirect()) {
+  if (isShuttingDown() || (!isWsReady() && !cam.isRtspDirect())) {
     return;
   }
   const isLegacyString = typeof opts === 'string';
@@ -643,7 +643,7 @@ function stop(cam, why, opts = {}) {
     pushFrameToEncoder(cam);
   }
 
-  if (closedMode !== STREAM_MODES.DOWNLOAD && !cam.isDeviceOffline() && !cam.isRtspDirect()) {
+  if (!isShuttingDown() && closedMode !== STREAM_MODES.DOWNLOAD && !cam.isDeviceOffline() && !cam.isRtspDirect()) {
     call({command: 'device.get_properties', serialNumber: serial}).then((res) => {
       if (res.success && res.result && res.result.properties) {
         applyDeviceProperties(cam, res.result.properties, false);

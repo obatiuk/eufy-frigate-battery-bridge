@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Wait for in-flight station stop commands and background snapshot saves up to a bounded deadline during graceful
+  shutdown while clearing active viewer holds and ignoring new triggers
 - Roll back `Frigate` event cooldown when event creation fails so follow-up detections can file immediately, and
   restore live status card rendering right after event creation instead of holding suppression across review lookups
 - Isolate per-camera and per-step housekeeping failures with rate-limited error logs so one failing camera never
