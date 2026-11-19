@@ -20,6 +20,7 @@ const {
   isWsSettledForEvents,
   canRunStartupProbeNow,
   formatRpcError,
+  computeWsReconnectDelayMs,
   call,
   connectWs,
   stopWsClient,
@@ -285,5 +286,25 @@ describe('src/services/eufy split modules', () => {
       log.error = origError;
       registerEufySubsystems({onEnsureInitialConnected: async () => {}});
     }
+  });
+
+  it('computes bounded exponential reconnect backoff with jitter in computeWsReconnectDelayMs', () => {
+    // Verify initial reconnect stays around 10s while consecutive failures back off with jitter up to 60s max.
+    assert.equal(typeof computeWsReconnectDelayMs, 'function');
+    const firstMin = computeWsReconnectDelayMs(0, () => 0);
+    const firstMax = computeWsReconnectDelayMs(0, () => 1);
+    assert.equal(Math.round(firstMin / 1000), 10);
+    assert.equal(Math.round(firstMax / 1000), 10);
+    assert.equal(firstMax > firstMin, true, 'attempt 0 still applies sub-second jitter');
+
+    const secondLow = computeWsReconnectDelayMs(1, () => 0);
+    const secondHigh = computeWsReconnectDelayMs(1, () => 1);
+    assert.equal(secondLow >= 16_000 && secondLow <= 20_000, true);
+    assert.equal(secondHigh >= 20_000 && secondHigh <= 24_000, true);
+    assert.equal(secondHigh > secondLow, true);
+
+    const capped = computeWsReconnectDelayMs(8, () => 1);
+    assert.equal(capped <= 60_000, true);
+    assert.equal(capped >= 48_000, true);
   });
 });

@@ -58,3 +58,4 @@ test `Regression NN: ...` (`make test-regression` runs them).
 - **48** [Per-Camera Housekeeping Error Isolation & Fatal Uncaught Exception Shutdown](regression/48-housekeeping-per-camera-error-isolation-and-fatal-exit.md) - `housekeeping.js`, `app.js` - AT-08
 - **49** [Frigate Event POST Failure Cooldown Rollback & Scoped Card Suppression](regression/49-frigate-event-post-failure-rollback-and-card-suppression.md) - `frigate-event-filing.js`, `camera.js`, `frigate-client.js` - AT-11, AT-17
 - **50** [Graceful Shutdown Drain for Station Stops, Snapshot Saves & Trigger Guards](regression/50-graceful-shutdown-await-stops-snapshots-and-ignore-triggers.md) - `app.js`, `camera.js`, `station.js`, `snapshot-cache.js`, `wake.js`, `arbitration.js`, `event-router.js` - AT-08
+- **51** [Eufy WebSocket Keepalive Pings, Handshake Timeout & Jittered Reconnect Backoff](regression/51-websocket-keepalive-ping-handshake-timeout-and-backoff.md) - `ws-transport.js` - AT-08

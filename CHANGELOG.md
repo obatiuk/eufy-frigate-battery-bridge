@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Detect silently dropped `eufy-security-ws` connections with `WebSocket` handshake timeouts and periodic keepalive
+  pings, and back off repeated reconnect attempts with jitter up to `60s`
 - Wait for in-flight station stop commands and background snapshot saves up to a bounded deadline during graceful
   shutdown while clearing active viewer holds and ignoring new triggers
 - Roll back `Frigate` event cooldown when event creation fails so follow-up detections can file immediately, and

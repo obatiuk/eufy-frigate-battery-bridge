@@ -22,10 +22,6 @@ classes, not line numbers (they drift); find them with `grep`.
     `Telemetry.evaluateRecordingModeChanges()` latches `recordingModeChecked` on any 1 of 4 keys, and one-shot flags /
     `clearLightOn()` commit before `setCameraProperty()` confirms RPC success. Sync recording mode only on full sets,
     return RPC success, commit after success, and test retries.
-- [ ] Detect a dead Eufy WebSocket connection with keepalive pings
-  - `connectWs()` (`ws-transport.js`) lacks `ping`/`pong`, an inactivity timeout, and `handshakeTimeout`, keeping
-    `wsReady` `true` on half-open sockets, and reconnects on a fixed 10s delay. Add `ping` + pong/inactivity timeout,
-    `handshakeTimeout`, and jittered reconnect backoff, with tests.
 - [ ] Serialize telemetry polling and stop forcing HomeBase refreshes while a camera is offline
   - `fetchAllCameraTelemetry()` (`telemetry-sync.js`) has no in-flight guard although the poller, viewer joins, the
     initial retry timer, and offline recovery all call it (each run sleeps `POLL_REFRESH_SETTLE_MS`), and it sets

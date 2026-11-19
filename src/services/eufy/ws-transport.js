@@ -22,14 +22,26 @@ const {validateEufyWsVersion, resetServiceVersionChecks} = require('../service-v
  *   readyState: number,
  *   send: (data: string, cb?: (err?: Error|null) => void) => void,
  *   close: () => void,
+ *   ping?: () => void,
+ *   terminate?: () => void,
  *   on: (event: string, listener: (...args: *[]) => void) => void,
  * }} WsSocketLike
  */
-/** @typedef {new (url: string) => WsSocketLike} WsSocketConstructor */
+/** @typedef {new (url: string, options?: {handshakeTimeout?: number}) => WsSocketLike} WsSocketConstructor */
 
 const WS_OPEN = 1;
 const WS_RPC_TIMEOUT_MS = 20000;
 const WS_RECONNECT_DELAY_MS = 10000;
+const WS_RECONNECT_MAX_DELAY_MS = 60000;
+const WS_RECONNECT_BACKOFF_FACTOR = 2;
+const WS_RECONNECT_INITIAL_JITTER_MS = 400;
+const WS_RECONNECT_JITTER_RATIO = 0.2;
+const WS_RECONNECT_JITTER_MIDPOINT = 0.5;
+const WS_RECONNECT_JITTER_SCALE = 2;
+const WS_HANDSHAKE_TIMEOUT_MS = 10000;
+const WS_PING_INTERVAL_MS = 30000;
+const WS_PONG_TIMEOUT_MS = 10000;
+const MS_PER_SECOND = 1000;
 const INITIAL_TELEMETRY_RETRY_MS = 10000;
 const MAX_SUPPORTED_API_SCHEMA = 21;
 
@@ -42,8 +54,16 @@ let wsReadyAt = 0;
 let wsHasEverDisconnected = false;
 let wsOutageWarned = false;
 let wsOutageErrorLogged = false;
+let wsReconnectAttempts = 0;
+let awaitingPong = false;
 /** @type {ReturnType<typeof setTimeout>|null} */
 let wsReconnectTimer = null;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let wsHandshakeTimer = null;
+/** @type {ReturnType<typeof setInterval>|null} */
+let wsPingTimer = null;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let wsPongTimeoutTimer = null;
 /** @type {ReturnType<typeof setTimeout>|null} */
 let initialTelemetryRetryTimer = null;
 let initialTelemetryLoaded = false;
@@ -142,10 +162,148 @@ function configureEufyClientHooks(hooks = {}) {
   if (typeof hooks.WebSocket === 'function') {
     WebSocketCtor = hooks.WebSocket;
     clearWsReconnectTimer();
+    clearWsKeepaliveTimers();
     resetServiceVersionChecks();
+    wsReconnectAttempts = 0;
     wsHasEverDisconnected = false;
     wsOutageWarned = false;
     wsOutageErrorLogged = false;
+  }
+}
+
+/**
+ * Computes the next WebSocket reconnect delay in milliseconds using bounded exponential backoff
+ * (`10s` initial, `20s`, `40s`, up to `60s` max) with jitter.
+ *
+ * @param {number} [attempt=0] - Zero-based consecutive failed reconnect attempt counter.
+ * @param {() => number} [randomFn=Math.random] - Uniform `[0, 1)` random generator.
+ * @returns {number}
+ */
+function computeWsReconnectDelayMs(attempt = 0, randomFn = Math.random) {
+  const safeAttempt = Math.max(0, Math.floor(attempt));
+  const rand = Math.min(1, Math.max(0, Number(randomFn()) || 0));
+  if (safeAttempt === 0) {
+    return WS_RECONNECT_DELAY_MS + Math.round(rand * WS_RECONNECT_INITIAL_JITTER_MS);
+  }
+  const expDelay = Math.min(
+    WS_RECONNECT_MAX_DELAY_MS,
+    WS_RECONNECT_DELAY_MS * WS_RECONNECT_BACKOFF_FACTOR ** safeAttempt
+  );
+  const centered = (rand - WS_RECONNECT_JITTER_MIDPOINT) * WS_RECONNECT_JITTER_SCALE;
+  const jittered = Math.round(expDelay * (1 + centered * WS_RECONNECT_JITTER_RATIO));
+  return Math.min(WS_RECONNECT_MAX_DELAY_MS, Math.max(WS_RECONNECT_DELAY_MS, jittered));
+}
+
+function clearWsHandshakeTimer() {
+  if (wsHandshakeTimer) {
+    clearTimeout(wsHandshakeTimer);
+    wsHandshakeTimer = null;
+  }
+}
+
+function clearWsPongTimeoutTimer() {
+  if (wsPongTimeoutTimer) {
+    clearTimeout(wsPongTimeoutTimer);
+    wsPongTimeoutTimer = null;
+  }
+}
+
+function clearWsKeepaliveTimers() {
+  clearWsHandshakeTimer();
+  clearWsPongTimeoutTimer();
+  if (wsPingTimer) {
+    clearInterval(wsPingTimer);
+    wsPingTimer = null;
+  }
+  awaitingPong = false;
+}
+
+/**
+ * Terminates a stalled or half-open WebSocket immediately, falling back to close() on minimal test stubs.
+ *
+ * @param {WsSocketLike} socket - Target socket instance.
+ */
+function terminateWsSocket(socket) {
+  try {
+    if (typeof socket.terminate === 'function') {
+      socket.terminate();
+    } else if (typeof socket.close === 'function') {
+      socket.close();
+    }
+  } catch (err) {
+    // Ignore errors terminating an already-closing socket.
+  }
+}
+
+/**
+ * Records inbound frame activity (pong or JSON message) on socket so keepalive checks stay satisfied.
+ *
+ * @param {WsSocketLike} socket - Active socket instance.
+ */
+function noteWsSocketInbound(socket) {
+  if (socket === ws) {
+    awaitingPong = false;
+    clearWsPongTimeoutTimer();
+  }
+}
+
+/**
+ * Starts a 10s watchdog requiring the initial 'version' frame after connectWs() opens a socket.
+ *
+ * @param {WsSocketLike} socket - Newly created WebSocket instance.
+ */
+function startWsHandshakeTimer(socket) {
+  clearWsHandshakeTimer();
+  wsHandshakeTimer = setTimeout(() => {
+    wsHandshakeTimer = null;
+    if (socket === ws && !wsReady) {
+      log.warn('bridge', 'eufy-security-ws version handshake timed out after 10 s, reconnecting');
+      terminateWsSocket(socket);
+    }
+  }, WS_HANDSHAKE_TIMEOUT_MS);
+  if (wsHandshakeTimer && typeof wsHandshakeTimer.unref === 'function') {
+    wsHandshakeTimer.unref();
+  }
+}
+
+/**
+ * Starts periodic 30s WebSocket ping probes with a 10s pong/message timeout to detect half-open sockets.
+ *
+ * @param {WsSocketLike} socket - Open WebSocket instance.
+ */
+function startWsKeepaliveLoop(socket) {
+  if (typeof socket.ping !== 'function') {
+    return;
+  }
+  if (wsPingTimer) {
+    clearInterval(wsPingTimer);
+    wsPingTimer = null;
+  }
+  awaitingPong = false;
+  wsPingTimer = setInterval(() => {
+    if (socket !== ws || socket.readyState !== WS_OPEN || typeof socket.ping !== 'function') {
+      return;
+    }
+    awaitingPong = true;
+    clearWsPongTimeoutTimer();
+    wsPongTimeoutTimer = setTimeout(() => {
+      wsPongTimeoutTimer = null;
+      if (socket === ws && awaitingPong) {
+        log.warn('bridge', 'eufy-security-ws keepalive ping timed out after 10 s, reconnecting');
+        terminateWsSocket(socket);
+      }
+    }, WS_PONG_TIMEOUT_MS);
+    if (wsPongTimeoutTimer && typeof wsPongTimeoutTimer.unref === 'function') {
+      wsPongTimeoutTimer.unref();
+    }
+    try {
+      socket.ping();
+    } catch (err) {
+      terminateWsSocket(socket);
+    }
+  }, WS_PING_INTERVAL_MS);
+  if (wsPingTimer && typeof wsPingTimer.unref === 'function') {
+    wsPingTimer.unref();
   }
 }
 
@@ -160,18 +318,27 @@ function clearWsReconnectTimer() {
   }
 }
 
+/**
+ * Schedules a jittered exponential reconnect timer when not shutting down and returns the rounded delay in seconds.
+ *
+ * @returns {number}
+ */
 function scheduleWsReconnect() {
   clearWsReconnectTimer();
+  const delayMs = computeWsReconnectDelayMs(wsReconnectAttempts);
+  wsReconnectAttempts += 1;
+  const delaySecs = Math.round(delayMs / MS_PER_SECOND);
   if (isShuttingDownFn()) {
-    return;
+    return delaySecs;
   }
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null;
     connectWs();
-  }, WS_RECONNECT_DELAY_MS);
+  }, delayMs);
   if (wsReconnectTimer && typeof wsReconnectTimer.unref === 'function') {
     wsReconnectTimer.unref();
   }
+  return delaySecs;
 }
 
 const isWsReady = () => wsReady;
@@ -325,6 +492,7 @@ function needsInitialTelemetryRetry(cam) {
  * @param {Record<string, *>} m - Parsed 'version' message from eufy-security-ws.
  */
 async function handleVersionMessage(m) {
+  clearWsHandshakeTimer();
   validateEufyWsVersion(m);
   const rawMaxSchema = Number(m.maxSchemaVersion);
   const targetSchema = Number.isFinite(rawMaxSchema)
@@ -343,12 +511,16 @@ async function handleVersionMessage(m) {
 
   if (!wsReady) {
     wsHasEverDisconnected = true;
-    log.error('bridge', 'start_listening failed (' + formatRpcError(st) + '), retrying connection in 10 s');
+    const retrySecs = scheduleWsReconnect();
+    log.error(
+      'bridge',
+      'start_listening failed (' + formatRpcError(st) + '), retrying connection in ' + retrySecs + ' s'
+    );
     ensureCameraEncodersStarted({wsConnected: false});
-    scheduleWsReconnect();
     return;
   }
 
+  wsReconnectAttempts = 0;
   const listenMsg = wsHasEverDisconnected
     ? 'eufy-security-ws reconnected, listening for eufy events (apiSchema=' + targetSchema + ')'
     : 'listening for eufy events (apiSchema=' + targetSchema + ')';
@@ -399,6 +571,7 @@ function failPendingRpcRequests() {
  */
 function connectWs() {
   clearWsReconnectTimer();
+  clearWsKeepaliveTimers();
   if (isShuttingDownFn()) {
     return;
   }
@@ -423,35 +596,46 @@ function connectWs() {
   const WebSocket = getWebSocketConstructor();
   let socket;
   try {
-    socket = new WebSocket(cfg.eufy_security_ws_url);
+    socket = new WebSocket(cfg.eufy_security_ws_url, {handshakeTimeout: WS_HANDSHAKE_TIMEOUT_MS});
   } catch (err) {
     wsReady = Boolean(false);
     wsHasEverDisconnected = true;
+    const retrySecs = scheduleWsReconnect();
     const errMsg = formatErrorMessage(err);
     const logConnectErr = !wsOutageErrorLogged ? log.error : log.debug;
     wsOutageErrorLogged = true;
-    logConnectErr('bridge', 'eufy-security-ws connect failed (' + errMsg + '), retrying in 10 s');
+    logConnectErr('bridge', 'eufy-security-ws connect failed (' + errMsg + '), retrying in ' + retrySecs + ' s');
     ensureCameraEncodersStarted({wsConnected: false});
-    scheduleWsReconnect();
     return;
   }
   ws = socket;
+  startWsHandshakeTimer(socket);
 
-  socket.on('open', () => log.debug('bridge', 'eufy-security-ws connected (' + cfg.eufy_security_ws_url + ')'));
+  socket.on('open', () => {
+    if (socket !== ws) {
+      return;
+    }
+    log.debug('bridge', 'eufy-security-ws connected (' + cfg.eufy_security_ws_url + ')');
+    startWsKeepaliveLoop(socket);
+  });
+
+  socket.on('pong', () => noteWsSocketInbound(socket));
 
   socket.on('close', () => {
     if (socket !== ws) {
       return;
     }
+    clearWsKeepaliveTimers();
     wsReady = Boolean(false);
     wsHasEverDisconnected = true;
     initialTelemetryLoaded = false;
     stations.resetRecovery();
     onResetPropertyChainsFn();
     failPendingRpcRequests();
+    const retrySecs = scheduleWsReconnect();
     const logClose = !wsOutageWarned ? log.warn : log.debug;
     wsOutageWarned = true;
-    logClose('bridge', 'eufy-security-ws connection closed, retrying in 10 s');
+    logClose('bridge', 'eufy-security-ws connection closed, retrying in ' + retrySecs + ' s');
     for (const c of camsRef) {
       const healthChanged = c.updateServiceHealth({wsConnected: false});
       if (c.handleStationDisconnected('ws_closed') && onWsClosedStopCallback) {
@@ -466,7 +650,6 @@ function connectWs() {
         pushFrameToEncoder(c);
       }
     }
-    scheduleWsReconnect();
   });
 
   socket.on('error', (err) => {
@@ -478,6 +661,7 @@ function connectWs() {
   });
 
   socket.on('message', async (rawFrame) => {
+    noteWsSocketInbound(socket);
     let parsedMsg;
     try {
       parsedMsg = JSON.parse(String(rawFrame));
@@ -523,6 +707,8 @@ function connectWs() {
  */
 function stopWsClient() {
   clearWsReconnectTimer();
+  clearWsKeepaliveTimers();
+  wsReconnectAttempts = 0;
   wsReady = false;
   const activeWs = ws;
   ws = null;
@@ -551,6 +737,7 @@ module.exports = {
   markInitialTelemetryLoaded,
   invokeRecoverDriverAndStations,
   formatRpcError,
+  computeWsReconnectDelayMs,
   call,
   ensureCameraEncodersStarted,
   connectWs,

@@ -29,12 +29,15 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
 
 - **WebSocket Lifecycle & JSON-RPC (`ws-transport.js`):**
   - Skips connection completely when all configured cameras specify direct `rtsp_url` (`isRtspDirect()`).
+  - Connects with a `10s` `handshakeTimeout` plus a `10s` post-open `'version'` frame watchdog, and runs a `30s`
+    WebSocket `ping` keepalive loop (`10s` `pong`/inbound-message timeout) that terminates half-open dead sockets.
   - On `'version'`, calls `validateEufyWsVersion(m)`, negotiates `set_api_schema` (`Math.min(m.maxSchemaVersion, 21)`),
     and sends `start_listening`. Each `call()` assigns `messageId: "b<seq>"` with a `20s` `.unref()` timeout
     (`WS_RPC_TIMEOUT_MS`, resolving `{success: false, errorCode: "no_reply"}` or `"ws_closed"` without rejecting).
   - On `close`, marks `wsReady = false`, fails pending RPCs, stops active Eufy streams (`error/ws-disconnect`), updates
-    camera `wsConnected` health (`Grey` `Disconnected` card), and retries every `10s` (edge-logging the initial outage
-    at `WARN`/`ERROR` and subsequent retries at `DEBUG` while `/healthz` stays `200 OK` per `AT-08`).
+    camera `wsConnected` health (`Grey` `Disconnected` card), and retries with jittered exponential backoff (`10s`
+    initial up to `60s` max, edge-logging the initial outage at `WARN`/`ERROR` and subsequent retries at `DEBUG` while
+    `/healthz` stays `200 OK` per `AT-08`).
 - **Property Unwrapping & Serialized Hardware Sync (`telemetry-sync.js`):**
   - `unwrapProperty()` normalizes both `{value}` metadata objects and raw scalars across `eufy-security-ws` schemas,
     while `DETECTION_PROPERTY_EVENT_MAP` maps boolean `'property changed'` updates (`motionDetected`, `personDetected`,
