@@ -37,6 +37,7 @@ const RTSP_ANALYZEDURATION_US = '1000000';
 const RTSP_THREAD_QUEUE_SIZE = '32';
 const DECODER_VIDEO_THREADS = '2';
 const RTSP_SOCKET_TIMEOUT_US = '5000000';
+const RTSP_DIRECT_SOCKET_TIMEOUT_US = '15000000';
 const RTSP_RETRY_DELAY_MS = 750;
 const RTSP_MAX_SPAWN_BACKOFF_MS = 15000;
 const P2P_SPAWN_RETRY_DELAY_MS = 1000;
@@ -277,9 +278,11 @@ function buildRtspVideoFilter(scaleFilter) {
  *
  * @param {string} rtspUrl - HomeBase or direct RTSP stream URL.
  * @param {string} scaleFilter - FFmpeg -vf scale filter string.
+ * @param {{ directRtsp?: boolean }} [opts={}] - RTSP decoder transport options.
  * @returns {readonly string[]}
  */
-function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
+function buildRtspDecoderArgs(rtspUrl, scaleFilter, opts = {}) {
+  const socketTimeoutUs = opts && opts.directRtsp ? RTSP_DIRECT_SOCKET_TIMEOUT_US : RTSP_SOCKET_TIMEOUT_US;
   return new FfmpegArgsBuilder()
     .hideBanner()
     .withSingleFilterThreads()
@@ -288,7 +291,7 @@ function buildRtspDecoderArgs(rtspUrl, scaleFilter) {
       '-rtsp_transport',
       'tcp',
       '-timeout',
-      RTSP_SOCKET_TIMEOUT_US,
+      socketTimeoutUs,
       '-probesize',
       RTSP_PROBESIZE_BYTES,
       '-analyzeduration',
@@ -600,7 +603,7 @@ function startRtspDecoder(cam) {
   const mySession = cam.getSessionId();
   const rtspUrl = cam.getRtspUrl();
   const scaleFilter = buildScaleFilter(cam.getPreserveAspect());
-  const args = buildRtspDecoderArgs(rtspUrl, scaleFilter);
+  const args = buildRtspDecoderArgs(rtspUrl, scaleFilter, {directRtsp: cam.isRtspDirect()});
 
   /** @type {import("child_process").ChildProcess} */
   let rtspProcess;

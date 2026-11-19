@@ -1359,15 +1359,16 @@ class Camera {
     } else {
       this.backfill.clearActiveClipAfterLiveEnd();
       this._clearActiveHardwareTriggers();
-      if (hadVideo && !preemptedByViewer) {
+      if (hadVideo && !preemptedByViewer && !this.isRtspDirect()) {
         this.sessionLifecycle.markSlept(now);
         this.transitionTo(SESSION_STATES.COOLDOWN, now, 'live session ended, entering cooldown');
       } else {
-        this.transitionTo(
-          SESSION_STATES.IDLE,
-          now,
-          preemptedByViewer ? 'preempted by viewer' : 'session ended without video'
-        );
+        const idleReason = preemptedByViewer
+          ? 'preempted by viewer'
+          : hadVideo
+            ? 'direct rtsp session ended'
+            : 'session ended without video';
+        this.transitionTo(SESSION_STATES.IDLE, now, idleReason);
       }
     }
     this.burstUntil = now + KEYFRAME_BURST_MS;
@@ -2044,6 +2045,29 @@ class Camera {
    */
   isPassiveRtspDirectProbe() {
     return this.session.isPassiveRtspDirectProbe();
+  }
+
+  /**
+   * Returns true when this camera has an active session for viewer classification, treating an
+   * un-decoded passive direct-RTSP background probe as still connecting rather than actively streaming.
+   *
+   * @returns {boolean}
+   */
+  isActivelyStreamingForViewer() {
+    return this.isRtspDirect()
+      ? Boolean(this.session.active && !this.isPassiveRtspDirectProbe())
+      : this.isSessionActive();
+  }
+
+  /**
+   * Promotes an in-flight passive direct-RTSP background probe into an explicit viewer session
+   * without restarting an already-spawned FFmpeg RTSP pull decoder.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @returns {boolean} True if an active passive probe was promoted.
+   */
+  promotePassiveRtspDirectProbeToViewer(now = Date.now()) {
+    return this.session.promotePassiveProbeToViewer(now, this.getViewLingerMs());
   }
 
   /**

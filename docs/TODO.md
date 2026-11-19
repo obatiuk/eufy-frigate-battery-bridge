@@ -30,14 +30,6 @@ classes, not line numbers (they drift); find them with `grep`.
   - `syncSingleFrigateMaskSection()` (`frigate-masks.js`) falls back to legacy
     `PUT /api/config/set?cameras.<name>.<section>.mask=<polygon>` and silently skips missing cameras. Remove the
     legacy fallback, warn once per missing camera, and test both paths.
-- [ ] Guard `SIGUSR2` synthetic test events against direct `rtsp_url` cameras and empty camera lists
-  - `registerSignalHandlers()` (`app.js`) calls `frigateEvent(cams[0], 'test detected')` without skipping `rtsp_url`
-    cameras or guarding `!targetCam` (unlike `handleSigUsr1BackfillTest()`). Select the first non-`rtsp_url` camera
-    (or guard `!targetCam`), with a unit test.
-- [ ] Report `"connecting direct RTSP stream"` when a viewer joins an `rtsp_url` passive probe (post-v0.0.2)
-  - `pollViewers()` (`go2rtc-viewers.js`) passes `camActive: cam.isSessionActive()`, already `true` during a `5s`
-    passive probe (`isPassiveRtspDirectProbe()`), logging `"streaming direct RTSP"` with `asked: false` before Frame 0
-    decodes. Treat an un-decoded probe as connecting and keep `AT-14` coverage intact.
 - [ ] Smooth multi-camera grid attaches and `h264_qsv` low-latency framing (post-v0.0.2)
   - `buildVideoCodecArgs()` (`encoder.js`) omits `-bf 0` on `h264_qsv` (unlike `vaapi`), and Grid View calls
     `registerNewViewer()` across all tiles while `shouldWriteEncoderFrame()` bursts frames between live decodes. Add

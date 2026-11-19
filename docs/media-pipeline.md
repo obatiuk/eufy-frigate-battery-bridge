@@ -88,8 +88,9 @@ h264_qsv -global_quality 19 -maxrate 3500k -bufsize 3500k`
     waits for `stdout` `'close'` before detaching so buffered tail frames finish draining. Forced `stopDecoder()` calls
     send `SIGTERM` followed by a `2s` `SIGKILL` timer (`DECODER_SIGKILL_DELAY_MS`).
 - **`HomeBase` & Direct `RTSP` Pull Decoder (`startRtspDecoder`, `buildRtspDecoderArgs`, `buildRtspVideoFilter`):**
-  - Pulls TCP `RTSP` (`-rtsp_transport tcp -timeout 5000000 -probesize 524288 -analyzeduration 1000000`) with URL
-    fragments stripped (`stripRtspUrlFragment`) and optional audio mapping (`0:a:0?`).
+  - Pulls TCP `RTSP` (`-rtsp_transport tcp -timeout 5000000` on `HomeBase` `RTSP`, or `-timeout 15000000` on direct
+    `rtsp_url` cameras to tolerate Wi-Fi TCP retransmissions, with `-probesize 524288 -analyzeduration 1000000`), URL
+    fragments stripped (`stripRtspUrlFragment`), and optional audio mapping (`0:a:0?`).
   - Prepends a non-duplicating Bresenham VFR `select` filter (`buildRtspVideoFilter`) ahead of Lanczos scaling/padding
     (`buildScaleFilter`, `0x1c1c1c` pillarbox/letterbox bars when `preserve_aspect_ratio: true`) so `20/25/30 fps`
     cameras are decimated to `<= LIVE_FPS` before rawvideo output while `<= LIVE_FPS` feeds (such as `10 fps` IR night

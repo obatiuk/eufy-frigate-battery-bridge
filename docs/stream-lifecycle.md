@@ -26,12 +26,15 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
 - **Standalone Direct RTSP Ingestion (`rtsp_url`, `beginRtspDirectProbeSession`, `recordRtspDirectProbeFailure`):**
   When explicit `rtsp_url` is set on a camera (`mode: "rtsp"` or `"auto"`), pulls `RTSP` video/audio directly from
   `rtsp_url` without `eufy-security-ws` RPCs or WS event subscriptions,
-  passively probing every `5s` while idle (`initiator=rtsp-direct-probe`) and immediately connecting on viewer attach
-  (`connecting direct RTSP stream`, never ignored or logged as `multi-camera dashboard grid view`, while keeping the
-  `Asleep` or `Disconnected` card displayed until Frame 0 decodes), bypassing all session timeouts (`hold_secs`,
-  `view_linger_secs`, `stream_max_secs`, `view_max_secs`, `idle_timeout_secs`, `view_cooldown_secs`, and Frigate hold
-  polls) so active feeds stream continuously until the `RTSP` connection ends or drops, and distinguishing reachable
-  standby (`404 Not Found` -> `Asleep` White) from unreachable/powered-off (`Connection refused` / timeout ->
+  passively probing every `5s` while idle (`initiator=rtsp-direct-probe`, or reconnecting after `1s` when an
+  established live session ends before resuming `5s` probe pacing) and immediately connecting or promoting an in-flight
+  passive probe on viewer attach (`connecting direct RTSP stream`, never ignored or logged as
+  `multi-camera dashboard grid view`, while keeping the `Asleep` or `Disconnected` card displayed until Frame 0
+  decodes), using a `15s` TCP socket and mid-stream stall timeout (`-timeout 15000000`, `15s` `midStallMs`, with an `8s`
+  initial probe cap) to ride through Wi-Fi TCP retransmissions, bypassing all session timeouts (`hold_secs`,
+  `view_linger_secs`, `stream_max_secs`, `view_max_secs`, `idle_timeout_secs`, `view_cooldown_secs` / `COOLDOWN`, and
+  Frigate hold polls) so active feeds stream continuously until the `RTSP` connection ends or drops, and distinguishing
+  reachable standby (`404 Not Found` -> `Asleep` White) from unreachable/powered-off (`Connection refused` / timeout ->
   `Disconnected` Grey) while keeping the persistent `5 fps` snapshot encoder running.
 - **Post-Event Clip Download Backfill (`backfill_enabled`, `backfill_only`, `processBackfillQueue`,
   `handleDatabaseQueryResult`):**

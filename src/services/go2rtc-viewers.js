@@ -254,7 +254,7 @@ function evaluateNewViewerConnections(cams, newConnections, isDashboardGrid) {
 
     const {asked, actionDesc} = classifyViewerAction({
       rtspDirect: cam.isRtspDirect(),
-      camActive: cam.isSessionActive(),
+      camActive: cam.isActivelyStreamingForViewer(),
       alreadyViewing,
       isDashboardGrid,
       blockedByOffline,
@@ -352,7 +352,13 @@ async function pollViewers(cams, hooks) {
       }
     }
     for (const cam of cams) {
-      if (cam.promoteStartupProbeToViewerWake() && (!cam.isRtspDirect() || !cam.isSessionActive())) {
+      if (!cam.promoteStartupProbeToViewerWake()) {
+        continue;
+      }
+      if (cam.promotePassiveRtspDirectProbeToViewer(Date.now())) {
+        continue;
+      }
+      if (!cam.isRtspDirect() || !cam.isSessionActive()) {
         triggerCam(cam, {
           reason: 'live view opened',
           ms: cam.getViewLingerMs(),

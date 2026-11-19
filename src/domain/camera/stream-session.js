@@ -27,8 +27,10 @@ const DEFAULT_RTSP_RETRY_MS = 10000;
 const DEFAULT_RTSP_MAX_RETRIES = 5;
 const DEFAULT_RTSP_TIMEOUT_MS = 25000;
 const DEFAULT_RTSP_MID_STALL_MS = 5000;
+const DEFAULT_RTSP_DIRECT_MID_STALL_MS = 15000;
 const DEFAULT_RTSP_DIRECT_TIMEOUT_MS = 8000;
 const DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS = 5000;
+const DEFAULT_RTSP_DIRECT_LIVE_RECONNECT_MS = 1000;
 const DEFAULT_RTSP_START_DEDUP_WINDOW_MS = 2000;
 const DEFAULT_MIN_RTSP_REWAKE_HOLD_MS = 10000;
 
@@ -44,6 +46,8 @@ const DEFAULT_MIN_EVENT_VIDEO_MS = 10000;
 
 const RTSP_DIRECT_PROBE_INITIATOR = 'rtsp-direct-probe';
 const RTSP_DIRECT_STREAM_REASON = 'rtsp direct stream';
+const RTSP_DIRECT_VIEWER_INITIATOR = 'viewer';
+const RTSP_DIRECT_VIEWER_REASON = 'live view opened';
 const RTSP_STANDBY_404_REGEX = /\b404\b|not found/i;
 const RTSP_NETWORK_UNREACHABLE_REGEX = new RegExp(
   '\\b(?:connection refused|timed out|timeout|no route to host|host is down|network is unreachable|' +
@@ -94,6 +98,7 @@ class StreamSession {
     this.startedAt = 0;
     this.lastStartAt = 0;
     this.lastStoppedAt = 0;
+    this.lastEndedHadVideo = false;
     this.gotVideo = false;
     this.firstVideoAt = 0;
     this.firstFrameAt = 0;
@@ -185,6 +190,7 @@ class StreamSession {
     this.transitionDecoderTo(DECODER_STATES.DETACHED, 'session ended');
     this.starting = false;
     this.startPromise = null;
+    this.lastEndedHadVideo = Boolean(hadVideo === undefined ? this.gotVideo : hadVideo);
     if (hadVideo === false) {
       this.gotVideo = false;
     }
@@ -783,17 +789,39 @@ class StreamSession {
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {boolean} hasRtspUrl - Whether a non-empty rtspUrl is configured.
-   * @param {number} [intervalMs=DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS] - Minimum interval between passive probes.
+   * @param {number} [intervalMs] - Optional explicit minimum interval between probes in ms.
    * @returns {boolean}
    */
-  shouldStartRtspDirect(now, hasRtspUrl, intervalMs = DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS) {
+  shouldStartRtspDirect(now, hasRtspUrl, intervalMs = undefined) {
     if (!this.directRtsp || this.active || !hasRtspUrl) {
       return false;
     }
     if (now < this.wantUntil()) {
       return true;
     }
-    return now - (this.lastStoppedAt || 0) >= intervalMs;
+    const effectiveIntervalMs =
+      intervalMs ??
+      (this.lastEndedHadVideo ? DEFAULT_RTSP_DIRECT_LIVE_RECONNECT_MS : DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS);
+    return now - (this.lastStoppedAt || 0) >= effectiveIntervalMs;
+  }
+
+  /**
+   * Promotes an in-flight passive direct-RTSP background probe into an explicit viewer session without
+   * restarting an already-spawned FFmpeg RTSP pull decoder.
+   *
+   * @param {number} now - Current epoch timestamp in milliseconds.
+   * @param {number} lingerMs - Viewer hold duration in milliseconds.
+   * @returns {boolean} True if an active passive probe was promoted.
+   */
+  promotePassiveProbeToViewer(now, lingerMs) {
+    if (!this.isPassiveRtspDirectProbe()) {
+      return false;
+    }
+    this.initiator = RTSP_DIRECT_VIEWER_INITIATOR;
+    this.reason = RTSP_DIRECT_VIEWER_REASON;
+    this.viewSince = now;
+    this.viewUntil = Math.max(this.viewUntil, now + lingerMs);
+    return true;
   }
 
   /**
@@ -914,7 +942,8 @@ class StreamSession {
    */
   evaluateRtspHealth(now, opts = {}) {
     const quietSince = opts.quietSince ?? (this.getQuietSince() || this.startedAt);
-    const midStallMs = opts.midStallMs ?? DEFAULT_RTSP_MID_STALL_MS;
+    const defaultMidStallMs = this.directRtsp ? DEFAULT_RTSP_DIRECT_MID_STALL_MS : DEFAULT_RTSP_MID_STALL_MS;
+    const midStallMs = opts.midStallMs ?? defaultMidStallMs;
     if (!this.gotVideo || this.rtspRewaking) {
       return this._evaluateRtspWakeHealth(now, quietSince, opts);
     }

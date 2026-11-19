@@ -273,14 +273,29 @@ function handleUncaughtException(cams, err) {
 }
 
 /**
+ * Triggers a synthetic Frigate detection event on the first non-direct Eufy camera when SIGUSR2 is received.
+ *
+ * @param {Camera[]} cams - Active camera collection.
+ * @returns {Camera|null} Selected target camera, or null when no Eufy camera is configured.
+ */
+function handleSigUsr2SyntheticEventTest(cams) {
+  const targetCam = Array.isArray(cams) ? cams.find((cam) => cam && !cam.isRtspDirect()) : undefined;
+  if (!targetCam) {
+    return null;
+  }
+  log.info(targetCam, 'received SIGUSR2 signal, triggering synthetic test event');
+  frigateEvent(targetCam, 'test detected');
+  return targetCam;
+}
+
+/**
  * Registers POSIX signal hooks (SIGUSR1, SIGUSR2, SIGTERM, SIGINT) and global error handlers.
  *
  * @param {Camera[]} cams - Active camera collection.
  */
 function registerSignalHandlers(cams) {
   process.on(PROCESS_SIGNALS.SIGUSR2, () => {
-    log.info(cams[0], 'received SIGUSR2 signal, triggering synthetic test event');
-    frigateEvent(cams[0], 'test detected');
+    handleSigUsr2SyntheticEventTest(cams);
   });
 
   process.on(PROCESS_SIGNALS.SIGUSR1, () => handleSigUsr1BackfillTest(cams));
@@ -376,6 +391,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  handleSigUsr2SyntheticEventTest,
   shutdownBridge,
   handleUncaughtException,
   resetBridgeShutdownForTests,

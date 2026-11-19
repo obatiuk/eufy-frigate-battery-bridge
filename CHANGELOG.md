@@ -4,6 +4,9 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Tolerate 15-second Wi-Fi TCP stalls on direct `RTSP` cameras without dropping the stream, skip viewer cooldown with a
+  1-second reconnect after live drops, report passive background probes as connecting when viewers join, and skip direct
+  `RTSP` cameras on synthetic test signals
 - Coalesce concurrent camera telemetry polls into a single pass and rate-limit unforced offline `HomeBase` refreshes to
   once every `5` minutes while keeping viewer and wake recovery refreshes immediate
 - Detect silently dropped `eufy-security-ws` connections with `WebSocket` handshake timeouts and periodic keepalive
