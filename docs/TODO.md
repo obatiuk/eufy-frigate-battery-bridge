@@ -17,11 +17,6 @@ classes, not line numbers (they drift); find them with `grep`.
 
 ### A. Reliability and runtime bugs
 
-- [ ] Roll back Frigate event filing when it fails, and keep card suppression exception-safe
-  - `frigateEvent()` (`frigate-client.js`) calls `completeFrigateEventFiling()` before the `POST` and holds
-    `enableCleanSnapshotCardSuppression()` across the 1.5s + 5s review lookup, so a failed `POST` leaves triggers
-    stuck in `COOLDOWN`. Commit filing after `POST` succeeds (or reset `evUntil` / `IDLE` and retry once), release
-    suppression right after `POST` in `try/finally`, and test `500` recovery.
 - [ ] Sync Eufy hardware properties only from full property sets, and retry failed writes
   - `applyDeviceProperties()` (`telemetry-sync.js`) runs on single-key `property changed` events,
     `Telemetry.evaluateRecordingModeChanges()` latches `recordingModeChecked` on any 1 of 4 keys, and one-shot flags /

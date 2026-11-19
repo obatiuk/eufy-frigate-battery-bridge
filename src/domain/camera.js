@@ -5595,6 +5595,17 @@ class Camera {
   }
 
   /**
+   * Rolls back a failed Frigate event HTTP POST so follow-up triggers are not stranded in cooldown.
+   *
+   * @param {number} waitId - Wait token of the failed filing attempt.
+   * @param {string} [reason='event filing failed'] - Diagnostic rollback reason.
+   * @returns {boolean}
+   */
+  rollbackFrigateEventFiling(waitId, reason = 'event filing failed') {
+    return this.eventFiling.rollback(waitId, reason);
+  }
+
+  /**
    * Registers a newly connected go2rtc consumer ID and triggers a short keyframe burst.
    *
    * @param {string|number} id - Consumer identifier from go2rtc.

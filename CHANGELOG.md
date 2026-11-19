@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Roll back `Frigate` event cooldown when event creation fails so follow-up detections can file immediately, and
+  restore live status card rendering right after event creation instead of holding suppression across review lookups
 - Isolate per-camera and per-step housekeeping failures with rate-limited error logs so one failing camera never
   starves sibling cameras, and exit non-zero on fatal uncaught exceptions so the container restarts cleanly
 - Return an unknown activity status when `Frigate` event queries time out or fail so outages neither extend battery

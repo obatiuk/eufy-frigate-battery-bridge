@@ -156,6 +156,75 @@ async function waitForFrigateEventSnapshot(cam, waitId) {
 }
 
 /**
+ * Injects a clean cached snapshot when no video decoded, posts the external event to Frigate,
+ * rolls back event cooldown if the POST fails, and restores live card rendering immediately after POST.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @param {number} waitId - Frigate event wait token captured when queued.
+ * @param {boolean} noVideo - True when no sustained video frame was decoded before filing.
+ * @returns {Promise<{ eventId: string, finalLabel: string, finalPerson: string }|null>}
+ */
+async function postFrigateCreateEvent(cam, waitId, noVideo) {
+  let injectedCleanSnapshot = false;
+  let committed = false;
+  try {
+    if (cam.canInjectCleanEventSnapshot(noVideo)) {
+      cam.enableCleanSnapshotCardSuppression(Date.now(), KEYFRAME_BURST_MS);
+      injectedCleanSnapshot = true;
+      pushFrameToEncoder(cam, Date.now());
+      await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
+      if (!cam.isFrigateSnapshotWaitActive(waitId)) {
+        return null;
+      }
+    }
+    const {finalLabel, finalPerson, subLabel, durationSecs} = cam.completeFrigateEventFiling(Date.now(), LIVE_FPS);
+    committed = true;
+    const createUrl = cfg.frigate_url + '/api/events/' + cam.getName() + '/' + finalLabel + '/create';
+    const createBody = {
+      source_type: 'api',
+      duration: durationSecs,
+      include_recording: true,
+      ...(subLabel ? {sub_label: subLabel} : {}),
+    };
+    const r = await fetch(createUrl, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS),
+      body: JSON.stringify(createBody),
+    });
+    if (!r.ok) {
+      cam.rollbackFrigateEventFiling(waitId);
+      const errBody = await readHttpErrorSnippet(r);
+      log.error(
+        cam,
+        'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + (errBody ? ' ' + errBody : '') + ')'
+      );
+      return null;
+    }
+    const resJson = await r.json();
+    const eventId = resJson && resJson.event_id ? String(resJson.event_id) : '';
+    if (!eventId) {
+      cam.rollbackFrigateEventFiling(waitId);
+      log.error(cam, 'Frigate event "' + finalLabel + '" failed (missing event_id in response)');
+      return null;
+    }
+    cam.recordCreatedFrigateEvent(eventId);
+    return {eventId, finalLabel, finalPerson};
+  } catch (err) {
+    if (committed) {
+      cam.rollbackFrigateEventFiling(waitId);
+    }
+    log.error(cam, 'Frigate event failed: ' + formatErrorMessage(err));
+    return null;
+  } finally {
+    if (injectedCleanSnapshot) {
+      cam.disableCleanSnapshotCardSuppression();
+      pushFrameToEncoder(cam, Date.now());
+    }
+  }
+}
+
+/**
  * Files an external detection event in Frigate via its HTTP API and notifies Home Assistant.
  *
  * @param {Camera} cam - Camera state object.
@@ -195,70 +264,34 @@ function frigateEvent(cam, ev, personName = '') {
     if (aborted) {
       return;
     }
-    let injectedCleanSnapshot = false;
+    const created = await postFrigateCreateEvent(cam, waitId, noVideo);
+    if (!created) {
+      return;
+    }
+
+    const {eventId, finalLabel, finalPerson} = created;
+    const personSuffix = finalPerson ? ' [person: ' + finalPerson + ']' : '';
+    if (noVideo) {
+      log.warn(
+        cam,
+        'Frigate event "' +
+          finalLabel +
+          '" created' +
+          personSuffix +
+          ' (eventId=' +
+          eventId +
+          ', using cached snapshot fallback)'
+      );
+    } else {
+      log.info(cam, 'Frigate event "' + finalLabel + '" created' + personSuffix + ' (eventId=' + eventId + ')');
+    }
 
     try {
-      if (cam.canInjectCleanEventSnapshot(noVideo)) {
-        cam.enableCleanSnapshotCardSuppression(Date.now(), KEYFRAME_BURST_MS);
-        injectedCleanSnapshot = true;
-        pushFrameToEncoder(cam, Date.now());
-        await sleep(CLEAN_SNAPSHOT_INJECT_DELAY_MS);
-        if (!cam.isFrigateSnapshotWaitActive(waitId)) {
-          return;
-        }
-      }
-      const {finalLabel, finalPerson, subLabel, durationSecs} = cam.completeFrigateEventFiling(Date.now(), LIVE_FPS);
-      const camName = cam.getName();
-      const createUrl = cfg.frigate_url + '/api/events/' + camName + '/' + finalLabel + '/create';
-      const createBody = {
-        source_type: 'api',
-        duration: durationSecs,
-        include_recording: true,
-        ...(subLabel ? {sub_label: subLabel} : {}),
-      };
-      const r = await fetch(createUrl, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        signal: AbortSignal.timeout(FRIGATE_API_TIMEOUT_MS),
-        body: JSON.stringify(createBody),
-      });
-      if (!r.ok) {
-        const errBody = await readHttpErrorSnippet(r);
-        log.error(
-          cam,
-          'Frigate event "' + finalLabel + '" failed (HTTP ' + r.status + (errBody ? ' ' + errBody : '') + ')'
-        );
-        return;
-      }
-      const resJson = await r.json();
-      const eventId = resJson.event_id;
-      cam.recordCreatedFrigateEvent(eventId);
-      const personSuffix = finalPerson ? ' [person: ' + finalPerson + ']' : '';
-      if (noVideo) {
-        log.warn(
-          cam,
-          'Frigate event "' +
-            finalLabel +
-            '" created' +
-            personSuffix +
-            ' (eventId=' +
-            eventId +
-            ', using cached snapshot fallback)'
-        );
-      } else {
-        log.info(cam, 'Frigate event "' + finalLabel + '" created' + personSuffix + ' (eventId=' + eventId + ')');
-      }
-
       await sleep(REVIEW_LOOKUP_DELAY_MS);
-      const reviewId = await lookupFrigateReviewId(camName, eventId);
+      const reviewId = await lookupFrigateReviewId(cam.getName(), eventId);
       notifyHA(cam, {event_id: eventId, review_id: reviewId, no_video: noVideo});
     } catch (err) {
-      log.error(cam, 'Frigate event failed: ' + formatErrorMessage(err));
-    } finally {
-      if (injectedCleanSnapshot) {
-        cam.disableCleanSnapshotCardSuppression();
-        pushFrameToEncoder(cam, Date.now());
-      }
+      log.error(cam, 'Frigate event review follow-up failed: ' + formatErrorMessage(err));
     }
   }, EVENT_DISPATCH_DELAY_MS);
   if (timer && typeof timer.unref === 'function') {

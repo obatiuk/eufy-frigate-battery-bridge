@@ -65,7 +65,8 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
     still filing, `enableCleanSnapshotCardSuppression()` suppresses the status card for `450ms` so Frigate captures an
     un-overlayed cached snapshot (`AT-17`).
   - Posts `POST /api/events/<cam>/<label>/create` (`source_type: "api"`, `duration`, `include_recording: true`, and
-    optional `sub_label` face name), then waits `1.5s` (`REVIEW_LOOKUP_DELAY_MS`) and queries
+    optional `sub_label` face name, rolling back event cooldown to `IDLE` if the `POST` fails and releasing clean
+    snapshot card suppression immediately after the `POST`), then waits `1.5s` (`REVIEW_LOOKUP_DELAY_MS`) and queries
     `GET /api/review?cameras=<cam>&limit=5` to match `data.detections` and forward `review_id` to Home Assistant.
 - **Active Object Hold Polling (`isFrigateCameraIdle`, `FRIGATE_CAMERA_STATES`):** Queries
   `GET /api/events?cameras=<cam>&limit=10` (`2.5s` `FRIGATE_FAST_QUERY_TIMEOUT_MS`) and returns `'idle'`, `'active'`, or

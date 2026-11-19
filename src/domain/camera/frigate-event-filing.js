@@ -247,6 +247,25 @@ class FrigateEventFiling {
   }
 
   /**
+   * Rolls back a completed filing attempt back to idle when the HTTP POST fails, unless a newer
+   * companion or extension request has already advanced waitId.
+   *
+   * @param {number} waitId - Wait token captured when the failed attempt was queued.
+   * @param {string} [reason='event filing failed'] - Diagnostic rollback reason.
+   * @returns {boolean} True when rolled back; false when superseded by a newer waitId.
+   */
+  rollback(waitId, reason = 'event filing failed') {
+    if (this.waitId !== waitId) {
+      return false;
+    }
+    this.pending = false;
+    this.until = 0;
+    this.dispatchedAt = 0;
+    this.transitionTo(FRIGATE_EVENT_STATES.IDLE, reason);
+    return true;
+  }
+
+  /**
    * Forgets the filed window so a new event can be filed from scratch (for example for a backfill clip).
    */
   resetWindow() {

@@ -245,4 +245,33 @@ describe('FrigateEventFiling (src/domain/camera/frigate-event-filing.js)', () =>
     filing.recordCreatedId(null);
     assert.equal(filing.lastCreatedId, '');
   });
+
+  it('rolls back a failed filing to idle only when its wait token is still current', () => {
+    // Verify: rollback clears cooldown/until so the next trigger can re-file, without clobbering a newer queued event.
+    const {filing, changes} = createRecordingFiling();
+    filing.request({label: 'motion detected', personName: '', now: 1000, shouldExtend: () => false});
+    const waitId = filing.waitId;
+    filing.beginSnapshotWait(waitId);
+    filing.complete(2000, 30);
+    assert.equal(filing.state, 'cooldown');
+    assert.equal(filing.until, 32000);
+
+    assert.equal(filing.rollback(waitId, 'post failed'), true);
+    assert.equal(filing.state, 'idle');
+    assert.equal(filing.until, 0);
+    assert.equal(filing.dispatchedAt, 0);
+    assert.equal(filing.pending, false);
+    assert.deepEqual(changes.slice(-1), ['cooldown->idle (post failed)']);
+
+    // If a companion upgrade already queued a newer attempt (waitId advanced), stale rollback must be ignored.
+    filing.request({label: 'motion detected', personName: '', now: 3000, shouldExtend: () => false});
+    const staleWaitId = filing.waitId;
+    filing.beginSnapshotWait(staleWaitId);
+    filing.complete(4000, 30);
+    filing.request({label: 'person detected', personName: 'Alice', now: 4100, shouldExtend: () => false});
+    assert.equal(filing.state, 'queued');
+    assert.equal(filing.rollback(staleWaitId, 'stale failure'), false);
+    assert.equal(filing.state, 'queued');
+    assert.equal(filing.label, 'person detected');
+  });
 });
