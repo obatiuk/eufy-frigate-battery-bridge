@@ -635,5 +635,74 @@ describe('Frigate and go2rtc Client Modules (src/services/)', () => {
     assert.equal(health.FRIGATE_FAST_QUERY_TIMEOUT_MS, 2500);
     assert.equal(typeof client.frigateEvent, 'function');
     assert.equal(typeof client.isFrigateCameraIdle, 'function');
+    assert.deepEqual(client.FRIGATE_CAMERA_STATES, {
+      IDLE: 'idle',
+      ACTIVE: 'active',
+      UNKNOWN: 'unknown',
+    });
+  });
+
+  it('returns tri-state idle, active, and unknown from isFrigateCameraIdle across HTTP and JSON failures', async () => {
+    // Verify isFrigateCameraIdle distinguishes idle/active event arrays from HTTP 500, timeout, and malformed JSON.
+    const {isFrigateCameraIdle, FRIGATE_CAMERA_STATES} = require('../../src/services/frigate-client');
+    const cam = new Camera({serial: 'SN0000000470', name: 'idle_tri_state_cam', mode: 'rtsp'});
+    const t0 = 1_700_000_000_000;
+    const origFetch = global.fetch;
+
+    try {
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return [];
+        },
+      });
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.IDLE);
+
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return [{id: 'ev-1', label: 'person', data: {type: 'object'}, start_time: t0 / 1000, end_time: null}];
+        },
+      });
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.ACTIVE);
+
+      global.fetch = async () => ({
+        ok: false,
+        status: 500,
+        async json() {
+          return [];
+        },
+      });
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.UNKNOWN);
+
+      global.fetch = async () => {
+        const timeoutErr = new Error('The operation was aborted due to timeout');
+        timeoutErr.name = 'TimeoutError';
+        throw timeoutErr;
+      };
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.UNKNOWN);
+
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          throw new SyntaxError('Unexpected token < in JSON');
+        },
+      });
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.UNKNOWN);
+
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return {detail: 'unexpected object'};
+        },
+      });
+      assert.equal(await isFrigateCameraIdle(cam, t0), FRIGATE_CAMERA_STATES.UNKNOWN);
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 });

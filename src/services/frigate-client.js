@@ -50,6 +50,11 @@ const CLEAN_SNAPSHOT_INJECT_DELAY_MS = 450;
 const REVIEW_LOOKUP_DELAY_MS = 1500;
 const REVIEW_QUERY_LIMIT = 5;
 const ACTIVE_EVENTS_QUERY_LIMIT = 10;
+const FRIGATE_CAMERA_STATES = Object.freeze({
+  IDLE: 'idle',
+  ACTIVE: 'active',
+  UNKNOWN: 'unknown',
+});
 
 /**
  * Resolves the Frigate event label ('person', 'car', 'dog', 'test', or 'motion') from a Eufy event string.
@@ -264,36 +269,40 @@ function frigateEvent(cam, ev, personName = '') {
 
 /**
  * Checks whether Frigate currently has any active or recently-active non-synthetic object
- * detections for a camera, used to decide whether to extend the hold window or allow early sleep.
+ * detections for a camera, returning 'idle', 'active', or 'unknown' when Frigate cannot be reached
+ * or returns a non-2xx / malformed response so outages are never treated as active detections.
  *
  * @param {Camera} cam - Camera state object.
  * @param {number} [clockNow] - Optional synthetic timestamp in milliseconds; uses Date.now() when omitted.
- * @returns {Promise<boolean>} True if Frigate has no active or recent tracked object detections on this camera.
+ * @returns {Promise<'idle'|'active'|'unknown'>}
  */
 async function isFrigateCameraIdle(cam, clockNow) {
   if (!cfg.frigate_url) {
-    return true;
+    return FRIGATE_CAMERA_STATES.IDLE;
   }
   try {
     const url = cfg.frigate_url + '/api/events?cameras=' + cam.getName() + '&limit=' + ACTIVE_EVENTS_QUERY_LIMIT;
     const r = await fetch(url, {signal: AbortSignal.timeout(FRIGATE_FAST_QUERY_TIMEOUT_MS)});
     if (!r.ok) {
-      return false;
+      return FRIGATE_CAMERA_STATES.UNKNOWN;
     }
     const events = await r.json();
     if (!Array.isArray(events)) {
-      return false;
+      return FRIGATE_CAMERA_STATES.UNKNOWN;
     }
     const evalNow = clockNow === undefined ? Date.now() : clockNow;
-    return !cam.evaluateFrigateEventsActivity(events, evalNow);
+    return cam.evaluateFrigateEventsActivity(events, evalNow)
+      ? FRIGATE_CAMERA_STATES.ACTIVE
+      : FRIGATE_CAMERA_STATES.IDLE;
   } catch (err) {
-    // Keep camera awake conservatively when Frigate /api/events cannot be reached.
-    return false;
+    // Report unknown on timeout, network error, or malformed JSON so hold extensions do not treat outages as active.
+    return FRIGATE_CAMERA_STATES.UNKNOWN;
   }
 }
 
 module.exports = {
   BACKFILL_SNAP_DELAY_MS,
+  FRIGATE_CAMERA_STATES,
   isFrigateConnected,
   isGo2rtcConnected,
   buildFrigateMaskPayload,

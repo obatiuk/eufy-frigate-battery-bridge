@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Return an unknown activity status when `Frigate` event queries time out or fail so outages neither extend battery
+  camera holds to their maximum duration nor trigger premature early sleep
 - Soft-validate the `Frigate`, `go2rtc`, and `eufy-security-ws` versions on startup and log a warning without blocking
   readiness when a service is older than supported
 - Align the stored Wi-Fi signal tier with the rounded status card reading, clear stale signal readings when a camera

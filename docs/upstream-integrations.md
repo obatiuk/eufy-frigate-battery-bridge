@@ -67,9 +67,10 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
   - Posts `POST /api/events/<cam>/<label>/create` (`source_type: "api"`, `duration`, `include_recording: true`, and
     optional `sub_label` face name), then waits `1.5s` (`REVIEW_LOOKUP_DELAY_MS`) and queries
     `GET /api/review?cameras=<cam>&limit=5` to match `data.detections` and forward `review_id` to Home Assistant.
-- **Active Object Hold Polling (`isFrigateCameraIdle`):** Queries `GET /api/events?cameras=<cam>&limit=10` (`2.5s`
-  `FRIGATE_FAST_QUERY_TIMEOUT_MS`) to check non-synthetic active detections before extending holds near expiry or
-  closing early under `idle_timeout_secs` (`AT-11`, `AT-12`).
+- **Active Object Hold Polling (`isFrigateCameraIdle`, `FRIGATE_CAMERA_STATES`):** Queries
+  `GET /api/events?cameras=<cam>&limit=10` (`2.5s` `FRIGATE_FAST_QUERY_TIMEOUT_MS`) and returns `'idle'`, `'active'`, or
+  `'unknown'` (on timeout, non-`2xx`, or malformed JSON) so outages neither extend holds to `stream_max_secs` nor
+  confirm early battery-saver sleep (`AT-11`, `AT-12`).
 - **Auto-Mask Sync & `0.14` - `0.18+` Compatibility (`syncFrigateMotionMasks`):**
   - Runs on initial telemetry load, every `60s` (`MASK_SYNC_INTERVAL_MS`), and `6s` after encoder drop recovery.
   - Fetches `GET /api/config` (`5s` timeout) to track `frigateConnected` service health (`AT-08`, `AT-18`) and inspect

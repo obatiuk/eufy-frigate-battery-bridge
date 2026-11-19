@@ -17,11 +17,6 @@ classes, not line numbers (they drift); find them with `grep`.
 
 ### A. Reliability and runtime bugs
 
-- [ ] Stop treating an unreachable Frigate as "object still active"
-  - `isFrigateCameraIdle()` (`frigate-client.js`) returns `false` on timeout, non-2xx, or bad JSON, so
-    `evaluateActiveHoldExtension()` (`housekeeping.js`) extends holds to `stream_max_secs` during outages. Return
-    tri-state (`idle`, `active`, `unknown`), skip extension and early-sleep confirmation on `unknown`, and test `500`,
-    timeout, and invalid JSON.
 - [ ] Isolate housekeeping failures per camera and stop masking fatal errors
   - `runHousekeepingTick()` (`housekeeping.js`, every 500ms) has no `try/catch`, so one throw skips every later camera
     and a deterministic throw starves them on every tick while logging about 2 lines per second through the

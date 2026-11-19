@@ -13,7 +13,7 @@ const {LIVE_FPS, STREAM_MODES} = require('../../config');
 const {log} = require('../../logger');
 const {WAKE_KINDS, DOWNLOAD_COMPLETED_INITIATOR} = require('../../domain/camera');
 const {stopDecoder} = require('../../media/decoder');
-const {frigateEvent, isFrigateCameraIdle, checkPeriodicMaskSync} = require('../frigate-client');
+const {FRIGATE_CAMERA_STATES, frigateEvent, isFrigateCameraIdle, checkPeriodicMaskSync} = require('../frigate-client');
 const {setCameraProperty, isWsReady, canRunStartupProbeNow} = require('../eufy-client');
 const {MIN_EVENT_VIDEO_DURATION_MS, MS_PER_SECOND, STOP_INITIATORS, getCams, isShuttingDown} = require('./context');
 const {trigger, startRtspStream, startLivestream, stop} = require('./wake');
@@ -40,9 +40,9 @@ async function evaluateEarlySleep(cam, now) {
     return;
   }
 
-  const frigateIdle = await isFrigateCameraIdle(cam);
+  const frigateState = await isFrigateCameraIdle(cam);
   const checkNow = Date.now();
-  if (frigateIdle && cam.canSleepEarlyOnIdle(checkNow, MIN_EVENT_VIDEO_DURATION_MS)) {
+  if (frigateState === FRIGATE_CAMERA_STATES.IDLE && cam.canSleepEarlyOnIdle(checkNow, MIN_EVENT_VIDEO_DURATION_MS)) {
     const quietSecs = cam.markEarlySleep(checkNow);
     const initiator = clearedByEufy ? 'bridge-early-sleep/eufy-cleared' : 'bridge-early-sleep/quiet-timeout';
     stop(cam, 'motion cleared early (battery saver, quietFor=' + quietSecs + 's, frigateIdle=true)', {
@@ -69,16 +69,17 @@ async function evaluateActiveHoldExtension(cam, clockNow) {
 
   cam.setExtendCheckInFlight(true);
   try {
-    const frigateIdle = await isFrigateCameraIdle(cam, clockNow);
+    const frigateState = await isFrigateCameraIdle(cam, clockNow);
     if (!cam.isSessionActive()) {
       return;
     }
     const extNow = clockNow === undefined ? Date.now() : clockNow;
     const hwActive = cam.hasActiveHardwareTriggers(extNow);
-    if (!frigateIdle) {
+    const frigateActive = frigateState === FRIGATE_CAMERA_STATES.ACTIVE;
+    if (frigateActive) {
       cam.confirmFrigateObjectDetected(extNow);
     }
-    if ((frigateIdle && !hwActive) || !needsTimeoutExtendCheck) {
+    if ((!frigateActive && !hwActive) || !needsTimeoutExtendCheck) {
       return;
     }
 
@@ -90,7 +91,7 @@ async function evaluateActiveHoldExtension(cam, clockNow) {
       return;
     }
     const liveSecs = cam.getLiveDurationSecs(extNow);
-    const reasonLabel = !frigateIdle
+    const reasonLabel = frigateActive
       ? 'active object still in progress in Frigate'
       : 'eufy hardware trigger still active';
     log.info(
