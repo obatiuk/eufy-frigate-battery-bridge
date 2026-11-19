@@ -1,18 +1,4 @@
 {
-  "src/config.js": {
-    "complexity": {
-      "count": 2
-    },
-    "max-lines": {
-      "count": 1
-    },
-    "max-params": {
-      "count": 1
-    },
-    "no-magic-numbers": {
-      "count": 43
-    }
-  },
   "src/domain/backfill-job.js": {
     "complexity": {
       "count": 1
@@ -20,24 +6,16 @@
   },
   "src/domain/camera.js": {
     "complexity": {
-      "count": 3
+      "count": 1
     },
     "max-lines": {
       "count": 1
     },
     "max-params": {
-      "count": 23
+      "count": 21
     },
     "no-magic-numbers": {
-      "count": 22
-    }
-  },
-  "src/domain/telemetry.js": {
-    "complexity": {
-      "count": 1
-    },
-    "max-params": {
-      "count": 1
+      "count": 5
     }
   },
   "src/logger.js": {
@@ -64,27 +42,6 @@
     },
     "no-magic-numbers": {
       "count": 361
-    }
-  },
-  "src/services/eufy-client.js": {
-    "max-params": {
-      "count": 1
-    }
-  },
-  "src/services/frigate-client.js": {
-    "complexity": {
-      "count": 2
-    },
-    "max-params": {
-      "count": 3
-    }
-  },
-  "src/services/stream-orchestrator.js": {
-    "complexity": {
-      "count": 1
-    },
-    "max-params": {
-      "count": 2
     }
   }
 }

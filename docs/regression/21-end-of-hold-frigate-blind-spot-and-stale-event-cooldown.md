@@ -18,5 +18,6 @@
   `getFrigateEventState()`, `beginSession()`, and `endSession()` clear expired `evUntil` and extend-check state;
   `nearEventExpiry` ignores pending or prior-session `evUntil` values; and `extendActiveHold()` keeps motion sessions on
   `motionUntil` while reporting `extended: false` (`extendMs: 0`) without side effects when `wantUntil()` is unchanged.
-- **Tests:** `test/domain.test.js` and `test/services.test.js` (`runHousekeepingTick` end-of-hold person detection,
-  expired `evUntil` reset across sessions, motion-vs-viewer expiry extension, and no-op `/api/wake` hold extension).
+- **Tests:** `test/regression/21-end-of-hold-frigate-blind-spot-and-stale-event-cooldown.test.js`
+  (`runHousekeepingTick` end-of-hold person detection, expired `evUntil` reset across sessions, motion-vs-viewer
+  expiry extension, and no-op `/api/wake` hold extension).

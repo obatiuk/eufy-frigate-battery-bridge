@@ -25,4 +25,6 @@
      coalesces a deferred post-backfill wake (`status: "scheduled"`) that promotes for its full requested `duration` as
      soon as `Event 1` (and any earlier `BackfillJob`) finishes or expires, absorbing deferred priority if a Eufy PIR
      trigger starts recording moments later and clearing deferred wakes on disconnect, offline, or shutdown.
-- **Tests:** `test/acceptance.test.js` (`AT-13`, `AT-16`, `AT-17`), `test/domain.test.js`, and `test/services.test.js`.
+- **Tests:** `test/acceptance/AT-13.test.js`, `test/acceptance/AT-16.test.js`, `test/acceptance/AT-17.test.js`,
+  `test/regression/36-same-camera-backfill-chronological-event-order.test.js`, and
+  `test/regression/36-same-camera-backfill-chronological-event-order.test.js`.

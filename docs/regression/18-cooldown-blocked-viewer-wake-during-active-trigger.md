@@ -8,5 +8,7 @@
   trigger events are active, allowing viewer wakes to proceed during cooldown while still guarding pure viewer re-wakes
   without triggers.
 - **Files:** `src/domain/camera.js`
-- **Tests:** `test/acceptance.test.js` (`AT-09`), `test/domain.test.js` (`isInViewerCooldown` with hardware triggers),
-  `test/services.test.js` (`classifyViewerAction` during cooldown with triggers)
+- **Tests:** `test/acceptance/AT-09.test.js`,
+  `test/regression/18-cooldown-blocked-viewer-wake-during-active-trigger.test.js` (`isInViewerCooldown` with hardware
+  triggers), `test/regression/18-cooldown-blocked-viewer-wake-during-active-trigger.test.js` (`classifyViewerAction`
+  during cooldown with triggers)

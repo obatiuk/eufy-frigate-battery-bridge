@@ -1,13 +1,13 @@
 # Configuration and camera modes
 
-Read when: changing `src/config.js`, `deploy/config.*.yaml`, camera modes, timers, Power Manager sync, or validation.
+Read when: changing `src/config/*`, `deploy/config.*.yaml`, camera modes, timers, Power Manager sync, or validation.
 Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-05`, `AT-10`, `AT-12`, `AT-19`), [README.md](../README.md) configuration
 reference, [config.schema.json](../deploy/config.schema.json).
-Sync targets when adding, renaming, or changing any option default or bound: `src/config.js` (top-level constants,
+Sync targets when adding, renaming, or changing any option default or bound: `src/config/` (`constants.js`,
 `BridgeConfigBuilder`, and `resolveCameraConfig()`), [config.schema.json](../deploy/config.schema.json),
 [config.example.minimal.yaml](../deploy/config.example.minimal.yaml),
 [config.example.full.yaml](../deploy/config.example.full.yaml), and the configuration tables in
-[README.md](../README.md) (`test/config.test.js` enforces schema default parity).
+[README.md](../README.md) (`test/config/config.test.js` enforces schema default parity).
 
 ## Camera Modes (`resolveCameraMode`) & Defensive Validation
 
@@ -108,3 +108,27 @@ false` is set), resolves to `"rtsp"` when explicit `rtsp_url` is configured, or 
   housekeeping watchdog and idle `wifiRssi` recovery turn off a camera spotlight (`light: false`) left on past `130s`
   while `IDLE` with no active triggers or pending `BackfillJob`. Disabled by default while the detection heuristic is
   refined.
+
+## Session Timers, Low-Battery Saver, Frame Rates & Snapshot Options
+
+- **Session & Viewer Timers (`stream_max_secs`, `idle_timeout_secs`, `view_linger_secs`, `view_max_secs`,
+  `view_cooldown_secs`):** Active motion holds extend up to `stream_max_secs` (`900s` default, `>= hold_secs`). When
+  `idle_timeout_secs > 0` (`earlySleepMs`), live motion streams poll Frigate and close early once `0` tracked objects
+  remain for `idle_timeout_secs` (or `5s` after Eufy reports activity cleared once `idle_timeout_secs` of video has
+  elapsed). Manual Live View sessions stay warm for `view_linger_secs` (`20s`) after the last viewer disconnects, cap
+  at `view_max_secs` (`300s`, `>= view_linger_secs`), and apply a `view_cooldown_secs` (`5s`) guard against pure viewer
+  re-wakes (bypassed whenever an unexpired Eufy hardware trigger is active).
+- **Low-Battery Saver (`low_battery_threshold`, `critical_battery_threshold`, `low_battery_hold_secs`,
+  `low_battery_wake_on_view`):** Unplugged cameras at or below `low_battery_threshold` (`30%` default) render a yellow
+  battery indicator (purple at or below `critical_battery_threshold`, `5%` default), shorten live event holds to
+  `low_battery_hold_secs` (`20s` default, `<= hold_secs`), and block manual Live View wakes unless
+  `low_battery_wake_on_view: true` is set.
+- **Frame Rates & Snapshots (`live_fps`, `idle_fps`, `startup_snapshot`, `instant_event_snapshot`,
+  `snapshot_capture_delay_secs`, `telemetry_poll_secs`):** Encoders send `idle_fps` (`5` default, matching Frigate's
+  `detect.fps` so still frames consume `~20-40 kbps` and zero detector checks when `record.continuous.days: 0`) while
+  asleep, switching to `live_fps` (`15` default) during live or backfill playback. `startup_snapshot` (`true`, `false`,
+  or `"always"`) wakes a camera on startup only when `sleep_screen: "snapshot"` has no cached file in
+  `BRIDGE_CACHE_DIR` (`"always"` refreshes on every restart). `instant_event_snapshot: true` files Frigate events after
+  `1s` of live video (`0.8s` on backfill) and falls back to a clean un-overlayed snapshot if a wake times out without
+  video; when `false`, `snapshot_capture_delay_secs` (`3s` default) sets the wait window. `telemetry_poll_secs` (`300s`
+  default, `0` disables) refreshes sleeping telemetry periodically.

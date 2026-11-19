@@ -14,6 +14,8 @@
   card; extended the post-handshake telemetry retry and station reconnect timers to cover service/station disruptions
   and missing `RTSP` URLs; handled `driver` `'connect'` events in `src/services/stream-orchestrator.js`; and cleared
   `frigateApiDown` in `syncFrigateMotionMasks()` when `auto_frigate_mask` is disabled.
-- **Tests:** `test/domain.test.js` (`detects offline/dead camera states`) and `test/services.test.js` (`Regression:
+- **Tests:** `test/regression/24-service-restart-camera-unavailable-without-frigate-restart.test.js` (`Regression 24:
+preserves deep-standby state=0 cameras as online before initial battery telemetry arrives`) and
+  `test/regression/22-wedged-homebase-station-p2p-and-missing-rtsp-url-after-wifi-outage.test.js` (`Regression 22:
 recovers disconnected or wedged eufy-security-ws driver/station sessions and missing rtspStreamUrl after Wi-Fi
 outages`).

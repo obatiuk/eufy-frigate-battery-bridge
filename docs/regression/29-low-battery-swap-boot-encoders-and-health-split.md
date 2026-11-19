@@ -13,6 +13,8 @@
   invoked it from `app.js` `startServices()` and the `start_listening` error path; and separated `go2rtcApiDown` from
   `frigateApiDown` in `frigate-client.js` so `pollViewers()` manages `go2rtcConnected` without clearing
   `frigateConnected`.
-- **Tests:** `test/domain.test.js` (`detects offline/dead camera states...`), `test/services.test.js` (`tracks go2rtc
-health separately...`, `starts non-offline Eufy encoders eagerly...`), and `test/acceptance.test.js` (`AT-07`,
-  `AT-08`, `AT-18`).
+- **Tests:** `test/regression/29-low-battery-swap-boot-encoders-and-health-split.test.js` (`clears stale
+OFFLINE_LOWBAT and OFFLINE states on >= 10% battery swaps...`),
+  `test/regression/29-low-battery-swap-boot-encoders-and-health-split.test.js` (`tracks go2rtc health separately...`),
+  `test/regression/29-low-battery-swap-boot-encoders-and-health-split.test.js` (`starts non-offline Eufy encoders
+eagerly...`), and `test/acceptance/AT-07.test.js`, `test/acceptance/AT-08.test.js`, `test/acceptance/AT-18.test.js`.

@@ -74,9 +74,12 @@ LOCAL_ENV := \
 	NPM_CONFIG_FUND="false" \
 	NPM_CONFIG_AUDIT="false"
 
-SRC_FILES := $(shell find $(PROJECT_ROOT)/src -type f -name '*.js')
-TEST_FILES := $(shell find $(PROJECT_ROOT)/test -type f -name '*.test.js')
+SRC_FILES := $(shell find $(PROJECT_ROOT)/src -type f -name '*.js' | sort)
+TEST_FILES := $(shell find $(PROJECT_ROOT)/test -type f -name '*.test.js' | sort)
+ACCEPTANCE_TEST_FILES := $(sort $(wildcard $(PROJECT_ROOT)/test/acceptance/*.test.js))
+REGRESSION_TEST_FILES := $(sort $(wildcard $(PROJECT_ROOT)/test/regression/*.test.js))
 TEST_REPORTER := $(PROJECT_ROOT)/test/reporter.js
+REGRESSION_TEST_PATTERN := ^Regression [0-9]+:
 CHECK :=
 
 # ======================================================================================================================
@@ -84,16 +87,16 @@ CHECK :=
 # ======================================================================================================================
 
 $(TEST_CACHE_DIR):
-	@mkdir -p "$(TEST_CACHE_DIR)"
+	@install -d "$(TEST_CACHE_DIR)"
 
 $(NODE_BIN):
-	@mkdir -p "$(NODE_DIR)" "$(NPM_CACHE_DIR)" "$(VENV_HOME)"
+	@install -d "$(NODE_DIR)" "$(NPM_CACHE_DIR)" "$(VENV_HOME)"
 	@curl -fsSL "$(NODE_URL)" | tar -xJ -C "$(NODE_DIR)" --strip-components=1
 
 $(DEPS_STAMP): $(PROJECT_ROOT)/package.json $(PROJECT_ROOT)/package-lock.json | $(NODE_BIN) $(TEST_CACHE_DIR)
-	@mkdir -p "$(NPM_CACHE_DIR)" "$(VENV_HOME)" "$(NODE_DIR)/lib" "$(TEST_CACHE_DIR)"
-	@cp "$(PROJECT_ROOT)/package.json" "$(VENV_DIR)/package.json"
-	@cp "$(PROJECT_ROOT)/package-lock.json" "$(VENV_DIR)/package-lock.json"
+	@install -d "$(NPM_CACHE_DIR)" "$(VENV_HOME)" "$(NODE_DIR)/lib" "$(TEST_CACHE_DIR)"
+	@install -m 0644 "$(PROJECT_ROOT)/package.json" "$(VENV_DIR)/package.json"
+	@install -m 0644 "$(PROJECT_ROOT)/package-lock.json" "$(VENV_DIR)/package-lock.json"
 	@$(LOCAL_ENV) "$(NPM_BIN)" ci --prefix "$(VENV_DIR)" --no-audit --no-fund --silent
 	@ln -sfn ../../node_modules "$(NODE_DIR)/lib/node"
 	@touch "$(DEPS_STAMP)"
@@ -151,10 +154,20 @@ CHECK += test
 .PHONY: test
 test: ## Run syntax checks and acceptance/unit test suites
 test: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
-	@for f in $(SRC_FILES) $(TEST_FILES) "$(TEST_REPORTER)"; do \
-		$(LOCAL_ENV) "$(NODE_BIN)" --check "$$f" || exit 1; \
-	done
+	@printf '%s\0' $(SRC_FILES) $(TEST_FILES) "$(TEST_REPORTER)" \
+		| $(LOCAL_ENV) xargs -0 -n 1 -P 8 "$(NODE_BIN)" --check
 	@$(LOCAL_ENV) "$(NODE_BIN)" --test --test-reporter="$(TEST_REPORTER)" $(TEST_FILES)
+
+.PHONY: test-acceptance
+test-acceptance: ## Run the locked acceptance suite (test/acceptance/*.test.js)
+test-acceptance: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@$(LOCAL_ENV) "$(NODE_BIN)" --test --test-reporter="$(TEST_REPORTER)" $(ACCEPTANCE_TEST_FILES)
+
+.PHONY: test-regression
+test-regression: ## Run the ordered regression suite (test/regression/*.test.js)
+test-regression: | $(DEPS_STAMP) $(TEST_CACHE_DIR)
+	@$(LOCAL_ENV) "$(NODE_BIN)" --test --test-reporter="$(TEST_REPORTER)" \
+		--test-name-pattern="$(REGRESSION_TEST_PATTERN)" $(REGRESSION_TEST_FILES)
 
 ##@ Build
 
@@ -196,10 +209,10 @@ check: $(CHECK)
 .PHONY: install-hooks
 install-hooks: ## Install the git commit-msg validation hook
 install-hooks: | $(DEPS_STAMP)
-	@mkdir -p "$(PROJECT_ROOT)/.git/hooks"
+	@install -d "$(PROJECT_ROOT)/.git/hooks"
 	@printf '#!/bin/sh\nexec "%s" "%s/scripts/check-commit-msg.js" "$$1"\n' \
 		"$(NODE_BIN)" "$(PROJECT_ROOT)" > "$(PROJECT_ROOT)/.git/hooks/commit-msg"
-	@chmod +x "$(PROJECT_ROOT)/.git/hooks/commit-msg"
+	@chmod 0755 "$(PROJECT_ROOT)/.git/hooks/commit-msg"
 
 .PHONY: clean
 clean: ## Remove local container images, build cache, .tmp, and .venv

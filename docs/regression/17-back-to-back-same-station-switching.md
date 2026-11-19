@@ -13,5 +13,5 @@
   (`wakeCameraExternal`, `activateRtspCamera`, or `arbitrateStationP2pSlot`, including preemptions) is issued. `AT-13`
   section 5 locks the instant-switching and pacing behavior.
 - **Files:** `src/services/stream-orchestrator.js`
-- **Tests:** `test/acceptance.test.js` (`AT-13`), `test/services.test.js` (back-to-back same-station switching test),
-  `docs/acceptance/AT-13.md` section 5
+- **Tests:** `test/acceptance/AT-13.test.js`, `test/regression/17-back-to-back-same-station-switching.test.js`
+  (back-to-back same-station switching test), `docs/acceptance/AT-13.md` section 5

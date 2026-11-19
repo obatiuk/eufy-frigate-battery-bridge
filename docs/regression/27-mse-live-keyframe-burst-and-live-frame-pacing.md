@@ -12,4 +12,4 @@
   connected `MSE` viewers receive an `IDR` keyframe within `<= 1s` without sub-frame duplicate floods; flushed due
   `liveFrames` immediately via `pushFrameToEncoder()` on decoded `RTSP` and `P2P` frame arrival; and prepended a
   non-duplicating Bresenham VFR `select` cap (`<= 15 fps`) in `buildRtspVideoFilter()`.
-- **Tests:** `test/media.test.js` (`Regression #27`).
+- **Tests:** `test/regression/27-mse-live-keyframe-burst-and-live-frame-pacing.test.js` (`Regression #27`).

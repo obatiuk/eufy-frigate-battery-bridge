@@ -25,6 +25,9 @@
   4. Replaced regex matching in `expandEnvString()` with a single-pass scanner that unescapes `$${...}` literals,
      validates `${VAR}` / `${VAR:-default}` syntax, and collects malformed or unclosed `${` errors in
      `expandConfigEnvVars()` without leaking resolved secret values.
-- **Tests:** `test/services.test.js` (`pollViewers` scoping and trailing hardware stream-start backfill guard),
-  `test/domain.test.js` (multi-clip `BackfillJob` `DOWNLOADING -> MATCHED` preservation), and `test/config.test.js`
-  (malformed/unclosed `${...}` rejection and `$${...}` escaping).
+- **Tests:** `test/regression/33-post-sleep-backfill-guard-poll-scope-and-env-syntax.test.js` (`pollViewers` scoping),
+  `test/regression/33-post-sleep-backfill-guard-poll-scope-and-env-syntax.test.js` (trailing hardware stream-start
+  backfill guard), `test/regression/33-post-sleep-backfill-guard-poll-scope-and-env-syntax.test.js` (multi-clip
+  `BackfillJob` `DOWNLOADING -> MATCHED` preservation), and
+  `test/regression/33-post-sleep-backfill-guard-poll-scope-and-env-syntax.test.js` (malformed/unclosed `${...}`
+  rejection and `$${...}` escaping).

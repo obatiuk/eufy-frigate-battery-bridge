@@ -8,5 +8,5 @@
 - **Fix:** Added word-start boundary matching (`findKeywordAtWordStart()` and `matchesEventKeyword()`) in
   `getEventPriority()` so keywords match only at index `0` or immediately after a non-alphanumeric delimiter (`'rings'`
   and `'doorbell ring'` match `'ring'`, while `'someone loitering'` matches `'loitering'` at `200`).
-- **Tests:** `test/config.test.js` (`expands all 13 documented trigger_events types and resolves built-in and custom
-event_priorities tiers`).
+- **Tests:** `test/regression/23-loitering-event-substring-matched-doorbell-ring-priority.test.js` (`expands all 13
+documented trigger_events types and resolves built-in and custom event_priorities tiers`).

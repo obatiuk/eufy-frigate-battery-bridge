@@ -682,7 +682,8 @@ function drawDebugHudCard(canvas, hud, st) {
     },
     st
   );
-  const modeKey = cam && cam.mode ? String(cam.mode).toLowerCase() : CAMERA_MODES.AUTO;
+  const configuredMode = cam && typeof cam.getConfiguredMode === 'function' ? cam.getConfiguredMode() : '';
+  const modeKey = configuredMode ? String(configuredMode).toLowerCase() : CAMERA_MODES.AUTO;
   const modeTag =
     cam && typeof cam.isRtspDirect === 'function' && cam.isRtspDirect()
       ? DEBUG_HUD_DIRECT_RTSP_TAG
@@ -690,7 +691,10 @@ function drawDebugHudCard(canvas, hud, st) {
         String(modeKey).toUpperCase().slice(0, DEBUG_HUD_MODE_TAG_LEN).padEnd(DEBUG_HUD_MODE_TAG_LEN, ' ');
   const sessNum = Math.max(
     0,
-    Math.min(DEBUG_HUD_MAX_SESSION_DISPLAY, Number(cam && cam.sessionId ? cam.sessionId : 0))
+    Math.min(
+      DEBUG_HUD_MAX_SESSION_DISPLAY,
+      Number(cam && typeof cam.getSessionId === 'function' ? cam.getSessionId() || 0 : 0)
+    )
   );
   const sessTag = '#' + String(sessNum).padStart(DEBUG_HUD_SESSION_PAD_LEN, '0') + ' ';
   const leftColX = boxX + DEBUG_HUD_LEFT_COL_OFFSET_X;
@@ -925,7 +929,7 @@ function renderSingleStatusCard(titleText, renderCtx) {
  * @param {Camera} cam - Camera domain instance.
  */
 function renderCameraCards(cam) {
-  cam.card.setLazyCardRenderer((titleText, targetBuf) => {
+  cam.setLazyCardRenderer((titleText, targetBuf) => {
     const lazyCtx = cam.prepareCardRenderContext();
     const lazyBg = prepareBackgroundCanvas(lazyCtx.cardConfig, lazyCtx.lastFrame);
     return renderSingleStatusCard(titleText, {
@@ -981,17 +985,17 @@ function renderLiveFrameWithCard(cam, rawFrame, now = Date.now()) {
   if (!cam.shouldOverlayCardOnLive() && !cam.hasDynamicDebugCard()) {
     return rawFrame;
   }
-  if (cam.card.theme === CARD_THEMES.HUD) {
+  if (cam.usesDebugHudTheme()) {
     const isLive = cam.isStreamingLive(now, DEFAULT_LIVE_OVERLAY_MAX_AGE_MS);
     const {baseCanvas, hasBackground} = isLive
       ? {baseCanvas: rawFrame, hasBackground: true}
-      : prepareBackgroundCanvas(cam.card.config, cam.lastFrame);
-    const out = cam.card.prepareLiveOverlayBuffer(baseCanvas);
+      : prepareBackgroundCanvas(cam.getCardConfig(), cam.getLastFrameBuffer());
+    const out = cam.acquireLiveOverlayBuffer(baseCanvas);
     const titleForState = isLive
       ? cam.isBackfillPlayback()
         ? CARD_STATUS_TITLES.BACKFILL
         : CARD_STATUS_TITLES.LIVE
-      : cam.active && !cam.isBackfillPlayback() && !cam.isPassiveRtspDirectProbe()
+      : cam.isSessionActive() && !cam.isBackfillPlayback() && !cam.isPassiveRtspDirectProbe()
         ? CARD_STATUS_TITLES.WAKING_UP
         : cam.isWaitingForSlotOrBackfill(now)
           ? CARD_STATUS_TITLES.WAITING
@@ -1000,12 +1004,12 @@ function renderLiveFrameWithCard(cam, rawFrame, now = Date.now()) {
             : cam.isLowBattery()
               ? CARD_STATUS_TITLES.ASLEEP_LOW_BATTERY
               : CARD_STATUS_TITLES.ASLEEP;
-    const st = cam.telemetry.evaluateVisualState(titleForState);
-    const stageMarker = isLive || cam.gotVideo ? cam.getFrameMarker() : FRAME_STAGE_MARKERS.SNAPSHOT;
+    const st = cam.evaluateVisualState(titleForState);
+    const stageMarker = isLive || cam.hasGotVideo() ? cam.getFrameMarker() : FRAME_STAGE_MARKERS.SNAPSHOT;
     drawDebugHudCard(
       out,
       {
-        position: cam.card.position,
+        position: cam.getCardPosition(),
         blurBackdrop: hasBackground,
         cam,
         frameMarker: stageMarker,

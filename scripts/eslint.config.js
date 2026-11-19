@@ -1,3 +1,4 @@
+// @ts-check
 /**
  * ESLint flat config: mechanical enforcement of the structural rules from the nodejs-development skill.
  * Existing violations are recorded in scripts/eslint-suppressions.json, so only new violations fail.

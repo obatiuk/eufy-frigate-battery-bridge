@@ -10,4 +10,4 @@
   whenever `!hadVideo`) to cancel both `QUEUED` and in-flight `WAITING_SNAPSHOT` requests and immediately reset
   `evState` to `IDLE`, and checked `isFrigateSnapshotWaitActive(waitId)` inside `frigateEvent()` while preserving
   clean-snapshot fallback for wakes that remain active past the snapshot wait window (`AT-17.3`).
-- **Tests:** `test/services.test.js`.
+- **Tests:** `test/regression/41-abort-inflight-frigate-snapshot-wait-on-no-video.test.js`.

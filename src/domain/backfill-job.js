@@ -233,6 +233,15 @@ class BackfillJob {
   }
 
   /**
+   * Returns the explicit logger scope of this job: the camera name plus the current backfill state.
+   *
+   * @returns {Readonly<{ name: string, state: string }>}
+   */
+  getLogScope() {
+    return Object.freeze({name: this.name, state: this.state});
+  }
+
+  /**
    * Validates and executes a state transition on this BackfillJob, logging accepted and refused
    * transitions at DEBUG level.
    *
@@ -451,6 +460,196 @@ class BackfillJob {
    */
   isUrgentTest() {
     return Boolean(this.ignoreTimeWindow);
+  }
+
+  /**
+   * Returns true while hardware clip recording is still active on this job.
+   *
+   * @returns {boolean}
+   */
+  isRecordingActive() {
+    return Boolean(this.recordingActive);
+  }
+
+  /**
+   * Returns the effective priority score of this backfill job.
+   *
+   * @returns {number}
+   */
+  getPriority() {
+    return this.priority;
+  }
+
+  /**
+   * Returns the human-readable trigger reason of this backfill job.
+   *
+   * @returns {string}
+   */
+  getReason() {
+    return this.reason;
+  }
+
+  /**
+   * Returns the hardware detection event label on this backfill job.
+   *
+   * @returns {string}
+   */
+  getEvent() {
+    return this.event;
+  }
+
+  /**
+   * Returns the recognized person name attached to this backfill job ('' when none).
+   *
+   * @returns {string}
+   */
+  getPersonName() {
+    return this.personName;
+  }
+
+  /**
+   * Returns the initial trigger epoch timestamp in milliseconds.
+   *
+   * @returns {number}
+   */
+  getTriggerAt() {
+    return this.at;
+  }
+
+  /**
+   * Returns the epoch timestamp (ms) when all active triggers cleared (0 while still recording).
+   *
+   * @returns {number}
+   */
+  getClearedAt() {
+    return this.clearedAt;
+  }
+
+  /**
+   * Returns the current finite state machine state of this backfill job.
+   *
+   * @returns {string}
+   */
+  getState() {
+    return this.state;
+  }
+
+  /**
+   * Returns the number of HomeBase database query attempts made for this job.
+   *
+   * @returns {number}
+   */
+  getQueryAttempts() {
+    return this.attempts;
+  }
+
+  /**
+   * Returns true if a post-download split-clip follow-up query was scheduled on this job.
+   *
+   * @returns {boolean}
+   */
+  hasFollowUpQueried() {
+    return Boolean(this.followUpQueried);
+  }
+
+  /**
+   * Returns true if hardware recording is active and clipMs is at or after this job's trigger start.
+   *
+   * @param {number} clipMs - Candidate clip start timestamp in milliseconds.
+   * @returns {boolean}
+   */
+  isRecordingNewerOrAt(clipMs) {
+    return Boolean(this.recordingActive && clipMs >= this.at);
+  }
+
+  /**
+   * Returns true once this job has matched a clip, started querying, or completed its post-clear settle window.
+   *
+   * @param {number} now - Current epoch timestamp in milliseconds.
+   * @param {number} [settleMs=BACKFILL_POST_CLEAR_SETTLE_MS] - Post-clear settle window in milliseconds.
+   * @returns {boolean}
+   */
+  isSettledOrMatched(now, settleMs = BACKFILL_POST_CLEAR_SETTLE_MS) {
+    return Boolean(
+      this.state === BACKFILL_STATES.MATCHED ||
+      this.attempts > 0 ||
+      (!this.recordingActive && this.clearedAt > 0 && now - this.clearedAt >= settleMs)
+    );
+  }
+
+  /**
+   * Returns true if this job currently holds at least one matched clip waiting to be dequeued.
+   *
+   * @returns {boolean}
+   */
+  hasMatchedClips() {
+    return this.matchedClips.length > 0;
+  }
+
+  /**
+   * Returns true if storagePath is present in this job's matchedClips queue.
+   *
+   * @param {string} storagePath - HomeBase clip storage path.
+   * @returns {boolean}
+   */
+  hasMatchedClipPath(storagePath) {
+    return this.matchedClips.some((c) => c.storagePath === storagePath);
+  }
+
+  /**
+   * Finds and returns the matched clip descriptor for storagePath, or null if absent.
+   *
+   * @param {string} storagePath - HomeBase clip storage path.
+   * @returns {Readonly<{
+   *   storagePath: string,
+   *   cipherId: number,
+   *   clipMs: number,
+   *   event: string,
+   *   personName: string,
+   *   reason: string
+   * }>|null}
+   */
+  findMatchedClipByPath(storagePath) {
+    return this.matchedClips.find((c) => c.storagePath === storagePath) || null;
+  }
+
+  /**
+   * Returns the storage paths of all currently queued matched clips on this job.
+   *
+   * @returns {string[]}
+   */
+  getMatchedClipPaths() {
+    return this.matchedClips.map((c) => c.storagePath);
+  }
+
+  /**
+   * Dequeues the next matched clip (if any) and transitions this job into DOWNLOADING.
+   *
+   * @returns {Readonly<{
+   *   storagePath: string,
+   *   cipherId: number,
+   *   clipMs: number,
+   *   event: string,
+   *   personName: string,
+   *   reason: string
+   * }>|null}
+   */
+  beginDownloadFromQueue() {
+    if (this.matchedClips.length > 0) {
+      return this.shiftNextClipForDownload();
+    }
+    if (this.state !== BACKFILL_STATES.MATCHED && this.state !== BACKFILL_STATES.DOWNLOADING) {
+      this.transitionTo(BACKFILL_STATES.MATCHED, 'clip matched for download');
+    }
+    this.transitionTo(BACKFILL_STATES.DOWNLOADING, 'clip dequeued for download');
+    return null;
+  }
+
+  /**
+   * Transitions an interrupted DOWNLOADING job back to MATCHED when re-queuing a failed clip attempt.
+   */
+  requeueAfterFailedDownload() {
+    this.transitionTo(BACKFILL_STATES.MATCHED, 're-queued after failed download');
   }
 
   /**

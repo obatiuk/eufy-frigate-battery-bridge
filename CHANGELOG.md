@@ -4,6 +4,17 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Soft-validate the `Frigate`, `go2rtc`, and `eufy-security-ws` versions on startup and log a warning without blocking
+  readiness when a service is older than supported
+- Align the stored Wi-Fi signal tier with the rounded status card reading, clear stale signal readings when a camera
+  reports itself shut off, log refused state-machine transitions at debug level, guard version handshakes, and clear
+  background timers on shutdown
+- Split configuration, camera sub-models, station state, upstream clients, and stream orchestration into focused
+  modules with encapsulated state, explicit log scopes, and reference guides for the media pipeline and upstream
+  integrations
+- Mirror the source hierarchy across isolated unit tests, split the locked acceptance and numbered regression suites
+  into one-file-per-case directories, replace fixed test waits with fake timers, scope `CI` workflow permissions, and
+  tighten commit, coupling, and hygiene checks
 - Keep the bridge responsive while camera snapshots are decoded at startup and saved when a stream ends by running
   `ffmpeg` in the background with a kill timeout, decoding all snapshots in parallel, and writing each snapshot to a
   temporary file first so a failed or killed save never corrupts the previous one
@@ -12,19 +23,19 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
   when `go2rtc` answers with an unusable stream list instead of silently missing viewers
 - Remove the duplicated container health check from the example `Compose` file so the image remains its only
   definition, and fail the documentation check when any `Compose` file defines one again
-- Validate configuration value types, integer fields, service URL schemes, runtime log and hardware-acceleration modes,
-  and unique safe camera identities at startup, and require a live post-validation process marker when the `HTTP`
-  listener is disabled so invalid configurations never report healthy
-- Simplify container health checks to return an immediate, dependency-free liveness response as soon as the `HTTP`
-  listener binds on startup, removing `WebSocket` status from the health payload and shortening the container probe
-  interval so services exit the starting state promptly
+- **BREAKING:** Validate configuration value types, integer fields, service URL schemes, runtime log and
+  hardware-acceleration modes, and unique safe camera identities at startup, and require a live post-validation process
+  marker when the `HTTP` listener is disabled so invalid configurations never report healthy
+- **BREAKING:** Simplify container health checks to return an immediate, dependency-free liveness response as soon as
+  the `HTTP` listener binds on startup, removing `WebSocket` status from the health payload and shortening the
+  container probe interval so services exit the starting state promptly
 - Expose full upstream service, `HomeBase` station, stream session, encoder, viewer, backfill, and live sensor telemetry
-  details on `GET /api/status` while keeping `GET /healthz` lightweight for frequent container probes
+  details on the runtime status endpoint while keeping the container health endpoint lightweight for frequent probes
 - Surface root-cause `ffmpeg`, `RTSP` handshake, snapshot cache, `HTTP`, `WebSocket`, and `Eufy` command errors in logs
   instead of masking them behind generic `ffmpeg` exit footers, bare `fetch failed` or blank dual-stack socket errors,
   truncated validation responses, or generic stop reasons
-- Deduplicate snapshot cache filenames to `last_<name>.jpg` whenever a camera's `serial` matches its `name`, and
-  automatically migrate existing duplicated cache files on startup
+- Deduplicate snapshot cache filenames whenever a camera's hardware serial matches its stream name, and automatically
+  migrate existing duplicated cache files on startup
 - Preserve the matched clip's hardware detection label and recognized person when extending long backfill `Frigate`
   events after transfer completion, even when an external wake request customized the event reason
 - Serialize `HomeBase` backfill queue steps and pace database lookups per station across sibling cameras while allowing

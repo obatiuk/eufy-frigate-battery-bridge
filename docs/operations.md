@@ -13,8 +13,14 @@ Read when: you need a build, test, publish, health check, or signal-driven diagn
   `.venv/node_modules/.bin/tsc --project scripts/tsconfig.json` with `noUnusedLocals`, `noUnusedParameters`, and
   `allowUnreachableCode: false`, plus `.venv/node_modules/.bin/knip` for unused files, exports, and dependencies)
 - **Run Syntax Check & Test Suites:** `make test` (auto-creates `.venv` if missing, checks JavaScript syntax across
-  `src/`, `test/reporter.js`, and `test/*.test.js` via `.venv/node/bin/node --check`, and runs all unit and locked
-  acceptance tests via `.venv/node/bin/node --test --test-reporter=./test/reporter.js test/*.test.js`)
+  `src/`, `test/reporter.js`, and `test/**/*.test.js` via `.venv/node/bin/node --check`, and runs all unit, regression,
+  and locked acceptance tests via `.venv/node/bin/node --test --test-reporter=./test/reporter.js 'test/**/*.test.js'`;
+  the reporter fails the run on skipped, todo, and empty runs, except the `typescript is not installed` skip of the
+  coupling check)
+- **Run Acceptance Tests Only:** `make test-acceptance` (runs the locked 1:1 acceptance suite in
+  `test/acceptance/*.test.js`)
+- **Run Regression Tests Only:** `make test-regression` (runs the ordered regression suite in
+  `test/regression/*.test.js`)
 - **Run Full Quality Gate:** `make check` (runs `deadcode`, `lint`, `docs-check`, and `test`)
 - **Build Image Locally:** `make docker-build` (runs `make check` and executes `node --test` with `test/reporter.js`
   inside the `node:22-alpine3.23` builder stage before building the minimal `alpine:3.23` Node 22 runtime image)
@@ -196,10 +202,12 @@ podman exec eufy-frigate-battery-bridge node -e '
   files. Existing structural violations are recorded in `scripts/eslint-suppressions.json`; only new ones fail.
 - `make lint-prune`: remove suppressions that no longer occur after a cleanup. `make lint-baseline` re-records all
   current violations (use only when deliberately accepting them).
-- `make docs-check`: size budgets (`AGENTS.md` 8 KB target / 16 KB hard limit, `docs/` 20 KB each, `.agents/**/SKILL.md`
-  4 KB), relative links, ASCII hyphens, 120 columns, PII redaction (`*.md` and `deploy/`), `ACCEPTANCE.md` / `AT-NN.md`
-  / `test/acceptance.test.js` 1:1 & literal-assertion parity, `REGRESSION.md` parity, and `prettier --check` tables.
+- `make docs-check`: size budgets (`AGENTS.md` 8 KB target / 16 KB hard limit, `docs/` 20 KB each, `README.md` 68 KB,
+  `.agents/**/SKILL.md` 4 KB), relative links, ASCII hyphens, 120 columns, PII redaction (`*.md` and `deploy/`),
+  `ACCEPTANCE.md` / `AT-NN.md` / `test/acceptance/AT-NN.test.js` 1:1 & literal-assertion parity, `REGRESSION.md` /
+  `test/regression/NN-slug.test.js` parity, and `prettier --check` tables.
 - `make format-docs`: `prettier --write` for `AGENTS.md`, `README.md`, `CHANGELOG.md`, `docs/`, and `.agents/`.
-- `make commit-msg-check MSG=<file>`: validate a commit message (`<= 6` bullets, `<= 8` lines total, no subject line,
-  blank line + `Co-authored-by:` trailer, no Markdown escapes, no en/em-dashes, no home-directory paths).
+- `make commit-msg-check MSG=<file>`: validate a commit message (`<= 6` bullets, `<= 8` lines total, `<= 120` columns,
+  no subject line, blank line + `Co-authored-by:` trailer, no Markdown escapes, no en/em-dashes, no home-directory
+  paths).
 - `make install-hooks`: install a `commit-msg` git hook that runs the same check.

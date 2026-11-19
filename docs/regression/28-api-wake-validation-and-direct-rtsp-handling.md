@@ -12,5 +12,5 @@
   `stream-orchestrator.js`: returning `422 UNSUPPORTED_OPERATION` when targeting direct `rtsp_url` cameras exclusively
   and skipping them as `status: "unsupported"` in mixed/`all` calls, failing atomically (`404 CAMERA_NOT_FOUND`) when
   any token is unknown, and returning structured `400` / `405` / `413` / `503` JSON payloads.
-- **Tests:** `test/services.test.js` (`enforces /api/wake hybrid direct rtsp_url handling...`) and
-  `test/acceptance.test.js` (`AT-17`).
+- **Tests:** `test/regression/28-api-wake-validation-and-direct-rtsp-handling.test.js` (`enforces /api/wake hybrid
+direct rtsp_url handling...`) and `test/acceptance/AT-17.test.js`.

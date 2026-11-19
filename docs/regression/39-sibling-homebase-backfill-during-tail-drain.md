@@ -13,4 +13,5 @@
      removing the self-only `allowDrainingSelf` special case from `isStationIdleForBackfill()`.
   2. Triggered `processBackfillQueue(now)` alongside `arbitrate(now)` inside `handleDownloadFinishedEvent()` so waiting
      sibling backfill queries and downloads start immediately as soon as `HomeBase` finishes transferring a clip.
-- **Tests:** `test/acceptance.test.js` (`AT-13`) and `test/domain.test.js`.
+- **Tests:** `test/acceptance/AT-13.test.js` and
+  `test/regression/39-sibling-homebase-backfill-during-tail-drain.test.js`.

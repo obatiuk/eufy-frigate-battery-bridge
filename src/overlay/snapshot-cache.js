@@ -215,6 +215,7 @@ async function readFileLastSeenHm(filePath) {
     const st = await fs.promises.stat(filePath);
     return formatLocalHm(new Date(st.mtimeMs));
   } catch (err) {
+    // Missing or unreadable snapshot cache file has no lastSeen timestamp yet.
     return '';
   }
 }
@@ -230,6 +231,7 @@ async function fileExists(filePath) {
     await fs.promises.access(filePath);
     return true;
   } catch (err) {
+    // ENOENT / EACCES indicates the candidate cache path is not accessible.
     return false;
   }
 }

@@ -38,7 +38,13 @@ async function notifyHA(cam, extra = {}, webhookUrl = cfg.ha_webhook_url) {
       body: bodyJson,
     });
     if (!response.ok) {
-      const rawBody = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
+      const rawBody =
+        typeof response.text === 'function'
+          ? await response.text().catch(() => {
+              // Best-effort diagnostic snippet; log HTTP status alone if body stream fails.
+              return '';
+            })
+          : '';
       const snippet = String(rawBody || '')
         .trim()
         .slice(0, HA_ERROR_SNIPPET_MAX_CHARS);

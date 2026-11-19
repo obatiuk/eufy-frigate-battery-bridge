@@ -11,4 +11,4 @@
   `activeBackfillClip` event (or an upgraded non-motion `evLabel`) and recognized person in
   `handleDownloadFinishedEvent()`, and updated `resolveFrigateEventLabel()` to preserve already-resolved Frigate labels
   from `LABELS`.
-- **Tests:** `test/services.test.js`.
+- **Tests:** `test/regression/43-preserve-backfill-clip-event-label-on-download-finished.test.js`.

@@ -20,6 +20,9 @@
   and stalled `pendingVideoPackets`/`pendingAudioPackets` with drop-oldest eviction and live `DROP:<n>` HUD reporting;
   guarded `resumeDecoderStdout()` on `cam.dec === dec`; and skipped `stationTransitions` on direct `rtsp_url` stops
   while deleting settled HomeBase promises from `stationTransitions`.
-- **Tests:** `test/media.test.js` (`caps FFmpeg filtergraph threads...`, `reuses a single per-camera decoder stdout...`,
-  `lazy-allocates StatusCard waking, busy...`), `test/domain.test.js` (`bounds downloadedPaths FIFO history...`), and
-  `test/services.test.js` (`skips stationTransitions on direct rtsp_url stops...`).
+- **Tests:** `test/regression/25-multi-camera-ffmpeg-thread-footprint-and-buffer-leaks.test.js` (`caps FFmpeg
+filtergraph threads...`, `reuses a single per-camera decoder stdout...`, `lazy-allocates StatusCard waking,
+busy...`), `test/regression/25-multi-camera-ffmpeg-thread-footprint-and-buffer-leaks.test.js` (`bounds
+downloadedPaths FIFO history...`), and
+  `test/regression/25-multi-camera-ffmpeg-thread-footprint-and-buffer-leaks.test.js` (`skips stationTransitions on
+direct rtsp_url stops...`).

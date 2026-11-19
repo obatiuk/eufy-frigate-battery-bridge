@@ -6,11 +6,12 @@
 > 1. **Read the Matrix, the Index, and the Relevant Criteria Before Touching Code:** Read section 1 (the matrix) and
 >    section 3 (the file and concern maps) of this document, then read every `docs/acceptance/AT-NN.md` listed for the
 >    files and subsystem concern you change. `make check` always runs all 19 locked tests as a full safety net.
-> 2. **1:1 Executable Acceptance Suite (`test/acceptance.test.js`):** Every acceptance criterion (`AT-01`-`AT-19`) has
->    one file in `docs/acceptance/` and one locked test in `test/acceptance.test.js` whose title starts with `AT-NN:`.
+> 2. **1:1 Executable Acceptance Suite (`test/acceptance/AT-NN.test.js`):** Every acceptance criterion (`AT-01`-`AT-19`)
+>    has one file in `docs/acceptance/` and one matching locked test file `test/acceptance/AT-NN.test.js` whose test
+>    title starts with `AT-NN:`.
 > 3. **Never Modify or Weaken Acceptance Tests Without Explicit User Confirmation:** Do **not** delete, skip, or weaken
->    any test in `test/acceptance.test.js` to make a build pass unless the user explicitly instructs you to change the
->    requirement. A requirement change edits the matching `docs/acceptance/AT-NN.md` and its test in the same change.
+>    any test in `test/acceptance/` to make a build pass unless the user explicitly instructs you to change the
+>    requirement. A requirement change edits `docs/acceptance/AT-NN.md` and `test/acceptance/AT-NN.test.js` together.
 
 ---
 
@@ -60,23 +61,59 @@ must strictly enforce the following behavior across all event and wake sources:
 
 The matrix in section 1 always applies. `AT-NN` links are in the index above.
 
-| File                                  | Read these criteria first                                                                 |
-| :------------------------------------ | :---------------------------------------------------------------------------------------- |
-| `src/domain/camera.js`                | Section 3.1 concern map (read the matching concern rows)                                  |
-| `src/domain/backfill-job.js`          | AT-01, AT-02, AT-03, AT-04, AT-15, AT-16, AT-17                                           |
-| `src/domain/telemetry.js`             | AT-07, AT-08, AT-10, AT-18, AT-19                                                         |
-| `src/domain/status-card.js`           | AT-17, AT-18, AT-19                                                                       |
-| `src/services/stream-orchestrator.js` | Section 3.1 concern map (read the matching concern rows)                                  |
-| `src/services/eufy-client.js`         | AT-01, AT-02, AT-05, AT-06, AT-07, AT-08, AT-10, AT-16, AT-18                             |
-| `src/services/frigate-client.js`      | AT-03, AT-04, AT-07, AT-08, AT-09, AT-11, AT-12, AT-14, AT-16, AT-17, AT-18               |
-| `src/services/http-server.js`         | AT-01, AT-02, AT-03, AT-04, AT-08, AT-17, AT-19                                           |
-| `src/services/ha-notifier.js`         | AT-17                                                                                     |
-| `src/media/encoder.js`                | AT-07, AT-08, AT-14, AT-16, AT-18                                                         |
-| `src/media/decoder.js`                | AT-05, AT-06, AT-16, AT-18                                                                |
-| `src/overlay/*`                       | AT-17, AT-18                                                                              |
-| `src/config.js`                       | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-10, AT-12, AT-13, AT-17, AT-18, AT-19 |
-| `src/app.js`                          | AT-08                                                                                     |
-| `src/logger.js`                       | AT-19                                                                                     |
+| File                                           | Read these criteria first                                                                 |
+| :--------------------------------------------- | :---------------------------------------------------------------------------------------- |
+| `src/domain/camera.js`                         | Section 3.1 concern map (read the matching concern rows)                                  |
+| `src/domain/camera/states.js`                  | Section 3.1 concern map (read the matching concern rows)                                  |
+| `src/domain/camera/debug-hud.js`               | AT-18                                                                                     |
+| `src/domain/camera/viewer-set.js`              | AT-03, AT-04, AT-09, AT-14                                                                |
+| `src/domain/camera/hardware-trigger-ledger.js` | AT-08, AT-09, AT-11, AT-12                                                                |
+| `src/domain/camera/frigate-event-filing.js`    | AT-11, AT-17                                                                              |
+| `src/domain/camera/audio-queue.js`             | AT-16, AT-18                                                                              |
+| `src/domain/camera/session-lifecycle.js`       | AT-08, AT-09, AT-13, AT-14                                                                |
+| `src/domain/camera/offline-state.js`           | AT-07, AT-08                                                                              |
+| `src/domain/camera/wake-scheduler.js`          | AT-01, AT-02, AT-13, AT-16, AT-17                                                         |
+| `src/domain/camera/stream-session.js`          | AT-05, AT-06, AT-08, AT-09, AT-11, AT-12, AT-13, AT-14, AT-16, AT-18                      |
+| `src/domain/camera/backfill-state.js`          | AT-01, AT-02, AT-03, AT-04, AT-13, AT-15, AT-16, AT-17                                    |
+| `src/domain/station.js`                        | AT-06, AT-08, AT-13, AT-16, AT-17                                                         |
+| `src/domain/backfill-job.js`                   | AT-01, AT-02, AT-03, AT-04, AT-15, AT-16, AT-17                                           |
+| `src/domain/telemetry.js`                      | AT-07, AT-08, AT-10, AT-18, AT-19                                                         |
+| `src/domain/telemetry-visuals.js`              | AT-18, AT-19                                                                              |
+| `src/domain/status-card.js`                    | AT-17, AT-18, AT-19                                                                       |
+| `src/services/stream-orchestrator.js`          | Section 3.1 concern map (read the matching concern rows)                                  |
+| `src/services/orchestrator/context.js`         | AT-07, AT-08, AT-13, AT-14                                                                |
+| `src/services/orchestrator/wake.js`            | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-08, AT-11, AT-13, AT-14, AT-16, AT-17 |
+| `src/services/orchestrator/arbitration.js`     | AT-05, AT-06, AT-09, AT-11, AT-13, AT-14, AT-16                                           |
+| `src/services/orchestrator/backfill-queue.js`  | AT-01, AT-02, AT-03, AT-04, AT-13, AT-15, AT-16, AT-17                                    |
+| `src/services/orchestrator/event-router.js`    | AT-01, AT-02, AT-05, AT-06, AT-07, AT-08, AT-10, AT-11, AT-15, AT-16                      |
+| `src/services/orchestrator/housekeeping.js`    | AT-05, AT-06, AT-08, AT-10, AT-11, AT-12, AT-16, AT-17                                    |
+| `src/services/eufy-client.js`                  | AT-01, AT-02, AT-05, AT-06, AT-07, AT-08, AT-10, AT-16, AT-18                             |
+| `src/services/eufy/ws-transport.js`            | AT-05, AT-06, AT-08, AT-16, AT-18                                                         |
+| `src/services/eufy/telemetry-sync.js`          | AT-01, AT-02, AT-05, AT-07, AT-08, AT-10, AT-18                                           |
+| `src/services/eufy/station-recovery.js`        | AT-05, AT-06, AT-08, AT-16, AT-18                                                         |
+| `src/services/frigate-client.js`               | AT-03, AT-04, AT-07, AT-08, AT-09, AT-11, AT-12, AT-14, AT-16, AT-17, AT-18               |
+| `src/services/http-server.js`                  | AT-01, AT-02, AT-03, AT-04, AT-08, AT-17, AT-19                                           |
+| `src/services/wake-request.js`                 | AT-01, AT-02, AT-03, AT-04, AT-17                                                         |
+| `src/services/http-responses.js`               | AT-08, AT-17, AT-19                                                                       |
+| `src/services/api-payloads.js`                 | AT-08, AT-19                                                                              |
+| `src/services/frigate-masks.js`                | AT-17, AT-19                                                                              |
+| `src/services/go2rtc-viewers.js`               | AT-03, AT-04, AT-09, AT-14                                                                |
+| `src/services/upstream-health.js`              | AT-08, AT-18                                                                              |
+| `src/services/service-versions.js`             | AT-08                                                                                     |
+| `src/services/ha-notifier.js`                  | AT-17                                                                                     |
+| `src/media/encoder.js`                         | AT-07, AT-08, AT-14, AT-16, AT-18                                                         |
+| `src/media/ffmpeg-args.js`                     | AT-05, AT-06, AT-07, AT-08, AT-14, AT-16, AT-18                                           |
+| `src/media/decoder.js`                         | AT-05, AT-06, AT-16, AT-18                                                                |
+| `src/overlay/*`                                | AT-17, AT-18                                                                              |
+| `src/config/index.js`                          | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-10, AT-12, AT-13, AT-17, AT-18, AT-19 |
+| `src/config/constants.js`                      | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-10, AT-12, AT-13, AT-17, AT-18, AT-19 |
+| `src/config/camera-config.js`                  | AT-05, AT-19                                                                              |
+| `src/config/env.js`                            | AT-08, AT-19                                                                              |
+| `src/config/validation.js`                     | AT-05, AT-19                                                                              |
+| `src/config/resolvers.js`                      | AT-01, AT-02, AT-03, AT-04, AT-05, AT-07, AT-10, AT-12, AT-13, AT-18, AT-19               |
+| `src/config/builder.js`                        | AT-05, AT-07, AT-10, AT-12, AT-19                                                         |
+| `src/app.js`                                   | AT-08                                                                                     |
+| `src/logger.js`                                | AT-19                                                                                     |
 
 ### 3.1 Concern Map for `camera.js` and `stream-orchestrator.js`
 

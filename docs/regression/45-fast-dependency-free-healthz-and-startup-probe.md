@@ -15,6 +15,7 @@
   cannot bind); tightened `HEALTHCHECK` in `deploy/Dockerfile` to `5s` (`2s` timeout) while verifying a live
   post-validation PID marker when `BRIDGE_HTTP_PORT=0`; and enforced strict URL scheme,
   runtime env, identity uniqueness, safe-name, and scalar/integer type checks at startup in `src/config.js`.
-- **Tests:** `test/acceptance.test.js` (`AT-08`), `test/services.test.js` (`serves dependency-free fixed-length
-/healthz responses...`), and `test/config.test.js` (`rejects non-integer or out-of-range port environment
-variables...`).
+- **Tests:** `test/acceptance/AT-08.test.js`,
+  `test/regression/45-fast-dependency-free-healthz-and-startup-probe.test.js` (`serves dependency-free fixed-length
+/healthz responses...`), and `test/regression/45-fast-dependency-free-healthz-and-startup-probe.test.js` (`exits 0
+in Dockerfile HEALTHCHECK...`).

@@ -36,5 +36,6 @@ started'` events on cameras already receiving `P2P` video (`gotVideo === true`).
      recycles zombie `P2P` sessions on an unresponsive wake timeout, while `handleStationEvent()` schedules periodic
      `station.connect` retries while a station stays disconnected and `resetStationSyncFlags()` re-runs hardware
      property and `RTSP` sync upon station `connect`.
-- **Tests:** `test/services.test.js` (`Regression: recovers disconnected or wedged eufy-security-ws driver/station
-sessions and missing rtspStreamUrl after Wi-Fi outages`), `test/domain.test.js`.
+- **Tests:** `test/regression/22-wedged-homebase-station-p2p-and-missing-rtsp-url-after-wifi-outage.test.js`
+  (`Regression 22: recovers disconnected or wedged eufy-security-ws driver/station sessions and missing rtspStreamUrl
+after Wi-Fi outages`), `test/domain/camera/debug-hud.test.js`.

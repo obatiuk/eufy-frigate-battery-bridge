@@ -13,4 +13,5 @@
   independent HomeBase stations to run in parallel, enforced the `4000ms` query cooldown across all cameras sharing a
   HomeBase (preserving immediate split-clip follow-up and `SIGUSR1` test queries), and added equal-priority round-robin
   tie-breaking by oldest `lastBackfillQueryAt` in `Camera.compareBackfillPriority()`.
-- **Tests:** `test/domain.test.js`, `test/services.test.js`.
+- **Tests:** `test/regression/42-per-station-backfill-serialization-and-query-pacing.test.js`,
+  `test/domain/station.test.js`, and `test/regression/42-per-station-backfill-serialization-and-query-pacing.test.js`.

@@ -21,9 +21,10 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) (`AT-17`, `AT-18`), [status-card-minimal
     behind status icons), 4-tier Wi-Fi arcs, `30x20` battery shells with pre-baked `15x15` top-right power badges
     (`solar`, `plugged`, `bolt`, and `unknown` `?` when battery percentage is unavailable) and `1.65px` crystal cutouts,
     and a 5x9 bitmap monospace font for the diagnostic `"hud"` theme.
-  - By default (`resolveTelemetryConfig` in `src/config.js`), `battery`, `power_source`, `wifi`, and `rssi` default to
-    `true`, `temperature` and `last_seen` default to `false` (hidden unless explicitly enabled in `telemetry`), and
-    `telemetry` is completely disabled (`enabled: false`) whenever direct `rtsp_url` is configured on a camera.
+  - By default (`resolveTelemetryConfig` in `src/config/resolvers.js`), `battery`, `power_source`, `wifi`, and `rssi`
+    default to `true`, `temperature` and `last_seen` default to `false` (hidden unless explicitly enabled in
+    `telemetry`), and `telemetry` is completely disabled (`enabled: false`) whenever direct `rtsp_url` is configured on
+    a camera.
   - Normal states stay **Calm White** (`#ffffff`): `Asleep` and `Asleep (Low Battery)` status silhouettes, healthy
     unplugged battery (`> 30%`), healthy Wi-Fi (`>= 2` bars / `>= -80 dBm`), and normal temperature (`6..35°C`).
     Chromatic accents appear only on active state changes or anomalies: **Sky Blue** (`#38bdf8`) for `Waking Up...`,

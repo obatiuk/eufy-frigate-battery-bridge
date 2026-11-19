@@ -206,8 +206,8 @@ class StatusCard {
     this.position = resolved.position;
     this.sleepScreen = resolved.sleepScreen;
 
-    this.autoFrigateMask = rawCamCfg.autoFrigateMask ?? rawCamCfg.auto_frigate_mask ?? GLOBAL_AUTO_FRIGATE_MASK;
-    this.showOnLive = rawCamCfg.cardShowOnLive ?? rawCamCfg.card_show_on_live ?? GLOBAL_CARD_SHOW_ON_LIVE;
+    this.autoFrigateMask = rawCamCfg.autoFrigateMask ?? GLOBAL_AUTO_FRIGATE_MASK;
+    this.showOnLive = rawCamCfg.cardShowOnLive ?? GLOBAL_CARD_SHOW_ON_LIVE;
     this.lastSyncedMaskPoly = '';
     this.suppressLiveCard = false;
 

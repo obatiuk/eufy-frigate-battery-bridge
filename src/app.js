@@ -26,7 +26,7 @@ const {log, formatErrorMessage} = require('./logger');
 const {Camera} = require('./domain/camera');
 const {loadCachedFrame} = require('./overlay/snapshot-cache');
 const {renderCameraCards} = require('./overlay/card-renderer');
-const {configureEncoderHooks, startEncoder, startMediaTickers} = require('./media/encoder');
+const {configureEncoderHooks, startEncoder, startMediaTickers, stopMediaTickers} = require('./media/encoder');
 const {setDecoderStopHandler} = require('./media/decoder');
 const {
   syncFrigateMotionMasks,
@@ -38,7 +38,9 @@ const {
   configureEufyClientHooks,
   ensureCameraEncodersStarted,
   connectWs,
+  stopWsClient,
   startTelemetryPoller,
+  stopTelemetryPoller,
   fetchAllCameraTelemetry,
 } = require('./services/eufy-client');
 const {
@@ -49,14 +51,20 @@ const {
   onEvent,
   processBackfillQueue,
   startHousekeepingLoop,
+  stopHousekeepingLoop,
 } = require('./services/stream-orchestrator');
 const {startHttpServer, stopHttpServer} = require('./services/http-server');
+const {verifyUpstreamServiceVersions, stopUpstreamVersionChecks} = require('./services/service-versions');
 
 const SIGUSR1_BACKFILL_DELAY_MS = 300;
 const SHUTDOWN_EXIT_DELAY_MS = 1500;
 const VIEWER_POLL_INTERVAL_MS = 750;
 
 let bridgeShuttingDown = false;
+/** @type {ReturnType<typeof setInterval>|null} */
+let viewerPollTimer = null;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let sigUsr1BackfillTimer = null;
 const isShuttingDown = () => bridgeShuttingDown;
 
 /**
@@ -117,11 +125,19 @@ function wireServices(cams, bySerial) {
     bySerial,
     isShuttingDown,
     onEvent,
-    onWsClosedStop: (cam) => stop(cam, 'bridge lost eufy-security-ws connection', false, 'error/ws-disconnect'),
+    onWsClosedStop: (cam) =>
+      stop(cam, 'bridge lost eufy-security-ws connection', {
+        preemptedByViewer: false,
+        initiator: 'error/ws-disconnect',
+      }),
     onDeviceOfflineStop: (cam) =>
-      stop(cam, 'camera reported offline (' + cam.getOfflineReason() + ')', false, 'error/device-offline'),
+      stop(cam, 'camera reported offline (' + cam.getOfflineReason() + ')', {
+        preemptedByViewer: false,
+        initiator: 'error/device-offline',
+      }),
     onDeviceOnlineResume: (cam) => startEncoder(cam),
-    onInitialTelemetryLoaded: () => void syncFrigateMotionMasks(cams, false, bridgeShuttingDown),
+    onInitialTelemetryLoaded: () =>
+      void syncFrigateMotionMasks(cams, {forceResync: false, shuttingDown: bridgeShuttingDown}),
   });
 }
 
@@ -140,14 +156,26 @@ function handleSigUsr1BackfillTest(cams) {
   log.info(targetCam, 'received SIGUSR1 signal, queueing test backfill download of latest HomeBase clip');
   for (const cam of cams) {
     if (cam.shouldStopForSigUsr1Test()) {
-      stop(cam, 'yielding P2P slot for SIGUSR1 backfill test', true, 'bridge-backfill');
+      stop(cam, 'yielding P2P slot for SIGUSR1 backfill test', {
+        preemptedByViewer: true,
+        initiator: 'bridge-backfill',
+      });
     } else if (cam.shouldClearQueueForSigUsr1Test()) {
       cam.clearViewerQueue('SIGUSR1 backfill test');
     }
   }
 
   targetCam.prepareSigUsr1BackfillTest(Date.now());
-  setTimeout(() => void processBackfillQueue(Date.now()), SIGUSR1_BACKFILL_DELAY_MS);
+  if (sigUsr1BackfillTimer) {
+    clearTimeout(sigUsr1BackfillTimer);
+  }
+  sigUsr1BackfillTimer = setTimeout(() => {
+    sigUsr1BackfillTimer = null;
+    void processBackfillQueue(Date.now());
+  }, SIGUSR1_BACKFILL_DELAY_MS);
+  if (sigUsr1BackfillTimer && typeof sigUsr1BackfillTimer.unref === 'function') {
+    sigUsr1BackfillTimer.unref();
+  }
 }
 
 /**
@@ -161,15 +189,33 @@ function shutdownBridge(cams) {
   }
   bridgeShuttingDown = true;
   clearBridgeReady();
+  if (viewerPollTimer) {
+    clearInterval(viewerPollTimer);
+    viewerPollTimer = null;
+  }
+  if (sigUsr1BackfillTimer) {
+    clearTimeout(sigUsr1BackfillTimer);
+    sigUsr1BackfillTimer = null;
+  }
+  stopHousekeepingLoop();
+  stopTelemetryPoller();
+  stopMediaTickers();
+  stopUpstreamVersionChecks();
   stopHttpServer();
   log.info('bridge', 'received shutdown signal, stopping active streams and encoders');
 
   for (const cam of cams) {
     cam.prepareForShutdown();
-    stop(cam, 'bridge container shutting down', false, 'system-shutdown');
+    stop(cam, 'bridge container shutting down', {preemptedByViewer: false, initiator: 'system-shutdown'});
     cam.stopEncoderProcess();
   }
-  setTimeout(() => process.exit(0), SHUTDOWN_EXIT_DELAY_MS);
+  const exitTimer = setTimeout(() => {
+    stopWsClient();
+    process.exit(0);
+  }, SHUTDOWN_EXIT_DELAY_MS);
+  if (exitTimer && typeof exitTimer.unref === 'function') {
+    exitTimer.unref();
+  }
 }
 
 /**
@@ -236,10 +282,17 @@ function startServices(cams) {
       triggerCam: trigger,
     });
   };
-  setInterval(runViewerPollTick, VIEWER_POLL_INTERVAL_MS);
+  if (viewerPollTimer) {
+    clearInterval(viewerPollTimer);
+  }
+  viewerPollTimer = setInterval(runViewerPollTick, VIEWER_POLL_INTERVAL_MS);
+  if (viewerPollTimer && typeof viewerPollTimer.unref === 'function') {
+    viewerPollTimer.unref();
+  }
 
   startHousekeepingLoop();
   startTelemetryPoller();
+  void verifyUpstreamServiceVersions({isShuttingDown});
   connectWs();
 }
 

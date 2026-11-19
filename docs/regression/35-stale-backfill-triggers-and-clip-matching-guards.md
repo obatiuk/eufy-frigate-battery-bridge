@@ -32,4 +32,6 @@
      `isUrgentBackfillProtectedFrom()`.
   5. Logged failed backfill query and `cancel_download` RPC responses and wrapped `processBackfillQueue()` in
      `try/catch` error logging.
-- **Tests:** `test/domain.test.js` and `test/services.test.js`.
+- **Tests:** `test/regression/35-stale-backfill-triggers-and-clip-matching-guards.test.js`,
+  `test/domain/backfill-job.test.js`, and
+  `test/regression/35-stale-backfill-triggers-and-clip-matching-guards.test.js`.

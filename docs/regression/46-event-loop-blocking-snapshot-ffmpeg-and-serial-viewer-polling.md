@@ -14,7 +14,9 @@
   `GET /api/streams` request, picks each camera's consumers by stream name (a stream that is not listed yet has no
   consumers, and unrelated streams are ignored), and warns once per episode when go2rtc answers with an unusable
   stream list.
-- **Tests:** `test/media.test.js` (`Snapshot Cache Event-Loop Safety`) and `test/services.test.js` (`polls go2rtc
-once for all cameras through the bulk streams endpoint...`, `warns once when go2rtc answers with an unusable stream
-list...`), plus the `pollViewers` fixtures in `test/acceptance.test.js` (`AT-03`, `AT-04`, `AT-14`) updated to the
-  keyed stream table.
+- **Tests:** `test/overlay/snapshot-cache.test.js` and
+  `test/regression/46-event-loop-blocking-snapshot-ffmpeg-and-serial-viewer-polling.test.js` (`Snapshot Cache
+Event-Loop Safety`) and `test/services/frigate-client.test.js` (`polls go2rtc once for all cameras through the bulk
+streams endpoint...`, `warns once when go2rtc answers with an unusable stream list...`), plus the `pollViewers`
+  fixtures in `test/acceptance/AT-03.test.js`, `test/acceptance/AT-04.test.js`, `test/acceptance/AT-14.test.js`
+  updated to the keyed stream table.

@@ -41,4 +41,4 @@
   6. Held Clip 1's final frame across `backfillContinuation` while `hasPendingBackfill()`, counted in-flight packets in
      `getEffectiveEventDurationSecs()`, and restricted `isMotionOnlyActiveSession()` / `hasReachedViewMaxDuration()` to
      `isActiveLiveSession()`.
-- **Tests:** `test/domain.test.js`, `test/media.test.js`, and `test/services.test.js`.
+- **Tests:** `test/regression/34-back-to-back-p2p-backfill-clip-and-tail-preservation.test.js`.

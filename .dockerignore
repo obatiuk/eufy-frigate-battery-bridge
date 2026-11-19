@@ -1,6 +1,9 @@
 .git/
+.github/
 .gitignore
 .dockerignore
+.ignore
+.geminiignore
 .agents/
 .idea/
 .tmp/

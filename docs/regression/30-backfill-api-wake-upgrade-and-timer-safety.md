@@ -13,6 +13,8 @@
   duplicate jobs; restricted `isMidStreamView` and log guards in `applyViewTrigger()` to `this.isActiveLiveSession()`;
   and made `scheduleApiWake()` clear any prior timer first while scheduled wake callbacks re-check `isWsReady()`,
   roll back `stationNextWakeAt`, skip `applyWakeTrigger()`, and log a warning on disconnect.
-- **Tests:** `test/domain.test.js` (`clears any existing apiWakeTimer...`), `test/services.test.js` (`upgrades an
-existing pending or active BackfillJob...`, `rejects a scheduled /api/wake...`), and `test/acceptance.test.js`
-  (`AT-17`).
+- **Tests:** `test/regression/30-backfill-api-wake-upgrade-and-timer-safety.test.js` (`clears any existing
+apiWakeTimer...`), `test/regression/30-backfill-api-wake-upgrade-and-timer-safety.test.js` (`upgrades
+pendingBackfill priority in place...`), `test/regression/30-backfill-api-wake-upgrade-and-timer-safety.test.js`
+  (`upgrades an existing pending or active BackfillJob...`, `rejects a scheduled /api/wake...`), and
+  `test/acceptance/AT-17.test.js`.

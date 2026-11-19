@@ -13,8 +13,9 @@
 - **Fix:** Added `Camera.canSignalProcess(proc)` so `.kill()` is never invoked on a `ChildProcess` whose `pid` is
   `undefined` or `<= 0`; unified `error` and `exit` settlement with exponential retry backoff across `startEncoder()`,
   `startDecoder()`, and `startRtspDecoder()`; hardened `test/reporter.js` with `util.inspect()` formatting and
-  non-rollup suite failure reporting; and isolated `test/services.test.js` with an in-memory `global.fetch` stub and
-  loopback RTSP fixture URLs.
-- **Tests:** `test/media.test.js` (`detaches encoder and decoders and schedules backoff retries when FFmpeg fails to
-spawn without emitting exit`) and `test/config.test.js` (`formats null-prototype IPC errors and suite-level worker
-crashes in test/reporter.js without throwing or hiding failures`).
+  non-rollup suite failure reporting; and isolated service tests (`test/helpers/service-mocks.js`) with an in-memory
+  `global.fetch` stub and loopback RTSP fixture URLs.
+- **Tests:** `test/regression/26-unspawned-ffmpeg-kill-group-sigterm-and-spawn-backoff.test.js` (`detaches encoder and
+decoders and schedules backoff retries when FFmpeg fails to spawn without emitting exit`) and
+  `test/regression/26-unspawned-ffmpeg-kill-group-sigterm-and-spawn-backoff.test.js` (`formats null-prototype IPC
+errors and suite-level worker crashes without throwing or hiding failures`).

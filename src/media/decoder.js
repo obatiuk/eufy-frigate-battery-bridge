@@ -24,7 +24,8 @@ const {
 } = require('../config');
 const {log, formatLocalHm, formatErrorMessage} = require('../logger');
 const {Camera} = require('../domain/camera');
-const {pushFrameToEncoder, FfmpegArgsBuilder} = require('./encoder');
+const {pushFrameToEncoder} = require('./encoder');
+const {FfmpegArgsBuilder} = require('./ffmpeg-args');
 
 /** @typedef {import("../domain/camera").Camera} CameraInstance */
 
@@ -164,7 +165,7 @@ function computeRtspDecoderRetryDelay(cam, sessionId, isSpawnError) {
 /**
  * Registers the callback used to stop a camera session once a 2-second startup snapshot probe completes.
  *
- * @param {(cam: Camera, why: string, preemptedByViewer?: boolean, initiator?: string) => void} fn - Stop handler.
+ * @param {(cam: Camera, why: string, opts?: { preemptedByViewer?: boolean, initiator?: string }) => void} fn - Handler.
  */
 function setDecoderStopHandler(fn) {
   stopCameraCallback = fn;
@@ -361,7 +362,10 @@ function handleDecodedP2pFrame(cam, rawBuf, now) {
   }
 
   if (cam.completeStartupProbeIfReady(now, STARTUP_PROBE_CAPTURE_MS) && stopCameraCallback) {
-    stopCameraCallback(cam, 'startup snapshot captured after 2s stable video', false, 'bridge-startup-probe');
+    stopCameraCallback(cam, 'startup snapshot captured after 2s stable video', {
+      preemptedByViewer: false,
+      initiator: 'bridge-startup-probe',
+    });
   }
 }
 
@@ -468,7 +472,7 @@ function handleP2pDecoderExit(cam, dec, mySession, code, getLastStderrLine = () 
     }
     return;
   }
-  if (cam.dec === dec) {
+  if (cam.isDecoderProcess(dec)) {
     cam.resumeDecoderStdout();
   }
   if (cam.detachDecoderIfMatch(dec, false)) {
@@ -480,7 +484,7 @@ function handleP2pDecoderExit(cam, dec, mySession, code, getLastStderrLine = () 
           ', session=' +
           mySession +
           '): ' +
-          getLastStderrLine(!cam.gotVideo)
+          getLastStderrLine(!cam.hasGotVideo())
       );
     }
   }
@@ -495,7 +499,7 @@ function handleP2pDecoderExit(cam, dec, mySession, code, getLastStderrLine = () 
  */
 function scheduleP2pDecoderSpawnRetry(cam, mySession, delayMs) {
   const timer = setTimeout(() => {
-    if (!cam.hasDecoderProcess() && cam.isCurrentSession(mySession) && cam.pendingVideoPackets.length > 0) {
+    if (!cam.hasDecoderProcess() && cam.isCurrentSession(mySession) && cam.hasPendingVideoPackets()) {
       startDecoder(cam);
     }
   }, delayMs);
@@ -540,7 +544,7 @@ function startDecoder(cam, codec = cam.getVideoCodec()) {
       return;
     }
     settled = true;
-    if (cam.dec === decoderProcess) {
+    if (cam.isDecoderProcess(decoderProcess)) {
       cam.resumeDecoderStdout();
     }
     if (cam.detachDecoderIfMatch(decoderProcess, false) && cam.isCurrentSession(mySession)) {
@@ -638,7 +642,7 @@ function startRtspDecoder(cam) {
     }
     settled = true;
     if (cam.detachDecoderIfMatch(rtspProcess, true) && cam.isCurrentSession(mySession, STREAM_MODES.RTSP)) {
-      const lastLine = getLastStderrLine(!cam.gotVideo);
+      const lastLine = getLastStderrLine(!cam.hasGotVideo());
       if ((cam.isEstablishedRtspStream() || cam.isRtspDirect()) && rtspDropCallback) {
         rtspDropCallback(cam, exitCode, lastLine);
         return;

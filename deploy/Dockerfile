@@ -13,7 +13,7 @@ COPY test/ /app/test/
 COPY deploy/ /app/deploy/
 RUN mkdir -p /app/.tmp/cache \
     && TMPDIR=/app/.tmp BRIDGE_CACHE_DIR=/app/.tmp/cache \
-       node --test --test-reporter=/app/test/reporter.js /app/test/*.test.js \
+       node --test --test-reporter=/app/test/reporter.js $(find /app/test -type f -name '*.test.js' | sort) \
     && rm -rf /app/.tmp
 
 FROM docker.io/library/alpine:3.23

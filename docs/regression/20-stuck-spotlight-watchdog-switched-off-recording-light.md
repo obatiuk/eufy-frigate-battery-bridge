@@ -9,5 +9,6 @@
   later of the light turning on and the last activity, and it never fires during a `BackfillJob` or backfill playback.
   Both the wedged-radio path and idle RSSI light detection now apply the same grace, the startup check was removed, and
   stuck-spotlight shutoff is gated behind experimental opt-in `track_stuck_spotlight: false` by default.
-- **Tests:** `AT-10` (fresh light after a long idle period, pending `BackfillJob`, `130s` grace), `test/domain.test.js`,
-  and `test/services.test.js` (wedged-radio recovery).
+- **Tests:** `AT-10` (fresh light after a long idle period, pending `BackfillJob`, `130s` grace),
+  `test/regression/20-stuck-spotlight-watchdog-switched-off-recording-light.test.js`, and
+  `test/regression/20-stuck-spotlight-watchdog-switched-off-recording-light.test.js` (wedged-radio recovery).

@@ -10,7 +10,6 @@
 'use strict';
 
 const {
-  AUDIO,
   FRAME,
   AUDIO_CHUNK,
   LIVE_FPS,
@@ -33,185 +32,62 @@ const {
   clampNum,
   resolveCameraConfig,
 } = require('../config');
-const {formatLocalTimestamp, log, maskSecrets} = require('../logger');
-const {WIFI_SIGNAL_LEVELS, Telemetry} = require('./telemetry');
+const {log, maskSecrets} = require('../logger');
+const {Telemetry} = require('./telemetry');
 const {StatusCard} = require('./status-card');
+const {ViewerSet} = require('./camera/viewer-set');
+const {AudioQueue} = require('./camera/audio-queue');
+const {SessionLifecycle} = require('./camera/session-lifecycle');
+const {FrigateEventFiling} = require('./camera/frigate-event-filing');
+const {OfflineState} = require('./camera/offline-state');
+const {WAKE_KINDS, WakeRequest, WakeScheduler} = require('./camera/wake-scheduler');
 const {
-  BACKFILL_STATES,
-  DEFAULT_BACKFILL_MAX_AGE_MS,
-  BACKFILL_POST_CLEAR_SETTLE_MS,
-  BACKFILL_RECORDING_WAIT_CAP_MS,
-  BACKFILL_MAX_QUERY_ATTEMPTS,
-  BackfillJob,
-} = require('./backfill-job');
+  MAX_LIVE_PENDING_VIDEO_PACKETS,
+  MAX_DOWNLOAD_PENDING_VIDEO_PACKETS,
+  MAX_LIVE_PENDING_AUDIO_PACKETS,
+  StreamSession,
+} = require('./camera/stream-session');
+const {
+  DOWNLOAD_COMPLETED_INITIATOR,
+  DOWNLOAD_EVENT_DURATION_MARGIN_SECS,
+  DOWNLOAD_FRAME_HIGH_WATERMARK,
+  DOWNLOAD_FRAME_LOW_WATERMARK,
+  MAX_DOWNLOADED_PATHS_HISTORY,
+  isCompletedDownloadStop,
+  BackfillState,
+} = require('./camera/backfill-state');
+const {HardwareTriggerLedger, COMPANION_EVENT_BURST_MS} = require('./camera/hardware-trigger-ledger');
+const {
+  SESSION_STATES,
+  ALLOWED_SESSION_TRANSITIONS,
+  canTransitionSession,
+  FRIGATE_EVENT_STATES,
+  DECODER_STATES,
+} = require('./camera/states');
+const {buildDebugHudLines: formatDebugHudLines} = require('./camera/debug-hud');
 
 const INITIAL_KEYFRAME_BURST_MS = 2000;
-const DOWNLOAD_EOF_FLUSH_SETTLE_MS = 1000;
-const DOWNLOAD_EVENT_DURATION_MARGIN_SECS = 6;
-const DOWNLOAD_FRAME_HIGH_WATERMARK = 30;
-const DOWNLOAD_FRAME_LOW_WATERMARK = 10;
 const DOWNLOAD_POOL_MAX_BUFFERS = DOWNLOAD_FRAME_HIGH_WATERMARK + 2;
-const MAX_BACKFILL_CLIP_DOWNLOAD_ATTEMPTS = 3;
-const DEFAULT_BACKFILL_DOWNLOAD_RETRY_COOLDOWN_MS = 4000;
-const MAX_DOWNLOADED_PATHS_HISTORY = 500;
-const MAX_LIVE_PENDING_VIDEO_PACKETS = 150;
-const MAX_DOWNLOAD_PENDING_VIDEO_PACKETS = 2400;
-const MAX_LIVE_PENDING_AUDIO_PACKETS = 200;
-const MAX_DOWNLOAD_PENDING_AUDIO_PACKETS = 3000;
 const MAX_LIVE_BURST_FRAMES = 12;
 const DEFAULT_LIVE_FRAME_PACE_MS = 62;
 
 // Default domain policy thresholds for watchdog health, Frigate polling, and trigger extensions.
-const DEFAULT_RTSP_HANDSHAKE_MIN_MS = 400;
-const DEFAULT_RTSP_DEC_STALL_MS = 7500;
-const DEFAULT_RTSP_RETRY_MS = 10000;
-const DEFAULT_RTSP_MAX_RETRIES = 5;
-const DEFAULT_RTSP_TIMEOUT_MS = 25000;
-const DEFAULT_RTSP_MID_STALL_MS = 5000;
-const DEFAULT_P2P_INITIAL_RETRY_MS = 5500;
-const DEFAULT_P2P_SUBSEQUENT_RETRY_MS = 8000;
-const DEFAULT_P2P_MAX_RETRIES = 3;
 const DEFAULT_HOLD_EXTEND_WINDOW_MS = 12000;
 const DEFAULT_HOLD_SAFETY_MARGIN_MS = 5000;
 const NO_FRIGATE_POLL = Object.freeze({shouldPoll: false, needsTimeoutExtendCheck: false});
-const DEBUG_HUD_ROW_CHARS = 110;
 const MS_PER_SECOND = 1000;
-const MS_PER_MINUTE = 60000;
-const DECIMAL_BASE = 10;
-const ISO_TIME_START_INDEX = 11;
 const HOMEBASE_3_SERIAL_PREFIX = 'T8030';
 const DOORBELL_SERIAL_PREFIX = 'T8214';
-const DEFAULT_MOTION_LABEL = 'motion';
-const DEFAULT_MOTION_EVENT = 'motion detected';
 const DEFAULT_MIN_WAKE_SECS = 5;
-const DEFAULT_RTSP_START_DEDUP_WINDOW_MS = 2000;
-const DEFAULT_FAILED_START_BACKOFF_MS = 5000;
 const DEFAULT_MIN_CLEAN_VIDEO_MS = 3000;
 const DEFAULT_ENCODER_WEDGED_TIMEOUT_MS = 10000;
 const DEFAULT_FRESH_FRAME_MAX_AGE_MS = 2000;
 const DEFAULT_DOWNLOAD_PACE_LEAD_MS = 4;
 const DEFAULT_LIVE_HEARTBEAT_WRITE_MS = 500;
-const DEFAULT_MIN_RTSP_REWAKE_HOLD_MS = 10000;
-const DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS = 5000;
-const DEFAULT_RTSP_DIRECT_TIMEOUT_MS = 8000;
-const RTSP_DIRECT_PROBE_INITIATOR = 'rtsp-direct-probe';
-const RTSP_DIRECT_STREAM_REASON = 'rtsp direct stream';
-const RTSP_STANDBY_404_REGEX = /\b404\b|not found/i;
-const RTSP_NETWORK_UNREACHABLE_REGEX = new RegExp(
-  '\\b(?:connection refused|timed out|timeout|no route to host|host is down|network is unreachable|' +
-    'name or service not known|temporary failure in name resolution|yielded no video)\\b',
-  'i'
-);
-const RTSP_BARE_INVALID_DATA_REGEX = /\binvalid data found when processing input\b/i;
-const RTSP_COMPONENT_TAG_REGEX = /\[rtsp\s*@/i;
 const FIRST_BACKFILL_PLAYED_FRAME_COUNT = 1;
-const HUD_MAX_SECONDS_DISPLAY = 999;
-const SECS_PER_MINUTE = 60;
-const SECS_PER_HOUR = 3600;
-const SECS_PER_DAY = 86400;
-const SECS_PER_WEEK = 604800;
-const SECS_PER_YEAR = 31536000;
-const HUD_MAX_VIDEO_AGE_SECS_DISPLAY = 9.9;
-const HUD_STATE_PAD_WIDTH = 7;
-const HUD_DEC_PAD_WIDTH = 6;
-const HUD_SECS_PAD_WIDTH = 3;
-const HUD_FPS_PAD_WIDTH = 2;
-const HUD_QUEUE_PAD_WIDTH = 2;
-const HUD_SINGLE_DIGIT_WIDTH = 1;
-const HUD_TEMP_POS_DIGITS = 2;
-const HUD_TEMP_PAD_WIDTH = 3;
-const HUD_SEEN_PAD_WIDTH = 5;
-const HUD_SESSION_MODE_PAD_WIDTH = 4;
-const HUD_RESTARTS_PAD_WIDTH = 2;
-const HUD_STOP_PAD_WIDTH = 3;
-const HUD_EVENT_STATE_PAD_WIDTH = 6;
-const HUD_EVENT_ID_SLICE_LEN = 6;
-const HUD_FRAME_COUNT_PAD_WIDTH = 4;
-const HUD_INITIATOR_PAD_WIDTH = 8;
-const HUD_COL1_WIDTH = 13;
-const HUD_COL2_WIDTH = 12;
-const HUD_SPAN12_WIDTH = 28;
-const HUD_COL3_WIDTH = 10;
-const HUD_COL4_WIDTH = 10;
-const HUD_SPAN34_WIDTH = 23;
-const HUD_COL5_WIDTH = 9;
-const HUD_COL6_WIDTH = 25;
-const HUD_COL7_WIDTH = 13;
-const HUD_FLAG_YES = 'Y';
-const HUD_FLAG_NO = 'N';
-const HUD_LIGHT_ON_LABEL = 'ON ';
-const HUD_LIGHT_OFF_LABEL = 'OFF';
-const HUD_POWER_CHARGING_LABEL = 'CHG';
-const HUD_POWER_LOW_LABEL = 'LOW';
-const HUD_POWER_BATTERY_LABEL = 'BAT';
-const HUD_SESSION_NONE_LABEL = 'NONE';
-const HUD_SESSION_BACKFILL_LABEL = 'BF';
-const HUD_SESSION_P2P_FALLBACK = 'P2P';
-const HUD_TRIGGER_ACTIVE_LABEL = 'ACTIVE ';
-const HUD_TRIGGER_CLEAR_LABEL = 'CLEAR  ';
-const HUD_SERVICE_OK_LABEL = 'OK';
-const HUD_SERVICE_DOWN_LABEL = 'DN';
-const HUD_EMPTY_DURATION_4 = '--- ';
-const HUD_EMPTY_SEEN_4 = '----';
-const HUD_EMPTY_EVENT_ID_6 = '------';
-
-/**
- * Pads or truncates a value to an exact fixed character width so diagnostic HUD columns never shift.
- *
- * @param {*} val - Value to format.
- * @param {number} width - Fixed character width.
- * @param {boolean} [alignRight=false] - Whether to right-align within width.
- * @returns {string}
- */
-function padFixedWidth(val, width, alignRight = false) {
-  const s = String(val ?? '').slice(0, width);
-  return alignRight ? s.padStart(width, ' ') : s.padEnd(width, ' ');
-}
-
-/**
- * Formats an integer with leading zeros up to digits width (clamped to width).
- *
- * @param {number} num - Integer value.
- * @param {number} width - Fixed digit width.
- * @returns {string}
- */
-function formatZeroPaddedInt(num, width) {
-  const clamped = Math.max(0, Math.min(Math.pow(DECIMAL_BASE, width) - 1, Math.round(Number(num) || 0)));
-  return String(clamped).padStart(width, '0');
-}
-
-/**
- * Formats a non-negative duration in seconds as a fixed 4-character '<3 digits><unit>' token,
- * showing seconds up to 999s ('000s'..'999s') and scaling to minutes ('m'), hours ('h'),
- * days ('d'), weeks ('w'), and years ('y') beyond 999s.
- *
- * @param {number} rawSecs - Duration in seconds.
- * @returns {string}
- */
-function formatHudDuration(rawSecs) {
-  const secs = Math.max(0, Math.round(Number(rawSecs) || 0));
-  if (secs <= HUD_MAX_SECONDS_DISPLAY) {
-    return formatZeroPaddedInt(secs, HUD_SECS_PAD_WIDTH) + 's';
-  }
-  if (secs < SECS_PER_HOUR) {
-    return formatZeroPaddedInt(Math.floor(secs / SECS_PER_MINUTE), HUD_SECS_PAD_WIDTH) + 'm';
-  }
-  if (secs < SECS_PER_DAY) {
-    return formatZeroPaddedInt(Math.floor(secs / SECS_PER_HOUR), HUD_SECS_PAD_WIDTH) + 'h';
-  }
-  if (secs < SECS_PER_WEEK) {
-    return formatZeroPaddedInt(Math.floor(secs / SECS_PER_DAY), HUD_SECS_PAD_WIDTH) + 'd';
-  }
-  if (secs < SECS_PER_YEAR) {
-    return formatZeroPaddedInt(Math.floor(secs / SECS_PER_WEEK), HUD_SECS_PAD_WIDTH) + 'w';
-  }
-  return formatZeroPaddedInt(Math.floor(secs / SECS_PER_YEAR), HUD_SECS_PAD_WIDTH) + 'y';
-}
-
 const DEFAULT_FRIGATE_POLL_COOLDOWN_MS = 4000;
 const DEFAULT_RECENT_FRIGATE_OBJECT_MS = 15000;
 const DEFAULT_EVENT_EXTEND_MARGIN_MS = 5000;
-const COMPANION_EVENT_BURST_MS = 1000;
 const DEFAULT_EARLY_SLEEP_POLL_MS = 5000;
 const DEFAULT_EARLY_SLEEP_SETTLE_MS = 5000;
 const IDLE_WEDGED_RSSI_THRESHOLD = 4;
@@ -220,7 +96,6 @@ const IDLE_WEDGED_MIN_STOPPED_MS = 15000;
 // A spotlight is only judged stuck after staying on this long with no activity; must exceed the longest hardware
 // clip (BACKFILL_MAX_TOTAL_RECORDING_WAIT_MS = 124s) so a light that a recording still needs is never switched off.
 const STUCK_LIGHT_GRACE_MS = 130000;
-const HARDWARE_TRIGGER_MAX_AGE_MS = 130000;
 const IDLE_WEDGED_STOP_COOLDOWN_MS = 60000;
 const DEFAULT_MID_STREAM_GRACE_MS = 3000;
 const DEFAULT_MIN_EXTEND_MS = 5000;
@@ -232,14 +107,10 @@ const MAX_SUSTAINED_LIVE_VIDEO_CUTOFF_MS = 15000;
 const DEFAULT_UNSOLICITED_VIDEO_DELAY_MS = 3000;
 const DEFAULT_MOTION_CLEAR_SETTLE_MS = 5000;
 const DEFAULT_MIN_EVENT_VIDEO_MS = 10000;
-const DEFAULT_DOWNLOAD_IDLE_COMPLETE_MS = 3000;
-const DEFAULT_DOWNLOAD_POST_PLAYBACK_HOLD_MS = 2500;
-const DEFAULT_DOWNLOAD_MIN_PLAYBACK_MS = 4500;
 const EXTERNAL_P2P_WAKE_REASON = 'external P2P wake - eufy-security-ws';
 const EXTERNAL_RTSP_WAKE_REASON = 'external RTSP wake - eufy-security-ws';
 const EXTERNAL_WAKE_INITIATOR = 'eufy-ws';
 const ARBITRATOR_INITIATOR_PREFIX = 'bridge-arbitrator/';
-const DOWNLOAD_COMPLETED_INITIATOR = 'eufy/download-finished';
 const API_WAKE_STATUSES = Object.freeze({
   WAKING: 'waking',
   SCHEDULED: 'scheduled',
@@ -265,29 +136,6 @@ const DIRECT_RTSP_WAKE_UNSUPPORTED_ERROR =
   'Direct rtsp_url camera connects automatically and does not support /api/wake';
 
 /**
- * Returns true when a stopped backfill download counts as complete: the HomeBase transfer finished, or the
- * orchestrator ended playback as complete (including the idle fallback when 'download finished' was missed). Any
- * other stop (station disconnect, preemption, cancel, offline) is an interruption that must be retried.
- *
- * @param {boolean} downloadFinished - Whether the 'download finished' transfer event was received.
- * @param {string} initiator - Decision maker identifier of the stop.
- * @returns {boolean}
- */
-function isCompletedDownloadStop(downloadFinished, initiator) {
-  return downloadFinished || initiator === DOWNLOAD_COMPLETED_INITIATOR;
-}
-
-/**
- * Formats an epoch millisecond timestamp as local 'HH:MM:SS' (or 'n/a' when <= 0).
- *
- * @param {number} ms - Epoch timestamp in milliseconds.
- * @returns {string}
- */
-function formatEpochHms(ms) {
-  return ms > 0 ? formatLocalTimestamp(new Date(ms)).slice(ISO_TIME_START_INDEX) : 'n/a';
-}
-
-/**
  * Rounds a floating-point value to 1 decimal place.
  *
  * @param {number} val - Numeric value to round.
@@ -295,391 +143,6 @@ function formatEpochHms(ms) {
  */
 function roundTenths(val) {
   return Math.round(val * TENTHS_ROUNDING_FACTOR) / TENTHS_ROUNDING_FACTOR;
-}
-
-/**
- * Enumerates the finite states of a Camera streaming session.
- *
- * @readonly
- * @enum {string}
- */
-const SESSION_STATES = Object.freeze({
-  IDLE: 'idle',
-  WAKING_RTSP: 'waking_rtsp',
-  WAKING_P2P: 'waking_p2p',
-  HANDSHAKING_BACKFILL: 'handshaking_backfill',
-  STREAMING_LIVE: 'streaming_live',
-  PLAYING_BACKFILL: 'playing_backfill',
-  DRAINING_BACKFILL_TAIL: 'draining_backfill_tail',
-  COOLDOWN: 'cooldown',
-});
-
-/**
- * Validated transition map for the Camera session finite state machine.
- *
- * @type {Readonly<Record<string, ReadonlySet<string>>>}
- */
-const ALLOWED_SESSION_TRANSITIONS = Object.freeze({
-  [SESSION_STATES.IDLE]: Object.freeze(
-    new Set([
-      SESSION_STATES.IDLE,
-      SESSION_STATES.WAKING_RTSP,
-      SESSION_STATES.WAKING_P2P,
-      SESSION_STATES.HANDSHAKING_BACKFILL,
-    ])
-  ),
-  [SESSION_STATES.WAKING_RTSP]: Object.freeze(
-    new Set([SESSION_STATES.WAKING_RTSP, SESSION_STATES.STREAMING_LIVE, SESSION_STATES.IDLE])
-  ),
-  [SESSION_STATES.WAKING_P2P]: Object.freeze(
-    new Set([SESSION_STATES.WAKING_P2P, SESSION_STATES.STREAMING_LIVE, SESSION_STATES.IDLE])
-  ),
-  [SESSION_STATES.HANDSHAKING_BACKFILL]: Object.freeze(
-    new Set([
-      SESSION_STATES.HANDSHAKING_BACKFILL,
-      SESSION_STATES.PLAYING_BACKFILL,
-      SESSION_STATES.DRAINING_BACKFILL_TAIL,
-      SESSION_STATES.IDLE,
-    ])
-  ),
-  [SESSION_STATES.STREAMING_LIVE]: Object.freeze(
-    new Set([SESSION_STATES.STREAMING_LIVE, SESSION_STATES.WAKING_RTSP, SESSION_STATES.COOLDOWN, SESSION_STATES.IDLE])
-  ),
-  [SESSION_STATES.PLAYING_BACKFILL]: Object.freeze(
-    new Set([SESSION_STATES.PLAYING_BACKFILL, SESSION_STATES.DRAINING_BACKFILL_TAIL, SESSION_STATES.IDLE])
-  ),
-  [SESSION_STATES.DRAINING_BACKFILL_TAIL]: Object.freeze(
-    new Set([SESSION_STATES.DRAINING_BACKFILL_TAIL, SESSION_STATES.IDLE])
-  ),
-  [SESSION_STATES.COOLDOWN]: Object.freeze(
-    new Set([
-      SESSION_STATES.COOLDOWN,
-      SESSION_STATES.WAKING_RTSP,
-      SESSION_STATES.WAKING_P2P,
-      SESSION_STATES.HANDSHAKING_BACKFILL,
-      SESSION_STATES.IDLE,
-    ])
-  ),
-});
-
-/**
- * Returns true if transitioning a Camera session from fromState to toState is permitted by the FSM.
- *
- * @param {string} fromState - Current session state.
- * @param {string} toState - Target session state.
- * @returns {boolean}
- */
-function canTransitionSession(fromState, toState) {
-  const allowed = ALLOWED_SESSION_TRANSITIONS[fromState];
-  return Boolean(allowed && allowed.has(toState));
-}
-
-/**
- * Enumerates the finite states of a Camera's Frigate detection event filing lifecycle.
- *
- * @readonly
- * @enum {string}
- */
-const FRIGATE_EVENT_STATES = Object.freeze({
-  IDLE: 'idle',
-  QUEUED: 'queued',
-  WAITING_SNAPSHOT: 'waiting_snapshot',
-  COOLDOWN: 'cooldown',
-});
-
-/**
- * Validated transition map for the Frigate event lifecycle finite state machine.
- *
- * @type {Readonly<Record<string, ReadonlySet<string>>>}
- */
-const ALLOWED_FRIGATE_EVENT_TRANSITIONS = Object.freeze({
-  [FRIGATE_EVENT_STATES.IDLE]: Object.freeze(new Set([FRIGATE_EVENT_STATES.IDLE, FRIGATE_EVENT_STATES.QUEUED])),
-  [FRIGATE_EVENT_STATES.QUEUED]: Object.freeze(
-    new Set([
-      FRIGATE_EVENT_STATES.QUEUED,
-      FRIGATE_EVENT_STATES.WAITING_SNAPSHOT,
-      FRIGATE_EVENT_STATES.COOLDOWN,
-      FRIGATE_EVENT_STATES.IDLE,
-    ])
-  ),
-  [FRIGATE_EVENT_STATES.WAITING_SNAPSHOT]: Object.freeze(
-    new Set([FRIGATE_EVENT_STATES.WAITING_SNAPSHOT, FRIGATE_EVENT_STATES.COOLDOWN, FRIGATE_EVENT_STATES.IDLE])
-  ),
-  [FRIGATE_EVENT_STATES.COOLDOWN]: Object.freeze(
-    new Set([FRIGATE_EVENT_STATES.COOLDOWN, FRIGATE_EVENT_STATES.QUEUED, FRIGATE_EVENT_STATES.IDLE])
-  ),
-});
-
-/**
- * Enumerates the finite states of a Camera's FFmpeg decoder backpressure and EOF flush pipeline.
- *
- * @readonly
- * @enum {string}
- */
-const DECODER_STATES = Object.freeze({
-  DETACHED: 'detached',
-  HANDSHAKING: 'handshaking',
-  DECODING: 'decoding',
-  PAUSED_BACKPRESSURE: 'paused_backpressure',
-  FLUSHING_EOF: 'flushing_eof',
-});
-
-/**
- * Validated transition map for the decoder backpressure finite state machine.
- *
- * @type {Readonly<Record<string, ReadonlySet<string>>>}
- */
-const ALLOWED_DECODER_TRANSITIONS = Object.freeze({
-  [DECODER_STATES.DETACHED]: Object.freeze(new Set([DECODER_STATES.DETACHED, DECODER_STATES.HANDSHAKING])),
-  [DECODER_STATES.HANDSHAKING]: Object.freeze(
-    new Set([
-      DECODER_STATES.HANDSHAKING,
-      DECODER_STATES.DECODING,
-      DECODER_STATES.PAUSED_BACKPRESSURE,
-      DECODER_STATES.FLUSHING_EOF,
-      DECODER_STATES.DETACHED,
-    ])
-  ),
-  [DECODER_STATES.DECODING]: Object.freeze(
-    new Set([
-      DECODER_STATES.DECODING,
-      DECODER_STATES.PAUSED_BACKPRESSURE,
-      DECODER_STATES.FLUSHING_EOF,
-      DECODER_STATES.DETACHED,
-    ])
-  ),
-  [DECODER_STATES.PAUSED_BACKPRESSURE]: Object.freeze(
-    new Set([
-      DECODER_STATES.PAUSED_BACKPRESSURE,
-      DECODER_STATES.DECODING,
-      DECODER_STATES.FLUSHING_EOF,
-      DECODER_STATES.DETACHED,
-    ])
-  ),
-  [DECODER_STATES.FLUSHING_EOF]: Object.freeze(
-    new Set([DECODER_STATES.FLUSHING_EOF, DECODER_STATES.PAUSED_BACKPRESSURE, DECODER_STATES.DETACHED])
-  ),
-});
-
-/** @type {Readonly<Record<string, string>>} */
-const SHORT_SESSION_STATE_LABELS = Object.freeze({
-  [SESSION_STATES.IDLE]: 'IDLE',
-  [SESSION_STATES.WAKING_RTSP]: 'WK_RTSP',
-  [SESSION_STATES.WAKING_P2P]: 'WK_P2P',
-  [SESSION_STATES.STREAMING_LIVE]: 'LIVE',
-  [SESSION_STATES.HANDSHAKING_BACKFILL]: 'BF_HSHK',
-  [SESSION_STATES.PLAYING_BACKFILL]: 'BF_PLAY',
-  [SESSION_STATES.DRAINING_BACKFILL_TAIL]: 'BF_TAIL',
-  [SESSION_STATES.COOLDOWN]: 'COOLDWN',
-});
-
-/** @type {Readonly<Record<string, string>>} */
-const SHORT_DECODER_STATE_LABELS = Object.freeze({
-  [DECODER_STATES.DETACHED]: 'DETACH',
-  [DECODER_STATES.HANDSHAKING]: 'HSHK',
-  [DECODER_STATES.DECODING]: 'DECODE',
-  [DECODER_STATES.PAUSED_BACKPRESSURE]: 'PAUSED',
-  [DECODER_STATES.FLUSHING_EOF]: 'FLUSH',
-});
-
-/** @type {Readonly<Record<string, string>>} */
-const SHORT_BACKFILL_STATE_LABELS = Object.freeze({
-  [BACKFILL_STATES.RECORDING]: 'ACTIVE',
-  [BACKFILL_STATES.SETTLING]: 'WAIT_Q',
-  [BACKFILL_STATES.READY_TO_QUERY]: 'QUERY',
-  [BACKFILL_STATES.MATCHED]: 'MATCH',
-  [BACKFILL_STATES.DOWNLOADING]: 'PLAYING',
-  [BACKFILL_STATES.COMPLETED]: 'DONE',
-  [BACKFILL_STATES.EXPIRED]: 'EXPIRED',
-});
-
-/** @type {Readonly<Record<string, string>>} */
-const SHORT_FRIGATE_EVENT_STATE_LABELS = Object.freeze({
-  [FRIGATE_EVENT_STATES.IDLE]: 'IDLE',
-  [FRIGATE_EVENT_STATES.QUEUED]: 'QUEUED',
-  [FRIGATE_EVENT_STATES.WAITING_SNAPSHOT]: 'WAIT_S',
-  [FRIGATE_EVENT_STATES.COOLDOWN]: 'RECORD',
-});
-
-/**
- * Abbreviates a SESSION_STATES value to fit inside a 7-character fixed column.
- *
- * @param {string} state - Session state value.
- * @returns {string}
- */
-function formatShortSessionState(state) {
-  return (
-    SHORT_SESSION_STATE_LABELS[state] ||
-    String(state || SHORT_SESSION_STATE_LABELS[SESSION_STATES.IDLE])
-      .toUpperCase()
-      .slice(0, HUD_STATE_PAD_WIDTH)
-  );
-}
-
-/**
- * Abbreviates a DECODER_STATES value to fit inside a 6-character fixed column.
- *
- * @param {string} state - Decoder state value.
- * @returns {string}
- */
-function formatShortDecoderState(state) {
-  return (
-    SHORT_DECODER_STATE_LABELS[state] ||
-    String(state || SHORT_DECODER_STATE_LABELS[DECODER_STATES.DETACHED])
-      .toUpperCase()
-      .slice(0, HUD_DEC_PAD_WIDTH)
-  );
-}
-
-/**
- * Abbreviates a BackfillJob state value to fit inside a 7-character fixed column.
- *
- * @param {*} bfJob - Active or pending BackfillJob instance (or null).
- * @returns {string}
- */
-function formatShortBackfillState(bfJob) {
-  if (!bfJob || !bfJob.state) {
-    return SHORT_SESSION_STATE_LABELS[SESSION_STATES.IDLE];
-  }
-  return SHORT_BACKFILL_STATE_LABELS[bfJob.state] || String(bfJob.state).toUpperCase().slice(0, HUD_STATE_PAD_WIDTH);
-}
-
-/**
- * Abbreviates a FRIGATE_EVENT_STATES value to fit inside a 6-character fixed column.
- *
- * @param {string} state - Frigate event state value.
- * @returns {string}
- */
-function formatShortEvState(state) {
-  return (
-    SHORT_FRIGATE_EVENT_STATE_LABELS[state] ||
-    String(state || SHORT_FRIGATE_EVENT_STATE_LABELS[FRIGATE_EVENT_STATES.IDLE])
-      .toUpperCase()
-      .slice(0, HUD_EVENT_STATE_PAD_WIDTH)
-  );
-}
-
-/**
- * Wake trigger kinds distinguishing motion/detection events from human viewer/API requests.
- *
- * @readonly
- * @enum {string}
- */
-const WAKE_KINDS = Object.freeze({
-  MOTION: 'motion',
-  VIEW: 'view',
-});
-
-/**
- * Fluent builder producing immutable wake/hold request value objects for Camera.applyWakeRequest().
- */
-class WakeRequest {
-  /**
-   * @param {'motion'|'view'} kind - Wake trigger kind.
-   * @param {string} reason - Human-readable trigger description.
-   * @param {number} durationMs - Requested hold duration in milliseconds.
-   */
-  constructor(kind, reason, durationMs) {
-    /** @type {'motion'|'view'} */
-    this._kind = kind === WAKE_KINDS.MOTION ? WAKE_KINDS.MOTION : WAKE_KINDS.VIEW;
-    this._reason = String(reason || '');
-    this._durationMs = Number(durationMs) || 0;
-    this._initiator = 'bridge';
-    this._priority = DEFAULT_EVENT_PRIORITY;
-    this._createEvent = false;
-    this._delayMs = 0;
-  }
-
-  /**
-   * Creates a motion/event wake request builder.
-   *
-   * @param {string} reason - Motion or detection event description.
-   * @param {number} durationMs - Hold duration in milliseconds.
-   * @returns {WakeRequest}
-   */
-  static motion(reason, durationMs) {
-    return new WakeRequest(WAKE_KINDS.MOTION, reason, durationMs);
-  }
-
-  /**
-   * Creates a viewer or external API wake request builder.
-   *
-   * @param {string} reason - Viewer or API wake description.
-   * @param {number} durationMs - Hold duration in milliseconds.
-   * @returns {WakeRequest}
-   */
-  static view(reason, durationMs) {
-    return new WakeRequest(WAKE_KINDS.VIEW, reason, durationMs);
-  }
-
-  /**
-   * Sets the structured initiator tag on this wake request.
-   *
-   * @param {string} initiator - Initiator tag (e.g. 'eufy-event', 'viewer', 'api-wake').
-   * @returns {this}
-   */
-  withInitiator(initiator) {
-    this._initiator = String(initiator || 'bridge');
-    return this;
-  }
-
-  /**
-   * Sets the event priority boost score on this wake request.
-   *
-   * @param {number} priority - Priority score.
-   * @returns {this}
-   */
-  withPriority(priority) {
-    this._priority = Number(priority) || 0;
-    return this;
-  }
-
-  /**
-   * Sets whether this wake request should also file a synthetic Frigate event.
-   *
-   * @param {boolean} createEvent - Whether to create a Frigate event.
-   * @returns {this}
-   */
-  withCreateEvent(createEvent) {
-    this._createEvent = Boolean(createEvent);
-    return this;
-  }
-
-  /**
-   * Sets an optional scheduling delay in milliseconds for API wake pacing.
-   *
-   * @param {number} delayMs - Delay in milliseconds.
-   * @returns {this}
-   */
-  withDelay(delayMs) {
-    this._delayMs = Math.max(0, Number(delayMs) || 0);
-    return this;
-  }
-
-  /**
-   * Builds and returns a deeply frozen immutable wake request object.
-   *
-   * @returns {Readonly<{
-   *   kind: 'motion'|'view',
-   *   reason: string,
-   *   durationMs: number,
-   *   initiator: string,
-   *   priority: number,
-   *   createEvent: boolean,
-   *   delayMs: number,
-   * }>}
-   */
-  build() {
-    return Object.freeze({
-      kind: this._kind,
-      reason: this._reason,
-      durationMs: this._durationMs,
-      initiator: this._initiator,
-      priority: this._priority,
-      createEvent: this._createEvent,
-      delayMs: this._delayMs,
-    });
-  }
 }
 
 /**
@@ -707,7 +170,6 @@ class Camera {
    */
   constructor(rawCamCfg, cachedSnapshot = {frame: null, lastSeen: ''}, renderCardsFn = null) {
     const resolvedCfg = resolveCameraConfig(rawCamCfg);
-    Object.assign(this, resolvedCfg);
     /** @type {string} */
     this.serial = resolvedCfg.serial;
     /** @type {string} */
@@ -743,7 +205,6 @@ class Camera {
     );
     this.rtspEnabledChecked = false;
     this.unexpectedRtspActive = false;
-    this.heardFromDeviceInSession = false;
     this.preserveAspect = resolvedCfg.preserveAspect;
     this.trackStuckSpotlight = Boolean(resolvedCfg.trackStuckSpotlight);
     this.useHwaccel = Boolean(ACTIVE_HWACCEL);
@@ -755,122 +216,70 @@ class Camera {
       ? false
       : shouldProbeStartupSnapshot(this.card.sleepScreen, resolvedCfg.startupSnapshot, cachedSnapshot.frame);
     this.isStartupProbe = false;
-    /** @type {BackfillJob|null} */
-    this.pendingBackfill = null;
-    /** @type {BackfillJob|null} */
-    this.queuedBackfillJob = null;
-    /** @type {BackfillJob|null} */
-    this.activeBackfillJob = null;
-    this.activeBackfillClip = null;
-    this.backfillClip = null;
-    this.backfillClipQueue = [];
-    this.lastDownloadedClipMs = 0;
-    this.lastBackfillQueryAt = 0;
-    this.lastBackfillDownloadFailedAt = 0;
-    this.downloadedPaths = new Set();
-    this.downloadFrames = [];
+    this.backfill = new BackfillState({
+      name: this.name,
+      priority: this.priority,
+      holdMs: this.timers.holdMs,
+      alwaysBackfill: this.alwaysBackfill,
+      backfillDownloads: this.backfillDownloads,
+    });
     this.liveFrames = [];
-    this.pendingVideoPackets = [];
-    this.pendingAudioPackets = [];
-    this.decoderInputEnded = false;
-    this.decoderStdoutPaused = false;
-    this.downloadFinished = false;
-    this.downloadFinishedAt = 0;
-    this.backfillClipStartMs = 0;
-    this.backfillTriggerAtMs = 0;
-    this.backfillPlaybackStartedAt = 0;
-    this.downloadVideoPackets = 0;
-    this.downloadDecodedFrames = 0;
-    this.downloadPlayedFrames = 0;
-    this.backfillContinuation = false;
-    this.activeTriggerEvents = new Set();
-    /** @type {Map<string, number>} */
-    this.activeTriggerStartedAt = new Map();
-    this.lastTriggerStartEvent = '';
-    this.lastTriggerStartAt = 0;
-    this.lastTriggerClearEvent = '';
-    this.lastTriggerClearAt = 0;
-    /** @type {Record<string, *>|null} */
-    this.lastSessionEventInfo = null;
+    this.hardwareTriggers = new HardwareTriggerLedger();
 
     // 4. Active Stream Session & Timers
-    /** @type {string} */
-    this.sessionState = SESSION_STATES.IDLE;
-    /** @type {string} */
-    this.prevSessionState = SESSION_STATES.IDLE;
-    this.sessionStateChangedAt = Date.now();
-    this.active = false;
-    this.activeMode = '';
-    this.starting = false;
-    this.startPromise = null;
+    this.sessionLifecycle = new SessionLifecycle(COOLDOWN_MS, {
+      onTransition: (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug(this, 'session state: ' + prev + ' -> ' + next + suffix);
+      },
+      onRefused: (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug(this, 'refused session state: ' + prev + ' -> ' + next + suffix);
+      },
+    });
+    this.session = new StreamSession({
+      directRtsp: this.directRtsp,
+      timers: this.timers,
+      onDecoderTransition: (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug({name: this.name, state: next}, 'decoder state: ' + prev + ' -> ' + next + suffix);
+      },
+      onDecoderRefused: (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug({name: this.name, state: prev}, 'refused decoder state: ' + prev + ' -> ' + next + suffix);
+      },
+    });
     this.eventActive = false;
-    this.sessionId = 0;
-    this.p2pReady = false;
-    this.rtspRewaking = false;
-    this.rtspRewakeStartedAt = 0;
-    this.rtspRetryTimer = null;
-    this.lastStoppedAt = 0;
     this.lastUnsolicitedStopAt = 0;
-    this.videoWidth = 0;
-    this.videoHeight = 0;
-    this.videoCodec = '';
-    this.motionUntil = 0;
-    this.lastMotionAt = 0;
-    this.motionClearedAt = 0;
     this.lastEarlySleepCheckAt = 0;
     this.lastExtendCheckAt = 0;
     this.extendCheckInFlight = false;
-    this.viewUntil = 0;
-    this.viewSince = 0;
-    this.apiWakeTimer = null;
-    this.apiWakePendingOpts = null;
-    this.apiWakeScheduledAt = 0;
-    /** @type {ReturnType<WakeRequest['build']>|null} */
-    this.deferredLiveWake = null;
+    this.wake = new WakeScheduler();
     this.lastApiTriggerLogAt = 0;
-    this.reason = '';
-    this.wakeInitiator = '';
-    this.sleptAt = 0;
     this.burstUntil = Date.now() + INITIAL_KEYFRAME_BURST_MS;
-    this.firstVideoAt = 0;
-    this.firstFrameAt = 0;
-    this.startedAt = 0;
-    this.lastStartAt = 0;
-    this.lastVideoAt = 0;
-    this.restarts = 0;
-    this.droppedFrames = 0;
-    this.gotVideo = false;
     this.frigateSawObject = false;
     this.lastFrigateObjectAt = 0;
-    this.runtimeExtended = false;
 
-    // 5. Frigate External Event State (FRIGATE_EVENT_STATES FSM)
-    /** @type {string} */
-    this.evState = FRIGATE_EVENT_STATES.IDLE;
-    this.evTimer = null;
-    this.evPending = false;
-    this.evLabel = '';
-    this.evPerson = '';
-    this.evUntil = 0;
-    this.evDispatchedAt = 0;
-    this.evWaitId = 0;
-    this.lastCreatedFrigateEventId = '';
+    // 5. Frigate External Event State (FrigateEventFiling model owns the FSM)
+    this.eventFiling = new FrigateEventFiling(
+      (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug({name: this.name, state: next}, 'frigate event state: ' + prev + ' -> ' + next + suffix);
+      },
+      (prev, next, reason) => {
+        const suffix = reason ? ' (' + reason + ')' : '';
+        log.debug({name: this.name, state: prev}, 'refused frigate event state: ' + prev + ' -> ' + next + suffix);
+      }
+    );
 
-    // 6. FFmpeg Process, Decoder Backpressure FSM & Zero-Allocation Media Buffers
-    /** @type {string} */
-    this.decoderState = DECODER_STATES.DETACHED;
+    // 6. FFmpeg Process & Zero-Allocation Media Buffers
     this.enc = null;
-    this.encoderStoppedForOffline = false;
-    this.offlineSeedTimer = null;
-    this.offlineSeedConsumerSeen = false;
-    this.offlineSeedExpireFn = null;
+    this.offline = new OfflineState();
     this.encoderConsumerConnected = false;
     this.stoppingP2p = false;
     this.idleRssiChangeCount = 0;
     this.idleRssiWindowStartAt = 0;
     this.lastWedgedRadioStopAt = 0;
-    this.dec = null;
-    this.decSpawnedAt = 0;
     this.frame = null;
     this.lastFrame = cachedSnapshot.frame;
     this.frameAt = 0;
@@ -887,11 +296,8 @@ class Camera {
     this.decoderReadBuf = null;
     /** @type {Buffer[]} */
     this.downloadFramePool = [];
-    this.audioOutBuf = Buffer.allocUnsafe(AUDIO_CHUNK);
-    this.pcm = [];
-    this.pcmLen = 0;
-    this.viewers = 0;
-    this.viewerIds = new Map();
+    this.audioQueue = new AudioQueue(AUDIO_CHUNK);
+    this.viewerSet = new ViewerSet();
     this.renderCardsFn = typeof renderCardsFn === 'function' ? renderCardsFn : null;
     this.lastRenderedSnapshot = null;
 
@@ -962,7 +368,7 @@ class Camera {
    * @returns {string}
    */
   getReason() {
-    return this.reason;
+    return this.session.reason;
   }
 
   /**
@@ -971,7 +377,7 @@ class Camera {
    * @returns {number}
    */
   getSessionId() {
-    return this.sessionId;
+    return this.session.id;
   }
 
   /**
@@ -980,7 +386,7 @@ class Camera {
    * @returns {boolean}
    */
   isSessionActive() {
-    return Boolean(this.active);
+    return Boolean(this.session.active);
   }
 
   /**
@@ -989,7 +395,7 @@ class Camera {
    * @returns {string}
    */
   getActiveMode() {
-    return this.activeMode;
+    return this.session.mode;
   }
 
   /**
@@ -1025,7 +431,7 @@ class Camera {
    * @returns {string}
    */
   getVideoCodec() {
-    return this.videoCodec;
+    return this.session.videoCodec;
   }
 
   /**
@@ -1034,7 +440,7 @@ class Camera {
    * @returns {string}
    */
   getStreamDimensionsSummary() {
-    return this.videoWidth + 'x' + this.videoHeight;
+    return this.session.videoWidth + 'x' + this.session.videoHeight;
   }
 
   /**
@@ -1044,6 +450,163 @@ class Camera {
    */
   getLastFrameBuffer() {
     return this.lastFrame;
+  }
+
+  /**
+   * Returns the explicit logger scope of this camera: its scope name plus the current session state, which the
+   * logger prints as the "[STATE]" tag.
+   *
+   * @returns {Readonly<{ name: string, state: string }>}
+   */
+  getLogScope() {
+    return Object.freeze({name: this.getScopeName(), state: this.sessionLifecycle.getState()});
+  }
+
+  /**
+   * Returns the resolved camera operating mode ('backfill', 'rtsp', 'p2p', 'auto', or 'custom').
+   *
+   * @returns {string}
+   */
+  getConfiguredMode() {
+    return this.mode;
+  }
+
+  /**
+   * Returns true when this camera is configured to use the RTSP stream (use_rtsp, or a direct rtsp_url).
+   *
+   * @returns {boolean}
+   */
+  isRtspEnabled() {
+    return Boolean(this.useRtsp);
+  }
+
+  /**
+   * Returns true once the active session has decoded its first video frame.
+   *
+   * @returns {boolean}
+   */
+  hasGotVideo() {
+    return Boolean(this.session.gotVideo);
+  }
+
+  /**
+   * Returns the number of wake or start retries made in the active session.
+   *
+   * @returns {number}
+   */
+  getRestartCount() {
+    return this.session.restarts;
+  }
+
+  /**
+   * Returns true once the camera hardware has sent any event or packet during the active session.
+   *
+   * @returns {boolean}
+   */
+  hasHeardFromDeviceInSession() {
+    return Boolean(this.session.heardFromDevice);
+  }
+
+  /**
+   * Returns true once the Eufy rtspStream property has been verified as enabled for this camera.
+   *
+   * @returns {boolean}
+   */
+  hasRtspPropertyChecked() {
+    return Boolean(this.rtspEnabledChecked);
+  }
+
+  /**
+   * Returns true while a backfill clip sequence continues after the current download finishes.
+   *
+   * @returns {boolean}
+   */
+  hasBackfillContinuation() {
+    return this.backfill.hasContinuation();
+  }
+
+  /**
+   * Returns true when video packets are queued waiting for a decoder process.
+   *
+   * @returns {boolean}
+   */
+  hasPendingVideoPackets() {
+    return this.session.hasPendingVideoPackets();
+  }
+
+  /**
+   * Returns true if proc is the decoder process currently attached to this camera.
+   *
+   * @param {*} proc - Candidate FFmpeg decoder process.
+   * @returns {boolean}
+   */
+  isDecoderProcess(proc) {
+    return this.session.isDecoderProcess(proc);
+  }
+
+  /**
+   * Returns true once a Frigate mask polygon has been verified or applied for this camera.
+   *
+   * @returns {boolean}
+   */
+  hasSyncedMaskPolygon() {
+    return Boolean(this.card.lastSyncedMaskPoly);
+  }
+
+  /**
+   * Returns the status card configuration (theme, position, sleep screen) used for rendering.
+   *
+   * @returns {{ theme: string, position: string, sleepScreen: string }}
+   */
+  getCardConfig() {
+    return this.card.config;
+  }
+
+  /**
+   * Returns the configured status card placement.
+   *
+   * @returns {string}
+   */
+  getCardPosition() {
+    return this.card.position;
+  }
+
+  /**
+   * Returns true when this camera is configured with the diagnostic "hud" card theme.
+   *
+   * @returns {boolean}
+   */
+  usesDebugHudTheme() {
+    return this.card.theme === CARD_THEMES.HUD;
+  }
+
+  /**
+   * Evaluates the status card visual state (colors, battery, Wi-Fi, temperature) for a status title.
+   *
+   * @param {string} statusTitle - Card status title such as 'Live' or 'Asleep'.
+   * @returns {Record<string, *>}
+   */
+  evaluateVisualState(statusTitle) {
+    return this.telemetry.evaluateVisualState(statusTitle);
+  }
+
+  /**
+   * Returns the alternating scratch buffer to composite a live status card onto baseCanvas.
+   *
+   * @param {Uint8Array} baseCanvas - Source or prepared background YUV420p frame.
+   * @returns {Uint8Array}
+   */
+  acquireLiveOverlayBuffer(baseCanvas) {
+    return this.card.prepareLiveOverlayBuffer(baseCanvas);
+  }
+
+  /**
+   * Registers the lazy renderer used to build the asleep, waking, and busy status cards on demand.
+   *
+   * @param {(titleText: string, targetBuf: Uint8Array) => Uint8Array} renderer - Card renderer callback.
+   */
+  setLazyCardRenderer(renderer) {
+    this.card.setLazyCardRenderer(renderer);
   }
 
   /**
@@ -1225,9 +788,7 @@ class Camera {
    * @returns {string}
    */
   peekEffectiveSessionState(now = Date.now()) {
-    return this.sessionState === SESSION_STATES.COOLDOWN && now - this.sleptAt >= COOLDOWN_MS
-      ? SESSION_STATES.IDLE
-      : this.sessionState;
+    return this.sessionLifecycle.peekEffective(now);
   }
 
   /**
@@ -1237,9 +798,7 @@ class Camera {
    * @returns {string}
    */
   peekEffectiveFrigateEventState(now = Date.now()) {
-    return this.evState === FRIGATE_EVENT_STATES.COOLDOWN && now >= (this.evUntil || 0)
-      ? FRIGATE_EVENT_STATES.IDLE
-      : this.evState;
+    return this.eventFiling.peekEffectiveState(now);
   }
 
   /**
@@ -1251,13 +810,14 @@ class Camera {
    */
   resolveRuntimeStatus(now = Date.now()) {
     const streaming =
-      this.isStreamingLive(now, DEFAULT_FRESH_FRAME_MAX_AGE_MS) || Boolean(this.active && this.gotVideo);
+      this.isStreamingLive(now, DEFAULT_FRESH_FRAME_MAX_AGE_MS) ||
+      Boolean(this.session.active && this.session.gotVideo);
     if (streaming) {
-      return this.isBackfillPlayback() || this.backfillContinuation
+      return this.isBackfillPlayback() || this.backfill.hasContinuation()
         ? CAMERA_RUNTIME_STATUSES.BACKFILL
         : CAMERA_RUNTIME_STATUSES.LIVE;
     }
-    if (this.active && !this.isBackfillPlayback() && !this.isRtspDirect()) {
+    if (this.session.active && !this.isBackfillPlayback() && !this.isRtspDirect()) {
       return CAMERA_RUNTIME_STATUSES.WAKING;
     }
     if (this.isWaitingForSlotOrBackfill(now, DEFAULT_FRESH_FRAME_MAX_AGE_MS)) {
@@ -1296,12 +856,12 @@ class Camera {
   _buildEncoderStatusSummary(now) {
     return Object.freeze({
       running: this.hasEncoderProcess(),
-      paused_for_offline: Boolean(this.encoderStoppedForOffline),
+      paused_for_offline: this.offline.isEncoderStopped(),
       codec: this.resolveEncoderCodec(ACTIVE_HWACCEL),
       hwaccel_fallback: Boolean(ACTIVE_HWACCEL && !this.useHwaccel),
       consumer_connected: Boolean(this.encoderConsumerConnected),
       stdin_backpressured: this.isEncoderStdinBackpressured(),
-      target_fps: this.active || this.isInKeyframeBurst(now) ? LIVE_FPS : IDLE_FPS,
+      target_fps: this.session.active || this.isInKeyframeBurst(now) ? LIVE_FPS : IDLE_FPS,
       measured_fps: this.measuredFps > 0 ? roundTenths(this.measuredFps) : 0,
       last_write_ago_secs: Math.max(0, roundTenths((now - this.lastWrite) / MS_PER_SECOND)),
       has_cached_snapshot: Buffer.isBuffer(this.lastFrame),
@@ -1317,31 +877,35 @@ class Camera {
   _buildSessionStatusSummary(now) {
     const wantUntilMs = this.wantUntil();
     const hasFiniteHold =
-      this.active &&
+      this.session.active &&
       !this.isRtspDirect() &&
       !this.isBackfillPlayback() &&
       wantUntilMs > 0 &&
       Number.isFinite(wantUntilMs);
-    const hasDimensions = this.active && this.videoWidth > 0 && this.videoHeight > 0;
+    const hasDimensions = this.session.active && this.session.videoWidth > 0 && this.session.videoHeight > 0;
     return Object.freeze({
-      id: this.sessionId,
-      active_mode: this.active ? this.activeMode || null : null,
-      initiator: this.active ? this.wakeInitiator || null : null,
-      reason: this.active ? this.reason || null : null,
-      got_video: Boolean(this.gotVideo),
-      video_codec: this.active && this.videoCodec ? this.videoCodec : null,
+      id: this.session.id,
+      active_mode: this.session.active ? this.session.mode || null : null,
+      initiator: this.session.active ? this.session.initiator || null : null,
+      reason: this.session.active ? this.session.reason || null : null,
+      got_video: Boolean(this.session.gotVideo),
+      video_codec: this.session.active && this.session.videoCodec ? this.session.videoCodec : null,
       resolution: hasDimensions ? this.getStreamDimensionsSummary() : null,
       uptime_secs:
-        this.active && this.startedAt > 0 ? Math.max(0, Math.round((now - this.startedAt) / MS_PER_SECOND)) : null,
+        this.session.active && this.session.startedAt > 0
+          ? Math.max(0, Math.round((now - this.session.startedAt) / MS_PER_SECOND))
+          : null,
       hold_remaining_secs: hasFiniteHold ? Math.max(0, Math.round((wantUntilMs - now) / MS_PER_SECOND)) : null,
       last_video_ago_secs:
-        this.lastVideoAt > 0 ? Math.max(0, roundTenths((now - this.lastVideoAt) / MS_PER_SECOND)) : null,
+        this.session.lastVideoAt > 0
+          ? Math.max(0, roundTenths((now - this.session.lastVideoAt) / MS_PER_SECOND))
+          : null,
       decoder_running: this.hasDecoderProcess(),
-      decoder_state: this.decoderState,
-      restarts: this.restarts || 0,
-      dropped_frames: this.droppedFrames || 0,
+      decoder_state: this.session.decoderState,
+      restarts: this.session.restarts || 0,
+      dropped_frames: this.session.droppedFrames || 0,
       queued_live_frames: this.liveFrames.length,
-      queued_download_frames: this.downloadFrames.length,
+      queued_download_frames: this.backfill.frames.length,
     });
   }
 
@@ -1352,15 +916,9 @@ class Camera {
    * @returns {Readonly<Record<string, *>>}
    */
   _buildViewersStatusSummary(now) {
-    let waking = 0;
-    for (const isWaking of this.viewerIds.values()) {
-      if (isWaking) {
-        waking++;
-      }
-    }
     return Object.freeze({
-      connected: this.viewers || 0,
-      waking,
+      connected: this.viewerSet.count(),
+      waking: this.viewerSet.wakingCount(),
       actively_viewing: this.isActivelyViewing(now),
     });
   }
@@ -1372,12 +930,13 @@ class Camera {
    * @returns {Readonly<Record<string, *>>}
    */
   _buildFrigateEventStatusSummary(now) {
-    const hasRemaining = this.evUntil > now && Number.isFinite(this.evUntil);
+    const eventUntil = this.eventFiling.until;
+    const hasRemaining = eventUntil > now && Number.isFinite(eventUntil);
     return Object.freeze({
       state: this.peekEffectiveFrigateEventState(now),
-      label: this.evLabel || null,
-      remaining_secs: hasRemaining ? Math.max(0, Math.round((this.evUntil - now) / MS_PER_SECOND)) : null,
-      last_event_id: this.lastCreatedFrigateEventId || null,
+      label: this.eventFiling.label || null,
+      remaining_secs: hasRemaining ? Math.max(0, Math.round((eventUntil - now) / MS_PER_SECOND)) : null,
+      last_event_id: this.eventFiling.lastCreatedId || null,
       mask_synced: this.hasAutoFrigateMask() ? Boolean(this.card.lastSyncedMaskPoly) : null,
     });
   }
@@ -1391,17 +950,17 @@ class Camera {
     if (this.directRtsp) {
       return null;
     }
-    const bfJob = this.pendingBackfill || this.activeBackfillJob;
+    const bfJob = this.backfill.pending || this.backfill.active;
     const playing = this.isBackfillPlayback();
     return Object.freeze({
-      state: bfJob && bfJob.state ? bfJob.state : SESSION_STATES.IDLE,
+      state: bfJob && bfJob.getState() ? bfJob.getState() : SESSION_STATES.IDLE,
       pending: this.hasPendingBackfill(),
       playing,
-      label: bfJob && bfJob.event ? bfJob.event : null,
-      query_attempts: bfJob ? bfJob.attempts || 0 : 0,
-      queued_clips: this.backfillClipQueue.length + (this.backfillClip ? 1 : 0),
-      played_frames: playing ? this.downloadPlayedFrames || 0 : 0,
-      decoded_frames: playing ? this.downloadDecodedFrames || 0 : 0,
+      label: bfJob && bfJob.getEvent() ? bfJob.getEvent() : null,
+      query_attempts: bfJob ? bfJob.getQueryAttempts() || 0 : 0,
+      queued_clips: this.backfill.clipQueue.length + (this.backfill.clip ? 1 : 0),
+      played_frames: playing ? this.backfill.playedFrames || 0 : 0,
+      decoded_frames: playing ? this.backfill.decodedFrames || 0 : 0,
     });
   }
 
@@ -1418,10 +977,12 @@ class Camera {
     const active = this.hasActiveHardwareTriggers(now);
     return Object.freeze({
       active,
-      active_events: active ? Object.freeze([...this.activeTriggerEvents]) : Object.freeze([]),
-      last_event: this.lastTriggerStartEvent || null,
+      active_events: active ? Object.freeze(this.hardwareTriggers.activeEvents()) : Object.freeze([]),
+      last_event: this.hardwareTriggers.lastStartEvent() || null,
       last_event_ago_secs:
-        this.lastMotionAt > 0 ? Math.max(0, Math.round((now - this.lastMotionAt) / MS_PER_SECOND)) : null,
+        this.session.lastMotionAt > 0
+          ? Math.max(0, Math.round((now - this.session.lastMotionAt) / MS_PER_SECOND))
+          : null,
     });
   }
 
@@ -1445,8 +1006,11 @@ class Camera {
       rtsp_url: rtspShown ? this.getMaskedRtspUrl() || null : null,
       status: this.resolveRuntimeStatus(now),
       session_state: this.peekEffectiveSessionState(now),
-      state_duration_secs: Math.max(0, Math.round((now - (this.sessionStateChangedAt || now)) / MS_PER_SECOND)),
-      active: Boolean(this.active),
+      state_duration_secs: Math.max(
+        0,
+        Math.round((now - (this.sessionLifecycle.getChangedAt() || now)) / MS_PER_SECOND)
+      ),
+      active: Boolean(this.session.active),
       passive_probe: this.isPassiveRtspDirectProbe(),
       reachable: this.isReachable(),
       disrupted: this.hasServiceDisruption(),
@@ -1699,83 +1263,18 @@ class Camera {
    * @returns {string}
    */
   transitionTo(nextState, now = Date.now(), reason = '') {
-    const prevState = this.sessionState;
-    if (prevState && !canTransitionSession(prevState, nextState)) {
-      return this.sessionState;
-    }
-    this.sessionState = nextState;
-    if (nextState === SESSION_STATES.COOLDOWN && !this.sleptAt) {
-      this.sleptAt = now;
-    }
-    if (prevState && prevState !== nextState) {
-      this.prevSessionState = prevState;
-      this.sessionStateChangedAt = now;
-      const suffix = reason ? ' (' + reason + ')' : '';
-      log.debug(this, 'session state: ' + prevState + ' -> ' + nextState + suffix);
-    }
-    return this.sessionState;
-  }
-
-  /**
-   * Transitions the decoder backpressure FSM to nextState when permitted by ALLOWED_DECODER_TRANSITIONS.
-   *
-   * @param {string} nextState - Target DECODER_STATES value.
-   * @param {string} [reason=''] - Optional human-readable transition trigger reason.
-   * @returns {string}
-   */
-  _transitionDecoderTo(nextState, reason = '') {
-    const prevState = this.decoderState;
-    const allowed = ALLOWED_DECODER_TRANSITIONS[prevState];
-    if (!prevState || (allowed && allowed.has(nextState))) {
-      this.decoderState = nextState;
-      if (prevState && prevState !== nextState) {
-        const suffix = reason ? ' (' + reason + ')' : '';
-        log.debug(
-          {name: this.name, decoderState: this.decoderState},
-          'decoder state: ' + prevState + ' -> ' + nextState + suffix
-        );
-      }
-    }
-    return this.decoderState;
-  }
-
-  /**
-   * Transitions the Frigate event lifecycle FSM to nextState when permitted by ALLOWED_FRIGATE_EVENT_TRANSITIONS.
-   *
-   * @param {string} nextState - Target FRIGATE_EVENT_STATES value.
-   * @param {string} [reason=''] - Optional human-readable transition trigger reason.
-   * @returns {string}
-   */
-  _transitionFrigateEventTo(nextState, reason = '') {
-    const prevState = this.evState;
-    const allowed = ALLOWED_FRIGATE_EVENT_TRANSITIONS[prevState];
-    if (!prevState || (allowed && allowed.has(nextState))) {
-      this.evState = nextState;
-      if (prevState && prevState !== nextState) {
-        const suffix = reason ? ' (' + reason + ')' : '';
-        log.debug(
-          {name: this.name, evState: this.evState},
-          'frigate event state: ' + prevState + ' -> ' + nextState + suffix
-        );
-      }
-    }
-    return this.evState;
+    return this.sessionLifecycle.transitionTo(nextState, now, reason);
   }
 
   /**
    * Resets per-decoder backpressure queues and active frame state.
    */
   _resetDecoderPipeState() {
-    this.pendingVideoPackets = [];
-    this.pendingAudioPackets = [];
+    this.session.resetDecoderPipeState();
     this.liveFrames = [];
-    this.decoderInputEnded = false;
-    this.decoderStdoutPaused = false;
     this.frame = null;
-    this.firstFrameAt = 0;
     this.frameNew = false;
-    this.pcm = [];
-    this.pcmLen = 0;
+    this.audioQueue.clear();
   }
 
   /**
@@ -1786,10 +1285,7 @@ class Camera {
    * @returns {string}
    */
   getSessionState(now = Date.now()) {
-    if (this.sessionState === SESSION_STATES.COOLDOWN && now - this.sleptAt >= COOLDOWN_MS) {
-      this.transitionTo(SESSION_STATES.IDLE, now, 'cooldown elapsed');
-    }
-    return this.sessionState;
+    return this.sessionLifecycle.refresh(now);
   }
 
   /**
@@ -1802,44 +1298,26 @@ class Camera {
   beginSession(mode, now = Date.now(), p2pReady = true) {
     this.getSessionState(now);
     this.getFrigateEventState(now);
-    this.active = true;
     this.stoppingP2p = false;
     this.unexpectedRtspActive = false;
-    this.heardFromDeviceInSession = false;
     this.idleRssiChangeCount = 0;
     this.idleRssiWindowStartAt = 0;
-    this.activeMode = mode;
-    switch (mode) {
-      case STREAM_MODES.RTSP:
-        this.transitionTo(SESSION_STATES.WAKING_RTSP, now, 'session start: rtsp');
-        break;
-      case STREAM_MODES.DOWNLOAD:
-        this.transitionTo(SESSION_STATES.HANDSHAKING_BACKFILL, now, 'session start: backfill download');
-        break;
-      default:
-        this.transitionTo(SESSION_STATES.WAKING_P2P, now, 'session start: p2p');
-        break;
-    }
+    const nextState = this.session.begin(mode, now, p2pReady);
+    const startReason =
+      mode === STREAM_MODES.RTSP
+        ? 'session start: rtsp'
+        : mode === STREAM_MODES.DOWNLOAD
+          ? 'session start: backfill download'
+          : 'session start: p2p';
+    this.transitionTo(nextState, now, startReason);
     if (mode !== STREAM_MODES.DOWNLOAD) {
-      this.activeBackfillJob = null;
-      this.backfillContinuation = false;
+      this.backfill.clearActiveForLiveSession();
       this.clearDeferredLiveWake();
     }
-    this.sessionId++;
-    this.p2pReady = p2pReady;
-    this.startedAt = now;
-    this.lastStartAt = now;
-    this.gotVideo = false;
     this.frigateSawObject = false;
     this.lastFrigateObjectAt = 0;
     this.lastExtendCheckAt = 0;
     this.extendCheckInFlight = false;
-    this.runtimeExtended = false;
-    this.rtspRewaking = false;
-    this.rtspRewakeStartedAt = 0;
-    this.restarts = 0;
-    this.droppedFrames = 0;
-    this.lastVideoAt = 0;
     this._resetDecoderPipeState();
     this.burstUntil = mode === STREAM_MODES.DOWNLOAD ? 0 : now + KEYFRAME_BURST_MS;
   }
@@ -1856,25 +1334,15 @@ class Camera {
     now = Date.now(),
     hadVideo = undefined,
     preemptedByViewer = false,
-    closedMode = this.activeMode || STREAM_MODES.P2P
+    closedMode = this.session.mode || STREAM_MODES.P2P
   ) {
-    this.active = false;
-    this.activeMode = '';
     this.unexpectedRtspActive = false;
-    this.heardFromDeviceInSession = false;
     this.idleRssiChangeCount = 0;
     this.idleRssiWindowStartAt = 0;
-    this.downloadFinished = false;
-    this.downloadFinishedAt = 0;
-    this.downloadFrames = [];
+    this.backfill.resetTransferState();
     this.downloadFramePool.length = 0;
     this._resetDecoderPipeState();
-    this._transitionDecoderTo(DECODER_STATES.DETACHED, 'session ended');
-    this.starting = false;
-    this.startPromise = null;
-    if (hadVideo === false) {
-      this.gotVideo = false;
-    }
+    this.session.end(now, hadVideo);
     if (!hadVideo) {
       this.abortPendingFrigateEvent('session ended without video');
     }
@@ -1884,26 +1352,15 @@ class Camera {
     this.lastFrigateObjectAt = 0;
     this.lastExtendCheckAt = 0;
     this.extendCheckInFlight = false;
-    this.runtimeExtended = false;
-    this.motionUntil = 0;
     this.eventPriority = 0;
-    this.p2pReady = false;
-    this.rtspRewaking = false;
-    this.rtspRewakeStartedAt = 0;
     this.isStartupProbe = false;
-    this.motionClearedAt = 0;
-    this.lastStartAt = 0;
-    this.sessionId++;
-    this.lastStoppedAt = now;
-    this.decSpawnedAt = 0;
     if (closedMode === STREAM_MODES.DOWNLOAD) {
       this._finalizeDownloadSessionEnd(now, hadVideo, preemptedByViewer);
     } else {
-      this.activeBackfillClip = null;
-      this.backfillContinuation = false;
+      this.backfill.clearActiveClipAfterLiveEnd();
       this._clearActiveHardwareTriggers();
       if (hadVideo && !preemptedByViewer) {
-        this.sleptAt = now;
+        this.sessionLifecycle.markSlept(now);
         this.transitionTo(SESSION_STATES.COOLDOWN, now, 'live session ended, entering cooldown');
       } else {
         this.transitionTo(
@@ -1925,34 +1382,6 @@ class Camera {
   }
 
   /**
-   * Re-queues an interrupted or failed backfill download clip at the front of backfillClipQueue
-   * when attempts remain under MAX_BACKFILL_CLIP_DOWNLOAD_ATTEMPTS.
-   *
-   * @param {Record<string, *>|null} activeClip - Active clip descriptor from the ended download.
-   * @param {number} now - Current epoch timestamp in milliseconds.
-   */
-  _requeueFailedBackfillClip(activeClip, now) {
-    if (!activeClip) {
-      return;
-    }
-    const attempts = Number(activeClip.downloadAttempts) || 1;
-    if (attempts >= MAX_BACKFILL_CLIP_DOWNLOAD_ATTEMPTS) {
-      return;
-    }
-    this.downloadedPaths.delete(activeClip.storagePath);
-    this.backfillClipQueue = [
-      activeClip,
-      ...this.backfillClipQueue.filter((item) => item.storagePath !== activeClip.storagePath),
-    ];
-    this.backfillClip = this.backfillClipQueue[0] || null;
-    if (this.activeBackfillJob && !this.pendingBackfill) {
-      this.activeBackfillJob.transitionTo(BACKFILL_STATES.MATCHED, 're-queued after failed download');
-      this.pendingBackfill = this.activeBackfillJob;
-    }
-    this.lastBackfillDownloadFailedAt = now;
-  }
-
-  /**
    * Finalizes backfill clip/job queues, follow-up queries, and continuation state when a
    * STREAM_MODES.DOWNLOAD session ends.
    *
@@ -1961,59 +1390,8 @@ class Camera {
    * @param {boolean} preemptedByViewer - Whether stopped due to viewer switching cameras.
    */
   _finalizeDownloadSessionEnd(now, hadVideo, preemptedByViewer) {
-    const activeClip = this.activeBackfillClip;
-    const downloadSucceeded = hadVideo === undefined ? true : Boolean(hadVideo);
-    this.activeBackfillClip = null;
     this.transitionTo(SESSION_STATES.IDLE, now, 'backfill session ended');
-    if (downloadSucceeded) {
-      this.lastBackfillDownloadFailedAt = 0;
-    } else if (!preemptedByViewer) {
-      this._requeueFailedBackfillClip(activeClip, now);
-    }
-    if (!this.pendingBackfill && this.queuedBackfillJob) {
-      this.pendingBackfill = this.queuedBackfillJob;
-      this.queuedBackfillJob = null;
-    }
-    const shouldPrepareFollowUp = Boolean(
-      downloadSucceeded &&
-      !preemptedByViewer &&
-      !this.pendingBackfill &&
-      this.backfillClipQueue.length === 0 &&
-      this.activeBackfillJob &&
-      this.activeBackfillJob.needsFollowUpClipQuery(this.lastDownloadedClipMs)
-    );
-    if (shouldPrepareFollowUp && this.activeBackfillJob) {
-      this.activeBackfillJob.prepareFollowUpQuery(now);
-      this.pendingBackfill = this.activeBackfillJob;
-      this.lastBackfillQueryAt = 0;
-    }
-    this.backfillContinuation = Boolean(
-      !preemptedByViewer && downloadSucceeded && (this.backfillClipQueue.length > 0 || this.pendingBackfill)
-    );
-    this._completeActiveBackfillJobAfterDownload(downloadSucceeded && !preemptedByViewer);
-  }
-
-  /**
-   * Updates activeBackfillJob state once a download attempt finishes or yields to remaining clips.
-   *
-   * @param {boolean} completedCleanly - Whether the clip finished cleanly without viewer preemption.
-   */
-  _completeActiveBackfillJobAfterDownload(completedCleanly) {
-    if (this.backfillClipQueue.length === 0) {
-      if (this.activeBackfillJob && !this.pendingBackfill) {
-        this.activeBackfillJob.completeCurrentDownload();
-      }
-      this.activeBackfillJob = null;
-      return;
-    }
-    if (
-      completedCleanly &&
-      this.activeBackfillJob &&
-      !this.pendingBackfill &&
-      this.activeBackfillJob.matchedClips.length > 0
-    ) {
-      this.activeBackfillJob.completeCurrentDownload();
-    }
+    this.backfill.finalizeDownloadEnd(now, hadVideo, preemptedByViewer);
   }
 
   /**
@@ -2035,47 +1413,26 @@ class Camera {
    * }}
    */
   terminateSession(now, why, preemptedByViewer = false, initiator = 'bridge') {
-    const effectiveNow = Math.max(now, this.lastStartAt || 0, this.startedAt || 0);
-    const inFlightStart = this.startPromise;
+    const effectiveNow = Math.max(now, this.session.lastStartAt || 0, this.session.startedAt || 0);
+    const inFlightStart = this.session.startPromise;
     const hadVideo = this.hasConfirmedSessionVideo();
     const hasFreshSessionFrame = Buffer.isBuffer(this.frame) && this.frame.length === FRAME;
     const shouldPersistSnapshot = Boolean(hadVideo || this.hasDecodedFrame() || hasFreshSessionFrame);
-    const hadDownloadFinished = Boolean(this.downloadFinished);
+    const hadDownloadFinished = Boolean(this.backfill.finished);
     const hadUnexpectedRtsp = Boolean(this.unexpectedRtspActive);
-    const hadHeardFromDevice = Boolean(this.heardFromDeviceInSession);
+    const hadHeardFromDevice = Boolean(this.session.heardFromDevice);
     const wasEventActive = this.eventActive;
-    const prevMotionUntil = this.motionUntil;
-    const liveSecs = Math.round((effectiveNow - this.startedAt) / 1000);
-    const lastVideoAgo = this.lastVideoAt ? ((effectiveNow - this.lastVideoAt) / 1000).toFixed(1) + 's' : 'none';
-    const restartsCount = this.restarts;
-    const closedSession = this.sessionId;
-    const closedMode = this.activeMode || STREAM_MODES.P2P;
+    const prevMotionUntil = this.session.motionUntil;
+    const liveSecs = Math.round((effectiveNow - this.session.startedAt) / MS_PER_SECOND);
+    const lastVideoAgo = this.session.lastVideoAt
+      ? ((effectiveNow - this.session.lastVideoAt) / MS_PER_SECOND).toFixed(1) + 's'
+      : 'none';
+    const restartsCount = this.session.restarts;
+    const closedSession = this.session.id;
+    const closedMode = this.session.mode || STREAM_MODES.P2P;
     const isDownload = closedMode === STREAM_MODES.DOWNLOAD;
-    const frameBasis = this.downloadDecodedFrames || this.downloadVideoPackets;
-    const clipDurationSecs = (frameBasis / Math.max(1, LIVE_FPS)).toFixed(1);
-    const playbackSpanSecs =
-      this.backfillPlaybackStartedAt > 0 && this.lastVideoAt >= this.backfillPlaybackStartedAt
-        ? ((this.lastVideoAt - this.backfillPlaybackStartedAt) / 1000).toFixed(1)
-        : '0.0';
-    const postHoldSecs = this.lastVideoAt > 0 ? ((effectiveNow - this.lastVideoAt) / 1000).toFixed(1) : '0.0';
     const backfillSummary = isDownload
-      ? ', clipStart=' +
-        formatEpochHms(this.backfillClipStartMs) +
-        ', triggerAt=' +
-        formatEpochHms(this.backfillTriggerAtMs) +
-        ', clipDuration=' +
-        clipDurationSecs +
-        's, decodedFrames=' +
-        this.downloadDecodedFrames +
-        ', playedFrames=' +
-        this.downloadPlayedFrames +
-        ', packets=' +
-        this.downloadVideoPackets +
-        ', playbackSpan=' +
-        playbackSpanSecs +
-        's, postHold=' +
-        postHoldSecs +
-        's'
+      ? this.backfill.formatSleepSummary(effectiveNow, this.session.lastVideoAt, LIVE_FPS)
       : '';
 
     this.clearApiWakeTimer();
@@ -2090,23 +1447,19 @@ class Camera {
       wasEventActive &&
       !isDownload &&
       (preemptedByViewer || String(initiator).startsWith(ARBITRATOR_INITIATOR_PREFIX)) &&
-      prevMotionUntil > effectiveNow &&
-      !this.pendingBackfill &&
-      this.backfillDownloads
+      prevMotionUntil > effectiveNow
     ) {
-      this.pendingBackfill = new BackfillJob(
-        this.lastSessionEventInfo || {
-          name: this.name,
-          at: this.startedAt || effectiveNow,
-          lastActivityAt: this.lastMotionAt || effectiveNow,
-          event: this.evLabel || 'motion detected',
-          personName: this.evPerson || '',
-          reason: this.reason || 'motion detected',
-          priority: this.priority + (this.eventPriority || DEFAULT_EVENT_PRIORITY),
-          attempts: 0,
-          recordingActive: true,
-        }
-      );
+      this.backfill.requeuePreemptedEvent({
+        name: this.name,
+        at: this.session.startedAt || effectiveNow,
+        lastActivityAt: this.session.lastMotionAt || effectiveNow,
+        event: this.eventFiling.label || 'motion detected',
+        personName: this.eventFiling.person || '',
+        reason: this.session.reason || 'motion detected',
+        priority: this.priority + (this.eventPriority || DEFAULT_EVENT_PRIORITY),
+        attempts: 0,
+        recordingActive: true,
+      });
     }
     const wokeWithoutDeviceReply = Boolean(
       !this.isRtspDirect() &&
@@ -2118,7 +1471,7 @@ class Camera {
       this.telemetry.markWakeTimedOut();
     }
     if (this.isDeviceOffline()) {
-      this.motionUntil = 0;
+      this.session.motionUntil = 0;
       this._clearActiveHardwareTriggers();
       this.clearDeferredLiveWake();
       this.clearViewerQueue('device_offline');
@@ -2159,7 +1512,7 @@ class Camera {
    * @returns {number}
    */
   wantUntil() {
-    return Math.max(this.motionUntil, this.viewUntil);
+    return this.session.wantUntil();
   }
 
   /**
@@ -2169,7 +1522,7 @@ class Camera {
    * @returns {boolean}
    */
   isInMotion(now = Date.now()) {
-    return now < this.motionUntil;
+    return this.session.isInMotion(now);
   }
 
   /**
@@ -2188,7 +1541,7 @@ class Camera {
    * @returns {boolean}
    */
   usesP2pSlot() {
-    return Boolean(this.active && this.activeMode !== STREAM_MODES.RTSP);
+    return this.session.usesP2pSlot();
   }
 
   /**
@@ -2200,11 +1553,7 @@ class Camera {
    * @returns {boolean}
    */
   isOccupyingStationP2pChannel() {
-    return Boolean(
-      this.active &&
-      this.activeMode !== STREAM_MODES.RTSP &&
-      !(this.activeMode === STREAM_MODES.DOWNLOAD && this.downloadFinished)
-    );
+    return this.session.isOccupyingP2pChannel(this.backfill.finished);
   }
 
   /**
@@ -2213,7 +1562,7 @@ class Camera {
    * @returns {boolean}
    */
   isActiveRtspSession() {
-    return Boolean(this.active && this.activeMode === STREAM_MODES.RTSP);
+    return this.session.isActiveRtsp();
   }
 
   /**
@@ -2222,7 +1571,7 @@ class Camera {
    * @returns {boolean}
    */
   isActiveLiveSession() {
-    return Boolean(this.active && this.activeMode !== STREAM_MODES.DOWNLOAD);
+    return this.session.isActiveLive();
   }
 
   /**
@@ -2238,11 +1587,11 @@ class Camera {
    * Returns true if this camera is active in the given RTSP session, has a resolved rtspUrl,
    * and does not yet have a running FFmpeg decoder process.
    *
-   * @param {number} [sessionId=this.sessionId] - Expected session identifier.
+   * @param {number} [sessionId=this.session.id] - Expected session identifier.
    * @returns {boolean}
    */
-  canSpawnRtspDecoder(sessionId = this.sessionId) {
-    return Boolean(this.isCurrentSession(sessionId, STREAM_MODES.RTSP) && this.rtspUrl && !this.dec);
+  canSpawnRtspDecoder(sessionId = this.session.id) {
+    return Boolean(this.isCurrentSession(sessionId, STREAM_MODES.RTSP) && this.rtspUrl && !this.session.dec);
   }
 
   /**
@@ -2251,7 +1600,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldFileInitialRtspEvent() {
-    return Boolean(this.eventActive && !this.rtspRewaking && this.restarts === 0);
+    return Boolean(this.eventActive && !this.session.rtspRewaking && this.session.restarts === 0);
   }
 
   /**
@@ -2260,7 +1609,7 @@ class Camera {
    * @returns {boolean}
    */
   isEstablishedRtspStream() {
-    return Boolean(this.gotVideo && !this.rtspRewaking);
+    return this.session.isEstablishedRtsp();
   }
 
   /**
@@ -2270,7 +1619,7 @@ class Camera {
    * @returns {boolean}
    */
   wantsWake(now = Date.now()) {
-    return Boolean(!this.active && !this.isDeviceOffline() && now < this.wantUntil());
+    return Boolean(!this.session.active && !this.isDeviceOffline() && now < this.wantUntil());
   }
 
   /**
@@ -2290,7 +1639,7 @@ class Camera {
    * @returns {boolean}
    */
   hasExpiredLiveHold(now = Date.now()) {
-    return Boolean(!this.isRtspDirect() && this.isActiveLiveSession() && now >= this.wantUntil());
+    return this.session.hasExpiredLiveHold(now);
   }
 
   /**
@@ -2320,7 +1669,7 @@ class Camera {
    * @returns {boolean}
    */
   isBackfillPlayback() {
-    return Boolean(this.active && this.activeMode === STREAM_MODES.DOWNLOAD);
+    return this.session.isBackfillPlayback();
   }
 
   /**
@@ -2339,7 +1688,7 @@ class Camera {
    */
   isRtspCapable() {
     return Boolean(!this.isDoorbell() && this.useRtsp && (this.rtspUrl || this.rtspSupported))
-      ? this.activeMode !== STREAM_MODES.P2P && this.activeMode !== STREAM_MODES.DOWNLOAD
+      ? this.session.mode !== STREAM_MODES.P2P && this.session.mode !== STREAM_MODES.DOWNLOAD
       : false;
   }
 
@@ -2347,9 +1696,7 @@ class Camera {
    * Records that the camera actively emitted a property update or livestream event during the current session.
    */
   markDeviceHeardInSession() {
-    if (this.active) {
-      this.heardFromDeviceInSession = true;
-    }
+    this.session.markDeviceHeard();
   }
 
   /**
@@ -2457,12 +1804,7 @@ class Camera {
    * Cancels any pending offline snapshot seeding timer on this camera.
    */
   clearOfflineSeedTimer() {
-    if (this.offlineSeedTimer) {
-      clearTimeout(this.offlineSeedTimer);
-      this.offlineSeedTimer = null;
-    }
-    this.offlineSeedConsumerSeen = false;
-    this.offlineSeedExpireFn = null;
+    this.offline.clearSeedTimer();
   }
 
   /**
@@ -2471,7 +1813,7 @@ class Camera {
    * @returns {boolean}
    */
   isSeedingOfflineSnapshot() {
-    return Boolean(this.offlineSeedTimer);
+    return this.offline.isSeeding();
   }
 
   /**
@@ -2481,19 +1823,7 @@ class Camera {
    * @param {() => void} onExpire - Callback invoked when the seed window expires.
    */
   scheduleOfflineSeedStop(seedDurationMs, onExpire) {
-    this.clearOfflineSeedTimer();
-    this.offlineSeedExpireFn = onExpire;
-    const waitMs = Math.max(1, Number(seedDurationMs) || 1);
-    const timer = setTimeout(() => {
-      this.offlineSeedTimer = null;
-      this.offlineSeedConsumerSeen = false;
-      this.offlineSeedExpireFn = null;
-      onExpire();
-    }, waitMs);
-    if (timer && typeof timer.unref === 'function') {
-      timer.unref();
-    }
-    this.offlineSeedTimer = timer;
+    this.offline.scheduleSeedStop(seedDurationMs, onExpire);
   }
 
   /**
@@ -2506,14 +1836,11 @@ class Camera {
    * @returns {boolean} True if this was the first consumer connection during the active seed window.
    */
   notifyOfflineSeedConsumerConnected(postConsumerHoldMs, now = Date.now()) {
-    if (!this.offlineSeedTimer || this.offlineSeedConsumerSeen || !this.offlineSeedExpireFn) {
+    const holdMs = this.offline.beginConsumerHold(postConsumerHoldMs);
+    if (!holdMs) {
       return false;
     }
-    const expireFn = this.offlineSeedExpireFn;
-    const holdMs = Math.max(1, Number(postConsumerHoldMs) || 1);
     this.triggerKeyframeBurst(now, holdMs + SHORT_KEYFRAME_BURST_MS);
-    this.scheduleOfflineSeedStop(holdMs, expireFn);
-    this.offlineSeedConsumerSeen = true;
     return true;
   }
 
@@ -2550,7 +1877,7 @@ class Camera {
    * Marks this camera's persistent FFmpeg encoder as intentionally stopped because the camera is offline.
    */
   markEncoderStoppedForOffline() {
-    this.encoderStoppedForOffline = true;
+    this.offline.markEncoderStopped();
   }
 
   /**
@@ -2560,10 +1887,8 @@ class Camera {
    * @returns {boolean} True if an active encoder process was stopped or newly marked stopped for offline.
    */
   pauseEncoderForOffline() {
-    this.clearOfflineSeedTimer();
     this.encoderConsumerConnected = false;
-    const wasAlreadyPaused = Boolean(this.encoderStoppedForOffline && !this.enc);
-    this.encoderStoppedForOffline = true;
+    const wasAlreadyPaused = this.offline.pause(Boolean(this.enc));
     if (!this.enc) {
       return !wasAlreadyPaused;
     }
@@ -2585,7 +1910,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldResumeOfflineEncoder() {
-    return Boolean(this.encoderStoppedForOffline && !this.isDeviceOffline());
+    return this.offline.isEncoderStopped() && !this.isDeviceOffline();
   }
 
   /**
@@ -2594,10 +1919,7 @@ class Camera {
    * @returns {boolean} True if the encoder had been paused for offline.
    */
   clearEncoderOfflinePause() {
-    this.clearOfflineSeedTimer();
-    const wasPaused = Boolean(this.encoderStoppedForOffline);
-    this.encoderStoppedForOffline = false;
-    return wasPaused;
+    return this.offline.clearEncoderPause();
   }
 
   /**
@@ -2680,7 +2002,7 @@ class Camera {
    * @returns {boolean}
    */
   isViewerBlockedByBackfill() {
-    return Boolean(!this.active && this.hasPendingBackfill());
+    return Boolean(!this.session.active && this.hasPendingBackfill());
   }
 
   /**
@@ -2692,7 +2014,7 @@ class Camera {
    * @returns {boolean}
    */
   isWaitingForBackfill(now = Date.now(), freshFrameMaxAgeMs = DEFAULT_FRESH_FRAME_MAX_AGE_MS) {
-    return this.active
+    return this.session.active
       ? Boolean(this.isBackfillPlayback() && !this.isStreamingLive(now, freshFrameMaxAgeMs))
       : this.hasPendingBackfill();
   }
@@ -2721,26 +2043,18 @@ class Camera {
    * @returns {boolean}
    */
   isPassiveRtspDirectProbe() {
-    return Boolean(
-      this.isRtspDirect() && this.active && !this.gotVideo && this.wakeInitiator === RTSP_DIRECT_PROBE_INITIATOR
-    );
+    return this.session.isPassiveRtspDirectProbe();
   }
 
   /**
    * Returns true if an idle direct-`rtsp_url` camera should start a direct RTSP pull session now.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [intervalMs=DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS] - Minimum interval between passive probes in ms.
+   * @param {number} [intervalMs] - Minimum interval between passive probes in ms.
    * @returns {boolean}
    */
-  shouldStartRtspDirectSession(now = Date.now(), intervalMs = DEFAULT_RTSP_DIRECT_PROBE_INTERVAL_MS) {
-    if (!this.isRtspDirect() || this.isSessionActive() || !this.getRtspUrl()) {
-      return false;
-    }
-    if (now < this.wantUntil()) {
-      return true;
-    }
-    return now - (this.lastStoppedAt || 0) >= intervalMs;
+  shouldStartRtspDirectSession(now = Date.now(), intervalMs = undefined) {
+    return this.session.shouldStartRtspDirect(now, Boolean(this.getRtspUrl()), intervalMs);
   }
 
   /**
@@ -2750,10 +2064,9 @@ class Camera {
    */
   beginRtspDirectProbeSession(now = Date.now()) {
     this.eventActive = false;
-    this.reason = RTSP_DIRECT_STREAM_REASON;
-    this.wakeInitiator = RTSP_DIRECT_PROBE_INITIATOR;
+    this.session.markRtspDirectProbeMeta();
     this.beginSession(STREAM_MODES.RTSP, now, true);
-    this.motionUntil = Math.max(this.motionUntil, now + this.getEventHoldMs());
+    this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
   }
 
   /**
@@ -2789,41 +2102,9 @@ class Camera {
    * }>}
    */
   evaluateRtspDirectDrop(code, reasonText = '') {
-    if (!this.gotVideo) {
-      const rawReason = String(reasonText || '').trim();
-      const clarifiedReason =
-        RTSP_BARE_INVALID_DATA_REGEX.test(rawReason) && !RTSP_COMPONENT_TAG_REGEX.test(rawReason)
-          ? 'RTSP server closed connection or sent invalid reply (' + rawReason + ')'
-          : rawReason;
-      const isNetworkUnreachable = !rawReason || RTSP_NETWORK_UNREACHABLE_REGEX.test(rawReason);
-      const {isReachableStandby, disruptionChanged} = this.recordRtspDirectProbeFailure(clarifiedReason);
-      const stopWhy = isReachableStandby
-        ? 'direct RTSP server reachable in standby (404 Not Found)'
-        : isNetworkUnreachable
-          ? 'direct RTSP probe failed (' + (clarifiedReason || 'no video') + ')'
-          : 'direct RTSP handshake failed (' + clarifiedReason + ')';
-      const statusLog = !disruptionChanged
-        ? ''
-        : isReachableStandby
-          ? 'direct RTSP endpoint reachable in standby (404 Not Found) -> Asleep'
-          : isNetworkUnreachable
-            ? 'direct RTSP endpoint unreachable (' + (clarifiedReason || 'connection failed') + ') -> Disconnected'
-            : 'direct RTSP handshake failed (' + clarifiedReason + ') -> Disconnected';
-      return Object.freeze({
-        stopWhy,
-        stopInitiator: RTSP_DIRECT_PROBE_INITIATOR,
-        disruptionChanged,
-        isReachableStandby,
-        statusLog,
-      });
-    }
-    return Object.freeze({
-      stopWhy: 'direct RTSP stream ended (code=' + code + ', info="' + reasonText + '")',
-      stopInitiator: 'eufy/rtsp-end',
-      disruptionChanged: false,
-      isReachableStandby: true,
-      statusLog: '',
-    });
+    return this.session.evaluateRtspDirectDrop(code, reasonText, (clarified) =>
+      this.recordRtspDirectProbeFailure(clarified)
+    );
   }
 
   /**
@@ -2835,7 +2116,7 @@ class Camera {
    * @returns {Readonly<{ isReachableStandby: boolean, disruptionChanged: boolean }>}
    */
   recordRtspDirectProbeFailure(lastLine = '') {
-    const isReachableStandby = RTSP_STANDBY_404_REGEX.test(String(lastLine || ''));
+    const isReachableStandby = StreamSession.isStandby404(lastLine);
     const disruptionChanged = this.updateServiceHealth({stationConnected: isReachableStandby});
     return Object.freeze({isReachableStandby, disruptionChanged});
   }
@@ -2868,7 +2149,8 @@ class Camera {
     return this.getStationKey() === stationKey
       ? this.isOccupyingStationP2pChannel() ||
           (!this.isRtspCapable() &&
-            (this.wantsWake(now) || (!this.active && !urgentTest && now - (this.sleptAt || 0) < delayMs)))
+            (this.wantsWake(now) ||
+              (!this.session.active && !urgentTest && now - (this.sessionLifecycle.getSleptAt() || 0) < delayMs)))
       : false;
   }
 
@@ -2893,12 +2175,7 @@ class Camera {
    * @returns {boolean}
    */
   hasWakingViewer() {
-    for (const isWaking of this.viewerIds.values()) {
-      if (isWaking) {
-        return true;
-      }
-    }
-    return false;
+    return this.viewerSet.hasWaking();
   }
 
   /**
@@ -2907,7 +2184,7 @@ class Camera {
    * @returns {boolean}
    */
   hasPendingViewerWake() {
-    return Boolean(this.viewUntil > 0 || this.hasWakingViewer());
+    return Boolean(this.session.viewUntil > 0 || this.hasWakingViewer());
   }
 
   /**
@@ -2918,11 +2195,8 @@ class Camera {
    */
   clearViewerQueue(clearReason = '') {
     const hadViewers = this.hasPendingViewerWake();
-    this.viewUntil = 0;
-    this.viewSince = 0;
-    for (const id of this.viewerIds.keys()) {
-      this.viewerIds.set(id, false);
-    }
+    this.session.clearViewerHold();
+    this.viewerSet.clearWaking();
     if (hadViewers && clearReason) {
       log.debug(this, 'cleared pending viewer wake queue (' + clearReason + ')');
     }
@@ -2932,15 +2206,8 @@ class Camera {
    * Clears any pending or matched HomeBase backfill clip request on this camera.
    */
   clearPendingBackfill() {
-    this.pendingBackfill = null;
-    this.queuedBackfillJob = null;
-    this.activeBackfillJob = null;
-    this.activeBackfillClip = null;
-    this.backfillClip = null;
-    this.backfillClipQueue = [];
-    this.lastBackfillDownloadFailedAt = 0;
-    this.backfillContinuation = false;
-    if (!this.active) {
+    this.backfill.clearPending();
+    if (!this.session.active) {
       this._clearActiveHardwareTriggers();
     }
   }
@@ -2951,9 +2218,7 @@ class Camera {
    * @returns {boolean}
    */
   hasPendingBackfill() {
-    return Boolean(
-      this.pendingBackfill || this.queuedBackfillJob || this.backfillClip || this.backfillClipQueue.length > 0
-    );
+    return this.backfill.hasPending();
   }
 
   /**
@@ -2983,12 +2248,12 @@ class Camera {
    * @returns {boolean} True if a pending backfill job was canceled.
    */
   cancelBackfillIfLiveConfirmed(now, minVideoMs = this.getSustainedLiveVideoCutoffMs()) {
-    if (!this.pendingBackfill || this.pendingBackfill.isUrgentTest() || this.activeMode === STREAM_MODES.DOWNLOAD) {
+    if (!this.backfill.pending || this.backfill.hasUrgentTest() || this.session.mode === STREAM_MODES.DOWNLOAD) {
       return false;
     }
-    const videoStartRef = this.firstFrameAt || this.firstVideoAt;
+    const videoStartRef = this.session.firstFrameAt || this.session.firstVideoAt;
     const hasSustainedLiveVideo = videoStartRef > 0 && now - videoStartRef >= minVideoMs;
-    if (this.runtimeExtended || this.frigateSawObject || hasSustainedLiveVideo) {
+    if (this.session.runtimeExtended || this.frigateSawObject || hasSustainedLiveVideo) {
       this.clearPendingBackfill();
       return true;
     }
@@ -3001,18 +2266,7 @@ class Camera {
    * @returns {boolean}
    */
   needsBackfillObjectCheck() {
-    return Boolean(this.pendingBackfill && !this.frigateSawObject);
-  }
-
-  /**
-   * Returns true if the camera has an unfulfilled backfill request that has exceeded maxAgeMs.
-   *
-   * @param {number} now - Current epoch timestamp in milliseconds.
-   * @param {number} [maxAgeMs=DEFAULT_BACKFILL_MAX_AGE_MS] - Maximum allowed age in milliseconds.
-   * @returns {boolean}
-   */
-  isBackfillExpired(now, maxAgeMs = DEFAULT_BACKFILL_MAX_AGE_MS) {
-    return this.pendingBackfill ? this.pendingBackfill.isExpired(now, maxAgeMs) : false;
+    return this.backfill.needsObjectCheck(this.frigateSawObject);
   }
 
   /**
@@ -3024,17 +2278,8 @@ class Camera {
    * @returns {boolean}
    */
   canQueryBackfill(now, minEventAgeMs, queryCooldownMs) {
-    const maxRecordingWaitMs = Math.max(
-      BACKFILL_RECORDING_WAIT_CAP_MS,
-      this.timers.holdMs + BACKFILL_POST_CLEAR_SETTLE_MS
-    );
-    const canQueryWhileIdleOrDraining = !this.active || Boolean(this.isBackfillPlayback() && this.downloadFinished);
-    return canQueryWhileIdleOrDraining &&
-      this.pendingBackfill &&
-      !this.backfillClip &&
-      now - this.lastBackfillQueryAt >= queryCooldownMs
-      ? this.pendingBackfill.isReadyToQuery(now, minEventAgeMs, maxRecordingWaitMs)
-      : false;
+    const canQueryInState = !this.session.active || Boolean(this.isBackfillPlayback() && this.backfill.finished);
+    return this.backfill.canQuery(now, canQueryInState, {minEventAgeMs, queryCooldownMs});
   }
 
   /**
@@ -3042,64 +2287,23 @@ class Camera {
    * station-wide database query result without matching an in-progress hardware recording.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [minEventAgeMs=BACKFILL_POST_CLEAR_SETTLE_MS] - Minimum event age in milliseconds.
+   * @param {number} [minEventAgeMs] - Minimum event age in milliseconds.
    * @returns {boolean}
    */
-  canMatchDatabaseQueryResult(now = Date.now(), minEventAgeMs = BACKFILL_POST_CLEAR_SETTLE_MS) {
-    if (this.activeBackfillJob) {
-      return true;
-    }
-    if (!this.pendingBackfill) {
-      return false;
-    }
-    if (!this.pendingBackfill.recordingActive) {
-      return true;
-    }
-    const maxRecordingWaitMs = Math.max(
-      BACKFILL_RECORDING_WAIT_CAP_MS,
-      this.timers.holdMs + BACKFILL_POST_CLEAR_SETTLE_MS
-    );
-    return this.pendingBackfill.isReadyToQuery(now, minEventAgeMs, maxRecordingWaitMs);
+  canMatchDatabaseQueryResult(now = Date.now(), minEventAgeMs = undefined) {
+    return this.backfill.canMatchQueryResult(now, minEventAgeMs);
   }
 
   /**
    * Attempts to match a parsed HomeBase database clip candidate against this camera's pending
-   * or active BackfillJob, queuing matching clips in chronological order on this.backfillClipQueue
-   * and setting this.backfillClip to the next clip to download.
+   * or active BackfillJob, queuing matching clips in chronological order on backfillClipQueue
+   * and setting backfillClip to the next clip to download.
    *
    * @param {{ devSn: string, storagePath: string, cipherId: number, clipMs: number }} candidate - Parsed DB row.
    * @returns {boolean} True if matched and queued for download.
    */
   tryMatchBackfillCandidate(candidate) {
-    const job = this.pendingBackfill || this.activeBackfillJob;
-    if (!job || !candidate) {
-      return false;
-    }
-    if (
-      this.queuedBackfillJob &&
-      this.queuedBackfillJob.recordingActive &&
-      candidate.clipMs >= this.queuedBackfillJob.at
-    ) {
-      return false;
-    }
-    if (job.isUrgentTest() && this.backfillClip) {
-      return false;
-    }
-    if (this.backfillClipQueue.some((c) => c.storagePath === candidate.storagePath)) {
-      return false;
-    }
-    if (!job.enqueueMatchedCandidate(candidate, this.downloadedPaths)) {
-      return false;
-    }
-    const newlyMatched = job.matchedClips.find((c) => c.storagePath === candidate.storagePath);
-    if (newlyMatched) {
-      this.backfillClipQueue.push(newlyMatched);
-      if (!job.isUrgentTest()) {
-        this.backfillClipQueue.sort((a, b) => (a.clipMs || 0) - (b.clipMs || 0));
-      }
-    }
-    this.backfillClip = this.backfillClipQueue[0] || null;
-    return true;
+    return this.backfill.tryMatchCandidate(candidate);
   }
 
   /**
@@ -3109,32 +2313,7 @@ class Camera {
    * @returns {string}
    */
   formatBackfillClipMatchLog(candidate) {
-    const job = this.pendingBackfill || this.activeBackfillJob;
-    const clipMs = candidate && candidate.clipMs ? candidate.clipMs : 0;
-    const triggerMs = job && job.at ? job.at : 0;
-    const clearedMs = job && job.clearedAt ? job.clearedAt : 0;
-    const preRollStr = clipMs > 0 && triggerMs > 0 ? ((triggerMs - clipMs) / 1000).toFixed(1) + 's' : 'n/a';
-    const sensorSpanStr =
-      triggerMs > 0 && clearedMs >= triggerMs ? ((clearedMs - triggerMs) / 1000).toFixed(1) + 's' : 'active';
-    return (
-      'matched recorded HomeBase clip for backfill (path="' +
-      candidate.storagePath +
-      '", clipStart=' +
-      formatEpochHms(clipMs) +
-      ', triggerAt=' +
-      formatEpochHms(triggerMs) +
-      ', clearedAt=' +
-      formatEpochHms(clearedMs) +
-      ', preRoll=' +
-      preRollStr +
-      ', sensorSpan=' +
-      sensorSpanStr +
-      ', cipherId=' +
-      candidate.cipherId +
-      ', reason="' +
-      this.getBackfillReason('backfill') +
-      '")'
-    );
+    return this.backfill.formatClipMatchLog(candidate);
   }
 
   /**
@@ -3145,7 +2324,7 @@ class Camera {
    * @returns {boolean}
    */
   isCurrentSession(sessionId, mode = '') {
-    return Boolean(this.active && this.sessionId === sessionId && (!mode || this.activeMode === mode));
+    return this.session.isCurrent(sessionId, mode);
   }
 
   /**
@@ -3157,7 +2336,7 @@ class Camera {
    * @returns {boolean}
    */
   isActiveDecoder(dec, sessionId, mode = '') {
-    return Boolean(this.isCurrentSession(sessionId, mode) && this.dec === dec);
+    return this.session.isActiveDecoder(dec, sessionId, mode);
   }
 
   /**
@@ -3166,7 +2345,7 @@ class Camera {
    * @returns {boolean}
    */
   canIngestP2pPacket() {
-    return Boolean(this.active && this.p2pReady);
+    return this.session.canIngestP2pPacket();
   }
 
   /**
@@ -3177,10 +2356,7 @@ class Camera {
    * @returns {boolean}
    */
   hasResolutionChanged(width, height) {
-    return Boolean(
-      (width && this.videoWidth && width !== this.videoWidth) ||
-      (height && this.videoHeight && height !== this.videoHeight)
-    );
+    return this.session.hasResolutionChanged(width, height);
   }
 
   /**
@@ -3192,7 +2368,7 @@ class Camera {
    * @returns {boolean} True if the camera should be stopped after completing the startup probe.
    */
   completeStartupProbeIfReady(now, minCaptureMs) {
-    if (!this.isStartupProbe || !this.firstFrameAt || now - this.firstFrameAt < minCaptureMs) {
+    if (!this.isStartupProbe || !this.session.firstFrameAt || now - this.session.firstFrameAt < minCaptureMs) {
       return false;
     }
     this.isStartupProbe = false;
@@ -3234,13 +2410,13 @@ class Camera {
    * @returns {boolean}
    */
   isStreamingLive(now, freshFrameMaxAgeMs) {
-    if (!this.active) {
-      return Boolean(this.backfillContinuation && this.hasPendingBackfill() && Buffer.isBuffer(this.lastFrame));
+    if (!this.session.active) {
+      return Boolean(this.backfill.continuation && this.hasPendingBackfill() && Buffer.isBuffer(this.lastFrame));
     }
     return Boolean(
       this.hasFreshFrame(now, freshFrameMaxAgeMs) ||
-      (this.firstFrameAt > 0 && this.gotVideo && Buffer.isBuffer(this.lastFrame)) ||
-      (this.isBackfillPlayback() && this.backfillContinuation && Buffer.isBuffer(this.lastFrame))
+      (this.session.firstFrameAt > 0 && this.session.gotVideo && Buffer.isBuffer(this.lastFrame)) ||
+      (this.isBackfillPlayback() && this.backfill.continuation && Buffer.isBuffer(this.lastFrame))
     );
   }
 
@@ -3256,13 +2432,16 @@ class Camera {
    */
   isReadyForEventSnapshot(now, requiredDelayMs, freshFrameMs, recentFallbackMs) {
     const hasSustainedLiveVideo =
-      this.active &&
+      this.session.active &&
       (this.hasFreshFrame(now, freshFrameMs) ||
-        (this.evDispatchedAt > 0 && this.gotVideo && Buffer.isBuffer(this.lastFrame))) &&
-      this.firstFrameAt > 0 &&
-      now - this.firstFrameAt >= requiredDelayMs;
+        (this.eventFiling.dispatchedAt > 0 && this.session.gotVideo && Buffer.isBuffer(this.lastFrame))) &&
+      this.session.firstFrameAt > 0 &&
+      now - this.session.firstFrameAt >= requiredDelayMs;
     const hasRecentCompletedVideo =
-      INSTANT_EVENT_SNAPSHOT && !this.active && this.gotVideo && now - this.lastVideoAt < recentFallbackMs;
+      INSTANT_EVENT_SNAPSHOT &&
+      !this.session.active &&
+      this.session.gotVideo &&
+      now - this.session.lastVideoAt < recentFallbackMs;
     return Boolean(hasSustainedLiveVideo || hasRecentCompletedVideo);
   }
 
@@ -3273,7 +2452,7 @@ class Camera {
    * @returns {boolean}
    */
   isActivelyViewing(now = Date.now()) {
-    return Boolean(this.active && now < this.viewUntil);
+    return this.session.isActivelyViewing(now);
   }
 
   /**
@@ -3286,7 +2465,7 @@ class Camera {
   isInViewerCooldown(now = Date.now()) {
     return this.isRtspDirect() || this.hasActiveHardwareTriggers(now)
       ? false
-      : this.getSessionState(now) === SESSION_STATES.COOLDOWN || now - this.sleptAt < COOLDOWN_MS;
+      : this.getSessionState(now) === SESSION_STATES.COOLDOWN || now - this.sessionLifecycle.getSleptAt() < COOLDOWN_MS;
   }
 
   /**
@@ -3325,10 +2504,10 @@ class Camera {
   ) {
     const canEvaluate = Boolean(
       !this.isRtspDirect() &&
-      this.active &&
-      this.gotVideo &&
+      this.session.active &&
+      this.session.gotVideo &&
       !this.extendCheckInFlight &&
-      this.activeMode !== STREAM_MODES.DOWNLOAD &&
+      this.session.mode !== STREAM_MODES.DOWNLOAD &&
       !this.isStartupProbe
     );
     if (!canEvaluate) {
@@ -3336,14 +2515,13 @@ class Camera {
     }
     this.getFrigateEventState(now);
     const holdUntil = this.wantUntil();
-    const nearMaxLimit = now - this.startedAt >= this.timers.maxMs - safetyMarginMs;
+    const nearMaxLimit = now - this.session.startedAt >= this.timers.maxMs - safetyMarginMs;
     const nearHoldExpiry = holdUntil - now <= checkWindowMs;
     const nearEventExpiry = Boolean(
       this.eventActive &&
-      !this.evPending &&
-      !this.evTimer &&
-      this.evUntil > this.startedAt &&
-      this.evUntil - now <= checkWindowMs
+      !this.eventFiling.hasPendingDispatch() &&
+      this.eventFiling.until > this.session.startedAt &&
+      this.eventFiling.until - now <= checkWindowMs
     );
     const needsTimeoutExtendCheck = (nearHoldExpiry || nearEventExpiry) && !nearMaxLimit;
     if (!needsTimeoutExtendCheck && !this.needsBackfillObjectCheck()) {
@@ -3366,7 +2544,7 @@ class Camera {
    * @returns {boolean}
    */
   isMotionOnlyActiveSession(now = Date.now()) {
-    return Boolean(this.isActiveLiveSession() && this.isInMotion(now) && now >= this.viewUntil);
+    return this.session.isMotionOnlyActive(now);
   }
 
   /**
@@ -3382,7 +2560,7 @@ class Camera {
       !this.isRtspDirect() &&
       this.timers.earlySleepMs > 0 &&
       this.isMotionOnlyActiveSession(now) &&
-      now - this.lastMotionAt >= Math.min(this.timers.earlySleepMs, minEventVideoMs)
+      now - this.session.lastMotionAt >= Math.min(this.timers.earlySleepMs, minEventVideoMs)
     );
   }
 
@@ -3395,7 +2573,7 @@ class Camera {
    * @returns {boolean}
    */
   isMidStreamRetrigger(now = Date.now(), graceMs = DEFAULT_MID_STREAM_GRACE_MS) {
-    return Boolean(this.gotVideo && now - (this.lastStartAt || 0) > graceMs);
+    return this.session.isMidStreamRetrigger(now, graceMs);
   }
 
   /**
@@ -3411,14 +2589,15 @@ class Camera {
     if (this.isRtspDirect() || earlySleepMs <= 0 || !this.isMotionOnlyActiveSession(now)) {
       return {due: false, clearedByEufy: false};
     }
-    if (!this.gotVideo || now - this.firstVideoAt < earlySleepMs) {
+    if (!this.session.gotVideo || now - this.session.firstVideoAt < earlySleepMs) {
       return {due: false, clearedByEufy: false};
     }
     if (now - this.lastEarlySleepCheckAt < pollIntervalMs) {
       return {due: false, clearedByEufy: false};
     }
-    const clearedByEufy = this.motionClearedAt > this.lastMotionAt && now - this.motionClearedAt >= settleMs;
-    const elapsedQuiet = now - this.lastMotionAt >= earlySleepMs;
+    const clearedByEufy =
+      this.session.motionClearedAt > this.session.lastMotionAt && now - this.session.motionClearedAt >= settleMs;
+    const elapsedQuiet = now - this.session.lastMotionAt >= earlySleepMs;
     if (!clearedByEufy && !elapsedQuiet) {
       return {due: false, clearedByEufy: false};
     }
@@ -3436,8 +2615,7 @@ class Camera {
    * @returns {boolean}
    */
   isRtspDecoderHandshaking(now, minActiveMs, maxStallMs) {
-    const decAgeMs = now - this.decSpawnedAt;
-    return this.dec && this.decSpawnedAt ? decAgeMs >= minActiveMs && decAgeMs < maxStallMs : false;
+    return this.session.isRtspDecoderHandshaking(now, minActiveMs, maxStallMs);
   }
 
   /**
@@ -3449,12 +2627,12 @@ class Camera {
    */
   didEufyEndEventCleanly(now, minCleanVideoMs) {
     return Boolean(
-      this.active &&
+      this.session.active &&
       this.eventActive &&
       this.timers.letEufyDecideEnd &&
-      this.gotVideo &&
-      now >= this.viewUntil &&
-      (this.motionClearedAt > this.lastMotionAt || now - this.firstVideoAt >= minCleanVideoMs)
+      this.session.gotVideo &&
+      now >= this.session.viewUntil &&
+      (this.session.motionClearedAt > this.session.lastMotionAt || now - this.session.firstVideoAt >= minCleanVideoMs)
     );
   }
 
@@ -3522,8 +2700,8 @@ class Camera {
    * @returns {boolean}
    */
   recordIdleRssiChange(now = Date.now()) {
-    const stoppedRef = Math.max(this.sleptAt || 0, this.lastStoppedAt || 0);
-    const isBackfillRecording = Boolean(this.pendingBackfill && this.pendingBackfill.recordingActive);
+    const stoppedRef = Math.max(this.sessionLifecycle.getSleptAt() || 0, this.session.lastStoppedAt || 0);
+    const isBackfillRecording = Boolean(this.backfill.pending && this.backfill.pending.isRecordingActive());
     const hasStuckIdleLight = this.hasStuckIdleLightPastGrace(now);
     if (
       (this.isRtspCapable() && !hasStuckIdleLight) ||
@@ -3574,7 +2752,10 @@ class Camera {
    */
   isPiggybackedExternalSession() {
     return Boolean(
-      this.active && this.alwaysBackfill && this.wakeInitiator === EXTERNAL_WAKE_INITIATOR && !this.hasWakingViewer()
+      this.session.active &&
+      this.alwaysBackfill &&
+      this.session.initiator === EXTERNAL_WAKE_INITIATOR &&
+      !this.hasWakingViewer()
     );
   }
 
@@ -3587,10 +2768,10 @@ class Camera {
    * @returns {boolean}
    */
   isWithinPostSleepGuard(now, guardMs = DEFAULT_UNSOLICITED_VIDEO_DELAY_MS) {
-    if (this.active) {
+    if (this.session.active) {
       return false;
     }
-    const stoppedRef = Math.max(this.sleptAt || 0, this.lastStoppedAt || 0);
+    const stoppedRef = Math.max(this.sessionLifecycle.getSleptAt() || 0, this.session.lastStoppedAt || 0);
     return Boolean(this.stoppingP2p || (stoppedRef > 0 && now - stoppedRef <= guardMs));
   }
 
@@ -3604,7 +2785,7 @@ class Camera {
    */
   canAdoptExternalWake(now, guardMs = DEFAULT_UNSOLICITED_VIDEO_DELAY_MS) {
     const allowedInMode = !this.alwaysBackfill || this.canPiggybackExternalP2pInBackfill(now);
-    return !this.active && allowedInMode ? !this.isWithinPostSleepGuard(now, guardMs) : false;
+    return !this.session.active && allowedInMode ? !this.isWithinPostSleepGuard(now, guardMs) : false;
   }
 
   /**
@@ -3619,12 +2800,12 @@ class Camera {
       return false;
     }
     this.cancelStartupProbe();
-    this.reason = EXTERNAL_P2P_WAKE_REASON;
-    this.wakeInitiator = EXTERNAL_WAKE_INITIATOR;
-    this.lastMotionAt = now;
-    this.motionUntil = Math.max(this.motionUntil, now + this.getEventHoldMs());
-    this.viewSince = now;
-    this.viewUntil = Math.max(this.viewUntil, now + this.timers.holdMs);
+    this.session.reason = EXTERNAL_P2P_WAKE_REASON;
+    this.session.initiator = EXTERNAL_WAKE_INITIATOR;
+    this.session.lastMotionAt = now;
+    this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
+    this.session.viewSince = now;
+    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.timers.holdMs);
     this.eventActive = true;
     this.beginSession(STREAM_MODES.P2P, now, true);
     return true;
@@ -3642,12 +2823,12 @@ class Camera {
       return false;
     }
     this.cancelStartupProbe();
-    this.reason = EXTERNAL_RTSP_WAKE_REASON;
-    this.wakeInitiator = EXTERNAL_WAKE_INITIATOR;
-    this.lastMotionAt = now;
-    this.motionUntil = Math.max(this.motionUntil, now + this.getEventHoldMs());
-    this.viewSince = now;
-    this.viewUntil = Math.max(this.viewUntil, now + this.timers.holdMs);
+    this.session.reason = EXTERNAL_RTSP_WAKE_REASON;
+    this.session.initiator = EXTERNAL_WAKE_INITIATOR;
+    this.session.lastMotionAt = now;
+    this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
+    this.session.viewSince = now;
+    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.timers.holdMs);
     this.eventActive = true;
     this.beginSession(STREAM_MODES.RTSP, now, true);
     return true;
@@ -3663,7 +2844,7 @@ class Camera {
    * @returns {{ shouldStop: boolean, sleptAgo: string }}
    */
   shouldStopUnsolicitedVideo(now, delayMs = DEFAULT_UNSOLICITED_VIDEO_DELAY_MS) {
-    const stoppedRef = Math.max(this.sleptAt || 0, this.lastStoppedAt || 0);
+    const stoppedRef = Math.max(this.sessionLifecycle.getSleptAt() || 0, this.session.lastStoppedAt || 0);
     if (now - stoppedRef <= delayMs || now - this.lastUnsolicitedStopAt <= delayMs) {
       return {shouldStop: false, sleptAgo: '0s'};
     }
@@ -3679,7 +2860,7 @@ class Camera {
    * @returns {boolean}
    */
   hasReachedMaxDuration(now) {
-    return !this.isRtspDirect() && this.isActiveLiveSession() ? now - this.startedAt >= this.timers.maxMs : false;
+    return this.session.hasReachedMaxDuration(now);
   }
 
   /**
@@ -3689,12 +2870,7 @@ class Camera {
    * @returns {boolean}
    */
   hasReachedViewMaxDuration(now) {
-    return Boolean(
-      !this.isRtspDirect() &&
-      this.isActiveLiveSession() &&
-      !this.isInMotion(now) &&
-      now - Math.max(this.startedAt, this.motionUntil) >= this.timers.viewMaxMs
-    );
+    return this.session.hasReachedViewMaxDuration(now);
   }
 
   /**
@@ -3703,7 +2879,7 @@ class Camera {
    * @returns {boolean}
    */
   hasBufferedDownloadFrames() {
-    return Boolean(this.isBackfillPlayback() && this.downloadFrames.length > 0);
+    return Boolean(this.isBackfillPlayback() && this.backfill.frames.length > 0);
   }
 
   /**
@@ -3729,10 +2905,10 @@ class Camera {
    */
   shouldBufferLiveFrame(now = Date.now(), minIntervalMs = DEFAULT_LIVE_FRAME_PACE_MS) {
     if (
-      !this.active ||
+      !this.session.active ||
       this.isBackfillPlayback() ||
       !this.hasWritableEncoderStdin() ||
-      !this.firstFrameAt ||
+      !this.session.firstFrameAt ||
       !this.frame
     ) {
       return false;
@@ -3762,7 +2938,7 @@ class Camera {
     }
     if (this.liveFrames.length >= maxBurstFrames) {
       const dropped = this.liveFrames.shift();
-      this.droppedFrames++;
+      this.session.droppedFrames++;
       if (Buffer.isBuffer(dropped) && this.downloadFramePool.length < DOWNLOAD_POOL_MAX_BUFFERS) {
         this.downloadFramePool.push(dropped);
       }
@@ -3770,7 +2946,7 @@ class Camera {
     const frameCopy = this.acquireDownloadFrameBuffer(rawBuf);
     this.liveFrames.push(frameCopy);
     this.frameAt = now;
-    this.lastVideoAt = now;
+    this.session.lastVideoAt = now;
     if (lastSeenHm) {
       this.telemetry.updateLastSeen(lastSeenHm);
     }
@@ -3819,7 +2995,7 @@ class Camera {
     }
     this.frame = nextBuf;
     this.frameAt = now;
-    this.lastVideoAt = now;
+    this.session.lastVideoAt = now;
     this.frameNew = true;
     this.lastFrame = nextBuf;
     if (lastSeenHm) {
@@ -3884,9 +3060,9 @@ class Camera {
     if (
       this.unexpectedRtspActive ||
       this.isBackfillPlayback() ||
-      this.isCurrentSession(this.sessionId, STREAM_MODES.RTSP) ||
-      (this.isCurrentSession(this.sessionId, STREAM_MODES.P2P) && this.gotVideo) ||
-      (this.useRtsp && !this.isDoorbell() && !this.isCurrentSession(this.sessionId, STREAM_MODES.P2P))
+      this.isCurrentSession(this.session.id, STREAM_MODES.RTSP) ||
+      (this.isCurrentSession(this.session.id, STREAM_MODES.P2P) && this.session.gotVideo) ||
+      (this.useRtsp && !this.isDoorbell() && !this.isCurrentSession(this.session.id, STREAM_MODES.P2P))
     ) {
       return Object.freeze({
         shouldStopRtsp: false,
@@ -3901,7 +3077,9 @@ class Camera {
     const shouldDisableRtspProp = Boolean(
       this.telemetry.hasPowerConservationEnabled() && (!this.useRtsp || !this.rtspUrl || this.isDoorbell())
     );
-    const shouldRestartP2p = Boolean(this.isCurrentSession(this.sessionId, STREAM_MODES.P2P) && !this.gotVideo);
+    const shouldRestartP2p = Boolean(
+      this.isCurrentSession(this.session.id, STREAM_MODES.P2P) && !this.session.gotVideo
+    );
     return Object.freeze({shouldStopRtsp: true, shouldDisableRtspProp, shouldRestartP2p});
   }
 
@@ -3917,10 +3095,10 @@ class Camera {
    */
   shouldTurnOffStuckIdleLight(now = Date.now(), idleGraceMs = STUCK_LIGHT_GRACE_MS) {
     const lastActiveAt = Math.max(
-      this.sleptAt || 0,
-      this.lastStoppedAt || 0,
-      this.motionClearedAt || 0,
-      this.lastMotionAt || 0,
+      this.sessionLifecycle.getSleptAt() || 0,
+      this.session.lastStoppedAt || 0,
+      this.session.motionClearedAt || 0,
+      this.session.lastMotionAt || 0,
       this.telemetry.lightOnAt || 0
     );
     if (
@@ -3953,8 +3131,8 @@ class Camera {
     return Boolean(
       this !== otherCam &&
       this.isActiveRtspSession() &&
-      !this.gotVideo &&
-      now - this.startedAt < windowMs &&
+      !this.session.gotVideo &&
+      now - this.session.startedAt < windowMs &&
       this.getStationKey() === otherCam.getStationKey()
     );
   }
@@ -4017,10 +3195,10 @@ class Camera {
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    */
   prepareSigUsr1BackfillTest(now = Date.now()) {
-    this.downloadedPaths.clear();
-    this.clearPendingBackfill();
-    this.lastBackfillQueryAt = 0;
-    this.pendingBackfill = BackfillJob.createSigUsr1TestJob(now, this.name);
+    this.backfill.prepareSigUsr1Test(now);
+    if (!this.session.active) {
+      this._clearActiveHardwareTriggers();
+    }
   }
 
   /**
@@ -4039,7 +3217,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldClearQueueForSigUsr1Test() {
-    return Boolean(!this.active && !this.isRtspCapable());
+    return Boolean(!this.session.active && !this.isRtspCapable());
   }
 
   /**
@@ -4051,7 +3229,7 @@ class Camera {
     if (this.directRtsp) {
       return this.name + '(rtsp:direct)';
     }
-    return this.name + '(' + this.mode + ':' + Math.round(this.timers.holdMs / 1000) + 's)';
+    return this.name + '(' + this.mode + ':' + Math.round(this.timers.holdMs / MS_PER_SECOND) + 's)';
   }
 
   /**
@@ -4059,14 +3237,11 @@ class Camera {
    * and is past any post-failure download retry cooldown.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [retryCooldownMs=DEFAULT_BACKFILL_DOWNLOAD_RETRY_COOLDOWN_MS] - Cooldown after
-   *   a failed download attempt in ms.
+   * @param {number} [retryCooldownMs] - Cooldown after a failed download attempt in ms.
    * @returns {boolean}
    */
-  isReadyForBackfillDownload(now = Date.now(), retryCooldownMs = DEFAULT_BACKFILL_DOWNLOAD_RETRY_COOLDOWN_MS) {
-    const cooldownElapsed =
-      !this.lastBackfillDownloadFailedAt || now - this.lastBackfillDownloadFailedAt >= retryCooldownMs;
-    return Boolean(this.backfillClip && !this.active && cooldownElapsed);
+  isReadyForBackfillDownload(now = Date.now(), retryCooldownMs = undefined) {
+    return this.backfill.isReadyForDownload(now, this.session.active, retryCooldownMs);
   }
 
   /**
@@ -4076,7 +3251,7 @@ class Camera {
    * @returns {boolean}
    */
   needsLatestInfoBackfillQuery() {
-    return Boolean(this.pendingBackfill && !this.backfillClip);
+    return this.backfill.needsLatestInfoQuery();
   }
 
   /**
@@ -4085,11 +3260,10 @@ class Camera {
    * @param {Camera[]} allCams - All configured Camera instances.
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @param {number} delayMs - Required idle delay after P2P sleep in milliseconds.
-   * @param {number} [retryCooldownMs=DEFAULT_BACKFILL_DOWNLOAD_RETRY_COOLDOWN_MS] - Cooldown after
-   *   a failed download attempt in ms.
+   * @param {number} [retryCooldownMs] - Cooldown after a failed download attempt in ms.
    * @returns {boolean}
    */
-  canStartBackfillDownloadNow(allCams, now, delayMs, retryCooldownMs = DEFAULT_BACKFILL_DOWNLOAD_RETRY_COOLDOWN_MS) {
+  canStartBackfillDownloadNow(allCams, now, delayMs, retryCooldownMs = undefined) {
     return Boolean(
       this.isReadyForBackfillDownload(now, retryCooldownMs) && this.isStationIdleForBackfill(allCams, now, delayMs)
     );
@@ -4145,9 +3319,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldClearStationQueryCooldownAfterStop(closedMode) {
-    return closedMode === STREAM_MODES.DOWNLOAD
-      ? Boolean(this.pendingBackfill && this.pendingBackfill.followUpQueried && this.lastBackfillQueryAt === 0)
-      : false;
+    return this.backfill.shouldClearStationQueryCooldown(closedMode);
   }
 
   /**
@@ -4156,7 +3328,7 @@ class Camera {
    * @returns {number}
    */
   getBackfillPriority() {
-    return (this.pendingBackfill || this.activeBackfillJob)?.priority || 0;
+    return this.backfill.getPriority();
   }
 
   /**
@@ -4226,8 +3398,8 @@ class Camera {
    * @returns {boolean}
    */
   isPacingStationBackfillQuery(stationKey, allCams, window) {
-    return this.hasStationBackfillKey(stationKey, allCams) && this.lastBackfillQueryAt > 0
-      ? window.now - this.lastBackfillQueryAt < window.queryCooldownMs
+    return this.hasStationBackfillKey(stationKey, allCams) && this.backfill.lastQueryAt > 0
+      ? window.now - this.backfill.lastQueryAt < window.queryCooldownMs
       : false;
   }
 
@@ -4313,7 +3485,7 @@ class Camera {
    * @returns {boolean}
    */
   hasConnectedViewers() {
-    return this.viewers > 0;
+    return this.viewerSet.hasAny();
   }
 
   /**
@@ -4323,7 +3495,7 @@ class Camera {
    * @param {*} eventId - Created Frigate event ID.
    */
   recordCreatedFrigateEvent(eventId) {
-    this.lastCreatedFrigateEventId = String(eventId || '');
+    this.eventFiling.recordCreatedId(eventId);
   }
 
   /**
@@ -4332,7 +3504,7 @@ class Camera {
    * @returns {string}
    */
   getEventPerson() {
-    return this.evPerson || '';
+    return this.eventFiling.person || '';
   }
 
   /**
@@ -4343,11 +3515,7 @@ class Camera {
    * @returns {string}
    */
   getBackfillEventLabel() {
-    const clipEvent = this.activeBackfillClip && this.activeBackfillClip.event ? this.activeBackfillClip.event : '';
-    if (this.evLabel && this.evLabel !== DEFAULT_MOTION_LABEL && (!clipEvent || clipEvent === DEFAULT_MOTION_EVENT)) {
-      return this.evLabel;
-    }
-    return clipEvent || this.evLabel || this.reason;
+    return this.backfill.resolveEventLabel(this.eventFiling.label, this.session.reason);
   }
 
   /**
@@ -4356,7 +3524,7 @@ class Camera {
    * @returns {string}
    */
   getBackfillEventPerson() {
-    return this.evPerson || (this.activeBackfillClip && this.activeBackfillClip.personName) || '';
+    return this.backfill.resolveEventPerson(this.eventFiling.person);
   }
 
   /**
@@ -4368,14 +3536,14 @@ class Camera {
    */
   isNonSyntheticFrigateEvent(ev) {
     return !ev ||
-      (this.lastCreatedFrigateEventId && ev.id === this.lastCreatedFrigateEventId) ||
+      (this.eventFiling.lastCreatedId && ev.id === this.eventFiling.lastCreatedId) ||
       ev.sub_label === 'eufy' ||
       ev.source_type === 'api' ||
       ev.data?.type === 'api'
       ? false
       : ev.data?.type === 'object'
         ? true
-        : !this.evPerson || ev.sub_label !== this.evPerson;
+        : !this.eventFiling.person || ev.sub_label !== this.eventFiling.person;
   }
 
   /**
@@ -4393,7 +3561,7 @@ class Camera {
     if (!Array.isArray(events)) {
       return false;
     }
-    const minEndMs = Math.max(this.startedAt || 0, now - recentTailMs);
+    const minEndMs = Math.max(this.session.startedAt || 0, now - recentTailMs);
     let sawActiveOrRecent = false;
     let latestEventMs = 0;
 
@@ -4463,49 +3631,11 @@ class Camera {
    * @param {number} now - Current epoch timestamp in milliseconds.
    */
   beginBackfillDownload(clip, _isTest, now) {
-    if (
-      this.pendingBackfill &&
-      (!this.activeBackfillJob ||
-        this.pendingBackfill.matchedClips.some((c) => c.storagePath === clip.storagePath) ||
-        this.pendingBackfill.isUrgentTest())
-    ) {
-      this.activeBackfillJob = this.pendingBackfill;
-      this.pendingBackfill = this.queuedBackfillJob;
-      this.queuedBackfillJob = null;
-    }
-    if (this.activeBackfillJob) {
-      if (this.activeBackfillJob.matchedClips.length > 0) {
-        this.activeBackfillJob.shiftNextClipForDownload();
-      } else {
-        if (
-          this.activeBackfillJob.state !== BACKFILL_STATES.MATCHED &&
-          this.activeBackfillJob.state !== BACKFILL_STATES.DOWNLOADING
-        ) {
-          this.activeBackfillJob.transitionTo(BACKFILL_STATES.MATCHED, 'clip matched for download');
-        }
-        this.activeBackfillJob.transitionTo(BACKFILL_STATES.DOWNLOADING, 'clip dequeued for download');
-      }
-    }
-    const nextAttempt = (Number(clip.downloadAttempts) || 0) + 1;
-    this.activeBackfillClip = Object.freeze({...clip, downloadAttempts: nextAttempt});
-    this.backfillClipQueue = this.backfillClipQueue.filter((item) => item.storagePath !== clip.storagePath);
-    this.backfillClip = this.backfillClipQueue[0] || null;
-    this.recordDownloadedClipPath(clip.storagePath);
-    this.lastDownloadedClipMs = clip.clipMs || now;
-    this.backfillClipStartMs = clip.clipMs || 0;
-    this.backfillTriggerAtMs = this.activeBackfillJob ? this.activeBackfillJob.at || 0 : 0;
-    this.backfillPlaybackStartedAt = 0;
-    this.downloadVideoPackets = 0;
-    this.downloadDecodedFrames = 0;
-    this.downloadPlayedFrames = 0;
-    this.downloadFinished = false;
-    this.downloadFinishedAt = 0;
-    this.downloadFrames = [];
+    this.backfill.prepareDownload(clip, now);
     this.eventActive = false;
-    this.reason = 'backfill: ' + clip.reason;
-    this.wakeInitiator = 'bridge-backfill';
-    this.evUntil = 0;
-    this.evDispatchedAt = 0;
+    this.session.reason = 'backfill: ' + clip.reason;
+    this.session.initiator = 'bridge-backfill';
+    this.eventFiling.resetWindow();
     this.beginSession(STREAM_MODES.DOWNLOAD, now, true);
   }
 
@@ -4523,13 +3653,13 @@ class Camera {
     this.beginSession(STREAM_MODES.RTSP, now, true);
     return (
       'WAKE [RTSP] (initiator=' +
-      (this.wakeInitiator || 'bridge') +
+      (this.session.initiator || 'bridge') +
       ', reason="' +
-      this.reason +
+      this.session.reason +
       '", priority=' +
       this.getEffectivePriority(now) +
       ', session=' +
-      this.sessionId +
+      this.session.id +
       ')'
     );
   }
@@ -4547,21 +3677,21 @@ class Camera {
     const ecoTag = this.isLowBattery() ? ' [low-battery economy mode]' : '';
     const wakeLog =
       'WAKE (initiator=' +
-      (this.wakeInitiator || 'bridge') +
+      (this.session.initiator || 'bridge') +
       ', reason="' +
-      this.reason +
+      this.session.reason +
       '", station=' +
       stationKey +
       ', priority=' +
       this.getEffectivePriority(now) +
       ', session=' +
-      this.sessionId +
+      this.session.id +
       ')' +
       ecoTag;
     return Object.freeze({
       shouldFileEvent: Boolean(this.eventActive),
-      eventReason: this.reason,
-      personName: this.pendingBackfill ? this.pendingBackfill.personName : '',
+      eventReason: this.session.reason,
+      personName: this.backfill.pending ? this.backfill.pending.getPersonName() : '',
       wakeLog,
     });
   }
@@ -4586,8 +3716,8 @@ class Camera {
    * @param {boolean} [preemptEnabled=PREEMPT_EVENT_STREAMS] - Whether event stream preemption is enabled.
    */
   expireBlockedMotionHold(activeCam, preemptEnabled = PREEMPT_EVENT_STREAMS) {
-    if (!preemptEnabled && this.lastMotionAt > activeCam.lastMotionAt) {
-      this.motionUntil = 0;
+    if (!preemptEnabled && this.session.lastMotionAt > activeCam.session.lastMotionAt) {
+      this.session.motionUntil = 0;
       this.eventPriority = 0;
     }
   }
@@ -4599,19 +3729,18 @@ class Camera {
    * @returns {number}
    */
   markRtspAttemptStart(now = Date.now()) {
-    this.lastStartAt = now;
-    return this.sessionId;
+    return this.session.markRtspAttemptStart(now);
   }
 
   /**
    * Returns true if a device.start_rtsp_livestream wake attempt was recorded within windowMs.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [windowMs=2000] - Recency window in milliseconds.
+   * @param {number} [windowMs] - Recency window in milliseconds.
    * @returns {boolean}
    */
-  hasRecentRtspStartAttempt(now = Date.now(), windowMs = DEFAULT_RTSP_START_DEDUP_WINDOW_MS) {
-    return Boolean(this.lastStartAt > 0 && now - this.lastStartAt < windowMs);
+  hasRecentRtspStartAttempt(now = Date.now(), windowMs = undefined) {
+    return this.session.hasRecentRtspStartAttempt(now, windowMs);
   }
 
   /**
@@ -4620,7 +3749,7 @@ class Camera {
    * @returns {boolean}
    */
   isFirstWakeAttempt() {
-    return this.restarts === 0;
+    return this.session.isFirstWakeAttempt();
   }
 
   /**
@@ -4630,9 +3759,7 @@ class Camera {
    * @returns {number} Elapsed quiet duration in seconds.
    */
   markEarlySleep(checkNow = Date.now()) {
-    const quietSecs = Math.round((checkNow - this.lastMotionAt) / 1000);
-    this.motionUntil = checkNow;
-    return quietSecs;
+    return this.session.markEarlySleep(checkNow);
   }
 
   /**
@@ -4653,7 +3780,7 @@ class Camera {
    * @returns {number}
    */
   getLiveDurationSecs(now = Date.now()) {
-    return this.startedAt ? Math.round((now - this.startedAt) / 1000) : 0;
+    return this.session.getLiveDurationSecs(now);
   }
 
   /**
@@ -4663,7 +3790,7 @@ class Camera {
    */
   recordApiWakeTriggered(createEvent = false) {
     if (createEvent) {
-      this.motionClearedAt = 0;
+      this.session.motionClearedAt = 0;
     }
   }
 
@@ -4673,7 +3800,7 @@ class Camera {
    * @returns {boolean}
    */
   hasPendingApiWakeTimer() {
-    return Boolean(this.apiWakeTimer);
+    return this.wake.hasPendingApiTimer();
   }
 
   /**
@@ -4682,49 +3809,7 @@ class Camera {
    * @returns {number}
    */
   getScheduledApiWakeDurationMs() {
-    return this.apiWakePendingOpts ? this.apiWakePendingOpts.durationMs : 0;
-  }
-
-  /**
-   * Returns the human-readable reason of the pending or active BackfillJob on this camera.
-   *
-   * @param {string} [fallback='backfill'] - Fallback string when no job is present.
-   * @returns {string}
-   */
-  getBackfillReason(fallback = 'backfill') {
-    return (this.pendingBackfill || this.activeBackfillJob)?.reason || fallback;
-  }
-
-  /**
-   * Drops only the expired or query-exhausted pendingBackfill job, promoting any unexpired
-   * queuedBackfillJob into pendingBackfill without disturbing activeBackfillJob,
-   * activeBackfillClip, or queued clips belonging to an active download.
-   *
-   * @param {number} now - Current epoch timestamp in milliseconds.
-   */
-  _dropUnfulfilledPendingBackfill(now) {
-    const droppedJob = this.pendingBackfill;
-    const nextJob =
-      this.queuedBackfillJob && !this.queuedBackfillJob.expireIfNeeded(now) ? this.queuedBackfillJob : null;
-    this.pendingBackfill = nextJob;
-    this.queuedBackfillJob = null;
-    if (nextJob) {
-      this.lastBackfillQueryAt = 0;
-    }
-    if (droppedJob && droppedJob.matchedClips.length > 0) {
-      const droppedPaths = new Set(droppedJob.matchedClips.map((c) => c.storagePath));
-      this.backfillClipQueue = this.backfillClipQueue.filter((c) => !droppedPaths.has(c.storagePath));
-      this.backfillClip = this.backfillClipQueue[0] || null;
-    }
-    if (!this.active && this.activeBackfillJob === droppedJob) {
-      this.activeBackfillJob = null;
-    }
-    if (!this.active && !this.hasPendingBackfill()) {
-      this.backfillContinuation = false;
-      this.lastBackfillDownloadFailedAt = 0;
-      this._clearActiveHardwareTriggers();
-    }
-    this.promoteDeferredLiveWakeIfReady(now);
+    return this.wake.getScheduledApiDurationMs();
   }
 
   /**
@@ -4732,28 +3817,21 @@ class Camera {
    * pending jobs to READY_TO_QUERY, and returns the expired reason string when expired.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [minEventAgeMs=BACKFILL_POST_CLEAR_SETTLE_MS] - Minimum event age before READY_TO_QUERY.
+   * @param {number} [minEventAgeMs] - Minimum event age before READY_TO_QUERY.
    * @returns {string} Expired backfill reason, or empty string if not expired.
    */
-  expirePendingBackfillIfNeeded(now = Date.now(), minEventAgeMs = BACKFILL_POST_CLEAR_SETTLE_MS) {
+  expirePendingBackfillIfNeeded(now = Date.now(), minEventAgeMs = undefined) {
     this.expireStaleHardwareTriggers(now);
-    if (this.queuedBackfillJob && this.queuedBackfillJob.expireIfNeeded(now)) {
-      this.queuedBackfillJob = null;
-    }
-    let expiredReason = '';
-    if (this.pendingBackfill && this.pendingBackfill.expireIfNeeded(now)) {
-      expiredReason = this.pendingBackfill.reason;
-      this._dropUnfulfilledPendingBackfill(now);
-    }
-    const maxRecordingWaitMs = Math.max(
-      BACKFILL_RECORDING_WAIT_CAP_MS,
-      this.timers.holdMs + BACKFILL_POST_CLEAR_SETTLE_MS
+    const {expiredReason, droppedPending, shouldClearTriggers} = this.backfill.expireIfNeeded(
+      now,
+      this.session.active,
+      minEventAgeMs
     );
-    if (this.pendingBackfill) {
-      this.pendingBackfill.markReadyToQueryIfSettled(now, minEventAgeMs, maxRecordingWaitMs);
+    if (shouldClearTriggers) {
+      this._clearActiveHardwareTriggers();
     }
-    if (this.queuedBackfillJob) {
-      this.queuedBackfillJob.markReadyToQueryIfSettled(now, minEventAgeMs, maxRecordingWaitMs);
+    if (droppedPending) {
+      this.promoteDeferredLiveWakeIfReady(now);
     }
     return expiredReason;
   }
@@ -4766,7 +3844,7 @@ class Camera {
    * @returns {Readonly<{ clip: Record<string, *>, sessionId: number, wakeLog: string }>}
    */
   startNextBackfillDownload(now = Date.now()) {
-    const clip = this.backfillClip;
+    const clip = this.backfill.clip;
     const isTest = this.hasUrgentTestBackfill();
     this.beginBackfillDownload(clip, isTest, now);
     const wakeLog =
@@ -4775,9 +3853,9 @@ class Camera {
       '", path="' +
       clip.storagePath +
       '", session=' +
-      this.sessionId +
+      this.session.id +
       ')';
-    return Object.freeze({clip, sessionId: this.sessionId, wakeLog});
+    return Object.freeze({clip, sessionId: this.session.id, wakeLog});
   }
 
   /**
@@ -4805,27 +3883,23 @@ class Camera {
    * Consumes a HomeBase database query attempt for the pending BackfillJob and returns an immutable outcome.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [maxAttempts=BACKFILL_MAX_QUERY_ATTEMPTS] - Maximum allowed query attempts.
+   * @param {number} [maxAttempts] - Maximum allowed query attempts.
    * @returns {Readonly<{ allowed: boolean, attempts: number, maxAttempts: number, reason: string }>}
    */
-  beginBackfillDatabaseQuery(now = Date.now(), maxAttempts = BACKFILL_MAX_QUERY_ATTEMPTS) {
-    if (!this.pendingBackfill) {
-      return Object.freeze({allowed: false, attempts: 0, maxAttempts, reason: ''});
+  beginBackfillDatabaseQuery(now = Date.now(), maxAttempts = undefined) {
+    const out = this.backfill.beginDatabaseQuery(now, this.session.active, maxAttempts);
+    if (out.shouldClearTriggers) {
+      this._clearActiveHardwareTriggers();
     }
-    const maxRecordingWaitMs = Math.max(
-      BACKFILL_RECORDING_WAIT_CAP_MS,
-      this.timers.holdMs + BACKFILL_POST_CLEAR_SETTLE_MS
-    );
-    this.pendingBackfill.markReadyToQueryIfSettled(now, BACKFILL_POST_CLEAR_SETTLE_MS, maxRecordingWaitMs);
-    const reason = this.pendingBackfill.reason;
-    const allowed = this.pendingBackfill.consumeQueryAttempt(maxAttempts);
-    const attempts = this.pendingBackfill.attempts;
-    if (allowed) {
-      this.lastBackfillQueryAt = now;
-    } else {
-      this._dropUnfulfilledPendingBackfill(now);
+    if (out.droppedPending) {
+      this.promoteDeferredLiveWakeIfReady(now);
     }
-    return Object.freeze({allowed, attempts, maxAttempts, reason});
+    return Object.freeze({
+      allowed: out.allowed,
+      attempts: out.attempts,
+      maxAttempts: out.maxAttempts,
+      reason: out.reason,
+    });
   }
 
   /**
@@ -4834,7 +3908,7 @@ class Camera {
    * @returns {boolean}
    */
   canBeginP2pStart() {
-    return Boolean(this.active && !this.starting);
+    return this.session.canBeginP2pStart();
   }
 
   /**
@@ -4843,8 +3917,7 @@ class Camera {
    * @returns {number}
    */
   beginP2pStartAttempt() {
-    this.starting = true;
-    return this.sessionId;
+    return this.session.beginP2pStartAttempt();
   }
 
   /**
@@ -4854,17 +3927,14 @@ class Camera {
    * @param {boolean} [updateStartAt=true] - Whether to set lastStartAt = now.
    */
   markP2pStreamReady(now = Date.now(), updateStartAt = true) {
-    this.p2pReady = true;
-    if (updateStartAt) {
-      this.lastStartAt = now;
-    }
+    this.session.markP2pStreamReady(now, updateStartAt);
   }
 
   /**
    * Marks the camera's P2P stream as not ready to ingest packets.
    */
   markP2pStreamNotReady() {
-    this.p2pReady = false;
+    this.session.markP2pStreamNotReady();
   }
 
   /**
@@ -4872,12 +3942,10 @@ class Camera {
    *
    * @param {number} sessionId - Session identifier of the failed attempt.
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [backoffMs=5000] - Backoff offset in milliseconds.
+   * @param {number} [backoffMs] - Backoff offset in milliseconds.
    */
-  applyFailedStartBackoff(sessionId, now = Date.now(), backoffMs = DEFAULT_FAILED_START_BACKOFF_MS) {
-    if (this.isCurrentSession(sessionId)) {
-      this.lastStartAt = now - backoffMs;
-    }
+  applyFailedStartBackoff(sessionId, now = Date.now(), backoffMs = undefined) {
+    this.session.applyFailedStartBackoff(sessionId, now, backoffMs);
   }
 
   /**
@@ -4886,9 +3954,7 @@ class Camera {
    * @param {number} sessionId - Session identifier of the completed start attempt.
    */
   finishP2pStartAttempt(sessionId) {
-    if (this.sessionId === sessionId) {
-      this.starting = false;
-    }
+    this.session.finishP2pStartAttempt(sessionId);
   }
 
   /**
@@ -4898,8 +3964,7 @@ class Camera {
    * @returns {Promise<*>}
    */
   setStartPromise(promise) {
-    this.startPromise = promise;
-    return promise;
+    return this.session.setStartPromise(promise);
   }
 
   /**
@@ -4912,11 +3977,11 @@ class Camera {
     if (this.isRtspDirect()) {
       return false;
     }
-    this.motionUntil = 0;
+    this.session.motionUntil = 0;
     this._clearActiveHardwareTriggers();
     this.clearDeferredLiveWake();
     this.clearViewerQueue(clearReason);
-    return Boolean(this.active);
+    return Boolean(this.session.active);
   }
 
   /**
@@ -4927,32 +3992,37 @@ class Camera {
    * @returns {Readonly<{ action: 'clean_end'|'interrupted'|'expired'|'inactive', warnMsg: string }>}
    */
   evaluateExternalLivestreamStop(now = Date.now(), minCleanVideoMs = DEFAULT_MIN_CLEAN_VIDEO_MS) {
-    if (this.isBackfillPlayback() || (this.stoppingP2p && (!this.active || (this.starting && !this.gotVideo)))) {
+    if (
+      this.isBackfillPlayback() ||
+      (this.stoppingP2p && (!this.session.active || (this.session.starting && !this.session.gotVideo)))
+    ) {
       return Object.freeze({action: 'inactive', warnMsg: ''});
     }
-    if (this.active && this.starting) {
+    if (this.session.active && this.session.starting) {
       return Object.freeze({action: 'inactive', warnMsg: ''});
     }
     const liveSecs = this.getLiveDurationSecs(now);
-    const lastVideoAgo = this.lastVideoAt ? ((now - this.lastVideoAt) / MS_PER_SECOND).toFixed(1) + 's' : 'none';
-    this.p2pReady = false;
+    const lastVideoAgo = this.session.lastVideoAt
+      ? ((now - this.session.lastVideoAt) / MS_PER_SECOND).toFixed(1) + 's'
+      : 'none';
+    this.session.p2pReady = false;
 
     if (this.isPiggybackedExternalSession() || this.didEufyEndEventCleanly(now, minCleanVideoMs)) {
-      this.motionUntil = 0;
-      this.viewUntil = 0;
+      this.session.motionUntil = 0;
+      this.session.viewUntil = 0;
       return Object.freeze({action: 'clean_end', warnMsg: ''});
     }
-    if (this.active && !this.isInMotion(now) && !this.hasWakingViewer() && this.gotVideo) {
+    if (this.session.active && !this.isInMotion(now) && !this.hasWakingViewer() && this.session.gotVideo) {
       return Object.freeze({action: 'expired', warnMsg: ''});
     }
-    if (this.active && now < this.wantUntil()) {
+    if (this.session.active && now < this.wantUntil()) {
       const remainingSecs = Math.round((this.wantUntil() - now) / MS_PER_SECOND);
       const warnMsg =
         'stream interrupted by eufy/camera (initiator=eufy/camera, ' +
         'reason="livestream stopped event while session active", live=' +
         liveSecs +
         's, gotVideo=' +
-        this.gotVideo +
+        this.session.gotVideo +
         ', lastVideoAgo=' +
         lastVideoAgo +
         ', remainingHold=' +
@@ -4960,7 +4030,7 @@ class Camera {
         's) - re-requesting livestream';
       return Object.freeze({action: 'interrupted', warnMsg});
     }
-    if (this.active) {
+    if (this.session.active) {
       return Object.freeze({action: 'expired', warnMsg: ''});
     }
     return Object.freeze({action: 'inactive', warnMsg: ''});
@@ -4973,35 +4043,14 @@ class Camera {
    * @returns {Readonly<{ hasPending: boolean, isInfo: boolean, logMsg: string }>}
    */
   evaluateBackfillAfterMotionCleared(eventName) {
-    if (!this.pendingBackfill) {
-      return Object.freeze({
-        hasPending: false,
-        isInfo: false,
-        logMsg: 'eufy reported activity cleared (event="' + eventName + '")',
-      });
-    }
-    if (this.isBackfillRecordingCleared()) {
-      return Object.freeze({
-        hasPending: true,
-        isInfo: false,
-        logMsg:
-          'eufy reported activity cleared (event="' +
-          eventName +
-          '"), queued clip backfill ready after HomeBase settle delay',
-      });
-    }
-    return Object.freeze({
-      hasPending: true,
-      isInfo: false,
-      logMsg: 'eufy reported "' + eventName + '" cleared while other trigger events remain active for backfill',
-    });
+    return this.backfill.evaluateAfterMotionCleared(eventName);
   }
 
   /**
    * Resets motionClearedAt and cancels any startup snapshot probe when a new motion trigger arrives.
    */
   prepareForMotionTrigger() {
-    this.motionClearedAt = 0;
+    this.session.motionClearedAt = 0;
     this.cancelStartupProbe();
   }
 
@@ -5011,7 +4060,9 @@ class Camera {
    * @returns {boolean}
    */
   hasDecodedFrame() {
-    return this.isBackfillPlayback() ? this.downloadDecodedFrames > 0 || this.firstFrameAt > 0 : this.firstFrameAt > 0;
+    return this.isBackfillPlayback()
+      ? this.backfill.decodedFrames > 0 || this.session.firstFrameAt > 0
+      : this.session.firstFrameAt > 0;
   }
 
   /**
@@ -5021,7 +4072,7 @@ class Camera {
    * @returns {boolean}
    */
   hasConfirmedSessionVideo() {
-    return this.isBackfillPlayback() ? this.hasDecodedFrame() : this.gotVideo;
+    return this.isBackfillPlayback() ? this.hasDecodedFrame() : this.session.gotVideo;
   }
 
   /**
@@ -5043,11 +4094,7 @@ class Camera {
    * @returns {string} Formatted stop reason if limit reached, or empty string.
    */
   expireMaxDurationHold(now = Date.now()) {
-    if (!this.hasReachedMaxDuration(now)) {
-      return '';
-    }
-    this.motionUntil = 0;
-    return 'reached max_secs limit (' + Math.round(this.timers.maxMs / MS_PER_MINUTE) + 'm)';
+    return this.session.expireMaxDurationHold(now);
   }
 
   /**
@@ -5057,10 +4104,7 @@ class Camera {
    * @returns {string} Formatted stop reason if limit reached, or empty string.
    */
   getViewMaxDurationReason(now = Date.now()) {
-    if (!this.hasReachedViewMaxDuration(now)) {
-      return '';
-    }
-    return 'reached view_max_secs limit (' + Math.round(this.timers.viewMaxMs / MS_PER_MINUTE) + 'm)';
+    return this.session.getViewMaxDurationReason(now);
   }
 
   /**
@@ -5069,14 +4113,14 @@ class Camera {
    * @returns {number}
    */
   getQuietSinceTimestamp() {
-    return Math.max(this.lastVideoAt, this.lastStartAt);
+    return this.session.getQuietSince();
   }
 
   /**
    * Resets motion hold state prior to graceful bridge shutdown.
    */
   prepareForShutdown() {
-    this.motionUntil = 0;
+    this.session.motionUntil = 0;
     this.clearDeferredLiveWake();
   }
 
@@ -5084,7 +4128,7 @@ class Camera {
    * Clears any deferred live wake request queued during active backfill playback.
    */
   clearDeferredLiveWake() {
-    this.deferredLiveWake = null;
+    this.wake.clearDeferred();
   }
 
   /**
@@ -5096,20 +4140,7 @@ class Camera {
    * @returns {number} Coalesced wake duration in milliseconds.
    */
   schedulePostBackfillWake(req, _now = Date.now()) {
-    if (!req || typeof req !== 'object') {
-      return 0;
-    }
-    const prev = this.deferredLiveWake;
-    const mergedCreateEvent = Boolean((prev && prev.createEvent) || req.createEvent);
-    const mergedDurationMs = Math.max(prev ? prev.durationMs : 0, req.durationMs);
-    const mergedPriority = Math.max(prev ? prev.priority : 0, req.priority);
-    const mergedReason = req.reason || (prev ? prev.reason : '');
-    const mergedInitiator = req.initiator || (prev ? prev.initiator : 'api-wake');
-    const builder = mergedCreateEvent
-      ? WakeRequest.motion(mergedReason, mergedDurationMs).withPriority(mergedPriority)
-      : WakeRequest.view(mergedReason, mergedDurationMs);
-    this.deferredLiveWake = builder.withInitiator(mergedInitiator).withCreateEvent(mergedCreateEvent).build();
-    return mergedDurationMs;
+    return this.wake.defer(req);
   }
 
   /**
@@ -5121,11 +4152,10 @@ class Camera {
    * @returns {boolean} True if a deferred wake was promoted.
    */
   promoteDeferredLiveWakeIfReady(now = Date.now(), allCams = []) {
-    if (!this.deferredLiveWake || this.active || this.hasPendingBackfill()) {
+    if (!this.wake.hasDeferred() || this.session.active || this.hasPendingBackfill()) {
       return false;
     }
-    const deferred = this.deferredLiveWake;
-    this.deferredLiveWake = null;
+    const deferred = this.wake.takeDeferred();
     this.recordApiWakeTriggered(Boolean(deferred.createEvent));
     this.applyWakeRequest(deferred, now, allCams);
     return true;
@@ -5141,12 +4171,10 @@ class Camera {
    * @returns {number} Effective event priority boost.
    */
   _consumeDeferredWakePriority(evPriority, recordingActive) {
-    if (!recordingActive || !this.deferredLiveWake || !this.backfillDownloads) {
+    if (!recordingActive || !this.wake.hasDeferred() || !this.backfillDownloads) {
       return evPriority;
     }
-    const mergedPrio = Math.max(evPriority, this.deferredLiveWake.priority);
-    this.deferredLiveWake = null;
-    return mergedPrio;
+    return this.wake.absorbPriority(evPriority);
   }
 
   /**
@@ -5198,7 +4226,7 @@ class Camera {
    * @returns {boolean}
    */
   hasRegisteredViewer(viewerId) {
-    return this.viewerIds.has(viewerId);
+    return this.viewerSet.has(viewerId);
   }
 
   /**
@@ -5208,7 +4236,7 @@ class Camera {
    * @param {boolean} asked - Whether this viewer is allowed to wake/extend the camera.
    */
   setViewerWakingStatus(viewerId, asked) {
-    this.viewerIds.set(viewerId, Boolean(asked));
+    this.viewerSet.setWaking(viewerId, asked);
   }
 
   /**
@@ -5225,12 +4253,12 @@ class Camera {
   }
 
   /**
-   * Returns an immutable logger scope object `{ name, evState }` for Frigate event lifecycle logs.
+   * Returns an immutable logger scope object `{ name, state }` for Frigate event lifecycle logs.
    *
-   * @returns {Readonly<{ name: string, evState: string }>}
+   * @returns {Readonly<{ name: string, state: string }>}
    */
   getEventLogScope() {
-    return Object.freeze({name: this.name, evState: this.evState});
+    return Object.freeze({name: this.name, state: this.eventFiling.state});
   }
 
   /**
@@ -5239,7 +4267,7 @@ class Camera {
    * @param {*} timer - Node.js Timeout handle.
    */
   setFrigateEventTimer(timer) {
-    this.evTimer = timer;
+    this.eventFiling.setTimer(timer);
   }
 
   /**
@@ -5254,7 +4282,8 @@ class Camera {
    */
   shouldWaitForEventSnapshot(now, requiredDelayMs, freshFrameMs, recentFallbackMs) {
     return Boolean(
-      this.evLabel !== 'test' && !this.isReadyForEventSnapshot(now, requiredDelayMs, freshFrameMs, recentFallbackMs)
+      this.eventFiling.label !== 'test' &&
+      !this.isReadyForEventSnapshot(now, requiredDelayMs, freshFrameMs, recentFallbackMs)
     );
   }
 
@@ -5262,49 +4291,35 @@ class Camera {
    * Coalesces a duplicate /api/wake request into the camera's pending wake timer options
    * and returns the remaining delay in milliseconds.
    *
-   * @param {number} durationMs - Requested wake hold duration in milliseconds.
-   * @param {string} reason - Wake reason string.
-   * @param {boolean} createEvent - Whether to file a synthetic Frigate event.
+   * @param {{durationMs: number, reason: string, createEvent: boolean}} spec - Duplicate wake request options
+   *   (durationMs: requested wake hold duration in ms; reason: wake reason string; createEvent: whether to file a
+   *   synthetic Frigate event).
    * @param {number} now - Current epoch timestamp in milliseconds.
    * @returns {number} Remaining scheduled delay in milliseconds.
    */
-  coalesceApiWake(durationMs, reason, createEvent, now) {
-    const prevDuration = this.apiWakePendingOpts ? this.apiWakePendingOpts.durationMs : 0;
-    const prevCreateEvent = Boolean(this.apiWakePendingOpts && this.apiWakePendingOpts.createEvent);
-    this.apiWakePendingOpts = {
-      durationMs: Math.max(prevDuration, durationMs),
-      reason,
-      createEvent: Boolean(prevCreateEvent || createEvent),
-    };
-    return Math.max(0, (this.apiWakeScheduledAt || now) - now);
+  coalesceApiWake(spec, now) {
+    return this.wake.coalesceApi(spec, now);
   }
 
   /**
    * Schedules a paced /api/wake timer on this camera.
    *
-   * @param {number} durationMs - Requested wake duration in milliseconds.
-   * @param {string} reason - Wake reason string.
-   * @param {boolean} createEvent - Whether to file a synthetic Frigate event.
-   * @param {number} delayMs - Pacing delay in milliseconds.
-   * @param {number} now - Current epoch timestamp in milliseconds.
+   * @param {{
+   *   durationMs: number,
+   *   reason: string,
+   *   createEvent: boolean,
+   *   delayMs: number,
+   *   now: number,
+   * }} spec - Paced wake specification (durationMs: requested wake duration in ms; reason: wake reason string;
+   *   createEvent: whether to file a synthetic Frigate event; delayMs: pacing delay in ms; now: current epoch ms).
    * @param {(pending: {
    *   durationMs: number,
    *   reason: string,
    *   createEvent: boolean,
    * }) => void} onFire - Callback when timer fires.
    */
-  scheduleApiWake(durationMs, reason, createEvent, delayMs, now, onFire) {
-    this.clearApiWakeTimer();
-    this.apiWakePendingOpts = {durationMs, reason, createEvent};
-    this.apiWakeScheduledAt = now + delayMs;
-    this.apiWakeTimer = setTimeout(() => {
-      const pending = this.apiWakePendingOpts || {durationMs, reason, createEvent};
-      this.clearApiWakeTimer();
-      onFire(pending);
-    }, delayMs);
-    if (this.apiWakeTimer && typeof this.apiWakeTimer.unref === 'function') {
-      this.apiWakeTimer.unref();
-    }
+  scheduleApiWake(spec, onFire) {
+    this.wake.scheduleApi(spec, onFire);
   }
 
   /**
@@ -5315,13 +4330,7 @@ class Camera {
    * @returns {boolean} True if the RTSP wake was stalled and reset.
    */
   resetStalledRtspWakeIfNeeded(now, stallMs) {
-    if (this.activeMode === STREAM_MODES.RTSP && !this.gotVideo && now - this.startedAt > stallMs) {
-      this.startedAt = now;
-      this.lastStartAt = now;
-      this.restarts = 0;
-      return true;
-    }
-    return false;
+    return this.session.resetStalledRtspWake(now, stallMs);
   }
 
   /**
@@ -5337,7 +4346,7 @@ class Camera {
       camera: this.name,
       title: this.getDisplayTitle(),
       status,
-      mode: this.activeMode || (this.isRtspCapable() ? STREAM_MODES.RTSP : STREAM_MODES.P2P),
+      mode: this.session.mode || (this.isRtspCapable() ? STREAM_MODES.RTSP : STREAM_MODES.P2P),
       hold_secs: Math.round(durationMs / MS_PER_SECOND),
       delay_ms: delayMs,
     };
@@ -5363,7 +4372,7 @@ class Camera {
       camera: this.name,
       title: this.getDisplayTitle(),
       status,
-      mode: this.activeMode || (this.isRtspCapable() ? STREAM_MODES.RTSP : STREAM_MODES.P2P),
+      mode: this.session.mode || (this.isRtspCapable() ? STREAM_MODES.RTSP : STREAM_MODES.P2P),
       hold_secs: 0,
       delay_ms: 0,
       error,
@@ -5383,32 +4392,27 @@ class Camera {
    *   session duration in milliseconds.
    * @returns {boolean}
    */
-  isDownloadComplete(
-    now,
-    idleCompleteMs = DEFAULT_DOWNLOAD_IDLE_COMPLETE_MS,
-    postPlaybackHoldMs = DEFAULT_DOWNLOAD_POST_PLAYBACK_HOLD_MS,
-    minPlaybackMs = DEFAULT_DOWNLOAD_MIN_PLAYBACK_MS
-  ) {
-    const hasBufferedStdout = Boolean(this.dec && this.dec.stdout && this.dec.stdout.readableLength > 0);
+  isDownloadComplete(now, idleCompleteMs = undefined, postPlaybackHoldMs = undefined, minPlaybackMs = undefined) {
+    const hasBufferedStdout = Boolean(
+      this.session.dec && this.session.dec.stdout && this.session.dec.stdout.readableLength > 0
+    );
     const hasUnencodedFrame = Boolean(this.frameNew && this.hasWritableEncoderStdin());
     const allPipesDrained =
-      !hasUnencodedFrame && this.pendingVideoPackets.length === 0 && !this.decoderStdoutPaused && !hasBufferedStdout;
-    const readyToComplete = Boolean(
-      this.hasDecodedFrame() &&
-      this.gotVideo &&
-      this.downloadFrames.length === 0 &&
-      allPipesDrained &&
-      (minPlaybackMs <= 0 || now - this.startedAt >= minPlaybackMs)
-    );
-    const decoderFlushed =
-      !this.dec || now - Math.max(this.downloadFinishedAt || 0, this.lastVideoAt || 0) >= DOWNLOAD_EOF_FLUSH_SETTLE_MS;
-    const effectivePostHoldMs =
-      this.backfillClipQueue.length > 0 || Boolean(this.pendingBackfill) ? 0 : postPlaybackHoldMs;
-    return readyToComplete
-      ? this.downloadFinished
-        ? Boolean(decoderFlushed && now - this.lastVideoAt >= effectivePostHoldMs)
-        : now - this.lastVideoAt > idleCompleteMs
-      : false;
+      !hasUnencodedFrame &&
+      this.session.pendingVideoPackets.length === 0 &&
+      !this.session.decoderStdoutPaused &&
+      !hasBufferedStdout;
+    return this.backfill.isDownloadComplete(now, {
+      hasDecodedFrame: this.hasDecodedFrame(),
+      gotVideo: this.session.gotVideo,
+      allPipesDrained,
+      hasDec: Boolean(this.session.dec),
+      startedAt: this.session.startedAt,
+      lastVideoAt: this.session.lastVideoAt,
+      idleCompleteMs,
+      postPlaybackHoldMs,
+      minPlaybackMs,
+    });
   }
 
   /**
@@ -5419,12 +4423,11 @@ class Camera {
    * @returns {number} Number of buffered frames and queued video packets remaining.
    */
   markDownloadFinished(now) {
-    this.downloadFinished = true;
-    this.downloadFinishedAt = now;
+    const remaining = this.backfill.markTransferFinished(now, this.session.pendingVideoPackets.length);
     if (this.isBackfillPlayback() && this.hasDecodedFrame()) {
       this.transitionTo(SESSION_STATES.DRAINING_BACKFILL_TAIL, now, 'download transfer finished');
     }
-    return this.downloadFrames.length + this.pendingVideoPackets.length;
+    return remaining;
   }
 
   /**
@@ -5435,31 +4438,10 @@ class Camera {
    * @returns {string}
    */
   formatBackfillTransferCompleteLog(bufferedCount, fps = LIVE_FPS) {
-    const frameBasis = Math.max(this.downloadDecodedFrames, this.downloadVideoPackets);
-    const estClipSecs = (frameBasis / Math.max(1, fps)).toFixed(1);
-    return (
-      'eufy clip transfer complete, playing remaining ' +
-      bufferedCount +
-      ' buffered frames at ' +
-      fps +
-      ' fps (clipStart=' +
-      formatEpochHms(this.backfillClipStartMs) +
-      ', packets=' +
-      this.downloadVideoPackets +
-      ', decodedFrames=' +
-      this.downloadDecodedFrames +
-      ', playedFrames=' +
-      this.downloadPlayedFrames +
-      ', bufferedFrames=' +
-      this.downloadFrames.length +
-      ', pendingPackets=' +
-      this.pendingVideoPackets.length +
-      ', estClipDuration=' +
-      estClipSecs +
-      's, session=' +
-      this.sessionId +
-      ')'
-    );
+    return this.backfill.formatTransferCompleteLog(bufferedCount, this.session.pendingVideoPackets.length, {
+      fps,
+      sessionId: this.session.id,
+    });
   }
 
   /**
@@ -5471,7 +4453,7 @@ class Camera {
    */
   shouldLogUnexpectedDecoderExit(sessionId, exitCode) {
     return this.isCurrentSession(sessionId)
-      ? !(this.isBackfillPlayback() && this.downloadFinished && exitCode === 0)
+      ? !(this.isBackfillPlayback() && this.backfill.finished && exitCode === 0)
       : false;
   }
 
@@ -5500,11 +4482,14 @@ class Camera {
     const pickScore = this.getEffectivePriority(now);
     const curScore = cur.getEffectivePriority(now);
     const curFinishedOrStalled =
-      cur.motionClearedAt > cur.lastMotionAt || (!cur.gotVideo && now - cur.startedAt >= stallPreemptMs);
+      cur.session.motionClearedAt > cur.session.lastMotionAt ||
+      (!cur.session.gotVideo && now - cur.session.startedAt >= stallPreemptMs);
     const samePriorityCanPreempt =
-      pickScore === curScore && this.lastMotionAt > cur.lastMotionAt && Boolean(preemptEnabled || curFinishedOrStalled);
+      pickScore === curScore &&
+      this.session.lastMotionAt > cur.session.lastMotionAt &&
+      Boolean(preemptEnabled || curFinishedOrStalled);
     return !this.isInMotion(now)
-      ? !cur.isInMotion(now) && this.viewSince > cur.viewSince
+      ? !cur.isInMotion(now) && this.session.viewSince > cur.session.viewSince
       : !cur.isInMotion(now) || pickScore > curScore || samePriorityCanPreempt || Boolean(curFinishedOrStalled);
   }
 
@@ -5547,9 +4532,9 @@ class Camera {
       if (prioDiff !== 0) {
         return prioDiff;
       }
-      return b.lastMotionAt - a.lastMotionAt;
+      return b.session.lastMotionAt - a.session.lastMotionAt;
     }
-    return b.viewSince - a.viewSince;
+    return b.session.viewSince - a.session.viewSince;
   }
 
   /**
@@ -5565,7 +4550,7 @@ class Camera {
     if (prioDiff !== 0) {
       return prioDiff;
     }
-    return (a.lastBackfillQueryAt || 0) - (b.lastBackfillQueryAt || 0);
+    return (a.backfill.lastQueryAt || 0) - (b.backfill.lastQueryAt || 0);
   }
 
   /**
@@ -5598,15 +4583,8 @@ class Camera {
    * @param {number} [maxDownloadBytes=maxLiveBytes] - Maximum buffered PCM bytes during clip downloads.
    */
   appendAudioChunk(pcmChunk, maxLiveBytes, maxDownloadBytes = maxLiveBytes) {
-    const byteCapacity = this.activeMode === STREAM_MODES.DOWNLOAD ? maxDownloadBytes : maxLiveBytes;
-    this.pcm.push(pcmChunk);
-    this.pcmLen += pcmChunk.length;
-    while (this.pcm.length > 1 && this.pcmLen > byteCapacity) {
-      const oldestChunk = this.pcm.shift();
-      if (oldestChunk) {
-        this.pcmLen -= oldestChunk.length;
-      }
-    }
+    const byteCapacity = this.session.mode === STREAM_MODES.DOWNLOAD ? maxDownloadBytes : maxLiveBytes;
+    this.audioQueue.push(pcmChunk, byteCapacity);
   }
 
   /**
@@ -5618,66 +4596,7 @@ class Camera {
    * @returns {Uint8Array}
    */
   consumeAudioChunk(chunkBytes, silenceBuf) {
-    if ((this.isBackfillPlayback() && !this.firstFrameAt) || this.pcmLen < chunkBytes) {
-      return silenceBuf;
-    }
-    const first = this.pcm[0];
-    if (first.length >= chunkBytes) {
-      let out = first;
-      if (first.length === chunkBytes) {
-        this.pcm.shift();
-      } else {
-        out = first.subarray(0, chunkBytes);
-        this.pcm[0] = first.subarray(chunkBytes);
-      }
-      this.pcmLen -= chunkBytes;
-      return out;
-    }
-
-    if (this.audioOutBuf.length < chunkBytes) {
-      this.audioOutBuf = Buffer.allocUnsafe(chunkBytes);
-    }
-    const out = this.audioOutBuf.subarray(0, chunkBytes);
-    let copied = 0;
-    while (copied < chunkBytes && this.pcm.length > 0) {
-      const head = this.pcm[0];
-      const need = chunkBytes - copied;
-      if (head.length <= need) {
-        out.set(head, copied);
-        copied += head.length;
-        this.pcm.shift();
-      } else {
-        out.set(head.subarray(0, need), copied);
-        this.pcm[0] = head.subarray(need);
-        copied += need;
-      }
-    }
-    this.pcmLen -= copied;
-    return out;
-  }
-
-  /**
-   * Records a downloaded HomeBase clip path in bounded FIFO order so long-running processes
-   * never accumulate unbounded downloadedPaths Set entries.
-   *
-   * @param {string} storagePath - HomeBase clip storage path.
-   */
-  recordDownloadedClipPath(storagePath) {
-    if (!storagePath) {
-      return;
-    }
-    if (this.downloadedPaths.has(storagePath)) {
-      this.downloadedPaths.delete(storagePath);
-    } else {
-      while (this.downloadedPaths.size >= MAX_DOWNLOADED_PATHS_HISTORY) {
-        const oldest = this.downloadedPaths.values().next().value;
-        if (oldest === undefined) {
-          break;
-        }
-        this.downloadedPaths.delete(oldest);
-      }
-    }
-    this.downloadedPaths.add(storagePath);
+    return this.audioQueue.consume(chunkBytes, silenceBuf, this.isBackfillPlayback() && !this.session.firstFrameAt);
   }
 
   /**
@@ -5740,26 +4659,26 @@ class Camera {
     lastSeenHm = '',
     cancelBackfillMs = this.getSustainedLiveVideoCutoffMs()
   ) {
-    if (!this.firstFrameAt) {
-      this.firstFrameAt = now;
+    if (!this.session.firstFrameAt) {
+      this.session.firstFrameAt = now;
       if (this.isBackfillPlayback()) {
-        this.backfillPlaybackStartedAt = now;
-        if (!this.gotVideo) {
-          this.gotVideo = true;
-          this.firstVideoAt = now;
+        this.backfill.playbackStartedAt = now;
+        if (!this.session.gotVideo) {
+          this.session.gotVideo = true;
+          this.session.firstVideoAt = now;
         }
       }
     }
     this.markDecoderDecoding();
-    if (this.active) {
+    if (this.session.active) {
       if (this.isBackfillPlayback()) {
-        this.backfillContinuation = false;
-        this.downloadDecodedFrames++;
-        this.downloadPlayedFrames++;
+        this.backfill.continuation = false;
+        this.backfill.decodedFrames++;
+        this.backfill.playedFrames++;
         this.transitionTo(
-          this.downloadFinished ? SESSION_STATES.DRAINING_BACKFILL_TAIL : SESSION_STATES.PLAYING_BACKFILL,
+          this.backfill.finished ? SESSION_STATES.DRAINING_BACKFILL_TAIL : SESSION_STATES.PLAYING_BACKFILL,
           now,
-          this.downloadFinished ? 'download transfer finished' : 'first backfill frame decoded'
+          this.backfill.finished ? 'download transfer finished' : 'first backfill frame decoded'
         );
       } else {
         this.transitionTo(SESSION_STATES.STREAMING_LIVE, now, 'first live frame decoded');
@@ -5768,7 +4687,7 @@ class Camera {
     const prevFrame = this.frame;
     this.frame = liveFrame;
     this.frameAt = now;
-    this.lastVideoAt = now;
+    this.session.lastVideoAt = now;
     this.frameNew = true;
     this.lastFrame = snapshotCopy === liveFrame && prevFrame && prevFrame !== liveFrame ? prevFrame : snapshotCopy;
     this.needsStartupSnapshot = false;
@@ -5789,16 +4708,14 @@ class Camera {
    * @returns {boolean} True if buffered for paced playback, false if it should be committed now.
    */
   bufferDownloadFrame(frameCopy, maxBufferFrames) {
-    if (!this.frame) {
+    const res = this.backfill.bufferFrame(Boolean(this.frame), frameCopy, maxBufferFrames);
+    if (!res.buffered) {
       return false;
     }
-    this.downloadDecodedFrames++;
-    if (this.downloadFrames.length < maxBufferFrames) {
-      this.downloadFrames.push(frameCopy);
-    } else {
-      this.droppedFrames++;
+    if (res.dropped) {
+      this.session.droppedFrames++;
     }
-    if (!this.decoderStdoutPaused && this.downloadFrames.length >= DOWNLOAD_FRAME_HIGH_WATERMARK) {
+    if (!this.session.decoderStdoutPaused && res.shouldPauseDecoder) {
       this.pauseDecoderStdout();
     }
     return true;
@@ -5810,10 +4727,7 @@ class Camera {
    * @returns {string} Resulting decoder FSM state.
    */
   markDecoderDecoding() {
-    if (!this.decoderStdoutPaused && !this.decoderInputEnded) {
-      return this._transitionDecoderTo(DECODER_STATES.DECODING, 'first frame decoded');
-    }
-    return this.decoderState;
+    return this.session.markDecoderDecoding();
   }
 
   /**
@@ -5823,27 +4737,7 @@ class Camera {
    * @returns {string} Resulting decoder FSM state.
    */
   pauseDecoderStdout() {
-    this.decoderStdoutPaused = true;
-    this._transitionDecoderTo(DECODER_STATES.PAUSED_BACKPRESSURE, 'high watermark reached');
-    if (this.dec && this.dec.stdout && typeof this.dec.stdout.pause === 'function') {
-      this.dec.stdout.pause();
-    }
-    return this.decoderState;
-  }
-
-  /**
-   * Appends a compressed A/V packet to a bounded decoder queue using a drop-oldest policy.
-   *
-   * @param {Uint8Array[]} queue - Target pending packet queue.
-   * @param {Uint8Array} packetBuf - Compressed packet buffer.
-   * @param {number} maxPackets - Maximum packets retained before evicting the oldest packet.
-   */
-  _pushBoundedPacket(queue, packetBuf, maxPackets) {
-    while (queue.length >= maxPackets) {
-      queue.shift();
-      this.droppedFrames++;
-    }
-    queue.push(packetBuf);
+    return this.session.pauseDecoderStdout();
   }
 
   /**
@@ -5851,26 +4745,11 @@ class Camera {
    * needs drain) or writes it directly to the active FFmpeg decoder stdin.
    *
    * @param {Uint8Array} packetBuf - Raw compressed H.264/H.265 packet.
-   * @param {boolean} [audioEnabled=AUDIO] - Whether audio pipe draining is enabled.
+   * @param {boolean} [audioEnabled] - Whether audio pipe draining is enabled.
    * @returns {boolean} True if written or queued.
    */
-  enqueueOrWriteVideoPacket(packetBuf, audioEnabled = AUDIO) {
-    const stdin = this.dec ? this.dec.stdin : null;
-    if (!stdin || !stdin.writable) {
-      return false;
-    }
-    if (this.decoderStdoutPaused || this.pendingVideoPackets.length > 0 || stdin.writableNeedDrain) {
-      const maxVideoPkts = this.isBackfillPlayback()
-        ? MAX_DOWNLOAD_PENDING_VIDEO_PACKETS
-        : MAX_LIVE_PENDING_VIDEO_PACKETS;
-      this._pushBoundedPacket(this.pendingVideoPackets, packetBuf, maxVideoPkts);
-      if (!this.decoderStdoutPaused && !stdin.writableNeedDrain) {
-        this.drainPendingDecoderInput(audioEnabled);
-      }
-      return true;
-    }
-    stdin.write(packetBuf);
-    return true;
+  enqueueOrWriteVideoPacket(packetBuf, audioEnabled = undefined) {
+    return this.session.enqueueOrWriteVideoPacket(packetBuf, audioEnabled);
   }
 
   /**
@@ -5880,102 +4759,32 @@ class Camera {
    * without gaps during backfill playback.
    *
    * @param {Uint8Array} packetBuf - Raw compressed AAC packet.
-   * @param {boolean} [audioEnabled=AUDIO] - Whether audio is enabled.
+   * @param {boolean} [audioEnabled] - Whether audio is enabled.
    * @returns {boolean} True if written or queued.
    */
-  enqueueOrWriteAudioPacket(packetBuf, audioEnabled = AUDIO) {
-    if (!audioEnabled) {
-      return false;
-    }
-    const maxAudioPkts = this.isBackfillPlayback()
-      ? MAX_DOWNLOAD_PENDING_AUDIO_PACKETS
-      : MAX_LIVE_PENDING_AUDIO_PACKETS;
-    if (!this.dec && this.canIngestP2pPacket()) {
-      this._pushBoundedPacket(this.pendingAudioPackets, packetBuf, maxAudioPkts);
-      return true;
-    }
-    const audioStream = this.dec && this.dec.stdio && this.dec.stdio[3] ? this.dec.stdio[3] : null;
-    if (!audioStream || !audioStream.writable) {
-      return false;
-    }
-    if (this.pendingAudioPackets.length > 0 || audioStream.writableNeedDrain) {
-      this._pushBoundedPacket(this.pendingAudioPackets, packetBuf, maxAudioPkts);
-      if (!audioStream.writableNeedDrain) {
-        this.drainPendingDecoderInput(audioEnabled);
-      }
-      return true;
-    }
-    audioStream.write(packetBuf);
-    return true;
+  enqueueOrWriteAudioPacket(packetBuf, audioEnabled = undefined) {
+    return this.session.enqueueOrWriteAudioPacket(packetBuf, audioEnabled);
   }
 
   /**
    * Drains queued compressed video/audio packets into the FFmpeg decoder pipes once backpressure
    * clears, closing the input pipes if markDecoderInputEnded was requested on download EOF.
    *
-   * @param {boolean} [audioEnabled=AUDIO] - Whether audio pipe draining is enabled.
+   * @param {boolean} [audioEnabled] - Whether audio pipe draining is enabled.
    * @param {boolean} [fromPipeDrain=false] - Whether invoked from a decoder input pipe drain event.
    */
-  drainPendingDecoderInput(audioEnabled = AUDIO, fromPipeDrain = false) {
-    if (!this.dec) {
-      return;
-    }
-    const stdin = this.dec.stdin;
-    if (!this.decoderStdoutPaused || fromPipeDrain) {
-      while (this.pendingVideoPackets.length > 0 && stdin && stdin.writable && !stdin.writableNeedDrain) {
-        const nextPkt = this.pendingVideoPackets.shift();
-        stdin.write(nextPkt);
-      }
-    }
-
-    const audioStream = audioEnabled && this.dec.stdio && this.dec.stdio[3] ? this.dec.stdio[3] : null;
-    while (
-      this.pendingAudioPackets.length > 0 &&
-      audioStream &&
-      audioStream.writable &&
-      !audioStream.writableNeedDrain
-    ) {
-      const nextAudio = this.pendingAudioPackets.shift();
-      audioStream.write(nextAudio);
-    }
-
-    if (this.decoderInputEnded) {
-      if (this.pendingAudioPackets.length === 0) {
-        try {
-          if (audioStream && audioStream.writable) {
-            audioStream.end();
-          }
-        } catch (err) {
-          // Ignore errors when closing decoder audio pipe after draining.
-        }
-      }
-      if (this.pendingVideoPackets.length === 0) {
-        if (!this.decoderStdoutPaused && this.pendingAudioPackets.length === 0) {
-          this._transitionDecoderTo(DECODER_STATES.FLUSHING_EOF, 'input pipe ended');
-        }
-        try {
-          if (stdin && stdin.writable) {
-            stdin.end();
-          }
-        } catch (err) {
-          // Ignore errors when closing decoder video pipe after draining.
-        }
-      }
-    }
+  drainPendingDecoderInput(audioEnabled = undefined, fromPipeDrain = false) {
+    this.session.drainPendingDecoderInput(audioEnabled, fromPipeDrain);
   }
 
   /**
    * Marks the decoder input stream as ended (on backfill download EOF) and closes the FFmpeg
    * input pipes immediately or as soon as any queued compressed packets finish draining.
    *
-   * @param {boolean} [audioEnabled=AUDIO] - Whether audio pipe is enabled.
+   * @param {boolean} [audioEnabled] - Whether audio pipe is enabled.
    */
-  markDecoderInputEnded(audioEnabled = AUDIO) {
-    this.decoderInputEnded = true;
-    if (!this.decoderStdoutPaused && this.pendingVideoPackets.length === 0 && this.pendingAudioPackets.length === 0) {
-      this._transitionDecoderTo(DECODER_STATES.FLUSHING_EOF, 'input pipe ended');
-    }
-    this.drainPendingDecoderInput(audioEnabled);
+  markDecoderInputEnded(audioEnabled = undefined) {
+    this.session.markDecoderInputEnded(audioEnabled);
   }
 
   /**
@@ -5983,20 +4792,7 @@ class Camera {
    * and drains any compressed packets queued while paused.
    */
   resumeDecoderStdout() {
-    if (!this.decoderStdoutPaused && this.decoderState !== DECODER_STATES.PAUSED_BACKPRESSURE) {
-      return;
-    }
-    this.decoderStdoutPaused = false;
-    const allInputDrained =
-      this.decoderInputEnded && this.pendingVideoPackets.length === 0 && this.pendingAudioPackets.length === 0;
-    this._transitionDecoderTo(
-      allInputDrained ? DECODER_STATES.FLUSHING_EOF : DECODER_STATES.DECODING,
-      allInputDrained ? 'input pipe ended' : 'low watermark resumed'
-    );
-    if (this.dec && this.dec.stdout && typeof this.dec.stdout.resume === 'function') {
-      this.dec.stdout.resume();
-    }
-    this.drainPendingDecoderInput();
+    this.session.resumeDecoderStdout();
   }
 
   /**
@@ -6014,8 +4810,8 @@ class Camera {
       return null;
     }
     const prevFrame = this.frame;
-    const nextBuf = this.downloadFrames.shift();
-    this.downloadPlayedFrames++;
+    const nextBuf = this.backfill.frames.shift();
+    this.backfill.playedFrames++;
     if (
       Buffer.isBuffer(prevFrame) &&
       prevFrame !== nextBuf &&
@@ -6025,13 +4821,13 @@ class Camera {
     }
     this.frame = nextBuf;
     this.frameAt = now;
-    this.lastVideoAt = now;
+    this.session.lastVideoAt = now;
     this.frameNew = true;
     this.lastFrame = nextBuf;
     if (lastSeenHm) {
       this.telemetry.updateLastSeen(lastSeenHm);
     }
-    if (this.decoderStdoutPaused && this.downloadFrames.length <= DOWNLOAD_FRAME_LOW_WATERMARK) {
+    if (this.session.decoderStdoutPaused && this.backfill.frames.length <= DOWNLOAD_FRAME_LOW_WATERMARK) {
       this.resumeDecoderStdout();
     }
     return nextBuf;
@@ -6071,7 +4867,7 @@ class Camera {
    */
   attachEncoder(enc, now = Date.now()) {
     this.enc = enc;
-    this.encoderStoppedForOffline = false;
+    this.offline.markEncoderStarted();
     this.encoderConsumerConnected = false;
     this.lastSent = null;
     this.lastWrite = now;
@@ -6182,7 +4978,7 @@ class Camera {
     if (Buffer.isBuffer(this.lastFrame) && this.lastRenderedSnapshot !== this.lastFrame && this.renderCardsFn) {
       this.renderCardsFn(this);
     }
-    if (this.active && !this.isBackfillPlayback() && !this.isRtspDirect()) {
+    if (this.session.active && !this.isBackfillPlayback() && !this.isRtspDirect()) {
       return {frame: this.card.waking, isLive: false};
     }
     if (this.isWaitingForSlotOrBackfill(now, freshFrameMaxAgeMs)) {
@@ -6317,7 +5113,7 @@ class Camera {
    * @returns {boolean}
    */
   hasDecoderProcess() {
-    return Boolean(this.dec);
+    return this.session.hasDecoderProcess();
   }
 
   /**
@@ -6328,14 +5124,7 @@ class Camera {
    * @returns {boolean} True if matched and cleared.
    */
   detachDecoderIfMatch(dec, clearSpawnedAt = false) {
-    if (this.dec === dec) {
-      this.dec = null;
-      if (clearSpawnedAt) {
-        this.decSpawnedAt = 0;
-      }
-      return true;
-    }
-    return false;
+    return this.session.detachDecoderIfMatch(dec, clearSpawnedAt);
   }
 
   /**
@@ -6346,14 +5135,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldDeferDecoderDetachOnExit(dec) {
-    const canListenStdoutClose = Boolean(
-      dec &&
-      dec.stdout &&
-      !dec.stdout.readableEnded &&
-      !dec.stdout.closed &&
-      (typeof dec.stdout.once === 'function' || typeof dec.stdout.on === 'function')
-    );
-    return Boolean(this.dec === dec && this.isBackfillPlayback() && canListenStdoutClose);
+    return this.session.shouldDeferDecoderDetachOnExit(dec);
   }
 
   /**
@@ -6363,7 +5145,7 @@ class Camera {
    * @returns {boolean}
    */
   shouldResumePausedDecoderOnExit() {
-    return Boolean(this.decoderStdoutPaused && this.downloadFrames.length <= DOWNLOAD_FRAME_LOW_WATERMARK);
+    return Boolean(this.session.decoderStdoutPaused && this.backfill.frames.length <= DOWNLOAD_FRAME_LOW_WATERMARK);
   }
 
   /**
@@ -6374,13 +5156,13 @@ class Camera {
    * @returns {'S'|'FB'|'B'|'L'}
    */
   getFrameMarker() {
-    if (!this.active) {
-      return this.backfillContinuation && this.hasPendingBackfill()
+    if (!this.session.active) {
+      return this.backfill.continuation && this.hasPendingBackfill()
         ? FRAME_STAGE_MARKERS.BACKFILL
         : FRAME_STAGE_MARKERS.SNAPSHOT;
     }
     return this.isBackfillPlayback()
-      ? this.downloadPlayedFrames > FIRST_BACKFILL_PLAYED_FRAME_COUNT || this.backfillContinuation
+      ? this.backfill.playedFrames > FIRST_BACKFILL_PLAYED_FRAME_COUNT || this.backfill.continuation
         ? FRAME_STAGE_MARKERS.BACKFILL
         : FRAME_STAGE_MARKERS.FIRST_BACKFILL
       : FRAME_STAGE_MARKERS.LIVE;
@@ -6390,10 +5172,7 @@ class Camera {
    * Clears any pending RTSP decoder retry timer on this camera.
    */
   clearRtspRetryTimer() {
-    if (this.rtspRetryTimer) {
-      clearTimeout(this.rtspRetryTimer);
-      this.rtspRetryTimer = null;
-    }
+    this.session.clearRtspRetryTimer();
   }
 
   /**
@@ -6403,14 +5182,7 @@ class Camera {
    * @param {() => void} onRetry - Callback invoked when the retry timer fires.
    */
   scheduleRtspDecoderRetry(delayMs, onRetry) {
-    this.clearRtspRetryTimer();
-    this.rtspRetryTimer = setTimeout(() => {
-      this.rtspRetryTimer = null;
-      onRetry();
-    }, delayMs);
-    if (this.rtspRetryTimer && typeof this.rtspRetryTimer.unref === 'function') {
-      this.rtspRetryTimer.unref();
-    }
+    this.session.scheduleRtspDecoderRetry(delayMs, onRetry);
   }
 
   /**
@@ -6482,6 +5254,71 @@ class Camera {
   }
 
   /**
+   * Captures every value the diagnostic "hud" theme prints as one immutable plain object, so the formatter in
+   * `camera/debug-hud.js` never reaches into this Camera.
+   *
+   * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+   * @returns {Readonly<import("./camera/debug-hud").DebugHudSnapshot>}
+   */
+  getDebugHudSnapshot(now = Date.now()) {
+    const wantUntilMs = this.wantUntil();
+    const bfJob = this.backfill.pending || this.backfill.active;
+    const tel = this.telemetry;
+    return Object.freeze({
+      sessionState: this.sessionLifecycle.getState(),
+      prevSessionState: this.sessionLifecycle.getPrevState(),
+      sessionStateChangedAt: this.sessionLifecycle.getChangedAt(),
+      decoderState: this.session.decoderState,
+      holdUntilMs: this.session.active && Number.isFinite(wantUntilMs) ? wantUntilMs : null,
+      live: Boolean(this.session.active || this.isInKeyframeBurst(now)),
+      measuredFps: this.measuredFps,
+      backfillState: bfJob && bfJob.getState() ? bfJob.getState() : '',
+      backfillAttempts: bfJob ? bfJob.getQueryAttempts() || 0 : 0,
+      backfillWaitSince:
+        this.backfill.pending && !this.backfill.clip ? this.backfill.pending.getTriggerAt() || 0 : null,
+      backfillClipQueueLength: this.backfill.clipQueue.length,
+      wsOk: this.isRtspDirect() || Boolean(tel.wsConnected),
+      stationOk: !this.isDeviceOffline() && Boolean(tel.stationConnected),
+      frigateOk: Boolean(tel.frigateConnected),
+      go2rtcOk: Boolean(tel.go2rtcConnected),
+      liveQueueLength: this.liveFrames.length,
+      downloadQueueLength: this.backfill.frames.length,
+      droppedFrames: this.session.droppedFrames || 0,
+      restarts: this.session.restarts || 0,
+      lightOn: tel.isLightOn(),
+      battery: tel.battery,
+      charging: Boolean(tel.charging),
+      lowBattery: this.isLowBattery(),
+      wifi: tel.wifi,
+      rssi: tel.rssi,
+      idleRssiChangeCount: this.idleRssiChangeCount || 0,
+      temp: tel.temp,
+      hwPowerMode: tel.hwPowerMode,
+      hwClipLength: tel.hwClipLength,
+      hwEndEarly: tel.hwEndEarly,
+      hwQuality: tel.hwQuality,
+      rtspEnabled: Boolean(this.useRtsp && (this.rtspUrl || this.rtspSupported)),
+      lastSeen: tel.lastSeen,
+      active: Boolean(this.session.active),
+      activeMode: this.session.mode,
+      lastMotionAt: this.session.lastMotionAt,
+      lastVideoAt: this.session.lastVideoAt,
+      wakingViewers: this.viewerSet.wakingCount(),
+      viewers: this.viewerSet.count(),
+      triggersActive: this.hasActiveHardwareTriggers(now),
+      motionClearedAt: this.session.motionClearedAt,
+      stoppingP2p: Boolean(this.stoppingP2p),
+      eventState: this.eventFiling.state,
+      eventUntil: this.eventFiling.until,
+      lastCreatedEventId: this.eventFiling.lastCreatedId,
+      downloadPlayedFrames: this.backfill.playedFrames || 0,
+      downloadDecodedFrames: this.backfill.decodedFrames || 0,
+      backfillContinuation: Boolean(this.backfill.continuation),
+      wakeInitiator: this.session.initiator,
+    });
+  }
+
+  /**
    * Builds 4 fixed-width monospace diagnostic text lines for the "hud" diagnostic theme.
    * Every field is padded to a constant column width so text never shifts horizontally when values change.
    *
@@ -6489,225 +5326,7 @@ class Camera {
    * @returns {ReadonlyArray<string>}
    */
   buildDebugHudLines(now = Date.now()) {
-    const curState = formatShortSessionState(this.sessionState);
-    const prevState = formatShortSessionState(this.prevSessionState);
-    const stateAgeSecs = Math.max(0, Math.round((now - (this.sessionStateChangedAt || now)) / MS_PER_SECOND));
-    const wantUntilMs = this.wantUntil();
-    const hasFiniteHold = this.active && Number.isFinite(wantUntilMs);
-    const holdRemSecs = hasFiniteHold ? Math.max(0, Math.round((wantUntilMs - now) / MS_PER_SECOND)) : 0;
-    const targetFps = this.active || this.isInKeyframeBurst(now) ? LIVE_FPS : IDLE_FPS;
-    const rawFps =
-      this.measuredFps > 0 ? this.measuredFps : this.active || this.isInKeyframeBurst(now) ? LIVE_FPS : IDLE_FPS;
-    const fpsStr =
-      formatZeroPaddedInt(Math.round(rawFps), HUD_FPS_PAD_WIDTH) +
-      '/' +
-      formatZeroPaddedInt(targetFps, HUD_FPS_PAD_WIDTH);
-
-    const decState = formatShortDecoderState(this.decoderState);
-    const bfJob = this.pendingBackfill || this.activeBackfillJob;
-    const bfState = formatShortBackfillState(bfJob);
-    const wsSvc = this.isRtspDirect() || this.telemetry.wsConnected ? HUD_SERVICE_OK_LABEL : HUD_SERVICE_DOWN_LABEL;
-    const hbSvc =
-      !this.isDeviceOffline() && this.telemetry.stationConnected ? HUD_SERVICE_OK_LABEL : HUD_SERVICE_DOWN_LABEL;
-    const frgSvc = this.telemetry.frigateConnected ? HUD_SERVICE_OK_LABEL : HUD_SERVICE_DOWN_LABEL;
-    const rtcSvc = this.telemetry.go2rtcConnected ? HUD_SERVICE_OK_LABEL : HUD_SERVICE_DOWN_LABEL;
-    const svcStr = 'WS:' + wsSvc + ' HB:' + hbSvc + ' FRG:' + frgSvc + ' RTC:' + rtcSvc;
-    const qShortStr =
-      formatZeroPaddedInt(this.liveFrames.length, HUD_QUEUE_PAD_WIDTH) +
-      '/' +
-      formatZeroPaddedInt(this.downloadFrames.length, HUD_QUEUE_PAD_WIDTH);
-    const dropRstStr =
-      'DROP:' +
-      formatZeroPaddedInt(this.droppedFrames || 0, HUD_SINGLE_DIGIT_WIDTH) +
-      ' RST:' +
-      formatZeroPaddedInt(this.restarts || 0, HUD_SINGLE_DIGIT_WIDTH);
-
-    const stAgeToken = '+' + formatHudDuration(stateAgeSecs);
-    const stSpan12 =
-      padFixedWidth('ST:' + prevState + ' -> ' + curState, HUD_SPAN12_WIDTH - stAgeToken.length) +
-      padFixedWidth(stAgeToken, stAgeToken.length, true);
-
-    const row1 = padFixedWidth(
-      stSpan12 +
-        ' | ' +
-        padFixedWidth('DEC:' + padFixedWidth(decState, HUD_DEC_PAD_WIDTH), HUD_COL3_WIDTH) +
-        ' | ' +
-        padFixedWidth('BF:' + padFixedWidth(bfState, HUD_STATE_PAD_WIDTH), HUD_COL4_WIDTH) +
-        ' | ' +
-        padFixedWidth('FPS:' + fpsStr, HUD_COL5_WIDTH) +
-        ' | ' +
-        padFixedWidth(svcStr, HUD_COL6_WIDTH) +
-        ' | ' +
-        padFixedWidth(dropRstStr, HUD_COL7_WIDTH),
-      DEBUG_HUD_ROW_CHARS
-    );
-
-    const lgtStr = this.telemetry.isLightOn() ? HUD_LIGHT_ON_LABEL : HUD_LIGHT_OFF_LABEL;
-    const batNum = this.telemetry.battery;
-    const batPctStr = batNum !== null ? formatZeroPaddedInt(batNum, HUD_SECS_PAD_WIDTH) + '%' : '---%';
-    const batModeTag = this.telemetry.charging
-      ? HUD_POWER_CHARGING_LABEL
-      : this.isLowBattery()
-        ? HUD_POWER_LOW_LABEL
-        : HUD_POWER_BATTERY_LABEL;
-    const wifiBars =
-      this.telemetry.wifi !== null ? formatZeroPaddedInt(this.telemetry.wifi, HUD_SINGLE_DIGIT_WIDTH) : '-';
-    const rssiVal =
-      this.telemetry.rssi !== null
-        ? '-' + formatZeroPaddedInt(Math.abs(this.telemetry.rssi), HUD_SECS_PAD_WIDTH) + 'dBm'
-        : '----dBm';
-    const idleRssiNum = formatZeroPaddedInt(this.idleRssiChangeCount || 0, HUD_SINGLE_DIGIT_WIDTH);
-    const tempVal =
-      this.telemetry.temp !== null
-        ? (this.telemetry.temp < 0
-            ? '-' + formatZeroPaddedInt(Math.abs(this.telemetry.temp), HUD_SINGLE_DIGIT_WIDTH)
-            : formatZeroPaddedInt(this.telemetry.temp, HUD_TEMP_POS_DIGITS)) + 'C'
-        : '--C';
-    const pwrM =
-      this.telemetry.hwPowerMode !== null && this.telemetry.hwPowerMode !== undefined
-        ? String(this.telemetry.hwPowerMode).slice(0, HUD_SINGLE_DIGIT_WIDTH)
-        : '-';
-    const clipL =
-      this.telemetry.hwClipLength !== null && this.telemetry.hwClipLength !== undefined
-        ? formatHudDuration(this.telemetry.hwClipLength)
-        : '---s';
-    const eeVal =
-      this.telemetry.hwEndEarly === null || this.telemetry.hwEndEarly === undefined
-        ? '-'
-        : this.telemetry.hwEndEarly
-          ? HUD_FLAG_YES
-          : HUD_FLAG_NO;
-    const qVal =
-      this.telemetry.hwQuality !== null && this.telemetry.hwQuality !== undefined
-        ? formatZeroPaddedInt(this.telemetry.hwQuality, HUD_SINGLE_DIGIT_WIDTH)
-        : '-';
-    const rtspFlag = this.useRtsp && (this.rtspUrl || this.rtspSupported) ? HUD_FLAG_YES : HUD_FLAG_NO;
-    const hwStr = 'M' + pwrM + '/' + clipL + '/EE:' + eeVal + '/Q' + qVal + '/RTSP:' + rtspFlag;
-    const seenStr = padFixedWidth(this.telemetry.lastSeen || HUD_EMPTY_SEEN_4, HUD_SEEN_PAD_WIDTH);
-
-    const row2 = padFixedWidth(
-      padFixedWidth('LIGHT:' + lgtStr, HUD_COL1_WIDTH) +
-        ' | ' +
-        padFixedWidth('BAT:' + batPctStr + ' ' + batModeTag, HUD_COL2_WIDTH) +
-        ' | ' +
-        padFixedWidth(
-          'WIFI:' + wifiBars + '/' + WIFI_SIGNAL_LEVELS.FULL + ' ' + rssiVal + ' IDLE:' + idleRssiNum,
-          HUD_SPAN34_WIDTH
-        ) +
-        ' | ' +
-        padFixedWidth('TMP:' + padFixedWidth(tempVal, HUD_TEMP_PAD_WIDTH), HUD_COL5_WIDTH) +
-        ' | ' +
-        padFixedWidth('HW:' + hwStr, HUD_COL6_WIDTH) +
-        ' | ' +
-        padFixedWidth('SEEN:' + seenStr, HUD_COL7_WIDTH),
-      DEBUG_HUD_ROW_CHARS
-    );
-
-    const sesMode = !this.active
-      ? HUD_SESSION_NONE_LABEL
-      : this.activeMode === STREAM_MODES.DOWNLOAD
-        ? HUD_SESSION_BACKFILL_LABEL
-        : String(this.activeMode || HUD_SESSION_P2P_FALLBACK).toUpperCase();
-    const holdRemStr = hasFiniteHold ? formatHudDuration(holdRemSecs) : HUD_EMPTY_DURATION_4;
-    const idleAgeStr =
-      !this.active && this.lastMotionAt > 0
-        ? formatHudDuration(Math.round((now - this.lastMotionAt) / MS_PER_SECOND))
-        : HUD_EMPTY_DURATION_4;
-    const vidAgeStr =
-      this.active && this.lastVideoAt > 0
-        ? Math.min(HUD_MAX_VIDEO_AGE_SECS_DISPLAY, Math.max(0, (now - this.lastVideoAt) / MS_PER_SECOND)).toFixed(1) +
-          's'
-        : HUD_EMPTY_DURATION_4;
-    let wakingViewers = 0;
-    for (const isWaking of this.viewerIds.values()) {
-      if (isWaking) wakingViewers++;
-    }
-    const vwStr =
-      formatZeroPaddedInt(wakingViewers, HUD_SINGLE_DIGIT_WIDTH) +
-      '/' +
-      formatZeroPaddedInt(this.viewers || 0, HUD_SINGLE_DIGIT_WIDTH);
-    const hasTrig = this.hasActiveHardwareTriggers(now);
-    const trigRefAt = hasTrig ? this.lastMotionAt : this.motionClearedAt || this.lastMotionAt;
-    const trigAgeStr =
-      trigRefAt > 0 ? formatHudDuration(Math.round((now - trigRefAt) / MS_PER_SECOND)) : HUD_EMPTY_DURATION_4;
-    const trigStr = (hasTrig ? HUD_TRIGGER_ACTIVE_LABEL : HUD_TRIGGER_CLEAR_LABEL) + trigAgeStr;
-    const stopStr = padFixedWidth(this.stoppingP2p ? HUD_SESSION_P2P_FALLBACK : HUD_FLAG_NO, HUD_STOP_PAD_WIDTH);
-
-    const row3 = padFixedWidth(
-      padFixedWidth(
-        'SES:' +
-          padFixedWidth(sesMode, HUD_SESSION_MODE_PAD_WIDTH) +
-          ' R:' +
-          formatZeroPaddedInt(this.restarts || 0, HUD_RESTARTS_PAD_WIDTH),
-        HUD_COL1_WIDTH
-      ) +
-        ' | ' +
-        padFixedWidth('HOLD:' + holdRemStr, HUD_COL2_WIDTH) +
-        ' | ' +
-        padFixedWidth('IDLE:' + idleAgeStr, HUD_COL3_WIDTH) +
-        ' | ' +
-        padFixedWidth('VID:' + vidAgeStr, HUD_COL4_WIDTH) +
-        ' | ' +
-        padFixedWidth('VW:' + vwStr, HUD_COL5_WIDTH) +
-        ' | ' +
-        padFixedWidth('TRIG:' + trigStr + '  Q:' + qShortStr, HUD_COL6_WIDTH) +
-        ' | ' +
-        padFixedWidth('STOP:' + stopStr, HUD_COL7_WIDTH),
-      DEBUG_HUD_ROW_CHARS
-    );
-
-    const evStr = formatShortEvState(this.evState);
-    const evRemStr =
-      this.evUntil > now && Number.isFinite(this.evUntil)
-        ? formatHudDuration(Math.round((this.evUntil - now) / MS_PER_SECOND))
-        : HUD_EMPTY_DURATION_4;
-    const evIdStr = padFixedWidth(
-      this.lastCreatedFrigateEventId
-        ? String(this.lastCreatedFrigateEventId).slice(-HUD_EVENT_ID_SLICE_LEN)
-        : HUD_EMPTY_EVENT_ID_6,
-      HUD_EVENT_ID_SLICE_LEN
-    );
-    const bfAtt = bfJob ? bfJob.attempts || 0 : 0;
-    const bfqWaitStr =
-      this.pendingBackfill && !this.backfillClip
-        ? formatHudDuration(Math.max(0, Math.round((now - (this.pendingBackfill.at || now)) / MS_PER_SECOND)))
-        : HUD_EMPTY_DURATION_4;
-    const bfqStr =
-      bfqWaitStr +
-      ' TRY:' +
-      formatZeroPaddedInt(bfAtt, HUD_SINGLE_DIGIT_WIDTH) +
-      '/' +
-      formatZeroPaddedInt(BACKFILL_MAX_QUERY_ATTEMPTS, HUD_FPS_PAD_WIDTH) +
-      ' Q:' +
-      formatZeroPaddedInt(this.backfillClipQueue.length, HUD_SINGLE_DIGIT_WIDTH);
-    const clipStr =
-      formatZeroPaddedInt(this.downloadPlayedFrames || 0, HUD_FRAME_COUNT_PAD_WIDTH) +
-      '/' +
-      formatZeroPaddedInt(this.downloadDecodedFrames || 0, HUD_FRAME_COUNT_PAD_WIDTH) +
-      'f';
-    const contStr = this.backfillContinuation ? HUD_FLAG_YES : HUD_FLAG_NO;
-    const initStr = padFixedWidth(
-      String(this.wakeInitiator || 'none').replace('bridge-backfill', 'backfill'),
-      HUD_INITIATOR_PAD_WIDTH
-    );
-
-    const row4 = padFixedWidth(
-      padFixedWidth(
-        'EV:' + padFixedWidth(evStr, HUD_EVENT_STATE_PAD_WIDTH) + ' ' + evRemStr + '/' + evIdStr,
-        HUD_SPAN12_WIDTH
-      ) +
-        ' | ' +
-        padFixedWidth('BFQ:' + bfqStr, HUD_SPAN34_WIDTH) +
-        ' | ' +
-        padFixedWidth('CONT:' + contStr, HUD_COL5_WIDTH) +
-        ' | ' +
-        padFixedWidth('CLIP:' + clipStr, HUD_COL6_WIDTH) +
-        ' | ' +
-        padFixedWidth('INIT:' + initStr, HUD_COL7_WIDTH),
-      DEBUG_HUD_ROW_CHARS
-    );
-
-    return Object.freeze([row1, row2, row3, row4]);
+    return formatDebugHudLines(this.getDebugHudSnapshot(now), now);
   }
 
   /**
@@ -6718,7 +5337,7 @@ class Camera {
    */
   prepareLiveCardOverlay(rawFrame) {
     const out = this.card.prepareLiveOverlayBuffer(rawFrame);
-    const isBackfill = this.isBackfillPlayback() || this.backfillContinuation;
+    const isBackfill = this.isBackfillPlayback() || this.backfill.continuation;
     const statusTitle = isBackfill ? CARD_STATUS_TITLES.BACKFILL : CARD_STATUS_TITLES.LIVE;
     const st = this.telemetry.evaluateVisualState(statusTitle);
     return Object.freeze({
@@ -6741,42 +5360,19 @@ class Camera {
       if (this.updateServiceHealth({stationConnected: true}) && this.renderCardsFn) {
         this.renderCardsFn(this);
       }
-      this.motionUntil = Math.max(this.motionUntil, now + this.getEventHoldMs());
-      this.lastMotionAt = now;
+      this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
+      this.session.lastMotionAt = now;
     }
-    this.lastVideoAt = now;
-    if (!this.firstFrameAt) {
-      this.firstFrameAt = now;
-    }
+    const wasRewaking = this.session.rtspRewaking;
+    const result = this.session.markRtspFrameReceived(now);
     if (this.isActiveRtspSession()) {
       this.transitionTo(
         SESSION_STATES.STREAMING_LIVE,
         now,
-        this.rtspRewaking ? 'rtsp re-wake frame received' : 'first rtsp frame received'
+        wasRewaking ? 'rtsp re-wake frame received' : 'first rtsp frame received'
       );
     }
-    if (!this.gotVideo) {
-      this.gotVideo = true;
-      this.firstVideoAt = now;
-      this.rtspRewaking = false;
-      this.restarts = 0;
-      return {
-        isFirstVideo: true,
-        isRewakeResume: false,
-        elapsedSec: ((now - this.startedAt) / 1000).toFixed(1),
-      };
-    }
-    if (this.rtspRewaking) {
-      this.rtspRewaking = false;
-      this.restarts = 0;
-      const refAt = this.rtspRewakeStartedAt || this.lastStartAt || now;
-      return {
-        isFirstVideo: false,
-        isRewakeResume: true,
-        elapsedSec: ((now - refAt) / 1000).toFixed(1),
-      };
-    }
-    return {isFirstVideo: false, isRewakeResume: false, elapsedSec: '0.0'};
+    return result;
   }
 
   /**
@@ -6787,17 +5383,11 @@ class Camera {
    */
   markP2pVideoPacketReceived(now) {
     if (this.isBackfillPlayback()) {
-      this.downloadVideoPackets++;
+      this.backfill.videoPackets++;
     } else {
       this.telemetry.markDeviceOnline();
     }
-    this.lastVideoAt = now;
-    if (!this.gotVideo) {
-      this.gotVideo = true;
-      this.firstVideoAt = now;
-      return {isFirstVideo: true, elapsedSec: ((now - this.startedAt) / 1000).toFixed(1)};
-    }
-    return {isFirstVideo: false, elapsedSec: '0.0'};
+    return this.session.markP2pVideoPacketReceived(now);
   }
 
   /**
@@ -6807,7 +5397,7 @@ class Camera {
    * @returns {boolean}
    */
   hasCodecChanged(codec) {
-    return Boolean(this.dec && this.videoCodec && codec !== this.videoCodec);
+    return this.session.hasCodecChanged(codec);
   }
 
   /**
@@ -6818,9 +5408,7 @@ class Camera {
    * @param {number} height - Video height in pixels.
    */
   updateStreamFormat(codec, width, height) {
-    this.videoCodec = codec;
-    this.videoWidth = width;
-    this.videoHeight = height;
+    this.session.updateStreamFormat(codec, width, height);
   }
 
   /**
@@ -6830,10 +5418,7 @@ class Camera {
    * @param {number} [spawnedAt=0] - Spawn timestamp in milliseconds (for RTSP handshake tracking).
    */
   attachDecoder(dec, spawnedAt = 0) {
-    this.dec = dec;
-    this.decSpawnedAt = spawnedAt;
-    this._transitionDecoderTo(DECODER_STATES.HANDSHAKING, 'decoder attached');
-    this.drainPendingDecoderInput();
+    this.session.attachDecoder(dec, spawnedAt);
   }
 
   /**
@@ -6843,20 +5428,11 @@ class Camera {
    * @returns {*} Detached FFmpeg ChildProcess or null.
    */
   detachDecoder() {
-    if (this.rtspRetryTimer) {
-      clearTimeout(this.rtspRetryTimer);
-      this.rtspRetryTimer = null;
-    }
-    const dec = this.dec;
-    this.dec = null;
-    this.decSpawnedAt = 0;
-    this._resetDecoderPipeState();
-    this._transitionDecoderTo(DECODER_STATES.DETACHED, 'decoder detached');
-    this.videoWidth = 0;
-    this.videoHeight = 0;
-    this.videoCodec = '';
-    this.pcm = [];
-    this.pcmLen = 0;
+    const dec = this.session.detachDecoder();
+    this.liveFrames = [];
+    this.frame = null;
+    this.frameNew = false;
+    this.audioQueue.clear();
     return dec;
   }
 
@@ -6895,14 +5471,7 @@ class Camera {
    * @returns {string}
    */
   getFrigateEventState(now = Date.now()) {
-    if (this.evState === FRIGATE_EVENT_STATES.COOLDOWN && now >= (this.evUntil || 0)) {
-      this.evUntil = 0;
-      this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.IDLE, 'cooldown elapsed');
-    }
-    if (this.evUntil > 0 && now >= this.evUntil && !this.evPending && !this.evTimer) {
-      this.evUntil = 0;
-    }
-    return this.evState;
+    return this.eventFiling.refresh(now);
   }
 
   /**
@@ -6911,7 +5480,7 @@ class Camera {
    * @returns {number}
    */
   getFrigateEventWaitId() {
-    return this.evWaitId;
+    return this.eventFiling.waitId;
   }
 
   /**
@@ -6921,47 +5490,27 @@ class Camera {
    * @returns {boolean}
    */
   isFrigateSnapshotWaitActive(waitId) {
-    return this.evWaitId === waitId ? this.evState === FRIGATE_EVENT_STATES.WAITING_SNAPSHOT : false;
+    return this.eventFiling.isSnapshotWaitActive(waitId);
   }
 
   /**
-   * Aborts any queued or in-flight WAITING_SNAPSHOT Frigate event filing and resets evState to IDLE.
+   * Aborts any queued or in-flight WAITING_SNAPSHOT Frigate event filing and resets the event state to IDLE.
    *
    * @param {string} [reason='session ended without video'] - Diagnostic reason for FSM transition.
    */
   abortPendingFrigateEvent(reason = 'session ended without video') {
-    if (
-      !this.evTimer &&
-      !this.evPending &&
-      this.evState !== FRIGATE_EVENT_STATES.QUEUED &&
-      this.evState !== FRIGATE_EVENT_STATES.WAITING_SNAPSHOT
-    ) {
-      return;
-    }
-    if (this.evTimer) {
-      clearTimeout(this.evTimer);
-      this.evTimer = null;
-    }
-    this.evWaitId++;
-    this.evPending = false;
-    this.evUntil = 0;
-    this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.IDLE, reason);
+    this.eventFiling.abort(reason);
   }
 
   /**
    * Transitions the Frigate event FSM from QUEUED to WAITING_SNAPSHOT when the dispatch timer fires,
    * returning false if the pending event wait was already aborted.
    *
-   * @param {number} [waitId=this.evWaitId] - Expected Frigate event wait token.
+   * @param {number} [waitId=this.eventFiling.waitId] - Expected Frigate event wait token.
    * @returns {boolean} True if transitioned to WAITING_SNAPSHOT.
    */
-  beginFrigateSnapshotWait(waitId = this.evWaitId) {
-    if (waitId !== this.evWaitId || !this.evPending) {
-      return false;
-    }
-    this.evTimer = null;
-    this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.WAITING_SNAPSHOT, 'dispatch timer fired');
-    return this.evState === FRIGATE_EVENT_STATES.WAITING_SNAPSHOT;
+  beginFrigateSnapshotWait(waitId = this.eventFiling.waitId) {
+    return this.eventFiling.beginSnapshotWait(waitId);
   }
 
   /**
@@ -6975,13 +5524,17 @@ class Camera {
    * @returns {boolean}
    */
   shouldExtendFrigateEvent(now = Date.now(), liveFps = LIVE_FPS, marginMs = DEFAULT_EVENT_EXTEND_MARGIN_MS) {
-    if (!this.active || this.evPending || this.evTimer || (!this.eventActive && !this.isBackfillPlayback())) {
+    if (
+      !this.session.active ||
+      this.eventFiling.hasPendingDispatch() ||
+      (!this.eventActive && !this.isBackfillPlayback())
+    ) {
       return false;
     }
     const targetUntil = this.isBackfillPlayback()
       ? now + this.getEffectiveEventDurationSecs(liveFps, now) * MS_PER_SECOND
       : this.wantUntil();
-    return targetUntil > Math.max(now, this.evUntil || 0) + marginMs;
+    return targetUntil > Math.max(now, this.eventFiling.until || 0) + marginMs;
   }
 
   /**
@@ -6995,55 +5548,12 @@ class Camera {
    * @returns {Readonly<{ status: 'upgraded'|'cooldown'|'queued', upgradedLabel: boolean, attachedPerson: boolean }>}
    */
   tryUpgradeOrQueueFrigateEvent(label, personName = '', now = Date.now()) {
-    const normalizedLabel = label === 'motion detected' ? 'motion' : label;
-
-    this.getFrigateEventState(now);
-    if (
-      this.evTimer ||
-      this.evPending ||
-      this.evState === FRIGATE_EVENT_STATES.QUEUED ||
-      this.evState === FRIGATE_EVENT_STATES.WAITING_SNAPSHOT
-    ) {
-      let upgradedLabel = false;
-      let attachedPerson = false;
-      if (this.evLabel === 'motion' && normalizedLabel !== 'motion') {
-        this.evLabel = normalizedLabel;
-        upgradedLabel = true;
-      }
-      if (personName && !this.evPerson) {
-        this.evPerson = personName;
-        attachedPerson = true;
-      }
-      return Object.freeze({status: 'upgraded', upgradedLabel, attachedPerson});
-    }
-    if (now < (this.evUntil || 0)) {
-      const upgradedLabelInCooldown = Boolean(this.evLabel === 'motion' && normalizedLabel !== 'motion');
-      const attachedPersonInCooldown = Boolean(personName && !this.evPerson);
-      if (!upgradedLabelInCooldown && !attachedPersonInCooldown && !this.shouldExtendFrigateEvent(now)) {
-        this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.COOLDOWN, 'event in cooldown');
-        return Object.freeze({status: 'cooldown', upgradedLabel: false, attachedPerson: false});
-      }
-      if (upgradedLabelInCooldown) {
-        this.evLabel = normalizedLabel;
-      }
-      if (attachedPersonInCooldown) {
-        this.evPerson = personName;
-      }
-      this.evWaitId++;
-      this.evPending = true;
-      this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.QUEUED, 'event extended or upgraded');
-      return Object.freeze({
-        status: 'queued',
-        upgradedLabel: upgradedLabelInCooldown,
-        attachedPerson: attachedPersonInCooldown,
-      });
-    }
-    this.evLabel = normalizedLabel;
-    this.evPerson = personName || '';
-    this.evWaitId++;
-    this.evPending = true;
-    this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.QUEUED, 'event queued');
-    return Object.freeze({status: 'queued', upgradedLabel: false, attachedPerson: false});
+    return this.eventFiling.request({
+      label,
+      personName,
+      now,
+      shouldExtend: () => this.shouldExtendFrigateEvent(now),
+    });
   }
 
   /**
@@ -7058,10 +5568,10 @@ class Camera {
     if (this.isBackfillPlayback()) {
       const remainingFromPackets = Math.max(
         0,
-        Math.max(this.downloadDecodedFrames, this.downloadVideoPackets) - this.downloadPlayedFrames
+        Math.max(this.backfill.decodedFrames, this.backfill.videoPackets) - this.backfill.playedFrames
       );
       const remainingFrames = Math.max(
-        this.downloadFrames.length + this.pendingVideoPackets.length + 1,
+        this.backfill.frames.length + this.session.pendingVideoPackets.length + 1,
         remainingFromPackets
       );
       return (
@@ -7069,7 +5579,7 @@ class Camera {
         DOWNLOAD_EVENT_DURATION_MARGIN_SECS
       );
     }
-    const remainingHoldSecs = this.active ? Math.ceil(Math.max(0, this.wantUntil() - now) / MS_PER_SECOND) : 0;
+    const remainingHoldSecs = this.session.active ? Math.ceil(Math.max(0, this.wantUntil() - now) / MS_PER_SECOND) : 0;
     return Math.max(this.timers.eventSecs, remainingHoldSecs);
   }
 
@@ -7081,15 +5591,7 @@ class Camera {
    * @returns {Readonly<{ finalLabel: string, finalPerson: string, subLabel: string|null, durationSecs: number }>}
    */
   completeFrigateEventFiling(now = Date.now(), liveFps = LIVE_FPS) {
-    const finalLabel = this.evLabel;
-    const finalPerson = this.evPerson;
-    const subLabel = finalPerson || null;
-    const durationSecs = this.getEffectiveEventDurationSecs(liveFps, now);
-    this.evPending = false;
-    this.evDispatchedAt = now;
-    this.evUntil = Math.max(this.evUntil || 0, now + durationSecs * MS_PER_SECOND);
-    this._transitionFrigateEventTo(FRIGATE_EVENT_STATES.COOLDOWN, 'event filed');
-    return Object.freeze({finalLabel, finalPerson, subLabel, durationSecs});
+    return this.eventFiling.complete(now, this.getEffectiveEventDurationSecs(liveFps, now));
   }
 
   /**
@@ -7099,12 +5601,12 @@ class Camera {
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    */
   registerNewViewer(id, now = Date.now()) {
-    this.viewerIds.set(id, false);
+    this.viewerSet.register(id);
     this.triggerKeyframeBurst(now, SHORT_KEYFRAME_BURST_MS);
   }
 
   /**
-   * Removes go2rtc consumer IDs that are no longer present in seenIds, updates this.viewers,
+   * Removes go2rtc consumer IDs that are no longer present in seenIds, updates the viewer total,
    * and returns the list of disconnected viewer descriptors.
    *
    * @param {Set<string|number>} seenIds - Set of currently connected consumer IDs.
@@ -7112,15 +5614,7 @@ class Camera {
    * @returns {Array<{ id: string|number, wasActiveViewer: boolean }>} Disconnected viewers.
    */
   pruneDisconnectedViewers(seenIds, totalViewers) {
-    const disconnected = [];
-    for (const [id, wasActiveViewer] of [...this.viewerIds.entries()]) {
-      if (!seenIds.has(id)) {
-        this.viewerIds.delete(id);
-        disconnected.push({id, wasActiveViewer});
-      }
-    }
-    this.viewers = totalViewers;
-    return disconnected;
+    return this.viewerSet.prune(seenIds, totalViewers);
   }
 
   /**
@@ -7134,11 +5628,11 @@ class Camera {
     const payload = {
       camera: this.name,
       title: this.getDisplayTitle(),
-      label: this.evLabel,
+      label: this.eventFiling.label,
       ...extra,
     };
-    if (this.evPerson) {
-      payload.person = this.evPerson;
+    if (this.eventFiling.person) {
+      payload.person = this.eventFiling.person;
     }
     return payload;
   }
@@ -7152,32 +5646,16 @@ class Camera {
    * @returns {Readonly<{ extended: boolean, extendMs: number, holdSecs: number }>}
    */
   extendActiveHold(now, minExtendMs = DEFAULT_MIN_EXTEND_MS, capAtFullHold = true) {
-    const prevUntil = this.wantUntil();
-    const baseHoldMs = this.getEventHoldMs();
-    const stepMs = Math.max(minExtendMs, Math.round(baseHoldMs / 2));
-    const maxAllowedUntil = this.startedAt + this.timers.maxMs;
-    const uncappedNext = Math.min(maxAllowedUntil, Math.max(prevUntil, now) + stepMs);
-    const nextUntil = capAtFullHold ? Math.min(now + baseHoldMs, uncappedNext) : uncappedNext;
-    const extendMotionHold =
-      this.isInMotion(now) ||
-      this.hasActiveHardwareTriggers(now) ||
-      (this.motionUntil > 0 && this.motionUntil >= this.viewUntil);
-    if (extendMotionHold) {
-      this.motionUntil = Math.max(this.motionUntil, nextUntil);
-    } else {
-      this.viewUntil = Math.max(this.viewUntil, nextUntil);
-    }
-    const extendMs = Math.max(0, this.wantUntil() - Math.max(prevUntil, now));
-    const extended = extendMs > 0;
-    if (extended) {
-      this.runtimeExtended = true;
+    const res = this.session.extendActiveHold(now, {
+      baseHoldMs: this.getEventHoldMs(),
+      minExtendMs,
+      capAtFullHold,
+      hasActiveTriggers: this.hasActiveHardwareTriggers(now),
+    });
+    if (res.extended) {
       this.clearPendingBackfill();
     }
-    return Object.freeze({
-      extended,
-      extendMs,
-      holdSecs: Math.round((this.wantUntil() - now) / MS_PER_SECOND),
-    });
+    return res;
   }
 
   /**
@@ -7193,14 +5671,7 @@ class Camera {
    * @returns {number}
    */
   computeTriggerHoldUntil(now, ms, minExtendMs = DEFAULT_MIN_EXTEND_MS, isMidStream = false, isCompanionBurst = false) {
-    if (!isMidStream) {
-      return now + ms;
-    }
-    const halfMs = Math.max(minExtendMs, Math.round(ms / 2));
-    const maxMs = this.timers.maxMs;
-    const maxAllowedUntil = this.active && this.startedAt ? this.startedAt + maxMs : now + maxMs;
-    const extendedFromCurrent = isCompanionBurst ? this.wantUntil() : Math.max(this.wantUntil(), now) + halfMs;
-    return Math.min(maxAllowedUntil, Math.max(now + ms, extendedFromCurrent));
+    return this.session.computeTriggerHoldUntil(now, ms, {minExtendMs, isMidStream, isCompanionBurst});
   }
 
   /**
@@ -7253,35 +5724,35 @@ class Camera {
     debounceMs = DEFAULT_TRIGGER_LOG_DEBOUNCE_MS
   ) {
     if (now >= this.wantUntil()) {
-      this.reason = reason;
-      this.wakeInitiator = initiator;
+      this.session.reason = reason;
+      this.session.initiator = initiator;
     }
-    if (!this.isInMotion(now) && !this.active) {
-      this.reason = reason;
-      this.wakeInitiator = initiator;
+    if (!this.isInMotion(now) && !this.session.active) {
+      this.session.reason = reason;
+      this.session.initiator = initiator;
       this.eventPriority = evPriority;
     } else if (evPriority >= (this.eventPriority || 0)) {
       this.eventPriority = evPriority;
-      this.reason = reason;
+      this.session.reason = reason;
     }
 
-    const prevMotionAt = this.lastMotionAt || 0;
+    const prevMotionAt = this.session.lastMotionAt || 0;
     const prevPriority = this.eventPriority || 0;
     const isCompanionBurst = prevMotionAt > 0 && now - prevMotionAt < COMPANION_EVENT_BURST_MS;
-    const videoStartRef = this.firstFrameAt || this.firstVideoAt;
+    const videoStartRef = this.session.firstFrameAt || this.session.firstVideoAt;
     const hasSustainedLiveVideo =
-      this.isActiveLiveSession() && this.gotVideo && videoStartRef > 0 && now - videoStartRef >= minExtendMs;
-    const isMidStream = hasSustainedLiveVideo && now - this.startedAt > midStreamGraceMs;
+      this.isActiveLiveSession() && this.session.gotVideo && videoStartRef > 0 && now - videoStartRef >= minExtendMs;
+    const isMidStream = hasSustainedLiveVideo && now - this.session.startedAt > midStreamGraceMs;
     const targetUntil = this.computeTriggerHoldUntil(now, ms, minExtendMs, isMidStream, isCompanionBurst);
     this.eventActive = true;
-    this.motionUntil = Math.max(this.motionUntil, targetUntil);
-    this.lastMotionAt = now;
+    this.session.motionUntil = Math.max(this.session.motionUntil, targetUntil);
+    this.session.lastMotionAt = now;
     if (hasSustainedLiveVideo) {
-      this.runtimeExtended = true;
+      this.session.runtimeExtended = true;
       this.clearPendingBackfill();
     }
 
-    if (!this.active) {
+    if (!this.session.active) {
       return {shouldLog: false, isDebug: false, message: ''};
     }
 
@@ -7328,10 +5799,10 @@ class Camera {
     debounceMs = DEFAULT_TRIGGER_LOG_DEBOUNCE_MS
   ) {
     if (now >= this.wantUntil()) {
-      this.reason = reason;
-      this.wakeInitiator = initiator;
+      this.session.reason = reason;
+      this.session.initiator = initiator;
     }
-    if (!this.isRtspCapable() && now >= this.viewUntil) {
+    if (!this.isRtspCapable() && now >= this.session.viewUntil) {
       const stationKey = this.getStationKey();
       for (const other of allCams) {
         if (other !== this && other.belongsToStationP2pSlot(stationKey) && other.hasPendingViewerWake()) {
@@ -7339,17 +5810,17 @@ class Camera {
         }
       }
     }
-    if (now >= this.viewUntil) {
-      this.viewSince = now;
+    if (now >= this.session.viewUntil) {
+      this.session.viewSince = now;
     }
     const isMidStreamView =
       this.isActiveLiveSession() &&
-      now - this.startedAt > midStreamGraceMs &&
+      now - this.session.startedAt > midStreamGraceMs &&
       (initiator === 'eufy-ws' || initiator === 'api-wake');
     const targetViewUntil = this.computeTriggerHoldUntil(now, ms, minExtendMs, isMidStreamView);
-    this.viewUntil = Math.max(this.viewUntil, targetViewUntil);
+    this.session.viewUntil = Math.max(this.session.viewUntil, targetViewUntil);
     if (isMidStreamView) {
-      this.runtimeExtended = true;
+      this.session.runtimeExtended = true;
       this.clearPendingBackfill();
     }
 
@@ -7385,55 +5856,20 @@ class Camera {
   }
 
   /**
-   * Clears all tracked active Eufy hardware trigger names and their start timestamps.
+   * Forgets every active Eufy hardware trigger entry.
    */
   _clearActiveHardwareTriggers() {
-    this.activeTriggerEvents.clear();
-    this.activeTriggerStartedAt.clear();
+    this.hardwareTriggers.clearAll();
   }
 
   /**
    * Prunes active Eufy hardware trigger entries whose age exceeds maxAgeMs (Eufy max clip length + margin).
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [maxAgeMs=HARDWARE_TRIGGER_MAX_AGE_MS] - Maximum trigger age before expiry in ms.
+   * @param {number} [maxAgeMs] - Maximum trigger age before expiry in ms (defaults to the ledger maximum).
    */
-  expireStaleHardwareTriggers(now = Date.now(), maxAgeMs = HARDWARE_TRIGGER_MAX_AGE_MS) {
-    if (this.activeTriggerEvents.size === 0) {
-      if (this.activeTriggerStartedAt.size > 0) {
-        this.activeTriggerStartedAt.clear();
-      }
-      return;
-    }
-    for (const trackedKey of [...this.activeTriggerStartedAt.keys()]) {
-      if (!this.activeTriggerEvents.has(trackedKey)) {
-        this.activeTriggerStartedAt.delete(trackedKey);
-      }
-    }
-    for (const evKey of [...this.activeTriggerEvents]) {
-      const startedAt = this.activeTriggerStartedAt.get(evKey) || 0;
-      if (startedAt > 0 && now - startedAt > maxAgeMs) {
-        this.activeTriggerEvents.delete(evKey);
-        this.activeTriggerStartedAt.delete(evKey);
-      }
-    }
-  }
-
-  /**
-   * Pure helper returning true if at least one active trigger entry is still within maxAgeMs.
-   *
-   * @param {number} now - Current epoch timestamp in milliseconds.
-   * @param {number} maxAgeMs - Maximum trigger age in milliseconds.
-   * @returns {boolean}
-   */
-  _hasUnexpiredTriggerEntry(now, maxAgeMs) {
-    for (const evKey of this.activeTriggerEvents) {
-      const startedAt = this.activeTriggerStartedAt.get(evKey) || 0;
-      if (startedAt <= 0 || now - startedAt <= maxAgeMs) {
-        return true;
-      }
-    }
-    return false;
+  expireStaleHardwareTriggers(now = Date.now(), maxAgeMs = undefined) {
+    this.hardwareTriggers.expireStale(now, maxAgeMs);
   }
 
   /**
@@ -7441,12 +5877,12 @@ class Camera {
    * have not cleared since the latest motion trigger timestamp, and have not exceeded maxAgeMs.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
-   * @param {number} [maxAgeMs=HARDWARE_TRIGGER_MAX_AGE_MS] - Maximum trigger age before expiry in ms.
+   * @param {number} [maxAgeMs] - Maximum trigger age before expiry in ms (defaults to the ledger maximum).
    * @returns {boolean}
    */
-  hasActiveHardwareTriggers(now = Date.now(), maxAgeMs = HARDWARE_TRIGGER_MAX_AGE_MS) {
-    return this.activeTriggerEvents.size > 0 && this.motionClearedAt <= this.lastMotionAt
-      ? this._hasUnexpiredTriggerEntry(now, maxAgeMs)
+  hasActiveHardwareTriggers(now = Date.now(), maxAgeMs = undefined) {
+    return !this.hardwareTriggers.isEmpty() && this.session.motionClearedAt <= this.session.lastMotionAt
+      ? this.hardwareTriggers.hasUnexpired(now, maxAgeMs)
       : false;
   }
 
@@ -7467,12 +5903,12 @@ class Camera {
     minVideoMs = DEFAULT_MIN_EVENT_VIDEO_MS
   ) {
     return Boolean(
-      this.gotVideo &&
-      this.firstVideoAt > 0 &&
-      now - this.firstVideoAt >= minVideoMs &&
-      now - this.lastMotionAt >= this.getEventHoldMs() &&
-      this.motionClearedAt > this.lastMotionAt &&
-      now - this.motionClearedAt >= settleMs &&
+      this.session.gotVideo &&
+      this.session.firstVideoAt > 0 &&
+      now - this.session.firstVideoAt >= minVideoMs &&
+      now - this.session.lastMotionAt >= this.getEventHoldMs() &&
+      this.session.motionClearedAt > this.session.lastMotionAt &&
+      now - this.session.motionClearedAt >= settleMs &&
       !this.hasRecentFrigateObjectActivity(now)
     );
   }
@@ -7504,166 +5940,79 @@ class Camera {
    * @param {number} [minHoldMs=10000] - Minimum hold window required to complete RTSP re-wake.
    * @returns {number} Remaining hold duration in seconds.
    */
-  beginRtspRewake(now, minHoldMs = DEFAULT_MIN_RTSP_REWAKE_HOLD_MS) {
+  beginRtspRewake(now, minHoldMs = undefined) {
     this.transitionTo(SESSION_STATES.WAKING_RTSP, now, 'rtsp stream dropped, re-waking');
-    this.rtspRewaking = true;
-    this.rtspRewakeStartedAt = now;
-    this.restarts = 0;
-    this.lastStartAt = now;
-    if (this.hasActiveHardwareTriggers(now) && !this.hasReachedMaxDuration(now)) {
-      this.extendActiveHold(now);
+    const canExtendHold = this.hasActiveHardwareTriggers(now) && !this.hasReachedMaxDuration(now);
+    const {remainingSecs, extended} = this.session.prepareRtspRewake(now, {
+      minHoldMs,
+      canExtendHold,
+      baseHoldMs: this.getEventHoldMs(),
+    });
+    if (extended) {
+      this.clearPendingBackfill();
     }
-    if (this.viewUntil > now && this.viewUntil - now < minHoldMs) {
-      this.viewUntil = now + minHoldMs;
-    }
-    if (this.motionUntil > now && this.motionUntil - now < minHoldMs) {
-      this.motionUntil = now + minHoldMs;
-    }
-    return Math.round((this.wantUntil() - now) / MS_PER_SECOND);
+    return remainingSecs;
   }
 
   /**
    * Evaluates RTSP session health, non-destructive wake retries, handshake protection, and timeouts.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
-   * @param {number} [quietSince=this.lastVideoAt || this.lastStartAt || this.startedAt] - Timestamp
-   *   of last video packet or start attempt.
-   * @param {number} [handshakeMinMs=DEFAULT_RTSP_HANDSHAKE_MIN_MS] - Minimum decoder age indicating
-   *   active RTSP handshake.
-   * @param {number} [decStallMs=DEFAULT_RTSP_DEC_STALL_MS] - Decoder age after which a silent
-   *   handshake is considered stalled.
-   * @param {number} [retryMs=DEFAULT_RTSP_RETRY_MS] - Interval between start_rtsp_livestream wake retries.
-   * @param {number} [maxRetries=DEFAULT_RTSP_MAX_RETRIES] - Maximum RTSP wake retries before timeout.
-   * @param {number} [timeoutMs=DEFAULT_RTSP_TIMEOUT_MS] - Hard RTSP wake timeout in milliseconds.
-   * @param {number} [midStallMs=DEFAULT_RTSP_MID_STALL_MS] - Mid-session frame silence threshold in milliseconds.
+   * @param {number} [quietSince] - Timestamp of last video packet or start attempt.
+   * @param {number} [handshakeMinMs] - Minimum decoder age indicating active RTSP handshake.
+   * @param {number} [decStallMs] - Decoder age after which a silent handshake is considered stalled.
+   * @param {number} [retryMs] - Interval between start_rtsp_livestream wake retries.
+   * @param {number} [maxRetries] - Maximum RTSP wake retries before timeout.
+   * @param {number} [timeoutMs] - Hard RTSP wake timeout in milliseconds.
+   * @param {number} [midStallMs] - Mid-session frame silence threshold in milliseconds.
    * @returns {{ action: 'none'|'retry'|'timeout'|'dropped', killStalledDec: boolean, logMsg: string }}
    */
   evaluateRtspHealth(
     now,
-    quietSince = this.getQuietSinceTimestamp() || this.startedAt,
-    handshakeMinMs = DEFAULT_RTSP_HANDSHAKE_MIN_MS,
-    decStallMs = DEFAULT_RTSP_DEC_STALL_MS,
-    retryMs = DEFAULT_RTSP_RETRY_MS,
-    maxRetries = DEFAULT_RTSP_MAX_RETRIES,
-    timeoutMs = DEFAULT_RTSP_TIMEOUT_MS,
-    midStallMs = DEFAULT_RTSP_MID_STALL_MS
+    quietSince = undefined,
+    handshakeMinMs = undefined,
+    decStallMs = undefined,
+    retryMs = undefined,
+    maxRetries = undefined,
+    timeoutMs = undefined,
+    midStallMs = undefined
   ) {
-    const waitingForWake = !this.gotVideo || this.rtspRewaking;
-    const wakeQuietSince = this.rtspRewaking ? this.lastStartAt : quietSince;
-    const wakeStartedAt = this.rtspRewaking ? this.rtspRewakeStartedAt || this.lastStartAt : this.startedAt;
-
-    if (waitingForWake) {
-      if (this.isRtspDirect()) {
-        const directTimeoutMs = Math.min(timeoutMs, DEFAULT_RTSP_DIRECT_TIMEOUT_MS);
-        if (now - wakeStartedAt > directTimeoutMs) {
-          this.motionUntil = 0;
-          return {
-            action: 'dropped',
-            killStalledDec: false,
-            logMsg: 'direct RTSP stream yielded no video after ' + Math.round(directTimeoutMs / MS_PER_SECOND) + 's',
-          };
-        }
-        return {action: 'none', killStalledDec: false, logMsg: ''};
-      }
-      if (this.isRtspDecoderHandshaking(now, handshakeMinMs, decStallMs)) {
-        return {action: 'none', killStalledDec: false, logMsg: ''};
-      }
-      if (now - wakeQuietSince > retryMs && this.restarts < maxRetries) {
-        this.restarts++;
-        this.lastStartAt = now;
-        const retryWaitSecs = (retryMs / 1000).toFixed(1);
-        const killStalledDec = Boolean(this.dec && now - (this.decSpawnedAt || 0) >= decStallMs);
-        const logMsg =
-          'RTSP ' +
-          (this.rtspRewaking ? 're-wake' : 'wake') +
-          ' still waiting for video after ' +
-          retryWaitSecs +
-          's (retry=' +
-          this.restarts +
-          '/' +
-          maxRetries +
-          '), re-sending start_rtsp_livestream (session=' +
-          this.sessionId +
-          ')';
-        return {action: 'retry', killStalledDec, logMsg};
-      }
-      if (now - wakeStartedAt > timeoutMs) {
-        const timeoutSecs = Math.round(timeoutMs / 1000);
-        this.motionUntil = 0;
-        const logMsg =
-          'HomeBase RTSP stream yielded no video after ' + timeoutSecs + 's (' + this.restarts + ' retries)';
-        return {action: 'timeout', killStalledDec: false, logMsg};
-      }
-      return {action: 'none', killStalledDec: false, logMsg: ''};
-    }
-
-    if (now - this.lastVideoAt > midStallMs) {
-      return {
-        action: 'dropped',
-        killStalledDec: false,
-        logMsg: 'no frames for ' + ((now - this.lastVideoAt) / 1000).toFixed(1) + 's',
-      };
-    }
-    return {action: 'none', killStalledDec: false, logMsg: ''};
+    return this.session.evaluateRtspHealth(now, {
+      quietSince,
+      handshakeMinMs,
+      decStallMs,
+      retryMs,
+      maxRetries,
+      timeoutMs,
+      midStallMs,
+    });
   }
 
   /**
    * Evaluates P2P watchdog stall and retry conditions for an active P2P livestream session.
    *
    * @param {number} now - Current epoch timestamp in milliseconds.
-   * @param {number} [quietSince=this.lastVideoAt || this.lastStartAt || this.startedAt] - Timestamp
-   *   of last video packet or start attempt.
-   * @param {number} [initialRetryMs=DEFAULT_P2P_INITIAL_RETRY_MS] - Quiet duration before retry 1.
-   * @param {number} [subsequentRetryMs=DEFAULT_P2P_SUBSEQUENT_RETRY_MS] - Quiet duration before retries 2..maxRetries.
-   * @param {number} [maxRetries=DEFAULT_P2P_MAX_RETRIES] - Maximum watchdog retries before forced error sleep.
+   * @param {number} [quietSince] - Timestamp of last video packet or start attempt.
+   * @param {number} [initialRetryMs] - Quiet duration before retry 1.
+   * @param {number} [subsequentRetryMs] - Quiet duration before retries 2..maxRetries.
+   * @param {number} [maxRetries] - Maximum watchdog retries before forced error sleep.
    * @returns {{ action: 'none'|'retry'|'timeout'|'expired', logMsg: string }}
    */
   evaluateP2pHealth(
     now,
-    quietSince = this.getQuietSinceTimestamp() || this.startedAt,
-    initialRetryMs = DEFAULT_P2P_INITIAL_RETRY_MS,
-    subsequentRetryMs = DEFAULT_P2P_SUBSEQUENT_RETRY_MS,
-    maxRetries = DEFAULT_P2P_MAX_RETRIES
+    quietSince = undefined,
+    initialRetryMs = undefined,
+    subsequentRetryMs = undefined,
+    maxRetries = undefined
   ) {
-    const retryAfterMs = this.restarts === 0 ? initialRetryMs : subsequentRetryMs;
-    if (now - quietSince <= retryAfterMs || this.starting) {
-      return {action: 'none', logMsg: ''};
-    }
-    if (this.isPiggybackedExternalSession()) {
-      this.motionUntil = 0;
-      this.viewUntil = 0;
-      return {action: 'expired', logMsg: 'external Eufy app stream stopped sending video'};
-    }
-    if (!this.isInMotion(now) && !this.hasWakingViewer() && this.gotVideo) {
-      return {action: 'expired', logMsg: 'viewer disconnected and camera stopped sending video'};
-    }
-    const quietSecs = ((now - quietSince) / 1000).toFixed(1);
-    const stallCause = this.gotVideo ? 'stream_stalled_mid_session' : 'no_initial_video_after_wake';
-    if (++this.restarts > maxRetries) {
-      this.motionUntil = 0;
-      const logMsg =
-        'camera stopped sending video after ' +
-        maxRetries +
-        ' retries (cause=' +
-        stallCause +
-        ', quietFor=' +
-        quietSecs +
-        's)';
-      return {action: 'timeout', logMsg};
-    }
-    const logMsg =
-      'stream stalled (initiator=bridge-watchdog, cause=' +
-      stallCause +
-      ', quietFor=' +
-      quietSecs +
-      's, gotVideo=' +
-      this.gotVideo +
-      ', retry=' +
-      this.restarts +
-      '/' +
-      maxRetries +
-      ') - resetting decoder and re-requesting livestream from eufy';
-    return {action: 'retry', logMsg};
+    return this.session.evaluateP2pHealth(now, {
+      quietSince,
+      initialRetryMs,
+      subsequentRetryMs,
+      maxRetries,
+      isPiggybackedExternal: this.isPiggybackedExternalSession(),
+      hasWakingViewer: this.hasWakingViewer(),
+    });
   }
 
   /**
@@ -7678,20 +6027,12 @@ class Camera {
    * @returns {boolean}
    */
   isDuplicateTriggerEvent(eventName, isStart, personName = '', now = Date.now()) {
-    const evKey = String(eventName || '').toLowerCase();
-    const backfillPerson = (this.pendingBackfill || this.activeBackfillJob)?.personName || '';
-    return isStart
-      ? Boolean(
-          this.activeTriggerEvents.has(evKey) &&
-          this.lastTriggerStartEvent === evKey &&
-          now - this.lastTriggerStartAt < COMPANION_EVENT_BURST_MS &&
-          (!personName || backfillPerson === personName)
-        )
-      : Boolean(
-          !this.activeTriggerEvents.has(evKey) &&
-          this.lastTriggerClearEvent === evKey &&
-          now - this.lastTriggerClearAt < COMPANION_EVENT_BURST_MS
-        );
+    if (!isStart) {
+      return this.hardwareTriggers.isDuplicateClear(eventName, now);
+    }
+    const job = this.backfill.pending || this.backfill.active;
+    const backfillPerson = (job && job.getPersonName()) || '';
+    return this.hardwareTriggers.isDuplicateStart(eventName, now, !personName || backfillPerson === personName);
   }
 
   /**
@@ -7713,46 +6054,18 @@ class Camera {
   ) {
     this.expireStaleHardwareTriggers(now);
     if (eventName) {
-      const lowerEvent = String(eventName).toLowerCase();
-      this.activeTriggerEvents.delete(lowerEvent);
-      this.activeTriggerStartedAt.delete(lowerEvent);
-      this.lastTriggerClearEvent = lowerEvent;
-      this.lastTriggerClearAt = now;
+      this.hardwareTriggers.clear(eventName, now);
     } else {
       this._clearActiveHardwareTriggers();
     }
-    let allCleared = this.activeTriggerEvents.size === 0;
-    if (this.activeBackfillJob && this.activeBackfillJob !== this.pendingBackfill) {
-      allCleared = this.activeBackfillJob.markRecordingCleared(now, eventName);
-    }
-    if (this.pendingBackfill) {
-      allCleared = this.pendingBackfill.markRecordingCleared(now, eventName);
-    }
-    if (this.queuedBackfillJob) {
-      allCleared = this.queuedBackfillJob.markRecordingCleared(now, eventName);
-    }
-    if (this.lastSessionEventInfo) {
-      this.lastSessionEventInfo = Object.freeze({
-        ...this.lastSessionEventInfo,
-        recordingActive: !allCleared,
-        activeEvents: [...this.activeTriggerEvents],
-      });
-    }
-    if (allCleared && (this.pendingBackfill || this.activeBackfillJob || this.queuedBackfillJob)) {
-      this.lastBackfillQueryAt = 0;
-    }
+    const allCleared = this.backfill.markTriggersCleared(now, eventName, {
+      initiallyCleared: this.hardwareTriggers.isEmpty(),
+      activeEvents: this.hardwareTriggers.activeEvents(),
+    });
     if (!allCleared) {
       return null;
     }
-    this.motionClearedAt = now;
-    if (this.timers.letEufyDecideEnd && this.active && this.isInMotion(now) && this.gotVideo) {
-      const minEnd = Math.max(now + settleMs, (this.firstVideoAt || now) + minVideoMs);
-      if (this.motionUntil > minEnd) {
-        this.motionUntil = minEnd;
-        return Math.round((minEnd - now) / 1000);
-      }
-    }
-    return null;
+    return this.session.shortenHoldOnMotionClear(now, settleMs, minVideoMs);
   }
 
   /**
@@ -7761,90 +6074,7 @@ class Camera {
    * @returns {boolean}
    */
   isBackfillRecordingCleared() {
-    return Boolean(this.pendingBackfill && !this.pendingBackfill.recordingActive);
-  }
-
-  /**
-   * Synchronizes queued/playing backfill clip metadata from a mutated BackfillJob.
-   *
-   * @param {BackfillJob} sourceJob - Updated backfill job providing event metadata.
-   */
-  _syncQueuedBackfillClipMeta(sourceJob) {
-    const mergeMeta = (clip) =>
-      Object.freeze({
-        ...clip,
-        event: sourceJob.event,
-        personName: sourceJob.personName,
-        reason: sourceJob.reason,
-      });
-    if (this.backfillClip) {
-      this.backfillClip = mergeMeta(this.backfillClip);
-    }
-    this.backfillClipQueue = this.backfillClipQueue.map(mergeMeta);
-  }
-
-  /**
-   * Updates lastSessionEventInfo with a frozen summary snapshot.
-   *
-   * @param {{
-   *   at: number,
-   *   event: string,
-   *   personName: string,
-   *   reason: string,
-   *   priority: number,
-   *   recordingActive: boolean
-   * }} meta - Session event summary fields.
-   */
-  _setLastSessionEventInfo(meta) {
-    this.lastSessionEventInfo = Object.freeze({
-      name: this.name,
-      at: meta.at,
-      lastActivityAt: meta.at,
-      event: meta.event,
-      personName: meta.personName,
-      reason: meta.reason,
-      priority: meta.priority,
-      attempts: 0,
-      recordingActive: meta.recordingActive,
-      activeEvents: [...this.activeTriggerEvents],
-    });
-  }
-
-  /**
-   * Upgrades any active, pending, or queued BackfillJobs in place for an /api/wake request.
-   *
-   * @param {(job: BackfillJob) => boolean} upgradeJobInPlace - Single-job upgrade callback.
-   * @param {{ defaultEvent: string, resolvedReason: string }} meta - Fallback label metadata.
-   * @param {number} now - Current epoch timestamp in milliseconds.
-   * @returns {{ hadJob: boolean, upgraded: boolean }}
-   */
-  _upgradeExistingJobsForApiWake(upgradeJobInPlace, meta, now) {
-    const jobs = [
-      this.activeBackfillJob,
-      this.pendingBackfill && !this.pendingBackfill.isExpired(now) && this.pendingBackfill !== this.activeBackfillJob
-        ? this.pendingBackfill
-        : null,
-      this.queuedBackfillJob && !this.queuedBackfillJob.isExpired(now) ? this.queuedBackfillJob : null,
-    ].filter(Boolean);
-    if (jobs.length === 0) {
-      return {hadJob: false, upgraded: false};
-    }
-    let upgraded = false;
-    for (const job of jobs) {
-      upgraded = upgradeJobInPlace(job) || upgraded;
-    }
-    const metaSource = jobs[jobs.length - 1];
-    if (upgraded && metaSource) {
-      this._setLastSessionEventInfo({
-        at: now,
-        event: metaSource.event || meta.defaultEvent,
-        personName: metaSource.personName || '',
-        reason: metaSource.reason || meta.resolvedReason,
-        priority: metaSource.priority,
-        recordingActive: Boolean(metaSource.recordingActive),
-      });
-    }
-    return {hadJob: true, upgraded};
+    return this.backfill.isRecordingCleared();
   }
 
   /**
@@ -7858,34 +6088,15 @@ class Camera {
    * @returns {boolean} True if a BackfillJob was queued or upgraded in place.
    */
   queueOrUpgradeApiWakeBackfill(now, reason, evPriorityOrOpts = DEFAULT_EVENT_PRIORITY) {
-    if (!this.backfillDownloads) {
-      return false;
-    }
     const opts = typeof evPriorityOrOpts === 'object' && evPriorityOrOpts !== null ? evPriorityOrOpts : null;
     const evPriority = opts ? Number(opts.evPriority ?? DEFAULT_EVENT_PRIORITY) : Number(evPriorityOrOpts);
-    const defaultEvent = (opts && opts.defaultEvent) || 'motion detected';
-    const resolvedReason = reason || defaultEvent;
-    const nextPriority = this.priority + evPriority;
-
-    const upgradeJobInPlace = (job) => {
-      const upgraded = job.upgradeEvent({
-        event: job.event || defaultEvent,
-        personName: job.personName || '',
-        reason: resolvedReason,
-        priority: nextPriority,
-        at: now,
-        recordingActive: false,
-      });
-      this._syncQueuedBackfillClipMeta(job);
-      return upgraded;
-    };
-
-    const existing = this._upgradeExistingJobsForApiWake(upgradeJobInPlace, {defaultEvent, resolvedReason}, now);
-    if (existing.hadJob) {
-      return existing.upgraded;
-    }
-    this.queueEventBackfill(now, defaultEvent, '', resolvedReason, evPriority, false);
-    return Boolean(this.pendingBackfill);
+    return this.backfill.queueOrUpgradeApiWake(now, reason, {
+      evPriority,
+      defaultEvent: opts ? opts.defaultEvent : undefined,
+      activeEvents: this.hardwareTriggers.activeEvents(),
+      isLiveWithVideo: Boolean(this.isActiveLiveSession() && this.session.gotVideo),
+      runtimeExtended: this.session.runtimeExtended,
+    });
   }
 
   /**
@@ -7901,92 +6112,19 @@ class Camera {
   queueEventBackfill(now, eventName, personName, reason, evPriority, recordingActive = true) {
     this.expireStaleHardwareTriggers(now);
     if (recordingActive && eventName) {
-      const lowerEvent = String(eventName).toLowerCase();
-      this.motionClearedAt = 0;
-      this.activeTriggerEvents.add(lowerEvent);
-      this.activeTriggerStartedAt.set(lowerEvent, now);
-      this.lastTriggerStartEvent = lowerEvent;
-      this.lastTriggerStartAt = now;
+      this.session.motionClearedAt = 0;
+      this.hardwareTriggers.start(eventName, now);
     }
     const mergedEvPriority = this._consumeDeferredWakePriority(evPriority, recordingActive);
-    const nextPriority = this.priority + mergedEvPriority;
-    this._setLastSessionEventInfo({
-      at: now,
-      event: eventName || 'motion detected',
-      personName: personName || '',
-      reason: reason || eventName || 'motion detected',
-      priority: nextPriority,
-      recordingActive,
-    });
-    if (
-      !this.backfillDownloads ||
-      (!this.alwaysBackfill && (this.runtimeExtended || (this.isActiveLiveSession() && this.gotVideo)))
-    ) {
-      return;
-    }
-
-    const nonRecordingUpgrade = {
-      event: eventName,
+    this.backfill.queueEvent(now, {
+      eventName,
       personName,
       reason,
-      priority: nextPriority,
-      at: now,
-      recordingActive: false,
-    };
-    const eventUpgrade = {...nonRecordingUpgrade, recordingActive};
-
-    if (this.activeBackfillJob) {
-      this.activeBackfillJob.upgradeEvent(nonRecordingUpgrade);
-      this._syncQueuedBackfillClipMeta(this.activeBackfillJob);
-    }
-
-    if (this.pendingBackfill && !this.pendingBackfill.isExpired(now)) {
-      const pendingAlreadySettledOrMatched = Boolean(
-        recordingActive &&
-        (this.backfillClip ||
-          this.pendingBackfill.state === BACKFILL_STATES.MATCHED ||
-          this.pendingBackfill.attempts > 0 ||
-          (!this.pendingBackfill.recordingActive &&
-            this.pendingBackfill.clearedAt > 0 &&
-            now - this.pendingBackfill.clearedAt >= BACKFILL_POST_CLEAR_SETTLE_MS))
-      );
-      if (pendingAlreadySettledOrMatched) {
-        this.pendingBackfill.upgradeEvent(nonRecordingUpgrade);
-        this._syncQueuedBackfillClipMeta(this.pendingBackfill);
-        if (this.queuedBackfillJob && !this.queuedBackfillJob.isExpired(now)) {
-          this.queuedBackfillJob.upgradeEvent(eventUpgrade);
-        } else {
-          this.queuedBackfillJob = new BackfillJob({
-            name: this.name,
-            at: now,
-            lastActivityAt: now,
-            event: eventName,
-            personName,
-            reason,
-            priority: nextPriority,
-            attempts: 0,
-            recordingActive,
-            activeEvents: [...this.activeTriggerEvents],
-          });
-        }
-        return;
-      }
-      this.pendingBackfill.upgradeEvent(eventUpgrade);
-      this._syncQueuedBackfillClipMeta(this.pendingBackfill);
-      return;
-    }
-
-    this.pendingBackfill = new BackfillJob({
-      name: this.name,
-      at: now,
-      lastActivityAt: now,
-      event: eventName,
-      personName,
-      reason,
-      priority: nextPriority,
-      attempts: 0,
+      evPriority: mergedEvPriority,
       recordingActive,
-      activeEvents: [...this.activeTriggerEvents],
+      activeEvents: this.hardwareTriggers.activeEvents(),
+      isLiveWithVideo: Boolean(this.isActiveLiveSession() && this.session.gotVideo),
+      runtimeExtended: this.session.runtimeExtended,
     });
   }
 
@@ -7996,19 +6134,1078 @@ class Camera {
    * @returns {boolean}
    */
   hasUrgentTestBackfill() {
-    return Boolean(this.pendingBackfill && this.pendingBackfill.isUrgentTest());
+    return this.backfill.hasUrgentTest();
   }
 
   /**
    * Clears any scheduled /api/wake pacing timer and pending options on this camera.
    */
   clearApiWakeTimer() {
-    if (this.apiWakeTimer) {
-      clearTimeout(this.apiWakeTimer);
-      this.apiWakeTimer = null;
-    }
-    this.apiWakePendingOpts = null;
-    this.apiWakeScheduledAt = 0;
+    this.wake.clearApiTimer();
+  }
+
+  /**
+   * Returns the configured per-camera base priority score.
+   *
+   * @returns {number}
+   */
+  getBasePriority() {
+    return this.priority;
+  }
+
+  /**
+   * Returns the resolved per-camera timing and mode configuration object.
+   *
+   * @returns {Record<string, *>}
+   */
+  getTimersConfig() {
+    return this.timers;
+  }
+
+  /**
+   * Returns the resolved Set of trigger event keywords enabled for this camera.
+   *
+   * @returns {Set<string>}
+   */
+  getTriggersSet() {
+    return this.triggers;
+  }
+
+  /**
+   * Returns true when post-event HomeBase clip backfill downloads are enabled for this camera.
+   *
+   * @returns {boolean}
+   */
+  hasBackfillDownloadsEnabled() {
+    return Boolean(this.backfillDownloads);
+  }
+
+  /**
+   * Sets the HomeBase or direct RTSP pull URL on this camera.
+   *
+   * @param {string} url - Candidate RTSP URL string.
+   */
+  setRtspUrl(url) {
+    this.rtspUrl = String(url || '');
+  }
+
+  /**
+   * Sets whether this camera hardware supports native HomeBase RTSP streaming.
+   *
+   * @param {boolean} supported - True when native RTSP is supported.
+   */
+  setRtspSupported(supported) {
+    this.rtspSupported = Boolean(supported);
+  }
+
+  /**
+   * Sets whether the Eufy rtspStream property has been verified for this camera.
+   *
+   * @param {boolean} checked - Verification state.
+   */
+  setRtspPropertyChecked(checked) {
+    this.rtspEnabledChecked = Boolean(checked);
+  }
+
+  /**
+   * Returns true when this camera still needs a first-boot startup snapshot probe.
+   *
+   * @returns {boolean}
+   */
+  requiresStartupSnapshot() {
+    return Boolean(this.needsStartupSnapshot);
+  }
+
+  /**
+   * Sets whether this camera needs a first-boot startup snapshot probe.
+   *
+   * @param {boolean} needed - Whether a startup snapshot probe is required.
+   */
+  setRequiresStartupSnapshot(needed) {
+    this.needsStartupSnapshot = Boolean(needed);
+  }
+
+  /**
+   * Returns the normalized status card theme configured for this camera.
+   *
+   * @returns {string}
+   */
+  getCardTheme() {
+    return this.card.theme;
+  }
+
+  /**
+   * Returns the pre-allocated YUV420p sleeping status card buffer.
+   *
+   * @returns {Uint8Array}
+   */
+  getAsleepCardBuffer() {
+    return this.card.asleep;
+  }
+
+  /**
+   * Returns the YUV420p waking status card buffer (rendering lazily on first access).
+   *
+   * @returns {Uint8Array|null}
+   */
+  getWakingCardBuffer() {
+    return this.card.waking;
+  }
+
+  /**
+   * Returns the YUV420p busy/waiting status card buffer (rendering lazily on first access).
+   *
+   * @returns {Uint8Array|null}
+   */
+  getBusyCardBuffer() {
+    return this.card.busy;
+  }
+
+  /**
+   * Returns the raw waking card buffer without triggering lazy allocation.
+   *
+   * @returns {Uint8Array|null}
+   */
+  peekWakingCardBuffer() {
+    return this.card.peekWakingBuffer();
+  }
+
+  /**
+   * Returns the raw busy card buffer without triggering lazy allocation.
+   *
+   * @returns {Uint8Array|null}
+   */
+  peekBusyCardBuffer() {
+    return this.card.peekBusyBuffer();
+  }
+
+  /**
+   * Returns the alternating two-slot live overlay scratch buffers (or null before first live overlay).
+   *
+   * @returns {Buffer[]|null}
+   */
+  getLiveOverlayBuffers() {
+    return this.card.liveOverlayBufs;
+  }
+
+  /**
+   * Returns true when live status card rendering is temporarily suppressed for clean event snapshots.
+   *
+   * @returns {boolean}
+   */
+  isLiveCardSuppressed() {
+    return Boolean(this.card.suppressLiveCard);
+  }
+
+  /**
+   * Sets whether live status card rendering is temporarily suppressed.
+   *
+   * @param {boolean} suppressed - Suppression flag.
+   */
+  setLiveCardSuppressed(suppressed) {
+    this.card.suppressLiveCard = Boolean(suppressed);
+  }
+
+  /**
+   * Returns the resolved telemetry visibility configuration for this camera.
+   *
+   * @returns {Record<string, boolean>}
+   */
+  getTelemetryConfig() {
+    return this.telemetry.config;
+  }
+
+  /**
+   * Returns the resolved Eufy Power Manager hardware recording configuration for this camera.
+   *
+   * @returns {Record<string, *>}
+   */
+  getHardwareRecordingConfig() {
+    return this.telemetry.hwRecordingCfg;
+  }
+
+  /**
+   * Returns true when eufy-security-ws connectivity is marked healthy on this camera.
+   *
+   * @returns {boolean}
+   */
+  isWsConnected() {
+    return Boolean(this.telemetry.wsConnected);
+  }
+
+  /**
+   * Returns true when the camera battery is currently charging or externally powered.
+   *
+   * @returns {boolean}
+   */
+  isCharging() {
+    return Boolean(this.telemetry.charging);
+  }
+
+  /**
+   * Returns the human-readable power source label ('Solar', 'Plugged', 'Charging', or 'Battery').
+   *
+   * @returns {string}
+   */
+  getPowerLabel() {
+    return this.telemetry.powerLabel;
+  }
+
+  /**
+   * Returns true once the Eufy videoStreamingQuality check has run for this camera.
+   *
+   * @returns {boolean}
+   */
+  hasQualityChecked() {
+    return Boolean(this.telemetry.qualityChecked);
+  }
+
+  /**
+   * Returns true once the Eufy Power Manager recording mode sync check has run for this camera.
+   *
+   * @returns {boolean}
+   */
+  hasRecordingModeChecked() {
+    return Boolean(this.telemetry.recordingModeChecked);
+  }
+
+  /**
+   * Returns the current 0..4 Wi-Fi signal bar tier (or null before telemetry arrives).
+   *
+   * @returns {number|null}
+   */
+  getWifiSignal() {
+    return this.telemetry.wifi;
+  }
+
+  /**
+   * Returns the current camera temperature reading in degrees Celsius (or null if unavailable).
+   *
+   * @returns {number|null}
+   */
+  getTemperature() {
+    return this.telemetry.temp;
+  }
+
+  /**
+   * Returns true when the camera hardware spotlight (light) is currently reported on.
+   *
+   * @returns {boolean}
+   */
+  isSpotlightOn() {
+    return this.telemetry.isLightOn();
+  }
+
+  /**
+   * Returns true when Low-Battery Saver conservation is supported on this camera's telemetry model.
+   *
+   * @returns {boolean}
+   */
+  hasPowerConservationEnabled() {
+    return this.telemetry.hasPowerConservationEnabled();
+  }
+
+  /**
+   * Marks the camera offline after an unresponsive wake timeout.
+   */
+  markWakeTimedOut() {
+    this.telemetry.markWakeTimedOut();
+  }
+
+  /**
+   * Updates the formatted 'HH:MM' last-seen timestamp on the camera's telemetry model.
+   *
+   * @param {string} lastSeenHm - Formatted local 'HH:MM' timestamp.
+   */
+  updateLastSeen(lastSeenHm) {
+    this.telemetry.updateLastSeen(lastSeenHm);
+  }
+
+  /**
+   * Returns the structured telemetry status snapshot using this camera's card configuration.
+   *
+   * @returns {Record<string, *>}
+   */
+  toTelemetryStatusSnapshot() {
+    return this.telemetry.toStatusSnapshot(this.card.config);
+  }
+
+  /**
+   * Returns the stored session lifecycle state without mutating an elapsed cooldown.
+   *
+   * @returns {string}
+   */
+  getStoredSessionState() {
+    return this.sessionLifecycle.getState();
+  }
+
+  /**
+   * Sets the epoch timestamp when the camera last went to sleep.
+   *
+   * @param {number} sleptAt - Epoch timestamp in milliseconds.
+   */
+  setSleptAt(sleptAt) {
+    this.sessionLifecycle.markSlept(sleptAt);
+  }
+
+  /**
+   * Sets whether a stream session is currently marked active.
+   *
+   * @param {boolean} active - Active flag.
+   */
+  setSessionActive(active) {
+    this.session.active = Boolean(active);
+  }
+
+  /**
+   * Sets the active stream mode ('rtsp', 'p2p', 'download', or '').
+   *
+   * @param {string} mode - Stream mode identifier.
+   */
+  setActiveMode(mode) {
+    this.session.mode = mode;
+  }
+
+  /**
+   * Returns true when the P2P livestream channel has reported ready.
+   *
+   * @returns {boolean}
+   */
+  isP2pReady() {
+    return Boolean(this.session.p2pReady);
+  }
+
+  /**
+   * Returns the epoch timestamp when the current session started.
+   *
+   * @returns {number}
+   */
+  getSessionStartedAt() {
+    return this.session.startedAt;
+  }
+
+  /**
+   * Sets the epoch timestamp when the current session started.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setSessionStartedAt(ts) {
+    this.session.startedAt = ts;
+  }
+
+  /**
+   * Sets the epoch timestamp of the latest stream start attempt.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastStartAt(ts) {
+    this.session.lastStartAt = ts;
+  }
+
+  /**
+   * Returns the epoch timestamp when the camera session last stopped.
+   *
+   * @returns {number}
+   */
+  getLastStoppedAt() {
+    return this.session.lastStoppedAt;
+  }
+
+  /**
+   * Sets the epoch timestamp when the camera session last stopped.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastStoppedAt(ts) {
+    this.session.lastStoppedAt = ts;
+  }
+
+  /**
+   * Sets whether the current session has received video data.
+   *
+   * @param {boolean} gotVideo - Video received flag.
+   */
+  setGotVideo(gotVideo) {
+    this.session.gotVideo = Boolean(gotVideo);
+  }
+
+  /**
+   * Sets the epoch timestamp of the first video packet/frame in the current session.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setFirstVideoAt(ts) {
+    this.session.firstVideoAt = ts;
+  }
+
+  /**
+   * Returns the epoch timestamp of the first decoded YUV420p frame in the current session.
+   *
+   * @returns {number}
+   */
+  getFirstFrameAt() {
+    return this.session.firstFrameAt;
+  }
+
+  /**
+   * Sets the epoch timestamp of the first decoded YUV420p frame in the current session.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setFirstFrameAt(ts) {
+    this.session.firstFrameAt = ts;
+  }
+
+  /**
+   * Returns the epoch timestamp of the latest video packet/frame in the current session.
+   *
+   * @returns {number}
+   */
+  getLastVideoAt() {
+    return this.session.lastVideoAt;
+  }
+
+  /**
+   * Sets the epoch timestamp of the latest video packet/frame in the current session.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastVideoAt(ts) {
+    this.session.lastVideoAt = ts;
+  }
+
+  /**
+   * Returns the number of packets or frames dropped due to queue bounds in the current session.
+   *
+   * @returns {number}
+   */
+  getDroppedFrameCount() {
+    return this.session.droppedFrames;
+  }
+
+  /**
+   * Sets the human-readable wake/session reason string.
+   *
+   * @param {string} reason - Session wake reason.
+   */
+  setReason(reason) {
+    this.session.reason = reason;
+  }
+
+  /**
+   * Returns the structured initiator tag for the current or most recent session.
+   *
+   * @returns {string}
+   */
+  getWakeInitiator() {
+    return this.session.initiator;
+  }
+
+  /**
+   * Sets the structured initiator tag for the current session.
+   *
+   * @param {string} initiator - Session initiator tag.
+   */
+  setWakeInitiator(initiator) {
+    this.session.initiator = initiator;
+  }
+
+  /**
+   * Returns true when the current session's hold window was extended mid-stream.
+   *
+   * @returns {boolean}
+   */
+  isRuntimeExtended() {
+    return Boolean(this.session.runtimeExtended);
+  }
+
+  /**
+   * Returns the motion/event hold expiry timestamp in milliseconds.
+   *
+   * @returns {number}
+   */
+  getMotionUntil() {
+    return this.session.motionUntil;
+  }
+
+  /**
+   * Sets the motion/event hold expiry timestamp in milliseconds.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setMotionUntil(ts) {
+    this.session.motionUntil = ts;
+  }
+
+  /**
+   * Sets the latest motion trigger timestamp in milliseconds.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastMotionAt(ts) {
+    this.session.lastMotionAt = ts;
+  }
+
+  /**
+   * Returns the epoch timestamp when Eufy reported motion cleared in the current session.
+   *
+   * @returns {number}
+   */
+  getMotionClearedAt() {
+    return this.session.motionClearedAt;
+  }
+
+  /**
+   * Sets the epoch timestamp when Eufy reported motion cleared in the current session.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setMotionClearedAt(ts) {
+    this.session.motionClearedAt = ts;
+  }
+
+  /**
+   * Returns the live viewer hold expiry timestamp in milliseconds.
+   *
+   * @returns {number}
+   */
+  getViewUntil() {
+    return this.session.viewUntil;
+  }
+
+  /**
+   * Sets the live viewer hold expiry timestamp in milliseconds.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setViewUntil(ts) {
+    this.session.viewUntil = ts;
+  }
+
+  /**
+   * Returns true when Frigate event filing is enabled for the active wake/session.
+   *
+   * @returns {boolean}
+   */
+  isEventActive() {
+    return Boolean(this.eventActive);
+  }
+
+  /**
+   * Sets whether Frigate event filing is enabled for the active wake/session.
+   *
+   * @param {boolean} active - Event active flag.
+   */
+  setEventActive(active) {
+    this.eventActive = Boolean(active);
+  }
+
+  /**
+   * Returns the epoch timestamp of the last Frigate hold-extension poll.
+   *
+   * @returns {number}
+   */
+  getLastExtendCheckAt() {
+    return this.lastExtendCheckAt;
+  }
+
+  /**
+   * Sets the epoch timestamp of the last Frigate hold-extension poll.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastExtendCheckAt(ts) {
+    this.lastExtendCheckAt = ts;
+  }
+
+  /**
+   * Sets the epoch timestamp of the last unsolicited P2P stop command.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastUnsolicitedStopAt(ts) {
+    this.lastUnsolicitedStopAt = ts;
+  }
+
+  /**
+   * Sets the epoch timestamp of the last idle wedged-radio stop command.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastWedgedRadioStopAt(ts) {
+    this.lastWedgedRadioStopAt = ts;
+  }
+
+  /**
+   * Clears all tracked go2rtc viewer consumer IDs on this camera.
+   */
+  clearViewerIds() {
+    this.viewerSet.clearAll();
+  }
+
+  /**
+   * Marks a Eufy hardware trigger event name as currently active in the trigger ledger.
+   *
+   * @param {string} eventName - Raw or normalized Eufy event name.
+   */
+  addActiveTriggerEvent(eventName) {
+    this.hardwareTriggers.addActive(eventName);
+  }
+
+  /**
+   * Clears all active Eufy hardware trigger events from the trigger ledger.
+   */
+  clearActiveTriggerEvents() {
+    this.hardwareTriggers.clearAll();
+  }
+
+  /**
+   * Returns the stored Frigate event filing state without mutating an elapsed cooldown.
+   *
+   * @returns {string}
+   */
+  getStoredFrigateEventState() {
+    return this.eventFiling.state;
+  }
+
+  /**
+   * Sets the stored Frigate event filing state.
+   *
+   * @param {string} state - FRIGATE_EVENT_STATES value.
+   */
+  setStoredFrigateEventState(state) {
+    this.eventFiling.state = state;
+  }
+
+  /**
+   * Returns the Frigate event cooldown expiry timestamp in milliseconds.
+   *
+   * @returns {number}
+   */
+  getFrigateEventUntil() {
+    return this.eventFiling.until;
+  }
+
+  /**
+   * Sets the Frigate event cooldown expiry timestamp in milliseconds.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setFrigateEventUntil(ts) {
+    this.eventFiling.until = ts;
+  }
+
+  /**
+   * Returns the active Frigate event snapshot timer handle (or null if none).
+   *
+   * @returns {*}
+   */
+  getFrigateEventTimer() {
+    return this.eventFiling.timer;
+  }
+
+  /**
+   * Sets the queued/filed Frigate event label on this camera.
+   *
+   * @param {string} label - Frigate event label.
+   */
+  setFrigateEventLabel(label) {
+    this.eventFiling.label = label;
+  }
+
+  /**
+   * Sets the recognized person name for Frigate event filing on this camera.
+   *
+   * @param {string} person - Recognized person name.
+   */
+  setFrigateEventPerson(person) {
+    this.eventFiling.person = person;
+  }
+
+  /**
+   * Returns the current decoder backpressure FSM state.
+   *
+   * @returns {string}
+   */
+  getDecoderState() {
+    return this.session.decoderState;
+  }
+
+  /**
+   * Returns the epoch timestamp when the current FFmpeg decoder process was spawned.
+   *
+   * @returns {number}
+   */
+  getDecoderSpawnedAt() {
+    return this.session.decSpawnedAt;
+  }
+
+  /**
+   * Returns true when the attached FFmpeg decoder stdout stream is paused for backpressure.
+   *
+   * @returns {boolean}
+   */
+  isDecoderStdoutPaused() {
+    return Boolean(this.session.decoderStdoutPaused);
+  }
+
+  /**
+   * Returns the queued compressed video packets awaiting decoder stdin consumption.
+   *
+   * @returns {Uint8Array[]}
+   */
+  getPendingVideoPackets() {
+    return this.session.pendingVideoPackets;
+  }
+
+  /**
+   * Replaces the queued compressed video packet array on the stream session.
+   *
+   * @param {Uint8Array[]} packets - Replacement packet queue.
+   */
+  setPendingVideoPackets(packets) {
+    this.session.pendingVideoPackets = packets;
+  }
+
+  /**
+   * Empties any queued compressed video packets in place.
+   */
+  clearPendingVideoPackets() {
+    this.session.pendingVideoPackets.length = 0;
+  }
+
+  /**
+   * Returns the queued compressed audio packets awaiting decoder pipe consumption.
+   *
+   * @returns {Uint8Array[]}
+   */
+  getPendingAudioPackets() {
+    return this.session.pendingAudioPackets;
+  }
+
+  /**
+   * Returns the total bytes of decoded PCM audio currently buffered in the audio queue.
+   *
+   * @returns {number}
+   */
+  getBufferedAudioBytes() {
+    return this.audioQueue.getBufferedBytes();
+  }
+
+  /**
+   * Returns the latest decoded YUV420p frame buffer (with live overlay applied when enabled).
+   *
+   * @returns {Uint8Array|null}
+   */
+  getCurrentFrameBuffer() {
+    return this.frame;
+  }
+
+  /**
+   * Sets the current YUV420p frame buffer on this camera.
+   *
+   * @param {Uint8Array|null} frame - Frame buffer or null.
+   */
+  setCurrentFrameBuffer(frame) {
+    this.frame = frame;
+  }
+
+  /**
+   * Sets the clean snapshot YUV420p frame buffer on this camera.
+   *
+   * @param {Uint8Array|null} frame - Clean snapshot frame buffer or null.
+   */
+  setLastFrameBuffer(frame) {
+    this.lastFrame = frame;
+  }
+
+  /**
+   * Sets the epoch timestamp when the current decoded frame arrived.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setFrameTimestamp(ts) {
+    this.frameAt = ts;
+  }
+
+  /**
+   * Sets whether a newly decoded frame is waiting to be written to the encoder.
+   *
+   * @param {boolean} isNew - Pending frame flag.
+   */
+  setFrameNew(isNew) {
+    this.frameNew = Boolean(isNew);
+  }
+
+  /**
+   * Returns the epoch timestamp of the most recent encoder frame write.
+   *
+   * @returns {number}
+   */
+  getLastWriteAt() {
+    return this.lastWrite;
+  }
+
+  /**
+   * Sets the epoch timestamp of the most recent encoder frame write.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastWriteAt(ts) {
+    this.lastWrite = ts;
+  }
+
+  /**
+   * Returns the last YUV420p frame buffer written to the encoder stdin.
+   *
+   * @returns {Uint8Array|null}
+   */
+  getLastSentFrameBuffer() {
+    return this.lastSent;
+  }
+
+  /**
+   * Returns the pre-allocated decoder stdout assembly buffer (or null before first decode).
+   *
+   * @returns {Buffer|null}
+   */
+  getDecoderReadBuffer() {
+    return this.decoderReadBuf;
+  }
+
+  /**
+   * Returns the two-slot live frame ring buffer (or null before first live burst).
+   *
+   * @returns {Buffer[]|null}
+   */
+  getLiveFrameRing() {
+    return this.liveFrameRing;
+  }
+
+  /**
+   * Returns the number of decoded live frames currently queued for paced output.
+   *
+   * @returns {number}
+   */
+  getBufferedLiveFrameCount() {
+    return this.liveFrames.length;
+  }
+
+  /**
+   * Returns the number of reusable frame buffers currently pooled for backfill downloads.
+   *
+   * @returns {number}
+   */
+  getDownloadFramePoolCount() {
+    return this.downloadFramePool.length;
+  }
+
+  /**
+   * Returns the pending BackfillJob waiting for settlement or HomeBase query (or null).
+   *
+   * @returns {import("./backfill-job").BackfillJob|null}
+   */
+  getPendingBackfillJob() {
+    return this.backfill.pending;
+  }
+
+  /**
+   * Sets the pending BackfillJob on this camera.
+   *
+   * @param {import("./backfill-job").BackfillJob|null} job - Pending BackfillJob or null.
+   */
+  setPendingBackfillJob(job) {
+    this.backfill.pending = job;
+  }
+
+  /**
+   * Returns the secondary BackfillJob queued behind an already-querying pending job (or null).
+   *
+   * @returns {import("./backfill-job").BackfillJob|null}
+   */
+  getQueuedBackfillJob() {
+    return this.backfill.queued;
+  }
+
+  /**
+   * Sets the secondary queued BackfillJob on this camera.
+   *
+   * @param {import("./backfill-job").BackfillJob|null} job - Queued BackfillJob or null.
+   */
+  setQueuedBackfillJob(job) {
+    this.backfill.queued = job;
+  }
+
+  /**
+   * Returns the BackfillJob currently being downloaded/replayed (or null).
+   *
+   * @returns {import("./backfill-job").BackfillJob|null}
+   */
+  getActiveBackfillJob() {
+    return this.backfill.active;
+  }
+
+  /**
+   * Returns the clip descriptor currently being downloaded/replayed (or null).
+   *
+   * @returns {Record<string, *>|null}
+   */
+  getActiveBackfillClip() {
+    return this.backfill.activeClip;
+  }
+
+  /**
+   * Returns the next matched HomeBase clip ready for download (or null).
+   *
+   * @returns {Record<string, *>|null}
+   */
+  getBackfillClip() {
+    return this.backfill.clip;
+  }
+
+  /**
+   * Sets the next matched HomeBase clip descriptor on this camera.
+   *
+   * @param {Record<string, *>|null} clip - Matched clip descriptor or null.
+   */
+  setBackfillClip(clip) {
+    this.backfill.clip = /** @type {*} */ (clip);
+  }
+
+  /**
+   * Returns the queue of matched HomeBase clips awaiting download.
+   *
+   * @returns {Array<Record<string, *>>}
+   */
+  getBackfillClipQueue() {
+    return this.backfill.clipQueue;
+  }
+
+  /**
+   * Replaces the queue of matched HomeBase clips awaiting download.
+   *
+   * @param {Array<Record<string, *>>} clips - Replacement matched clip array.
+   */
+  setBackfillClipQueue(clips) {
+    this.backfill.clipQueue = /** @type {*} */ (clips);
+  }
+
+  /**
+   * Returns the epoch timestamp of the latest HomeBase database query for this camera.
+   *
+   * @returns {number}
+   */
+  getLastBackfillQueryAt() {
+    return this.backfill.lastQueryAt;
+  }
+
+  /**
+   * Sets the epoch timestamp of the latest HomeBase database query for this camera.
+   *
+   * @param {number} ts - Epoch timestamp in milliseconds.
+   */
+  setLastBackfillQueryAt(ts) {
+    this.backfill.lastQueryAt = ts;
+  }
+
+  /**
+   * Returns true if the given HomeBase clip storage path is recorded in downloadedPaths.
+   *
+   * @param {string} storagePath - HomeBase .zxvideo storage path.
+   * @returns {boolean}
+   */
+  hasDownloadedClipPath(storagePath) {
+    return this.backfill.downloadedPaths.has(storagePath);
+  }
+
+  /**
+   * Returns the number of HomeBase clip paths retained in bounded downloadedPaths history.
+   *
+   * @returns {number}
+   */
+  getDownloadedClipPathCount() {
+    return this.backfill.downloadedPaths.size;
+  }
+
+  /**
+   * Returns the array of decoded YUV420p frames buffered for 15 fps backfill playback.
+   *
+   * @returns {Uint8Array[]}
+   */
+  getBufferedDownloadFrames() {
+    return this.backfill.frames;
+  }
+
+  /**
+   * Replaces the array of decoded frames buffered for backfill playback.
+   *
+   * @param {Uint8Array[]} frames - Replacement buffered frame array.
+   */
+  setBufferedDownloadFrames(frames) {
+    this.backfill.frames = frames;
+  }
+
+  /**
+   * Returns the epoch timestamp when Frame 0 of the active backfill clip began playback.
+   *
+   * @returns {number}
+   */
+  getBackfillPlaybackStartedAt() {
+    return this.backfill.playbackStartedAt;
+  }
+
+  /**
+   * Returns the count of compressed P2P video packets received during the active download.
+   *
+   * @returns {number}
+   */
+  getDownloadVideoPacketCount() {
+    return this.backfill.videoPackets;
+  }
+
+  /**
+   * Sets the count of compressed P2P video packets received during the active download.
+   *
+   * @param {number} count - Video packet count.
+   */
+  setDownloadVideoPacketCount(count) {
+    this.backfill.videoPackets = count;
+  }
+
+  /**
+   * Returns the count of YUV420p frames decoded during the active backfill download.
+   *
+   * @returns {number}
+   */
+  getDownloadDecodedFrameCount() {
+    return this.backfill.decodedFrames;
+  }
+
+  /**
+   * Sets the count of YUV420p frames decoded during the active backfill download.
+   *
+   * @param {number} count - Decoded frame count.
+   */
+  setDownloadDecodedFrameCount(count) {
+    this.backfill.decodedFrames = count;
+  }
+
+  /**
+   * Returns the count of backfill frames written out to the encoder during the active download.
+   *
+   * @returns {number}
+   */
+  getDownloadPlayedFrameCount() {
+    return this.backfill.playedFrames;
+  }
+
+  /**
+   * Sets the count of backfill frames written out to the encoder during the active download.
+   *
+   * @param {number} count - Played frame count.
+   */
+  setDownloadPlayedFrameCount(count) {
+    this.backfill.playedFrames = count;
   }
 }
 

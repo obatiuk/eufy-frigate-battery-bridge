@@ -20,4 +20,5 @@
   2. Updated `recordDecodedFrame()` to ensure `gotVideo = true` whenever Frame 0 decodes, and `endSession()` to clear
      `gotVideo = false` when a session ends with `hadVideo === false` so failed `0`-frame downloads re-queue cleanly up
      to `MAX_BACKFILL_CLIP_DOWNLOAD_ATTEMPTS` (`3`) after the `4s` cooldown without persisting stale snapshots.
-- **Tests:** `test/acceptance.test.js` (`AT-16`) and `test/domain.test.js`.
+- **Tests:** `test/acceptance/AT-16.test.js` and
+  `test/regression/37-backfill-decoded-frame-0-completion-gate.test.js`.

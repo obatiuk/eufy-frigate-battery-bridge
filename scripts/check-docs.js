@@ -13,13 +13,16 @@ const {execFileSync} = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const KB = 1024;
 const AGENTS_FILE = 'AGENTS.md';
+const README_FILE = 'README.md';
 const ACCEPTANCE_FILE = 'docs/ACCEPTANCE.md';
-const ACCEPTANCE_TEST_FILE = 'test/acceptance.test.js';
+const ACCEPTANCE_TEST_DIR = 'test/acceptance';
+const ACCEPTANCE_HARNESS_FILE = 'test/helpers/acceptance-harness.js';
 const REGRESSION_INDEX_FILE = 'docs/REGRESSION.md';
 const AGENTS_TARGET_BYTES = 8 * KB;
 const AGENTS_LIMIT_BYTES = 16 * KB;
 const DOC_LIMIT_BYTES = 20 * KB;
 const SKILL_LIMIT_BYTES = 4 * KB;
+const README_LIMIT_BYTES = 68 * KB;
 const MAX_LINE = 120;
 const MAX_REGRESSION_TITLE = 100;
 const EN_DASH = String.fromCharCode(0x2013);
@@ -29,9 +32,13 @@ const LINK_REGEX = /\]\(([^)\s]+)\)/g;
 const URL_REGEX = /https?:\/\//;
 const AT_TOKEN_REGEX = /\bAT-\d{2}\b/g;
 const SRC_REQUIRE_REGEX =
-  /(?:const|let|var)\s+(\{[^}]*\}|[A-Za-z0-9_$]+)\s*=\s*require\(['"]\.\.\/src\/([^'"]+)['"]\)/g;
+  /(?:const|let|var)\s+(\{[^}]*\}|[A-Za-z0-9_$]+)\s*=\s*require\(\s*['"](?:\.\.\/)+src\/([^'"]+)['"]\s*\)/g;
 const UPPER_CONSTANT_REGEX = /^[A-Z][A-Z0-9_]*$/;
 const AT_TEST_TITLE_REGEX = /\bit\(\s*['"](AT-\d{2}):/g;
+const REGRESSION_ENTRY_START_REGEX = /^- \*\*\d+\*\* /;
+const REGRESSION_ENTRY_REGEX = /^- \*\*(\d+)\*\* \[(.+)\]\(([^)]+)\) - (.+?) - (AT-\d{2}(?:, AT-\d{2})*|-)$/;
+const REGRESSION_TEST_TITLE_REGEX = /\bit\(\s*['"]Regression (\d+(?:, \d+)*): /g;
+const UNTAGGED_REGRESSIONS = Object.freeze([]);
 const FORBIDDEN_ACCEPTANCE_IMPORTS = new Set(['cfg']);
 const AT_REF_FILES = [/^docs\//, /^\.agents\//];
 const PII_FILES = [/\.md$/, /^deploy\//];
@@ -45,29 +52,36 @@ const PII_RULES = [
   {label: 'full T8 serial (use SN0000000001 placeholder)', re: /\bT8[0-9A-Z]{6,}\b/},
 ];
 const SKIP_DIRS = new Set(['.git', '.tmp', '.venv', 'node_modules', 'cache']);
+const SKIP_FILES = new Set(['NOTES.md', '.geminiignore']);
 const WIDTH_FILES = [/^AGENTS\.md$/, /^README\.md$/, /^CHANGELOG\.md$/, /^docs\/.*\.md$/, /^\.agents\//];
 const DASH_FILES = [/\.md$/, /^(src|test|scripts)\/.*\.js$/, /^Makefile$/];
 const COMPOSE_FILE_REGEX = /(?:^|\/)(?:docker-)?compose[^/]*\.ya?ml$/;
 const COMPOSE_HEALTHCHECK_REGEX = /^\s*healthcheck\s*:/;
 
 /**
- * Lists repository files below dir (relative paths with forward slashes), skipping tool folders.
+ * Lists repository files below dir (relative paths with forward slashes), skipping tool folders and local scratch
+ * notes.
  *
  * @param {string} dir - Absolute directory path.
+ * @param {string} [rootDir=ROOT] - Repository root used to compute relative paths.
  * @returns {string[]}
  */
-function listFiles(dir) {
+function listFiles(dir, rootDir = ROOT) {
   return fs.readdirSync(dir, {withFileTypes: true}).flatMap((entry) => {
     const abs = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      return SKIP_DIRS.has(entry.name) ? [] : listFiles(abs);
+      return SKIP_DIRS.has(entry.name) ? [] : listFiles(abs, rootDir);
     }
-    return [path.relative(ROOT, abs).split(path.sep).join('/')];
+    if (SKIP_FILES.has(entry.name)) {
+      return [];
+    }
+    return [path.relative(rootDir, abs).split(path.sep).join('/')];
   });
 }
 
 /**
- * Returns lines of a Markdown file that must obey the width rule (not headings, tables, code blocks, or URL lines).
+ * Returns lines of a Markdown file that must obey the width rule (not headings, tables, code blocks, URL lines, or
+ * regression index entries, which carry a long link).
  *
  * @param {string} text - File content.
  * @returns {Array<{no: number, text: string}>}
@@ -80,7 +94,7 @@ function widthLines(text) {
       fenced = !fenced;
       return;
     }
-    const exempt = fenced || /^(#|\s*\|)/.test(line) || URL_REGEX.test(line);
+    const exempt = fenced || /^(#|\s*\|)/.test(line) || URL_REGEX.test(line) || REGRESSION_ENTRY_START_REGEX.test(line);
     if (!exempt) {
       out.push({no: index + 1, text: line});
     }
@@ -137,22 +151,22 @@ function checkAcceptanceIndex(allFiles, errs) {
 }
 
 /**
- * Validates 1:1 AT-NN test coverage in test/acceptance.test.js and forbids importing or referencing constants, enums,
- * or singleton config thresholds from src/ (acceptance assertions must lock literal specification values).
+ * Forbids importing or referencing constants, enums, or singleton config thresholds from `src/` in an acceptance file
+ * (acceptance assertions must lock literal specification values).
  *
- * @param {Set<string>} validAtIds - Known AT-NN identifiers.
+ * @param {string} file - Relative repo path of the acceptance test or harness file.
+ * @param {string} testText - File contents.
  * @param {string[]} errs - Error accumulator.
  */
-function checkAcceptanceTestSuite(validAtIds, errs) {
-  const testText = fs.readFileSync(path.join(ROOT, ACCEPTANCE_TEST_FILE), 'utf8');
+function checkAcceptanceImports(file, testText, errs) {
   const importedLocalBindings = new Set();
 
   for (const match of testText.matchAll(SRC_REQUIRE_REGEX)) {
     const [, binding, modPath] = match;
     if (!binding.startsWith('{')) {
       errs.push(
-        ACCEPTANCE_TEST_FILE +
-          ': use destructured function/class imports from ../src/' +
+        file +
+          ': use destructured function/class imports from src/' +
           modPath +
           ' (namespace imports could read production constants)'
       );
@@ -170,10 +184,10 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
       importedLocalBindings.add(localName);
       if (UPPER_CONSTANT_REGEX.test(sym) || FORBIDDEN_ACCEPTANCE_IMPORTS.has(sym)) {
         errs.push(
-          ACCEPTANCE_TEST_FILE +
+          file +
             ': forbidden constant/config import "' +
             sym +
-            '" from ../src/' +
+            '" from src/' +
             modPath +
             ' (use literal values in acceptance tests)'
         );
@@ -185,7 +199,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
     const staticConstRe = new RegExp('\\b' + localName + '\\.([A-Z][A-Z0-9_]*)\\b', 'g');
     for (const refMatch of testText.matchAll(staticConstRe)) {
       errs.push(
-        ACCEPTANCE_TEST_FILE +
+        file +
           ': forbidden production constant reference "' +
           localName +
           '.' +
@@ -194,16 +208,106 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
       );
     }
   }
+}
 
-  const seenTestIds = [...testText.matchAll(AT_TEST_TITLE_REGEX)].map((m) => m[1]);
-  for (const id of validAtIds) {
-    if (!seenTestIds.includes(id)) {
-      errs.push(ACCEPTANCE_TEST_FILE + ': missing locked acceptance test for ' + id);
+/**
+ * Validates 1:1 AT-NN file and test coverage across `test/acceptance/AT-NN.test.js` and forbids importing constants,
+ * enums, or `cfg` from `src/`.
+ *
+ * @param {Set<string>} validAtIds - Known AT-NN identifiers.
+ * @param {Array<{file: string, text: string}>} acceptanceSources - Acceptance test files (`test/acceptance/*.test.js`).
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkAcceptanceTestSuite(validAtIds, acceptanceSources, errs) {
+  const byFile = new Map(acceptanceSources.map((s) => [s.file, s.text]));
+
+  for (const id of [...validAtIds].sort()) {
+    const expectedFile = ACCEPTANCE_TEST_DIR + '/' + id + '.test.js';
+    if (!byFile.has(expectedFile)) {
+      errs.push(expectedFile + ': missing locked acceptance test file for ' + id);
     }
   }
-  if (seenTestIds.length !== new Set(seenTestIds).size) {
-    errs.push(ACCEPTANCE_TEST_FILE + ': duplicate AT-NN test title');
+
+  for (const {file, text} of acceptanceSources) {
+    checkAcceptanceImports(file, text, errs);
+    const baseMatch = file.match(/^test\/acceptance\/(AT-\d{2})\.test\.js$/);
+    if (!baseMatch) {
+      errs.push(file + ': unexpected filename in ' + ACCEPTANCE_TEST_DIR + '/ (expected AT-NN.test.js)');
+      continue;
+    }
+    const fileId = baseMatch[1];
+    if (!validAtIds.has(fileId)) {
+      errs.push(file + ': orphan acceptance test file has no matching docs/acceptance/' + fileId + '.md');
+      continue;
+    }
+    const seenIds = [...text.matchAll(AT_TEST_TITLE_REGEX)].map((m) => m[1]);
+    if (seenIds.length !== 1 || seenIds[0] !== fileId) {
+      errs.push(file + ': expected exactly one locked it("' + fileId + ': ...") test');
+    }
   }
+}
+
+/**
+ * Parses one compact docs/REGRESSION.md index entry:
+ * `- **NN** [Title](regression/NN-slug.md) - `file.js`, `other.js` - AT-01, AT-02` (`-` when no acceptance test).
+ *
+ * @param {string} line - One line of docs/REGRESSION.md.
+ * @returns {{ok: true, num: number, title: string, rel: string, files: string[], atText: string}|{ok: false}|null}
+ *   null when the line is not an index entry, `{ok: false}` when it starts like one but is malformed.
+ */
+function parseRegressionIndexEntry(line) {
+  if (!REGRESSION_ENTRY_START_REGEX.test(line)) {
+    return null;
+  }
+  const match = line.match(REGRESSION_ENTRY_REGEX);
+  if (!match) {
+    return {ok: false};
+  }
+  const [, num, title, rel, filesText, atText] = match;
+  const files = [...filesText.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  return {ok: true, num: Number(num), title, rel, files, atText};
+}
+
+/**
+ * Validates the byte-size budget of one repository file (AGENTS.md, docs, skills, and the README).
+ *
+ * @param {string} file - Relative repo file path.
+ * @param {number} bytes - File size in bytes.
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkSizeBudget(file, bytes, errs) {
+  if (file === AGENTS_FILE && bytes > AGENTS_LIMIT_BYTES) {
+    errs.push(file + ': ' + bytes + ' bytes exceeds the hard limit of ' + AGENTS_LIMIT_BYTES);
+  } else if (file === README_FILE && bytes > README_LIMIT_BYTES) {
+    errs.push(file + ': ' + bytes + ' bytes exceeds ' + README_LIMIT_BYTES + '; move detail to docs/');
+  } else if (file.startsWith('docs/') && file.endsWith('.md') && bytes > DOC_LIMIT_BYTES) {
+    errs.push(file + ': ' + bytes + ' bytes exceeds ' + DOC_LIMIT_BYTES + '; split it');
+  } else if (file.startsWith('.agents/') && file.endsWith('SKILL.md') && bytes > SKILL_LIMIT_BYTES) {
+    errs.push(file + ': ' + bytes + ' bytes exceeds ' + SKILL_LIMIT_BYTES + '; move detail to references/');
+  }
+}
+
+/**
+ * Collects valid src/ JS basenames for regression index entries, mapping `src/<folder>/index.js`
+ * to `<folder>.js` as well so historical entries stay valid when a module splits into a directory.
+ *
+ * @param {string[]} allFiles - All relative repo file paths.
+ * @returns {Set<string>}
+ */
+function collectSrcBasenames(allFiles) {
+  const names = new Set();
+  for (const f of allFiles) {
+    if (!f.startsWith('src/') || !f.endsWith('.js')) {
+      continue;
+    }
+    const base = path.basename(f);
+    names.add(base);
+    const parent = path.dirname(f);
+    if (base === 'index.js' && parent !== 'src') {
+      names.add(path.basename(parent) + '.js');
+    }
+  }
+  return names;
 }
 
 /**
@@ -215,9 +319,7 @@ function checkAcceptanceTestSuite(validAtIds, errs) {
  * @param {string[]} errs - Error accumulator.
  */
 function checkRegressionIndex(allFiles, validAtIds, errs) {
-  const srcBasenames = new Set(
-    allFiles.filter((f) => f.startsWith('src/') && f.endsWith('.js')).map((f) => path.basename(f))
-  );
+  const srcBasenames = collectSrcBasenames(allFiles);
   const regFiles = allFiles.filter((f) => /^docs\/regression\/\d{2,}-.*\.md$/.test(f)).sort();
   const regByRel = new Map(regFiles.map((f) => ['regression/' + path.basename(f), f]));
   const indexText = fs.readFileSync(path.join(ROOT, REGRESSION_INDEX_FILE), 'utf8');
@@ -225,31 +327,23 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
   let expectedNum = 1;
 
   indexText.split('\n').forEach((line, idx) => {
-    if (!/^\|\s*\d+\s*\|/.test(line)) {
+    const entry = parseRegressionIndexEntry(line);
+    if (!entry) {
       return;
     }
     const loc = REGRESSION_INDEX_FILE + ':' + (idx + 1);
-    const cols = line
-      .split('|')
-      .slice(1, -1)
-      .map((c) => c.trim());
-    if (cols.length !== 4) {
-      errs.push(loc + ': expected 4 table columns');
+    if (!entry.ok) {
+      errs.push(
+        loc + ': malformed index entry (expected "- **NN** [Title](regression/NN-slug.md) - `file.js` - AT-NN")'
+      );
       return;
     }
-    const [numCol, linkCol, filesCol, atCol] = cols;
-    const num = Number(numCol);
+    const {num, title, rel, files, atText} = entry;
     if (num !== expectedNum) {
-      errs.push(loc + ': expected regression #' + expectedNum + ', found #' + numCol);
+      errs.push(loc + ': expected regression #' + expectedNum + ', found #' + num);
     }
     expectedNum = num + 1;
 
-    const linkMatch = linkCol.match(/^\[(.+)\]\(([^)]+)\)$/);
-    if (!linkMatch) {
-      errs.push(loc + ': malformed Title link cell');
-      return;
-    }
-    const [, title, rel] = linkMatch;
     if (title.length > MAX_REGRESSION_TITLE) {
       errs.push(
         loc + ': title is ' + title.length + ' chars (limit ' + MAX_REGRESSION_TITLE + '; move detail to Scope)'
@@ -266,29 +360,26 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
     } else {
       const fileNum = Number(path.basename(rel).split('-')[0]);
       if (fileNum !== num) {
-        errs.push(loc + ': row #' + num + ' links to mismatched file number ' + rel);
+        errs.push(loc + ': entry #' + num + ' links to mismatched file number ' + rel);
       }
       const h1 = fs.readFileSync(path.join(ROOT, fullPath), 'utf8').split('\n')[0];
       const hMatch = h1.match(/^#\s+0*(\d+)\.\s+(.+)$/);
       if (!hMatch || Number(hMatch[1]) !== num || hMatch[2] !== title) {
-        errs.push(fullPath + ':1: heading must match REGRESSION.md row #' + num + ' ("# ' + num + '. ' + title + '")');
+        errs.push(
+          fullPath + ':1: heading must match REGRESSION.md entry #' + num + ' ("# ' + num + '. ' + title + '")'
+        );
       }
     }
 
-    const codeFiles = [...filesCol.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
-    if (codeFiles.length === 0) {
-      errs.push(loc + ': Files column must list at least one backticked src/ filename');
+    if (files.length === 0) {
+      errs.push(loc + ': files list must name at least one backticked src/ filename');
     }
-    for (const codeFile of codeFiles) {
+    for (const codeFile of files) {
       if (!srcBasenames.has(codeFile)) {
-        errs.push(loc + ': unknown src/ filename `' + codeFile + '` in Files column');
+        errs.push(loc + ': unknown src/ filename `' + codeFile + '` in files list');
       }
     }
-
-    if (atCol !== '-' && !/^AT-\d{2}(\s*,\s*AT-\d{2})*$/.test(atCol)) {
-      errs.push(loc + ': Acceptance column must be "-" or comma-separated AT-NN IDs');
-    }
-    for (const atMatch of atCol.matchAll(AT_TOKEN_REGEX)) {
+    for (const atMatch of atText.matchAll(AT_TOKEN_REGEX)) {
       if (!validAtIds.has(atMatch[0])) {
         errs.push(loc + ': unknown acceptance ID ' + atMatch[0]);
       }
@@ -298,6 +389,71 @@ function checkRegressionIndex(allFiles, validAtIds, errs) {
   for (const [rel, fullPath] of regByRel.entries()) {
     if (!seenRels.has(rel)) {
       errs.push(REGRESSION_INDEX_FILE + ': missing row for ' + fullPath);
+    }
+  }
+}
+
+/**
+ * Validates that every docs/regression/NN-*.md entry has at least one test titled "Regression NN: ..." (several
+ * numbers may share a title: "Regression 11, 24: ...") and that every such tag has an entry. Entries that predate
+ * their tests stay in the untagged baseline, which may only shrink.
+ *
+ * @param {number[]} entryNumbers - Numbers of the existing docs/regression entries.
+ * @param {Array<{file: string, text: string}>} testSources - Test files to scan for tagged titles.
+ * @param {ReadonlySet<number>} untaggedBaseline - Entries still allowed to have no tagged test.
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkRegressionTags(entryNumbers, testSources, untaggedBaseline, errs) {
+  const entries = new Set(entryNumbers);
+  const tagged = new Set();
+  for (const {file, text} of testSources) {
+    for (const match of text.matchAll(REGRESSION_TEST_TITLE_REGEX)) {
+      for (const raw of match[1].split(', ')) {
+        const num = Number(raw);
+        tagged.add(num);
+        if (!entries.has(num)) {
+          const padded = String(num).padStart(2, '0');
+          errs.push(file + ': tag "Regression ' + num + '" has no docs/regression/' + padded + '-*.md entry');
+        }
+      }
+    }
+  }
+  for (const num of [...entries].sort((a, b) => a - b)) {
+    if (!tagged.has(num) && !untaggedBaseline.has(num)) {
+      errs.push('regression entry ' + num + ' has no test titled "Regression ' + num + ': ..."');
+    } else if (tagged.has(num) && untaggedBaseline.has(num)) {
+      errs.push('regression entry ' + num + ' now has a tagged test; remove it from the untagged baseline');
+    }
+  }
+  for (const num of untaggedBaseline) {
+    if (!entries.has(num)) {
+      errs.push('untagged baseline lists regression entry ' + num + ' but docs/regression has no such entry');
+    }
+  }
+}
+
+/**
+ * Validates 1:1 filename parity between `docs/regression/NN-slug.md` and `test/regression/NN-slug.test.js`.
+ *
+ * @param {string[]} allFiles - All relative repo file paths.
+ * @param {string[]} errs - Error accumulator.
+ */
+function checkRegressionTestFiles(allFiles, errs) {
+  const docStems = new Set(
+    allFiles.filter((f) => /^docs\/regression\/\d{2,}-.*\.md$/.test(f)).map((f) => path.basename(f, '.md'))
+  );
+  const testStems = new Set(
+    allFiles.filter((f) => /^test\/regression\/.*\.test\.js$/.test(f)).map((f) => path.basename(f, '.test.js'))
+  );
+
+  for (const stem of [...docStems].sort()) {
+    if (!testStems.has(stem)) {
+      errs.push('docs/regression/' + stem + '.md: missing matching test file test/regression/' + stem + '.test.js');
+    }
+  }
+  for (const stem of [...testStems].sort()) {
+    if (!docStems.has(stem)) {
+      errs.push('test/regression/' + stem + '.test.js: missing matching post-mortem docs/regression/' + stem + '.md');
     }
   }
 }
@@ -516,8 +672,26 @@ function runDocsCheck() {
   const files = listFiles(ROOT);
   const matches = (file, patterns) => patterns.some((p) => p.test(file));
   const validAtIds = checkAcceptanceIndex(files, errors);
-  checkAcceptanceTestSuite(validAtIds, errors);
+  const acceptanceSources = files
+    .filter((f) => /^test\/acceptance\/.*\.test\.js$/.test(f))
+    .map((f) => ({file: f, text: fs.readFileSync(path.join(ROOT, f), 'utf8')}));
+  checkAcceptanceTestSuite(validAtIds, acceptanceSources, errors);
+  if (files.includes(ACCEPTANCE_HARNESS_FILE)) {
+    checkAcceptanceImports(
+      ACCEPTANCE_HARNESS_FILE,
+      fs.readFileSync(path.join(ROOT, ACCEPTANCE_HARNESS_FILE), 'utf8'),
+      errors
+    );
+  }
   checkRegressionIndex(files, validAtIds, errors);
+  const regressionNumbers = files
+    .filter((f) => /^docs\/regression\/\d{2,}-.*\.md$/.test(f))
+    .map((f) => Number(path.basename(f).split('-')[0]));
+  const testSources = files
+    .filter((f) => /^test\/.*\.test\.js$/.test(f))
+    .map((f) => ({file: f, text: fs.readFileSync(path.join(ROOT, f), 'utf8')}));
+  checkRegressionTags(regressionNumbers, testSources, new Set(UNTAGGED_REGRESSIONS), errors);
+  checkRegressionTestFiles(files, errors);
   checkPackageVersionAndLockfile(errors);
   for (const file of files.filter((f) => COMPOSE_FILE_REGEX.test(f))) {
     checkComposeHasNoHealthcheck(file, fs.readFileSync(path.join(ROOT, file), 'utf8'), errors);
@@ -526,13 +700,7 @@ function runDocsCheck() {
   for (const file of files) {
     const abs = path.join(ROOT, file);
     const bytes = fs.statSync(abs).size;
-    if (file === AGENTS_FILE && bytes > AGENTS_LIMIT_BYTES) {
-      errors.push(file + ': ' + bytes + ' bytes exceeds the hard limit of ' + AGENTS_LIMIT_BYTES);
-    } else if (file.startsWith('docs/') && file.endsWith('.md') && bytes > DOC_LIMIT_BYTES) {
-      errors.push(file + ': ' + bytes + ' bytes exceeds ' + DOC_LIMIT_BYTES + '; split it');
-    } else if (file.startsWith('.agents/') && file.endsWith('SKILL.md') && bytes > SKILL_LIMIT_BYTES) {
-      errors.push(file + ': ' + bytes + ' bytes exceeds ' + SKILL_LIMIT_BYTES + '; move detail to references/');
-    }
+    checkSizeBudget(file, bytes, errors);
     if (!matches(file, DASH_FILES) && !matches(file, WIDTH_FILES) && !matches(file, PII_FILES)) {
       continue;
     }
@@ -593,6 +761,15 @@ if (require.main === module) {
 }
 
 module.exports = {
+  UNTAGGED_REGRESSIONS,
+  listFiles,
+  parseRegressionIndexEntry,
+  widthLines,
+  checkSizeBudget,
+  collectSrcBasenames,
+  checkAcceptanceTestSuite,
+  checkRegressionTags,
+  checkRegressionTestFiles,
   checkChangelogReleaseTag,
   checkChangelogPostRelease,
   checkComposeHasNoHealthcheck,

@@ -89,12 +89,15 @@ Make sure your setup meets these minimum versions so all features work properly:
 
 | Component                                                                                               | Minimum Version                     | Tested Version         | Why It Is Needed                                                                                                                                         |
 | :------------------------------------------------------------------------------------------------------ | :---------------------------------- | :--------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Frigate](https://frigate.video/)**                                                                   | `>= 0.16.0`                         | `0.18.x`               | Needed for automatic corner masks, recognized face names (`sub_label`), and event recording via Frigate's `HTTP` API.                                    |
+| **[Frigate](https://frigate.video/)**                                                                   | `>= 0.14.0`                         | `0.18.x`               | Needed for active review checks, automatic corner masks, recognized face names (`sub_label`), and event recording via Frigate's `HTTP` API.              |
 | **[go2rtc](https://github.com/AlexxIT/go2rtc)**                                                         | Included in Frigate (`>= 1.9.0`)    | `1.9.x` (bundled)      | Included inside Frigate (or run standalone) to receive the bridge's `RTSP` feeds and report active Live View connections.                                |
-| **[eufy-security-ws](https://github.com/bropat/eufy-security-ws)**                                      | `>= 2.0.0` (API schema `>= 20`)     | `3.1.0+` (schema `21`) | Needed for `HomeBase 3` clip downloads and automatic Eufy Power Manager setup.                                                                           |
+| **[eufy-security-ws](https://github.com/bropat/eufy-security-ws)**                                      | `>= 1.9.9` (API schema `>= 18`)     | `3.1.0+` (schema `21`) | Needed for `HomeBase 3` clip downloads and automatic Eufy Power Manager setup.                                                                           |
 | **[Docker](https://docs.docker.com/) / [Podman](https://podman.io/)**                                   | Docker `>= 24.0` or Podman `>= 4.5` | Podman `5.x`           | Needed to build and run the container image (`deploy/docker-compose.example.yml`).                                                                       |
 | **[Eufy HomeBase](https://support.eufy.com/s/article/S380-HomeBase-HomeBase-3-Compatibility)**          | `HomeBase 3` fw `>= 3.5.x`          | `3.8.7.4`              | Needed for `"backfill"` clip replay and facial recognition. `HomeBase 2` and standalone Wi-Fi cameras work in `"rtsp"` and `"p2p"` modes.                |
 | **[Eufy Account](https://support.eufy.com/s/article/Share-Your-eufySecurity-Devices-With-Your-Family)** | Dedicated secondary account         | -                      | Share your cameras from your main Eufy account to a second Eufy account for `eufy-security-ws`, and keep _push notifications turned ON_ on that account. |
+
+On startup, the bridge checks your `Frigate`, `go2rtc`, and `eufy-security-ws` versions in the background and logs a
+warning (without stopping the container) if any service is older than its minimum supported version.
 
 ### Step 1: Create `config.yaml` and Configure Services in Compose
 
@@ -389,6 +392,8 @@ validates your configuration and recovers from common Eufy and Wi-Fi hiccups:
   - **Checks configuration safety:** Detects conflicting settings (such as sleeping frame rates set higher than live
     frame rates, or camera clip lengths set shorter than hold times), adjusts them automatically, and logs a `[WARN ]`
     line if any explicitly configured option does not apply to the chosen mode or theme.
+  - **Checks service versions:** Verifies in the background that `Frigate`, `go2rtc`, and `eufy-security-ws` meet the
+    minimum supported versions and logs a `[WARN ]` message without interrupting startup if an older version is found.
   - **Syncs Eufy Power Manager:** Reads each camera's battery, signal, and recording settings, then configures Eufy
     Power Manager mode, clip length, retrigger delay, streaming quality, and `RTSP` toggles to match your chosen `mode`.
   - **Verifies cloud & `HomeBase` links:** Confirms that `eufy-security-ws` is connected to Eufy's cloud and every

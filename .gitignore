@@ -9,3 +9,5 @@ config.yaml
 deploy/config.json
 deploy/config.yaml
 cache/
+NOTES.md
+.geminiignore

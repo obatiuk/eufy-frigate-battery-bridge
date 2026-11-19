@@ -1,6 +1,8 @@
+// @ts-check
 /**
  * Validates a commit message file against the git-commit skill: no subject line, bullet lines only, at most 8 lines,
- * a Co-authored-by trailer after one blank line, no escapes, no en-dash or em-dash, no home paths.
+ * at most 120 characters per line, a Co-authored-by trailer after one blank line, no escapes, no en-dash or em-dash,
+ * no home paths.
  * Usage: node scripts/check-commit-msg.js <message-file>
  */
 'use strict';
@@ -9,6 +11,7 @@ const fs = require('node:fs');
 
 const MAX_LINES = 8;
 const MAX_BULLETS = 6;
+const MAX_LINE_LEN = 120;
 const TRAILER_PREFIX = 'Co-authored-by: ';
 const DASH_REGEX = new RegExp('[' + String.fromCharCode(0x2013) + String.fromCharCode(0x2014) + ']');
 const HOME_REGEX = /\/home\/[a-z0-9_-]+/i;
@@ -41,6 +44,11 @@ function findProblems(message) {
       problems.push('every body line must be a bullet: "' + line.slice(0, 40) + '"');
     }
   });
+  lines.forEach((line, index) => {
+    if (line.length > MAX_LINE_LEN) {
+      problems.push('line ' + (index + 1) + ' exceeds ' + MAX_LINE_LEN + ' characters (' + line.length + ')');
+    }
+  });
   if (/\\[-<]/.test(message)) {
     problems.push('contains a Markdown escape (backslash before - or <)');
   }
@@ -53,13 +61,17 @@ function findProblems(message) {
   return problems;
 }
 
-const file = process.argv[2];
-if (!file) {
-  console.error('usage: check-commit-msg.js <message-file>');
-  process.exit(2);
+if (require.main === module) {
+  const file = process.argv[2];
+  if (!file) {
+    console.error('usage: check-commit-msg.js <message-file>');
+    process.exit(2);
+  }
+  const found = findProblems(fs.readFileSync(file, 'utf8'));
+  if (found.length > 0) {
+    console.error('commit message rejected:\n- ' + found.join('\n- '));
+    process.exit(1);
+  }
 }
-const found = findProblems(fs.readFileSync(file, 'utf8'));
-if (found.length > 0) {
-  console.error('commit message rejected:\n- ' + found.join('\n- '));
-  process.exit(1);
-}
+
+module.exports = {findProblems};

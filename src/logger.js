@@ -106,71 +106,46 @@ function normalizeLevelName(rawLevel) {
 }
 
 /**
- * Resolves the log scope label from a stateful domain object or scope string.
+ * Explicit log scope: the camera or component label plus an optional state badge.
  *
- * @param {string|{
- *   getScopeName?: () => string,
- *   getName?: () => string,
- *   name?: string,
- *   cameraName?: string,
- *   sessionState?: string,
- *   state?: string,
- *   decoderState?: string,
- *   evState?: string
- * }|null|undefined} scope - Stateful domain instance or scope name.
- * @returns {string}
+ * @typedef {{name?: string, state?: string}} LogScope
  */
-function resolveScopeName(scope) {
+
+/**
+ * Any value accepted as a log scope: nothing or a name string (`'bridge'`), an explicit `{name, state}` object, or a
+ * domain object that hands the logger its scope through `getLogScope()`.
+ *
+ * @typedef {string|LogScope|{getLogScope: () => LogScope}|null|undefined} LogScopeInput
+ */
+
+/**
+ * Returns true when the scope object hands the logger its explicit scope through `getLogScope()`.
+ *
+ * @param {LogScope|{getLogScope: () => LogScope}} scope - Scope object.
+ * @returns {scope is {getLogScope: () => LogScope}}
+ */
+function isLogScopeProvider(scope) {
+  return 'getLogScope' in scope && typeof scope.getLogScope === 'function';
+}
+
+/**
+ * Resolves any accepted scope input to an explicit scope. Only `getLogScope()`, `name`, and `state` are read; other
+ * properties of the passed object are never inspected.
+ *
+ * @param {LogScopeInput} scope - Scope name, explicit scope, or provider of a scope.
+ * @returns {{name: string, state: string}}
+ */
+function resolveLogScope(scope) {
   if (!scope) {
-    return 'bridge';
+    return {name: 'bridge', state: ''};
   }
-  switch (typeof scope) {
-    case 'object':
-      if (typeof scope.getScopeName === 'function') {
-        return scope.getScopeName();
-      }
-      if (typeof scope.getName === 'function') {
-        return scope.getName() || 'bridge';
-      }
-      return scope.name || scope.cameraName || 'bridge';
-    default:
-      return String(scope);
+  if (typeof scope !== 'object') {
+    return {name: String(scope), state: ''};
   }
+  const explicit = isLogScopeProvider(scope) ? scope.getLogScope() : scope;
+  return {name: explicit.name || 'bridge', state: explicit.state || ''};
 }
 
-/**
- * Resolves the uppercase state badge prefix for log lines when scope is a stateful domain object
- * (Camera with sessionState, BackfillJob with state, or sub-FSM scope with decoderState / evState).
- *
- * @param {string|{
- *   name?: string,
- *   cameraName?: string,
- *   sessionState?: string,
- *   state?: string,
- *   decoderState?: string,
- *   evState?: string
- * }|null|undefined} scope - Stateful domain instance or scope name.
- * @returns {string}
- */
-function resolveStatePrefix(scope) {
-  if (!scope || typeof scope !== 'object') {
-    return '';
-  }
-  const rawState = scope.sessionState || scope.state || scope.decoderState || scope.evState || '';
-  return rawState ? '[' + String(rawState).toUpperCase() + '] ' : '';
-}
-
-/**
- * Formats a single structured log line for Grafana Alloy / Loki:
- *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [bridge] message
- *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [camera] [STATE] message
- *
- * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
- * @param {string|{name?: string, sessionState?: string}|null|undefined} scope - Camera scope or name.
- * @param {Array<*>} args - Message segments.
- * @param {Date} [now=new Date()] - Timestamp to format.
- * @returns {string}
- */
 /**
  * Masks embedded URL userinfo credentials (including passwords containing '@') in text.
  *
@@ -325,21 +300,33 @@ function sanitizeLogSegment(value) {
   return maskSecrets(value).replace(LOG_CR_REGEX, '\\r').replace(LOG_LF_REGEX, '\\n');
 }
 
+/**
+ * Formats a single structured log line for Grafana Alloy / Loki:
+ *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [bridge] message
+ *   YYYY-MM-DD HH:MM:SS - [LEVEL] - [camera] [STATE] message
+ *
+ * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
+ * @param {LogScopeInput} scope - Camera scope or name.
+ * @param {Array<*>} args - Message segments.
+ * @param {Date} [now=new Date()] - Timestamp to format.
+ * @returns {string}
+ */
 function formatLogLine(level, scope, args, now = new Date()) {
   const normLevel = normalizeLevelName(level);
   const timestamp = formatLocalTimestamp(now);
-  const levelTag = `[${normLevel.toUpperCase().padEnd(LOG_LEVEL_NAME_WIDTH)}]`;
-  const scopeName = sanitizeLogSegment(resolveScopeName(scope));
-  const statePrefix = sanitizeLogSegment(resolveStatePrefix(scope));
+  const levelTag = '[' + normLevel.toUpperCase().padEnd(LOG_LEVEL_NAME_WIDTH) + ']';
+  const resolved = resolveLogScope(scope);
+  const scopeName = sanitizeLogSegment(resolved.name);
+  const statePrefix = sanitizeLogSegment(resolved.state ? '[' + resolved.state.toUpperCase() + '] ' : '');
   const message = sanitizeLogSegment(args.join(' '));
-  return `${timestamp} - ${levelTag} - [${scopeName}] ${statePrefix}${message}`;
+  return timestamp + ' - ' + levelTag + ' - [' + scopeName + '] ' + statePrefix + message;
 }
 
 /**
  * Writes a structured log line to stdout when 'level' meets or exceeds currentLogLevel.
  *
  * @param {'debug'|'info'|'warn'|'error'} level - Log severity level.
- * @param {string|{name?: string}|null|undefined} scope - Camera state/config object or 'bridge'.
+ * @param {LogScopeInput} scope - Camera scope, explicit scope object, or 'bridge'.
  * @param {...*} args - Message segments.
  */
 function writeLog(level, scope, ...args) {

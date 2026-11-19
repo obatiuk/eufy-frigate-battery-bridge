@@ -14,4 +14,5 @@
   `lastActivityAt` update on active recording transitions, reset `motionClearedAt = 0` inside `queueEventBackfill()` on
   new active triggers, and preserved `activeBackfillJob`, `activeBackfillClip`, `backfillClipQueue`, and active
   hardware triggers.
-- **Tests:** `test/domain.test.js`.
+- **Tests:** `test/regression/40-preserve-queued-and-active-backfill-on-expiry.test.js` and
+  `test/domain/camera/backfill-state.test.js`.

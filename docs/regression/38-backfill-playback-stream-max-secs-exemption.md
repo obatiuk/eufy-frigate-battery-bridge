@@ -10,4 +10,5 @@
 - **Fix:** Restricted `hasReachedMaxDuration()` to `this.isActiveLiveSession()` (`!this.isRtspDirect() &&
 this.isActiveLiveSession()`) so `stream_max_secs` continues to cap active live `RTSP` and `P2P` sessions without
   truncating `HomeBase` backfill clip playback.
-- **Tests:** `test/acceptance.test.js` (`AT-12`, `AT-16`) and `test/domain.test.js`.
+- **Tests:** `test/acceptance/AT-12.test.js`, `test/acceptance/AT-16.test.js` and
+  `test/regression/38-backfill-playback-stream-max-secs-exemption.test.js`.

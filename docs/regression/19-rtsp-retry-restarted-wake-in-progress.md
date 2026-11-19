@@ -6,4 +6,5 @@
   of the retry command (a correlation, not a confirmed cause).
 - **Fix:** `DEFAULT_RTSP_RETRY_MS` is now `10s` (still `5` retries and the `25s` wake timeout). `api-wake` on a
   `backfill`-mode camera that starts a live stream now logs why (nothing active to wait for).
-- **Tests:** `test/domain.test.js` (`evaluateRtspHealth` default retry interval).
+- **Tests:** `test/regression/19-rtsp-retry-restarted-wake-in-progress.test.js` (`evaluateRtspHealth` default retry
+  interval).

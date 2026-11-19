@@ -24,4 +24,4 @@
   snippets to `1024` chars while preserving primary `PUT` errors, `go2rtc` poll failures, and `HA` webhook bodies; and
   added `formatRpcError()` so `eufy-security-ws` `errorCode` and `message` details are preserved in logs and stop
   reasons.
-- **Tests:** `test/domain.test.js`, `test/media.test.js`, `test/services.test.js`.
+- **Tests:** `test/regression/44-preserve-root-cause-ffmpeg-http-and-rpc-error-diagnostics.test.js`.

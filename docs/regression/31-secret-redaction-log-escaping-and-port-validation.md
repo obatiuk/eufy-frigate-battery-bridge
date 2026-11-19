@@ -10,6 +10,9 @@
   `FfmpegArgsBuilder.attachStderrTailCollector()`, enforced strict integer range validation via `parseEnvPort()` in
   `config.js` (caught cleanly inside `loadConfig()`), and updated `deploy/Dockerfile` `HEALTHCHECK` to exit `0` when
   `BRIDGE_HTTP_PORT=0`.
-- **Tests:** `test/domain.test.js` (`masks RTSP URL credentials...`), `test/services.test.js` (`masks URL credentials
-with @ passwords...`), `test/media.test.js` (`redacts URL credentials in FFmpeg stderr tail summaries...`), and
-  `test/config.test.js` (`rejects non-integer or out-of-range port environment variables...`).
+- **Tests:** `test/regression/31-secret-redaction-log-escaping-and-port-validation.test.js` (`masks RTSP URL
+credentials...`), `test/regression/31-secret-redaction-log-escaping-and-port-validation.test.js` (`masks URL
+credentials with @ passwords...`), `test/regression/31-secret-redaction-log-escaping-and-port-validation.test.js`
+  (`redacts URL credentials in FFmpeg stderr tail summaries...`), and
+  `test/regression/31-secret-redaction-log-escaping-and-port-validation.test.js` (`rejects non-integer or out-of-range
+port environment variables...`).
