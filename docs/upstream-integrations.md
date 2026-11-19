@@ -47,8 +47,10 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
     `recordingEndClipMotionStops`, `recordingRetriggerInterval`, `videoStreamingQuality`, and `rtspStream` (`AT-10`).
     Enabling `rtspStream: true` when `rtspStreamUrl` is empty immediately follows up with `device.get_properties`.
 - **Telemetry Refresh & `HomeBase` Station Self-Healing (`telemetry-sync.js`, `station-recovery.js`):**
-  - `fetchAllCameraTelemetry()` issues `driver.poll_refresh` (`2s` `POLL_REFRESH_SETTLE_MS`) when forced or when any
-    Eufy camera is offline before querying `device.get_properties` per camera.
+  - `fetchAllCameraTelemetry()` coalesces concurrent callers onto one active pass (queuing one forced follow-up if
+    `forceRefresh=true` arrives mid-flight) and issues `driver.poll_refresh` (`2s` `POLL_REFRESH_SETTLE_MS`) when
+    forced or at most once per `5` minutes (`OFFLINE_POLL_REFRESH_COOLDOWN_MS`) while any Eufy camera is offline before
+    querying `device.get_properties` per camera.
   - `ensureInitialDriverAndStationConnected()` checks `driver.is_connected` and `station.is_connected` after
     `start_listening` and dispatches `driver.connect` / `station.connect` when disconnected.
   - If `driver.poll_refresh` fails, `station.is_connected` times out (`no_reply`), a `P2P` wake stalls to retry `>= 2`

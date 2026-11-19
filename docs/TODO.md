@@ -22,12 +22,6 @@ classes, not line numbers (they drift); find them with `grep`.
     `Telemetry.evaluateRecordingModeChanges()` latches `recordingModeChecked` on any 1 of 4 keys, and one-shot flags /
     `clearLightOn()` commit before `setCameraProperty()` confirms RPC success. Sync recording mode only on full sets,
     return RPC success, commit after success, and test retries.
-- [ ] Serialize telemetry polling and stop forcing HomeBase refreshes while a camera is offline
-  - `fetchAllCameraTelemetry()` (`telemetry-sync.js`) has no in-flight guard although the poller, viewer joins, the
-    initial retry timer, and offline recovery all call it (each run sleeps `POLL_REFRESH_SETTLE_MS`), and it sets
-    `shouldRefreshHomeBase` whenever any camera is offline (`AT-07.4` covers online low-battery only).
-  - Add an in-flight guard that coalesces callers, rate-limit `driver.poll_refresh` with the 5-minute cooldown when
-    `!forceRefresh`, and test call counts.
 - [ ] Tighten the hardware-acceleration fallback regex, URL replacer, and shutdown signal in the encoder
   - `HWACCEL_FAILURE_STDERR_REGEX` (`encoder.js`) matches generic `device`, the `{name}` placeholder uses string
     `.replace(..., cam.getName())`, and `Camera.stopEncoderProcess()` sends only `SIGTERM`. Tighten the regex, use a

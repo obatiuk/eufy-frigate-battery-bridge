@@ -28,9 +28,11 @@ const {
 const {
   isTrackedPropertyEvent,
   resolvePropertyTriggerEvent,
+  fetchAllCameraTelemetry,
   stopTelemetryPoller,
   extractRecognizedPerson,
 } = require('../../../src/services/eufy/telemetry-sync');
+const {Camera} = require('../../../src/domain/camera');
 const {
   isStationRecycling,
   noteStationActivity,
@@ -306,5 +308,56 @@ describe('src/services/eufy split modules', () => {
     const capped = computeWsReconnectDelayMs(8, () => 1);
     assert.equal(capped <= 60_000, true);
     assert.equal(capped >= 48_000, true);
+  });
+
+  it('serializes concurrent fetchAllCameraTelemetry calls in telemetry-sync.js', async () => {
+    // Verify concurrent telemetry polls coalesce into a single device.get_properties pass per camera.
+    const cam = new Camera({serial: 'T8161T0000000099', name: 'patio', station_serial: 'T8030P0000000010'});
+    cam.applyTelemetryProperties({state: 1, battery: 90, chargingStatus: 2, wifiRssi: -60}, false);
+
+    FakeWebSocket.onSend = (sock, msg) => {
+      if (msg.command === 'set_api_schema') {
+        sock.emit('message', JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+      } else if (msg.command === 'start_listening') {
+        sock.emit(
+          'message',
+          JSON.stringify({
+            type: 'result',
+            messageId: msg.messageId,
+            success: true,
+            result: {state: {driver: {connected: true}, stations: [], devices: []}},
+          })
+        );
+      } else if (msg.command === 'device.get_properties') {
+        setImmediate(() => {
+          sock.emit(
+            'message',
+            JSON.stringify({
+              type: 'result',
+              messageId: msg.messageId,
+              success: true,
+              result: {properties: {state: {value: 1}, battery: {value: 90}, wifiRssi: {value: -60}}},
+            })
+          );
+        });
+      }
+    };
+
+    configureEufyClientHooks({
+      cams: [cam],
+      bySerial: new Map([[cam.getSerial(), cam]]),
+      WebSocket: FakeWebSocket,
+      isShuttingDown: () => false,
+      onDeviceOnlineResume: () => {},
+    });
+    connectWs();
+    FakeWebSocket.lastInstance.emit('message', JSON.stringify({type: 'version', maxSchemaVersion: 21}));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    FakeWebSocket.lastInstance.sent.length = 0;
+    await Promise.all([fetchAllCameraTelemetry(false), fetchAllCameraTelemetry(false), fetchAllCameraTelemetry(false)]);
+    assert.equal(FakeWebSocket.lastInstance.sent.filter((m) => m.command === 'device.get_properties').length, 1);
   });
 });

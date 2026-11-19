@@ -34,6 +34,7 @@ const {
 /** @typedef {import("../../domain/camera").Camera} Camera */
 
 const POLL_REFRESH_SETTLE_MS = 2000;
+const OFFLINE_POLL_REFRESH_COOLDOWN_MS = 300000;
 const UNKNOWN_PERSON_PLACEHOLDER_REGEX = /^(?:unknown|stranger)$/i;
 
 const TRACKED_PROPERTY_NAMES = new Set([
@@ -88,12 +89,20 @@ const DETECTION_PROPERTY_EVENT_MAP = Object.freeze({
 
 /** @type {Map<string, Promise<void>>} */
 const propertySyncChains = new Map();
+/** @type {Promise<void>|null} */
+let telemetryFetchInFlight = null;
+let activeFetchForced = false;
+let pendingForcedFetch = false;
+/** @type {number|null} */
+let lastPollRefreshAt = null;
 
 /**
- * Clears per-device property serialization chains when the WebSocket resets.
+ * Clears per-device property serialization chains and poll-refresh cooldown state when the WebSocket resets.
  */
 function resetPropertySyncChains() {
   propertySyncChains.clear();
+  lastPollRefreshAt = null;
+  pendingForcedFetch = false;
 }
 
 /**
@@ -303,20 +312,46 @@ function applyDeviceProperties(cam, props, allowCardRebuild = !cam.hasBatteryRea
 }
 
 /**
- * Queries device.get_properties for all configured cameras so battery, charging/power mode,
- * Wi-Fi signal/RSSI, temperature, and streaming quality are populated on API schema 13+.
+ * Returns true if the 5-minute unforced offline HomeBase poll_refresh cooldown has elapsed.
  *
- * @param {boolean} [forceRefresh=false] - Whether to force a driver.poll_refresh before reading properties.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {boolean}
  */
-async function fetchAllCameraTelemetry(forceRefresh = false) {
+function isOfflinePollRefreshDue(now) {
+  return lastPollRefreshAt === null ? true : now - lastPollRefreshAt >= OFFLINE_POLL_REFRESH_COOLDOWN_MS;
+}
+
+/**
+ * Returns true if HomeBase should run driver.poll_refresh before querying device.get_properties.
+ *
+ * @param {Camera[]} eufyCams - Configured non-direct Eufy cameras.
+ * @param {boolean} forceRefresh - Explicit forced refresh flag.
+ * @param {number} now - Current epoch timestamp in milliseconds.
+ * @returns {boolean}
+ */
+function shouldPollRefreshHomeBase(eufyCams, forceRefresh, now) {
+  if (eufyCams.length === 0) {
+    return false;
+  }
+  return forceRefresh ? true : eufyCams.some((c) => c.isDeviceOffline()) && isOfflinePollRefreshDue(now);
+}
+
+/**
+ * Executes one serialized HomeBase poll_refresh (when due) and per-camera device.get_properties pass.
+ *
+ * @param {boolean} forceRefresh - Whether to force driver.poll_refresh regardless of cooldown.
+ */
+async function runTelemetryFetchPass(forceRefresh) {
   ensureCameraEncodersStarted({rtspDirectOnly: true});
   if (!isWsReady()) {
     return;
   }
   const eufyCams = getCams().filter((c) => !c.isRtspDirect());
-  const shouldRefreshHomeBase = eufyCams.length > 0 && (forceRefresh || eufyCams.some((c) => c.isDeviceOffline()));
+  const refreshNow = Date.now();
+  const shouldRefreshHomeBase = shouldPollRefreshHomeBase(eufyCams, forceRefresh, refreshNow);
   const onOnlineResume = getOnlineResumeCallback();
   if (shouldRefreshHomeBase) {
+    lastPollRefreshAt = refreshNow;
     log.debug('bridge', 'polling HomeBase via driver.poll_refresh for fresh battery telemetry');
     const pollRes = await call({command: 'driver.poll_refresh'});
     if (!pollRes.success) {
@@ -350,6 +385,44 @@ async function fetchAllCameraTelemetry(forceRefresh = false) {
     }
   }
   markInitialTelemetryLoaded();
+}
+
+/**
+ * Queries device.get_properties for all configured cameras so battery, charging/power mode,
+ * Wi-Fi signal/RSSI, temperature, and streaming quality are populated on API schema 13+.
+ * Concurrent callers coalesce onto the active pass; a forced request arriving during an
+ * unforced pass schedules one forced follow-up pass before resolving.
+ *
+ * @param {boolean} [forceRefresh=false] - Whether to force a driver.poll_refresh before reading properties.
+ * @returns {Promise<void>}
+ */
+function fetchAllCameraTelemetry(forceRefresh = false) {
+  const wantForce = Boolean(forceRefresh);
+  if (telemetryFetchInFlight) {
+    if (wantForce && !activeFetchForced) {
+      pendingForcedFetch = true;
+    }
+    return telemetryFetchInFlight;
+  }
+  telemetryFetchInFlight = (async () => {
+    try {
+      let runForced = wantForce;
+      for (;;) {
+        activeFetchForced = runForced;
+        pendingForcedFetch = false;
+        await runTelemetryFetchPass(runForced);
+        if (!pendingForcedFetch || !isWsReady() || isShuttingDown()) {
+          break;
+        }
+        runForced = true;
+      }
+    } finally {
+      telemetryFetchInFlight = null;
+      activeFetchForced = false;
+      pendingForcedFetch = false;
+    }
+  })();
+  return telemetryFetchInFlight;
 }
 
 /** @type {ReturnType<typeof setInterval>|null} */

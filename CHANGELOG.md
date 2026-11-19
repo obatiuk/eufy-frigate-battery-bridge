@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Coalesce concurrent camera telemetry polls into a single pass and rate-limit unforced offline `HomeBase` refreshes to
+  once every `5` minutes while keeping viewer and wake recovery refreshes immediate
 - Detect silently dropped `eufy-security-ws` connections with `WebSocket` handshake timeouts and periodic keepalive
   pings, and back off repeated reconnect attempts with jitter up to `60s`
 - Wait for in-flight station stop commands and background snapshot saves up to a bounded deadline during graceful
