@@ -27,7 +27,11 @@ const {
   handleRtspStreamDropped,
   DEVICE_EVENT_HANDLERS,
 } = require('../../../src/services/orchestrator/event-router');
-const {runHousekeepingTick, startHousekeepingLoop} = require('../../../src/services/orchestrator/housekeeping');
+const {
+  runHousekeepingTick,
+  startHousekeepingLoop,
+  resetHousekeepingErrorState,
+} = require('../../../src/services/orchestrator/housekeeping');
 const orchestrator = require('../../../src/services/stream-orchestrator');
 const {Camera} = require('../../../src/domain/camera');
 const {stations} = require('../../../src/domain/station');
@@ -114,5 +118,6 @@ describe('src/services/orchestrator split modules', () => {
     assert.equal(orchestrator.processBackfillQueue, processBackfillQueue);
     assert.equal(orchestrator.runHousekeepingTick, runHousekeepingTick);
     assert.equal(orchestrator.startHousekeepingLoop, startHousekeepingLoop);
+    assert.equal(typeof resetHousekeepingErrorState, 'function');
   });
 });

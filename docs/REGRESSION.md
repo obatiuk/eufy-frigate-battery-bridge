@@ -55,3 +55,4 @@ test `Regression NN: ...` (`make test-regression` runs them).
 - **45** [Fast Dependency-Free `/healthz` Liveness Response & Immediate Startup Binding](regression/45-fast-dependency-free-healthz-and-startup-probe.md) - `http-server.js`, `app.js`, `config.js` - AT-08, AT-19
 - **46** [Event-Loop-Blocking Snapshot FFmpeg Calls & Serial go2rtc Viewer Polling](regression/46-event-loop-blocking-snapshot-ffmpeg-and-serial-viewer-polling.md) - `snapshot-cache.js`, `app.js`, `frigate-client.js`, `stream-orchestrator.js` - AT-08, AT-14
 - **47** [Unreachable Frigate Treated as Active Object During Hold & Early-Sleep Checks](regression/47-unreachable-frigate-idle-check-hold-extension.md) - `frigate-client.js`, `housekeeping.js` - AT-08, AT-11, AT-12
+- **48** [Per-Camera Housekeeping Error Isolation & Fatal Uncaught Exception Shutdown](regression/48-housekeeping-per-camera-error-isolation-and-fatal-exit.md) - `housekeeping.js`, `app.js` - AT-08

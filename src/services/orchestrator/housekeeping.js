@@ -10,7 +10,7 @@
 'use strict';
 
 const {LIVE_FPS, STREAM_MODES} = require('../../config');
-const {log} = require('../../logger');
+const {log, formatErrorMessage} = require('../../logger');
 const {WAKE_KINDS, DOWNLOAD_COMPLETED_INITIATOR} = require('../../domain/camera');
 const {stopDecoder} = require('../../media/decoder');
 const {FRIGATE_CAMERA_STATES, frigateEvent, isFrigateCameraIdle, checkPeriodicMaskSync} = require('../frigate-client');
@@ -27,6 +27,48 @@ const DOWNLOAD_NO_VIDEO_TIMEOUT_MS = 10000;
 const HOUSEKEEPING_INTERVAL_MS = 500;
 const STARTUP_PROBE_READY_DELAY_MS = 6000;
 const STARTUP_PROBE_HOLD_MS = 25000;
+const HOUSEKEEPING_ERROR_LOG_COOLDOWN_MS = 30000;
+const MAX_HOUSEKEEPING_ERROR_KEYS = 64;
+
+/** @type {Map<string, {lastLoggedAt: number, suppressed: number}>} */
+const housekeepingErrorState = new Map();
+
+/**
+ * Clears per-step housekeeping error rate-limit state (used by unit and regression tests).
+ */
+function resetHousekeepingErrorState() {
+  housekeepingErrorState.clear();
+}
+
+/**
+ * Logs an operational error thrown inside a housekeeping step, rate-limiting repeated ERROR lines
+ * per scope+step to once every 30s so a deterministic camera bug never floods container logs.
+ *
+ * @param {{scope: Camera|string, step: string, err: unknown, now?: number}} details - Error context.
+ */
+function logHousekeepingError({scope, step, err, now = Date.now()}) {
+  const scopeName =
+    scope && typeof scope === 'object' && typeof scope.getScopeName === 'function'
+      ? scope.getScopeName()
+      : String(scope || 'bridge');
+  const key = scopeName + ':' + step;
+  const existing = housekeepingErrorState.get(key);
+  if (existing && now - existing.lastLoggedAt < HOUSEKEEPING_ERROR_LOG_COOLDOWN_MS) {
+    existing.suppressed += 1;
+    log.debug(scope, 'housekeeping ' + step + ' failed (rate-limited): ' + formatErrorMessage(err));
+    return;
+  }
+  if (!existing && housekeepingErrorState.size >= MAX_HOUSEKEEPING_ERROR_KEYS) {
+    const oldestKey = housekeepingErrorState.keys().next().value;
+    if (oldestKey !== undefined) {
+      housekeepingErrorState.delete(oldestKey);
+    }
+  }
+  const suppressedCount = existing ? existing.suppressed : 0;
+  housekeepingErrorState.set(key, {lastLoggedAt: now, suppressed: 0});
+  const suppressedSuffix = suppressedCount > 0 ? ' (suppressed ' + suppressedCount + ' repeats)' : '';
+  log.error(scope, 'housekeeping ' + step + ' failed' + suppressedSuffix + ': ' + formatErrorMessage(err, true));
+}
 
 /**
  * Evaluates whether an active motion-woken camera can go to sleep early to conserve battery.
@@ -207,20 +249,26 @@ function checkP2pSessionHealth(cam, now) {
  */
 function prepareExpiredCameraHolds(now, clockNow) {
   for (const cam of getCams()) {
-    if (!cam.hasExpiredLiveHold(now)) {
-      continue;
+    try {
+      if (!cam.hasExpiredLiveHold(now)) {
+        continue;
+      }
+      const maxDurReason = cam.expireMaxDurationHold(now);
+      if (maxDurReason) {
+        stop(cam, maxDurReason, {preemptedByViewer: false, initiator: STOP_INITIATORS.MAX_LIMIT});
+        continue;
+      }
+      const viewMaxReason = cam.getViewMaxDurationReason(now);
+      if (viewMaxReason) {
+        stop(cam, viewMaxReason, {preemptedByViewer: false, initiator: STOP_INITIATORS.VIEW_LIMIT});
+        continue;
+      }
+      void evaluateActiveHoldExtension(cam, clockNow).catch((err) =>
+        logHousekeepingError({scope: cam, step: 'hold-extend', err})
+      );
+    } catch (err) {
+      logHousekeepingError({scope: cam, step: 'expire-hold', err, now});
     }
-    const maxDurReason = cam.expireMaxDurationHold(now);
-    if (maxDurReason) {
-      stop(cam, maxDurReason, {preemptedByViewer: false, initiator: STOP_INITIATORS.MAX_LIMIT});
-      continue;
-    }
-    const viewMaxReason = cam.getViewMaxDurationReason(now);
-    if (viewMaxReason) {
-      stop(cam, viewMaxReason, {preemptedByViewer: false, initiator: STOP_INITIATORS.VIEW_LIMIT});
-      continue;
-    }
-    void evaluateActiveHoldExtension(cam, clockNow);
   }
 }
 
@@ -257,8 +305,10 @@ function inspectCameraOnTick(cam, now, clockNow) {
     return;
   }
 
-  void evaluateEarlySleep(cam, now);
-  void evaluateActiveHoldExtension(cam, clockNow);
+  void evaluateEarlySleep(cam, now).catch((err) => logHousekeepingError({scope: cam, step: 'early-sleep', err}));
+  void evaluateActiveHoldExtension(cam, clockNow).catch((err) =>
+    logHousekeepingError({scope: cam, step: 'hold-extend', err})
+  );
 
   switch (cam.getActiveMode()) {
     case STREAM_MODES.RTSP:
@@ -274,7 +324,8 @@ function inspectCameraOnTick(cam, now, clockNow) {
 }
 
 /**
- * Executes one housekeeping, arbitration, backfill, mask-sync, and session-health tick.
+ * Executes one housekeeping, arbitration, backfill, mask-sync, and session-health tick, isolating
+ * errors per step and per camera so a failure on one camera never starves sibling cameras.
  *
  * @param {number} [clockNow] - Optional synthetic timestamp in milliseconds; uses Date.now() when omitted.
  */
@@ -282,27 +333,46 @@ function runHousekeepingTick(clockNow) {
   const now = clockNow === undefined ? Date.now() : clockNow;
   const cams = getCams();
   prepareExpiredCameraHolds(now, clockNow);
-  arbitrate(now);
-  void processBackfillQueue(now);
-  if (isWsReady() || cams.some((c) => c.isRtspDirect())) {
-    checkPeriodicMaskSync(cams, now, isShuttingDown());
+  try {
+    arbitrate(now);
+  } catch (err) {
+    logHousekeepingError({scope: 'bridge', step: 'arbitrate', err, now});
+  }
+  void Promise.resolve()
+    .then(() => processBackfillQueue(now))
+    .catch((err) => logHousekeepingError({scope: 'bridge', step: 'backfill-queue', err}));
+
+  try {
+    if (isWsReady() || cams.some((c) => c.isRtspDirect())) {
+      checkPeriodicMaskSync(cams, now, isShuttingDown());
+    }
+  } catch (err) {
+    logHousekeepingError({scope: 'bridge', step: 'mask-sync', err, now});
   }
 
-  if (canRunStartupProbeNow(now, STARTUP_PROBE_READY_DELAY_MS)) {
-    const nextProbeCam = cams.find((c) => c.canStartStartupProbe(cams, now));
-    if (nextProbeCam) {
-      nextProbeCam.startStartupProbe();
-      trigger(nextProbeCam, {
-        reason: 'startup snapshot probe',
-        ms: STARTUP_PROBE_HOLD_MS,
-        kind: WAKE_KINDS.VIEW,
-        initiator: 'bridge-probe',
-      });
+  try {
+    if (canRunStartupProbeNow(now, STARTUP_PROBE_READY_DELAY_MS)) {
+      const nextProbeCam = cams.find((c) => c.canStartStartupProbe(cams, now));
+      if (nextProbeCam) {
+        nextProbeCam.startStartupProbe();
+        trigger(nextProbeCam, {
+          reason: 'startup snapshot probe',
+          ms: STARTUP_PROBE_HOLD_MS,
+          kind: WAKE_KINDS.VIEW,
+          initiator: 'bridge-probe',
+        });
+      }
     }
+  } catch (err) {
+    logHousekeepingError({scope: 'bridge', step: 'startup-probe', err, now});
   }
 
   for (const cam of cams) {
-    inspectCameraOnTick(cam, now, clockNow);
+    try {
+      inspectCameraOnTick(cam, now, clockNow);
+    } catch (err) {
+      logHousekeepingError({scope: cam, step: 'camera-tick', err, now});
+    }
   }
 }
 
@@ -331,6 +401,7 @@ function startHousekeepingLoop() {
 }
 
 module.exports = {
+  resetHousekeepingErrorState,
   runHousekeepingTick,
   startHousekeepingLoop,
   stopHousekeepingLoop,

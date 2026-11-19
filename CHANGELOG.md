@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Isolate per-camera and per-step housekeeping failures with rate-limited error logs so one failing camera never
+  starves sibling cameras, and exit non-zero on fatal uncaught exceptions so the container restarts cleanly
 - Return an unknown activity status when `Frigate` event queries time out or fail so outages neither extend battery
   camera holds to their maximum duration nor trigger premature early sleep
 - Soft-validate the `Frigate`, `go2rtc`, and `eufy-security-ws` versions on startup and log a warning without blocking

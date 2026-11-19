@@ -17,13 +17,6 @@ classes, not line numbers (they drift); find them with `grep`.
 
 ### A. Reliability and runtime bugs
 
-- [ ] Isolate housekeeping failures per camera and stop masking fatal errors
-  - `runHousekeepingTick()` (`housekeeping.js`, every 500ms) has no `try/catch`, so one throw skips every later camera
-    and a deterministic throw starves them on every tick while logging about 2 lines per second through the
-    `uncaughtException` handler in `app.js`.
-  - Wrap `arbitrate()`, `processBackfillQueue()`, and each per-camera step in `try/catch` with a rate-limited scoped
-    error log, test that a throwing camera does not block the others, and decide whether `uncaughtException` should
-    keep the "service continuing" policy or exit so the container restarts into a clean state.
 - [ ] Roll back Frigate event filing when it fails, and keep card suppression exception-safe
   - `frigateEvent()` (`frigate-client.js`) calls `completeFrigateEventFiling()` before the `POST` and holds
     `enableCleanSnapshotCardSuppression()` across the 1.5s + 5s review lookup, so a failed `POST` leaves triggers

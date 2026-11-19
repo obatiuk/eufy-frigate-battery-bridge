@@ -182,8 +182,9 @@ function handleSigUsr1BackfillTest(cams) {
  * Gracefully stops all active camera livestreams and terminates FFmpeg encoder processes.
  *
  * @param {Camera[]} cams - Active camera collection.
+ * @param {number} [exitCode=0] - Process exit status code once teardown settles.
  */
-function shutdownBridge(cams) {
+function shutdownBridge(cams, exitCode = 0) {
   if (bridgeShuttingDown) {
     return;
   }
@@ -211,11 +212,33 @@ function shutdownBridge(cams) {
   }
   const exitTimer = setTimeout(() => {
     stopWsClient();
-    process.exit(0);
+    process.exit(exitCode);
   }, SHUTDOWN_EXIT_DELAY_MS);
   if (exitTimer && typeof exitTimer.unref === 'function') {
     exitTimer.unref();
   }
+}
+
+/**
+ * Logs a fatal top-level uncaught exception and shuts down with exit code 1 so the container
+ * supervisor restarts the bridge into a clean state instead of continuing with corrupted invariants.
+ *
+ * @param {Camera[]} cams - Active camera collection.
+ * @param {unknown} err - Uncaught error value.
+ */
+function handleUncaughtException(cams, err) {
+  log.error('bridge', 'fatal uncaught exception, shutting down: ' + formatErrorMessage(err, true));
+  if (bridgeShuttingDown) {
+    clearBridgeReady();
+    const fatalExitTimer = setTimeout(() => {
+      process.exit(1);
+    }, SHUTDOWN_EXIT_DELAY_MS);
+    if (fatalExitTimer && typeof fatalExitTimer.unref === 'function') {
+      fatalExitTimer.unref();
+    }
+    return;
+  }
+  shutdownBridge(cams, 1);
 }
 
 /**
@@ -234,9 +257,7 @@ function registerSignalHandlers(cams) {
   process.on(PROCESS_SIGNALS.SIGINT, () => shutdownBridge(cams));
   process.on('exit', clearBridgeReady);
 
-  process.on('uncaughtException', (err) => {
-    log.error('bridge', 'uncaught exception (service continuing): ' + formatErrorMessage(err, true));
-  });
+  process.on('uncaughtException', (err) => handleUncaughtException(cams, err));
 
   process.on('unhandledRejection', (reason) => {
     log.error('bridge', 'unhandled promise rejection (service continuing): ' + formatErrorMessage(reason, true));
@@ -316,7 +337,13 @@ async function main() {
   startServices(cams);
 }
 
-main().catch((err) => {
-  log.error('bridge', 'startup failed: ' + formatErrorMessage(err, true));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    log.error('bridge', 'startup failed: ' + formatErrorMessage(err, true));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  handleUncaughtException,
+};
