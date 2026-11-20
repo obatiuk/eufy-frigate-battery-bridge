@@ -18,6 +18,8 @@ const {
   ALLOWED_TOP_KEYS,
   ALLOWED_CAMERA_KEYS,
   CAMERA_MODES,
+  POWER_MODES,
+  STREAMING_QUALITIES,
   RTSP_PROTOCOLS,
   BOOLEAN_CONFIG_KEYS,
   INTEGER_CONFIG_KEYS,
@@ -38,6 +40,10 @@ const RTSP_URL_PROTOCOL_REGEX = /^rtsps?:\/\/.+/i;
 const SAFE_IDENTITY_TOKEN_REGEX = /^[A-Za-z0-9._-]+$/;
 const FULL_ENV_PLACEHOLDER_REGEX = /^\$\{[^}]+\}$/;
 const INLINE_ENV_PLACEHOLDER_REGEX = /\$\{[^}]+\}/g;
+/** @type {Set<string>} */
+const SUPPORTED_POWER_MODES = new Set(Object.values(POWER_MODES));
+/** @type {Set<string>} */
+const SUPPORTED_STREAMING_QUALITIES = new Set(Object.values(STREAMING_QUALITIES));
 
 /**
  * Finds unknown top-level and per-camera configuration keys in a single schema pass.
@@ -190,7 +196,35 @@ function isFiniteNumber(value) {
 }
 
 /**
- * Validates shared boolean, numeric, startup_snapshot, streaming quality, trigger_events, and telemetry types.
+ * Validates optional `power_mode` and `streaming_quality` profile values on a top-level or camera node.
+ *
+ * @param {Record<string, *>} node - Top-level or per-camera configuration mapping.
+ * @param {string} prefix - Scope prefix ('' or 'cameras[i] ').
+ * @param {string[]} errors - Mutable validation error collector.
+ */
+function validatePowerAndQualityOptions(node, prefix, errors) {
+  if (node.power_mode !== undefined) {
+    if (typeof node.power_mode !== 'string' || !SUPPORTED_POWER_MODES.has(node.power_mode)) {
+      errors.push(prefix + '"power_mode" must be one of "keep", "battery", "surveillance", or "custom"');
+    }
+  }
+  if (node.streaming_quality !== undefined) {
+    const q = node.streaming_quality;
+    const isNamedQuality = typeof q === 'string' && SUPPORTED_STREAMING_QUALITIES.has(q);
+    const isCustomIntQuality =
+      prefix !== '' && Number.isInteger(q) && q >= MIN_STREAMING_QUALITY && q <= MAX_STREAMING_QUALITY;
+    if (!isNamedQuality && !isCustomIntQuality) {
+      errors.push(
+        prefix +
+          '"streaming_quality" must be one of "keep", "auto", "low", "medium", "high", "ultra"' +
+          (prefix !== '' ? ', or integer 0..10' : '')
+      );
+    }
+  }
+}
+
+/**
+ * Validates shared boolean, numeric, startup_snapshot, power_mode, streaming_quality, trigger_events, and telemetry.
  *
  * @param {Record<string, *>} node - Top-level or per-camera configuration mapping.
  * @param {string} prefix - Scope prefix ('' or 'cameras[i] ').
@@ -216,14 +250,7 @@ function validateCommonOptionTypes(node, prefix, errors) {
   ) {
     errors.push(prefix + '"startup_snapshot" must be a boolean or "always"');
   }
-  if (node.enforce_streaming_quality !== undefined) {
-    const q = node.enforce_streaming_quality;
-    const validQuality =
-      typeof q === 'boolean' || (Number.isInteger(q) && q >= MIN_STREAMING_QUALITY && q <= MAX_STREAMING_QUALITY);
-    if (!validQuality) {
-      errors.push(prefix + '"enforce_streaming_quality" must be a boolean or integer 1..10');
-    }
-  }
+  validatePowerAndQualityOptions(node, prefix, errors);
   if (node.trigger_events !== undefined) {
     const validTriggers =
       Array.isArray(node.trigger_events) &&

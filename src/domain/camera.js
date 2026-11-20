@@ -242,6 +242,7 @@ class Camera {
     this.session = new StreamSession({
       directRtsp: this.directRtsp,
       timers: this.timers,
+      shouldLetEufyDecideEnd: () => this.shouldLetEufyDecideEnd(),
       onDecoderTransition: (prev, next, reason) => {
         const suffix = reason ? ' (' + reason + ')' : '';
         log.debug({name: this.name, state: next}, 'decoder state: ' + prev + ' -> ' + next + suffix);
@@ -670,12 +671,11 @@ class Camera {
         critical_battery_threshold: null,
         low_battery_hold_secs: null,
         low_battery_wake_on_view: null,
-        sync_power: null,
-        power_working_mode: null,
+        power_mode: null,
         recording_clip_length: null,
         recording_end_early: null,
         recording_retrigger_interval: null,
-        enforce_streaming_quality: null,
+        streaming_quality: null,
         track_stuck_spotlight: null,
         card_theme: cardCfg.card_theme,
         card_position: cardCfg.card_position,
@@ -700,10 +700,10 @@ class Camera {
       rtsp_url: this.useRtsp ? this.getMaskedRtspUrl() || null : null,
       backfill_only: Boolean(this.alwaysBackfill),
       backfill_enabled: Boolean(this.backfillDownloads),
-      hold_secs: Math.round(this.timers.holdMs / MS_PER_SECOND),
+      hold_secs: Math.round(this.getBaseHoldMs() / MS_PER_SECOND),
       stream_max_secs: Math.round(this.timers.maxMs / MS_PER_SECOND),
-      frigate_event_secs: this.timers.eventSecs,
-      end_early: Boolean(this.timers.letEufyDecideEnd),
+      frigate_event_secs: this.getConfiguredEventSecs(),
+      end_early: this.shouldLetEufyDecideEnd(),
       idle_timeout_secs: this.alwaysBackfill ? null : Math.round(this.timers.earlySleepMs / MS_PER_SECOND),
       view_linger_secs: Math.round(this.timers.lingerMs / MS_PER_SECOND),
       view_max_secs: Math.round(this.timers.viewMaxMs / MS_PER_SECOND),
@@ -711,12 +711,11 @@ class Camera {
       critical_battery_threshold: this.telemetry.criticalBatThreshold,
       low_battery_hold_secs: Math.round(this.timers.lowBatHoldMs / MS_PER_SECOND),
       low_battery_wake_on_view: Boolean(this.telemetry.lowBatWakeOnView),
-      sync_power: this.telemetry.hasPowerConservationEnabled(),
-      power_working_mode: hwCfg.powerWorkingMode,
+      power_mode: hwCfg.powerMode,
       recording_clip_length: hwCfg.recordingClipLength,
       recording_end_early: hwCfg.recordingEndClipMotionStops,
       recording_retrigger_interval: hwCfg.recordingRetriggerInterval,
-      enforce_streaming_quality: hwCfg.enforceQuality,
+      streaming_quality: hwCfg.streamingQuality,
       track_stuck_spotlight: this.hasStuckSpotlightTracking(),
       card_theme: cardCfg.card_theme,
       card_position: cardCfg.card_position,
@@ -1058,10 +1057,28 @@ class Camera {
    *
    * @param {Record<string, *>} props - Raw properties dictionary from eufy-security-ws.
    * @param {{commit?: boolean}} [opts={}] - Evaluation options.
-   * @returns {Readonly<{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }>}
+   * @returns {Readonly<{ shouldUpdate: boolean, currentQuality: number, targetQuality: number|null }>}
    */
   evaluateQualityChange(props, opts = {}) {
     return this.telemetry.evaluateQualityChange(props, opts);
+  }
+
+  /**
+   * Returns true when a named `streaming_quality` profile requires querying `device.get_properties_metadata`.
+   *
+   * @returns {boolean}
+   */
+  needsQualityMetadataLookup() {
+    return this.telemetry.needsQualityMetadataLookup();
+  }
+
+  /**
+   * Stores the camera's `videoStreamingQuality.states` metadata dictionary from `eufy-security-ws`.
+   *
+   * @param {Record<string, *>|null|undefined} states - `states` object from `device.get_properties_metadata`.
+   */
+  setQualityMetadataStates(states) {
+    this.telemetry.setQualityMetadataStates(states);
   }
 
   /**
@@ -1076,6 +1093,38 @@ class Camera {
   }
 
   /**
+   * Builds a structured summary of existing Eufy Power Manager settings vs target overrides for `WARN` logging.
+   *
+   * @param {Record<string, *>} props - Raw properties dictionary from eufy-security-ws.
+   * @param {ReadonlyArray<{ name: string, currentValue: *, targetValue: * }>} updates - Pending property updates.
+   * @returns {Readonly<{ powerMode: string, existingSummary: string, targetSummary: string }>}
+   */
+  describeRecordingOverride(props, updates) {
+    return this.telemetry.describeRecordingOverride(props, updates);
+  }
+
+  /**
+   * Builds a structured summary of existing Eufy `videoStreamingQuality` vs target override for `WARN` logging.
+   *
+   * @param {number} currentQuality - Reported numeric `videoStreamingQuality` value on the camera.
+   * @param {number} targetQuality - Target numeric `videoStreamingQuality` value to apply.
+   * @returns {Readonly<{ configuredQuality: string, existingSummary: string, targetSummary: string }>}
+   */
+  describeQualityOverride(currentQuality, targetQuality) {
+    return this.telemetry.describeQualityOverride(currentQuality, targetQuality);
+  }
+
+  /**
+   * Evaluates whether reported Eufy Motion Detection settings disable categories active in `trigger_events`,
+   * returning a deduplicated warning descriptor once per distinct mismatch state (or `null` when aligned).
+   *
+   * @returns {ReturnType<Telemetry['consumeTriggerDetectionWarning']>}
+   */
+  consumeTriggerDetectionWarning() {
+    return this.telemetry.consumeTriggerDetectionWarning();
+  }
+
+  /**
    * Marks the camera's videoStreamingQuality check as completed after RPC confirmation.
    */
   markQualityChecked() {
@@ -1087,6 +1136,25 @@ class Camera {
    */
   markRecordingModeChecked() {
     this.telemetry.markRecordingModeChecked();
+  }
+
+  /**
+   * Updates the camera's cached `videoStreamingQuality` reading immediately after `device.set_property` succeeds.
+   *
+   * @param {number} quality - Confirmed numeric streaming quality code.
+   */
+  applyConfirmedStreamingQuality(quality) {
+    this.telemetry.applyConfirmedStreamingQuality(quality);
+  }
+
+  /**
+   * Updates the camera's cached Power Manager property reading immediately after `device.set_property` succeeds.
+   *
+   * @param {string} name - Confirmed Eufy property name.
+   * @param {*} value - Confirmed target value.
+   */
+  applyConfirmedRecordingProperty(name, value) {
+    this.telemetry.applyConfirmedRecordingProperty(name, value);
   }
 
   /**
@@ -1770,6 +1838,17 @@ class Camera {
   }
 
   /**
+   * Returns true if this camera is offline due to a recoverable power, link, or timeout condition
+   * (excluding `state: 2/4/5` manually disabled or unpaired states) and warrants a rate-limited
+   * background `driver.poll_refresh`.
+   *
+   * @returns {boolean}
+   */
+  shouldPollRefreshWhileOffline() {
+    return this.telemetry.shouldPollRefreshWhileOffline();
+  }
+
+  /**
    * Returns true when any upstream dependency or camera link (eufy-security-ws, HomeBase/camera,
    * Frigate API, or go2rtc API) is currently disconnected or offline.
    *
@@ -1803,6 +1882,7 @@ class Camera {
   resetStationSyncFlags() {
     this.propertySyncEpoch += 1;
     this.telemetry.qualityChecked = false;
+    this.telemetry.qualityStatesLoaded = false;
     this.telemetry.recordingModeChecked = false;
     this.rtspEnabledChecked = false;
   }
@@ -1978,13 +2058,65 @@ class Camera {
   }
 
   /**
+   * Returns the camera's base hold duration in milliseconds before low-battery clamping,
+   * mirroring reported Eufy hardware telemetry when `power_mode === "keep"` and `hold_secs` was omitted.
+   *
+   * @returns {number}
+   */
+  getBaseHoldMs() {
+    if (!this.directRtsp && !this.timers.hasExplicitHoldSecs) {
+      const mirroredSecs = this.telemetry.resolveMirroredHoldSecs();
+      if (mirroredSecs !== null) {
+        return mirroredSecs * MS_PER_SECOND;
+      }
+    }
+    return this.timers.holdMs;
+  }
+
+  /**
+   * Returns true when `end_early` is active for this camera, mirroring reported Eufy hardware
+   * telemetry when `power_mode === "keep"` and `end_early` was omitted.
+   *
+   * @returns {boolean}
+   */
+  shouldLetEufyDecideEnd() {
+    if (this.directRtsp) {
+      return false;
+    }
+    if (!this.timers.hasExplicitEndEarly) {
+      const mirroredEndEarly = this.telemetry.resolveMirroredEndEarly();
+      if (mirroredEndEarly !== null) {
+        return mirroredEndEarly;
+      }
+    }
+    return Boolean(this.timers.letEufyDecideEnd);
+  }
+
+  /**
+   * Returns the configured Frigate event duration in seconds, mirroring reported Eufy hardware
+   * telemetry when `power_mode === "keep"` and both `frigate_event_secs` and `hold_secs` were omitted.
+   *
+   * @returns {number}
+   */
+  getConfiguredEventSecs() {
+    if (!this.directRtsp && !this.timers.hasExplicitEventSecs && !this.timers.hasExplicitHoldSecs) {
+      const mirroredSecs = this.telemetry.resolveMirroredHoldSecs();
+      if (mirroredSecs !== null) {
+        return mirroredSecs;
+      }
+    }
+    return this.timers.eventSecs;
+  }
+
+  /**
    * Returns the effective event hold duration in milliseconds for this camera, accounting
-   * for per-camera hold_secs and Low-Battery Economy Mode.
+   * for per-camera hold_secs, mirrored telemetry under `power_mode: "keep"`, and Low-Battery Economy Mode.
    *
    * @returns {number}
    */
   getEventHoldMs() {
-    return this.isLowBattery() ? Math.min(this.timers.holdMs, this.timers.lowBatHoldMs) : this.timers.holdMs;
+    const baseHoldMs = this.getBaseHoldMs();
+    return this.isLowBattery() ? Math.min(baseHoldMs, this.timers.lowBatHoldMs) : baseHoldMs;
   }
 
   /**
@@ -2287,7 +2419,7 @@ class Camera {
    */
   getSustainedLiveVideoCutoffMs() {
     const clipSecs = this.telemetry.hwRecordingCfg.recordingClipLength;
-    const baseMs = typeof clipSecs === 'number' && clipSecs > 0 ? clipSecs * MS_PER_SECOND : this.timers.holdMs;
+    const baseMs = typeof clipSecs === 'number' && clipSecs > 0 ? clipSecs * MS_PER_SECOND : this.getBaseHoldMs();
     return clampNum(
       Math.round(baseMs * SUSTAINED_LIVE_VIDEO_CUTOFF_RATIO),
       MIN_SUSTAINED_LIVE_VIDEO_CUTOFF_MS,
@@ -2687,7 +2819,7 @@ class Camera {
     return Boolean(
       this.session.active &&
       this.eventActive &&
-      this.timers.letEufyDecideEnd &&
+      this.shouldLetEufyDecideEnd() &&
       this.session.gotVideo &&
       now >= this.session.viewUntil &&
       (this.session.motionClearedAt > this.session.lastMotionAt || now - this.session.firstVideoAt >= minCleanVideoMs)
@@ -2863,7 +2995,7 @@ class Camera {
     this.session.lastMotionAt = now;
     this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
     this.session.viewSince = now;
-    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.timers.holdMs);
+    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.getBaseHoldMs());
     this.eventActive = true;
     this.beginSession(STREAM_MODES.P2P, now, true);
     return true;
@@ -2886,7 +3018,7 @@ class Camera {
     this.session.lastMotionAt = now;
     this.session.motionUntil = Math.max(this.session.motionUntil, now + this.getEventHoldMs());
     this.session.viewSince = now;
-    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.timers.holdMs);
+    this.session.viewUntil = Math.max(this.session.viewUntil, now + this.getBaseHoldMs());
     this.eventActive = true;
     this.beginSession(STREAM_MODES.RTSP, now, true);
     return true;
@@ -3097,8 +3229,8 @@ class Camera {
    */
   shouldDisableRtspProperty(rtspStreamProp, opts = {}) {
     if (
+      !this.directRtsp &&
       (!this.useRtsp || this.isDoorbell()) &&
-      this.telemetry.hwRecordingCfg.powerWorkingMode !== null &&
       !this.rtspEnabledChecked &&
       rtspStreamProp === true
     ) {
@@ -3138,9 +3270,7 @@ class Camera {
     if (!this.rtspUrl) {
       this.rtspSupported = false;
     }
-    const shouldDisableRtspProp = Boolean(
-      this.telemetry.hasPowerConservationEnabled() && (!this.useRtsp || !this.rtspUrl || this.isDoorbell())
-    );
+    const shouldDisableRtspProp = Boolean(!this.directRtsp && (!this.useRtsp || !this.rtspUrl || this.isDoorbell()));
     const shouldRestartP2p = Boolean(
       this.isCurrentSession(this.session.id, STREAM_MODES.P2P) && !this.session.gotVideo
     );
@@ -3302,7 +3432,7 @@ class Camera {
     if (this.directRtsp) {
       return this.name + '(rtsp:direct)';
     }
-    return this.name + '(' + this.mode + ':' + Math.round(this.timers.holdMs / MS_PER_SECOND) + 's)';
+    return this.name + '(' + this.mode + ':' + Math.round(this.getBaseHoldMs() / MS_PER_SECOND) + 's)';
   }
 
   /**
@@ -3682,7 +3812,7 @@ class Camera {
    */
   resolveApiWakeDurationSecs(rawDuration, minSecs = DEFAULT_MIN_WAKE_SECS) {
     const camMaxSecs = Math.round(this.timers.maxMs / MS_PER_SECOND);
-    const camHoldSecs = Math.round(this.timers.holdMs / MS_PER_SECOND);
+    const camHoldSecs = Math.round(this.getBaseHoldMs() / MS_PER_SECOND);
     const hasExplicit = rawDuration !== undefined && rawDuration !== null && !Number.isNaN(Number(rawDuration));
     return hasExplicit ? Math.max(minSecs, Math.min(camMaxSecs, Number(rawDuration))) : camHoldSecs;
   }
@@ -5701,6 +5831,7 @@ class Camera {
    * @returns {number}
    */
   getEffectiveEventDurationSecs(liveFps = LIVE_FPS, now = Date.now()) {
+    const configuredEventSecs = this.getConfiguredEventSecs();
     if (this.isBackfillPlayback()) {
       const remainingFromPackets = Math.max(
         0,
@@ -5711,12 +5842,12 @@ class Camera {
         remainingFromPackets
       );
       return (
-        Math.max(this.timers.eventSecs, Math.ceil(remainingFrames / Math.max(1, liveFps))) +
+        Math.max(configuredEventSecs, Math.ceil(remainingFrames / Math.max(1, liveFps))) +
         DOWNLOAD_EVENT_DURATION_MARGIN_SECS
       );
     }
     const remainingHoldSecs = this.session.active ? Math.ceil(Math.max(0, this.wantUntil() - now) / MS_PER_SECOND) : 0;
-    return Math.max(this.timers.eventSecs, remainingHoldSecs);
+    return Math.max(configuredEventSecs, remainingHoldSecs);
   }
 
   /**
@@ -6061,10 +6192,11 @@ class Camera {
   }
 
   /**
-   * Returns true if an active RTSP session that dropped mid-stream should immediately re-wake
-   * (requires end_early=false, unexpired wantUntil or active hardware/Frigate activity within max duration,
-   * and either a connected viewer, active hardware triggers, recent Frigate object activity, or active
-   * motion that has not already cleanly finished its post-motion hardware clip).
+   * Returns true if an active RTSP session that dropped mid-stream should immediately re-wake:
+   * under `end_early=true` (default), re-wakes across hardware clip boundaries while Eufy triggers,
+   * recent Frigate object detections, or a connected waking viewer (within `view_max_secs`) remain
+   * active, and sleeps cleanly once activity clears; under `end_early=false`, also re-wakes mid-hold
+   * motion drops until `hold_secs` is satisfied.
    *
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    * @returns {boolean}
@@ -6072,11 +6204,12 @@ class Camera {
   shouldRewakeRtspOnDrop(now = Date.now()) {
     const hwActive = this.hasActiveHardwareTriggers(now) && !this.hasReachedMaxDuration(now);
     const frigateActive = this.hasRecentFrigateObjectActivity(now) && !this.hasReachedMaxDuration(now);
-    const activeMotionNeedsRewake = this.isInMotion(now) && !this.didRtspMotionStreamFinishCleanly(now);
+    const viewerActive = this.hasWakingViewer() && !this.hasReachedViewMaxDuration(now);
+    const activeMotionNeedsRewake =
+      !this.shouldLetEufyDecideEnd() && this.isInMotion(now) && !this.didRtspMotionStreamFinishCleanly(now);
     return Boolean(
-      !this.timers.letEufyDecideEnd &&
       (now < this.wantUntil() || hwActive || frigateActive) &&
-      (activeMotionNeedsRewake || hwActive || frigateActive || this.hasWakingViewer())
+      (activeMotionNeedsRewake || hwActive || frigateActive || viewerActive)
     );
   }
 

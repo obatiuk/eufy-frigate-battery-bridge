@@ -270,7 +270,8 @@ describe('Environment Variable Expansion (${ENV_VAR} in config.yaml)', () => {
           idle_timeout_secs: 25,
           low_battery_hold_secs: 15,
           low_battery_wake_on_view: true,
-          enforce_streaming_quality: 2,
+          power_mode: 'battery',
+          streaming_quality: 'medium',
           cameras: [{serial: 'T8161T0000000099', mode: 'rtsp'}],
         },
         {}
@@ -283,7 +284,9 @@ describe('Environment Variable Expansion (${ENV_VAR} in config.yaml)', () => {
       assert.equal(camCfg.timers.earlySleepMs, 25000);
       assert.equal(camCfg.timers.lowBatHoldMs, 15000);
       assert.equal(camCfg.timers.lowBatWakeOnView, true);
-      assert.equal(camCfg.hwRecordingConfig.enforceQuality, 2);
+      assert.equal(camCfg.hwRecordingConfig.powerMode, 'battery');
+      assert.equal(camCfg.hwRecordingConfig.powerWorkingMode, 0);
+      assert.equal(camCfg.hwRecordingConfig.streamingQuality, 'medium');
     }
   );
 });

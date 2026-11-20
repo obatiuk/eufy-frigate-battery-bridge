@@ -43,6 +43,8 @@ const {
   MAX_HOLD_SECS,
   DEFAULT_HOLD_SECS,
   DEFAULT_BACKFILL_HOLD_SECS,
+  SURVEILLANCE_HOLD_SECS,
+  DEFAULT_END_EARLY,
   MIN_SESSION_MAX_SECS,
   MAX_SESSION_MAX_SECS,
   DEFAULT_MAX_SECS,
@@ -56,8 +58,11 @@ const {
   MIN_LOW_BAT_HOLD_SECS,
   MAX_LOW_BAT_HOLD_SECS,
   DEFAULT_LOW_BAT_HOLD_SECS,
-  MIN_POWER_WORKING_MODE,
-  MAX_POWER_WORKING_MODE,
+  MIN_STREAMING_QUALITY,
+  MAX_STREAMING_QUALITY,
+  POWER_WORKING_MODES,
+  POWER_MODES,
+  STREAMING_QUALITIES,
   OPTIMAL_BATTERY_MAX_CLIP_SECS,
   MIN_RECORDING_CLIP_SECS,
   MAX_RECORDING_CLIP_SECS,
@@ -70,6 +75,10 @@ const {stripRtspUrlFragment, hasDirectRtspUrl, CameraConfig} = require('./camera
 const {readEnvString} = require('./env');
 
 const ASCII_WORD_CHAR_REGEX = /[a-z0-9]/;
+/** @type {Set<string>} */
+const SUPPORTED_POWER_MODES = new Set(Object.values(POWER_MODES));
+/** @type {Set<string>} */
+const SUPPORTED_STREAMING_QUALITIES = new Set(Object.values(STREAMING_QUALITIES));
 
 /** @type {Record<string, *>} */
 let activeRawCfg = {};
@@ -471,6 +480,37 @@ function resolveCameraTriggers(camConfig = {}, globalTriggers = activeTriggers |
 }
 
 /**
+ * Resolves whether `trigger_events` was explicitly specified (per-camera or globally) and the normalized
+ * unexpanded trigger token set so alias expansion (such as `person`) can be distinguished from explicit sub-types.
+ *
+ * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object.
+ * @param {Record<string, *>} [baseCfg=activeRawCfg] - Global configuration object.
+ * @returns {{ hasExplicitTriggers: boolean, rawTriggers: Set<string> }}
+ */
+function resolveExplicitTriggerMetadata(camConfig = {}, baseCfg = activeRawCfg) {
+  if (camConfig && camConfig.rawTriggers instanceof Set) {
+    return {hasExplicitTriggers: Boolean(camConfig.hasExplicitTriggers), rawTriggers: camConfig.rawTriggers};
+  }
+  const camList =
+    Array.isArray(camConfig.trigger_events) && camConfig.trigger_events.length > 0 ? camConfig.trigger_events : null;
+  const globalList =
+    Array.isArray(baseCfg.trigger_events) && baseCfg.trigger_events.length > 0
+      ? baseCfg.trigger_events
+      : Array.isArray(activeRawCfg.trigger_events) && activeRawCfg.trigger_events.length > 0
+        ? activeRawCfg.trigger_events
+        : null;
+  const chosen = camList || globalList;
+  if (!chosen) {
+    return {hasExplicitTriggers: false, rawTriggers: new Set()};
+  }
+  const rawTriggers = new Set();
+  for (const item of chosen) {
+    rawTriggers.add(String(item).toLowerCase().trim());
+  }
+  return {hasExplicitTriggers: true, rawTriggers};
+}
+
+/**
  * Resolves the normalized streaming mode ('auto', 'rtsp', 'p2p', 'backfill', or 'custom') for a camera,
  * resolving omitted or 'auto' mode to 'rtsp' when direct rtsp_url is configured.
  *
@@ -626,6 +666,47 @@ function resolveClampedSessionDurations(camConfig, baseCfg, ctx) {
 }
 
 /**
+ * Resolves the effective `power_mode` profile for a camera, scoping `"custom"` strictly to `mode: "custom"`
+ * and falling back to non-invasive `"keep"` otherwise.
+ *
+ * @param {Record<string, *>} camConfig - Camera configuration entry.
+ * @param {Record<string, *>} baseCfg - Global configuration object.
+ * @param {string} mode - Resolved camera mode.
+ * @returns {'keep'|'battery'|'surveillance'|'custom'}
+ */
+function resolveEffectivePowerMode(camConfig, baseCfg, mode) {
+  const raw = camConfig.power_mode ?? baseCfg.power_mode ?? POWER_MODES.KEEP;
+  const token = typeof raw === 'string' && SUPPORTED_POWER_MODES.has(raw) ? raw : POWER_MODES.KEEP;
+  return token === POWER_MODES.CUSTOM && mode !== CAMERA_MODES.CUSTOM
+    ? POWER_MODES.KEEP
+    : /** @type {'keep'|'battery'|'surveillance'|'custom'} */ (token);
+}
+
+/**
+ * Resolves the effective `streaming_quality` profile for a camera, scoping raw integer `0..10` overrides
+ * strictly to `mode: "custom"` and falling back to non-invasive `"keep"` otherwise.
+ *
+ * @param {Record<string, *>} camConfig - Camera configuration entry.
+ * @param {Record<string, *>} baseCfg - Global configuration object.
+ * @param {string} mode - Resolved camera mode.
+ * @returns {'keep'|'auto'|'low'|'medium'|'high'|'ultra'|number}
+ */
+function resolveEffectiveStreamingQuality(camConfig, baseCfg, mode) {
+  const raw = camConfig.streaming_quality ?? baseCfg.streaming_quality ?? STREAMING_QUALITIES.KEEP;
+  if (
+    typeof raw === 'number' &&
+    Number.isInteger(raw) &&
+    raw >= MIN_STREAMING_QUALITY &&
+    raw <= MAX_STREAMING_QUALITY
+  ) {
+    return mode === CAMERA_MODES.CUSTOM ? raw : STREAMING_QUALITIES.KEEP;
+  }
+  return typeof raw === 'string' && SUPPORTED_STREAMING_QUALITIES.has(raw)
+    ? /** @type {'keep'|'auto'|'low'|'medium'|'high'|'ultra'} */ (raw)
+    : STREAMING_QUALITIES.KEEP;
+}
+
+/**
  * Resolves per-camera stream timing and mode settings with mode-aware defaults and
  * defensive non-contradiction clamping.
  *
@@ -647,7 +728,10 @@ function resolveClampedSessionDurations(camConfig, baseCfg, ctx) {
  *   criticalBatThreshold: number,
  *   lowBatHoldMs: number,
  *   lowBatWakeOnView: boolean,
- *   letEufyDecideEnd: boolean
+ *   letEufyDecideEnd: boolean,
+ *   hasExplicitHoldSecs: boolean,
+ *   hasExplicitEventSecs: boolean,
+ *   hasExplicitEndEarly: boolean
  * }}
  */
 function resolveCameraTimers(camConfig = {}, baseCfg = activeBuiltCfg) {
@@ -661,11 +745,22 @@ function resolveCameraTimers(camConfig = {}, baseCfg = activeBuiltCfg) {
     scope
   );
 
-  const defaultHoldSecs = alwaysBackfill ? DEFAULT_BACKFILL_HOLD_SECS : DEFAULT_HOLD_SECS;
+  const effectivePowerMode = isRtspDirect ? POWER_MODES.KEEP : resolveEffectivePowerMode(camConfig, baseCfg, mode);
+  const defaultHoldSecs =
+    effectivePowerMode === POWER_MODES.BATTERY
+      ? OPTIMAL_BATTERY_MAX_CLIP_SECS
+      : effectivePowerMode === POWER_MODES.SURVEILLANCE
+        ? SURVEILLANCE_HOLD_SECS
+        : alwaysBackfill
+          ? DEFAULT_BACKFILL_HOLD_SECS
+          : DEFAULT_HOLD_SECS;
   const rawHoldSecs = camConfig.hold_secs ?? baseCfg.hold_secs;
-  const holdSecs =
-    rawHoldSecs !== undefined ? clampNum(rawHoldSecs, MIN_HOLD_SECS, MAX_HOLD_SECS, defaultHoldSecs) : defaultHoldSecs;
+  const hasExplicitHoldSecs = rawHoldSecs !== undefined;
+  const holdSecs = hasExplicitHoldSecs
+    ? clampNum(rawHoldSecs, MIN_HOLD_SECS, MAX_HOLD_SECS, defaultHoldSecs)
+    : defaultHoldSecs;
   const holdMs = holdSecs * MS_PER_SECOND;
+  const hasExplicitEventSecs = (camConfig.frigate_event_secs ?? baseCfg.frigate_event_secs) !== undefined;
 
   const {maxMs, viewMaxMs, lingerMs, eventSecs, earlySleepMs} = resolveClampedSessionDurations(camConfig, baseCfg, {
     holdMs,
@@ -719,7 +814,8 @@ function resolveCameraTimers(camConfig = {}, baseCfg = activeBuiltCfg) {
     camConfig.end_early ??
     (mode === CAMERA_MODES.CUSTOM ? camConfig.recording_end_early : undefined) ??
     baseCfg.end_early;
-  const letEufyDecideEnd = rawEndEarly !== undefined ? Boolean(rawEndEarly) : alwaysBackfill;
+  const hasExplicitEndEarly = rawEndEarly !== undefined;
+  const letEufyDecideEnd = isRtspDirect ? false : hasExplicitEndEarly ? Boolean(rawEndEarly) : DEFAULT_END_EARLY;
 
   return Object.freeze({
     mode,
@@ -738,57 +834,10 @@ function resolveCameraTimers(camConfig = {}, baseCfg = activeBuiltCfg) {
     lowBatHoldMs,
     lowBatWakeOnView,
     letEufyDecideEnd,
+    hasExplicitHoldSecs,
+    hasExplicitEventSecs,
+    hasExplicitEndEarly,
   });
-}
-
-/**
- * Resolves effective powerWorkingMode and whether custom clip settings apply, promoting mode 0/1 to 2 when conflicting.
- *
- * @param {*} rawPowerMode - Raw power_working_mode value.
- * @param {boolean} hasExplicitClipCfg - Whether explicit clip overrides were set.
- * @param {{defaultClipSecs: number, letEufyDecideEnd: boolean, scope: string}} ctx - Clip context.
- * @returns {{powerWorkingMode: number, sendCustomClips: boolean}}
- */
-function resolveEffectivePowerWorkingMode(rawPowerMode, hasExplicitClipCfg, ctx) {
-  const {defaultClipSecs, letEufyDecideEnd, scope} = ctx;
-  let powerWorkingMode =
-    rawPowerMode !== undefined && rawPowerMode !== null && !Number.isNaN(Number(rawPowerMode))
-      ? clampNum(
-          Math.round(Number(rawPowerMode)),
-          MIN_POWER_WORKING_MODE,
-          MAX_POWER_WORKING_MODE,
-          MAX_POWER_WORKING_MODE
-        )
-      : MAX_POWER_WORKING_MODE;
-
-  if (powerWorkingMode >= MAX_POWER_WORKING_MODE) {
-    return {powerWorkingMode, sendCustomClips: true};
-  }
-  if (hasExplicitClipCfg) {
-    log.warn(
-      scope,
-      'power_working_mode=' +
-        powerWorkingMode +
-        ' ignores custom clip settings on Eufy firmware; promoting power_working_mode to 2 (Customize Recording)'
-    );
-    return {powerWorkingMode: MAX_POWER_WORKING_MODE, sendCustomClips: true};
-  }
-  if (
-    powerWorkingMode === MIN_POWER_WORKING_MODE &&
-    (defaultClipSecs > OPTIMAL_BATTERY_MAX_CLIP_SECS || !letEufyDecideEnd)
-  ) {
-    log.warn(
-      scope,
-      'power_working_mode=0 (Optimal Battery Life) hardcodes 20s early-ending clips on Eufy firmware, ' +
-        'which conflicts with hold_secs=' +
-        defaultClipSecs +
-        's / end_early=' +
-        letEufyDecideEnd +
-        '; promoting power_working_mode to 2 (Customize Recording)'
-    );
-    return {powerWorkingMode: MAX_POWER_WORKING_MODE, sendCustomClips: true};
-  }
-  return {powerWorkingMode, sendCustomClips: false};
 }
 
 /**
@@ -834,15 +883,16 @@ function resolveCustomClipRecordingFields(explicitCfg, ctx) {
 }
 
 /**
- * Resolves per-camera Eufy hardware Power Manager settings, automatically deriving
- * clip length and early-end behavior from the camera's resolved hold_secs and end_early
- * with defensive validation against contradictory overrides.
+ * Resolves per-camera Eufy Power Manager (`power_mode`) and live P2P streaming quality (`streaming_quality`)
+ * settings, keeping camera settings untouched by default (`"keep"`), mapping grouped presets (`"battery"` -> `0`,
+ * `"surveillance"` -> `1`) without silent promotion, and scoping `"custom"` clip fields to `mode: "custom"`.
  *
  * @param {Record<string, *>} [camConfig={}] - Individual camera configuration object from cfg.cameras.
  * @param {ReturnType<typeof resolveCameraTimers>|null} [resolvedTimers=null] - Pre-resolved camera timers.
  * @param {Record<string, *>} [baseCfg=activeBuiltCfg] - Global configuration object.
  * @returns {{
- *   enforceQuality: boolean|number|null,
+ *   powerMode: 'keep'|'battery'|'surveillance'|'custom'|null,
+ *   streamingQuality: 'keep'|'auto'|'low'|'medium'|'high'|'ultra'|number|null,
  *   powerWorkingMode: number|null,
  *   recordingClipLength: number|null,
  *   recordingEndClipMotionStops: boolean|null,
@@ -856,7 +906,8 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
   const timers = resolvedTimers || resolveCameraTimers(camConfig, baseCfg);
   if (timers.rtspDirect || hasDirectRtspUrl(camConfig)) {
     return Object.freeze({
-      enforceQuality: null,
+      powerMode: null,
+      streamingQuality: null,
       powerWorkingMode: null,
       recordingClipLength: null,
       recordingEndClipMotionStops: null,
@@ -864,15 +915,26 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
     });
   }
   const scope = CameraConfig.resolveScopeName(camConfig);
-  const enforceQuality =
-    camConfig.enforce_streaming_quality !== undefined
-      ? camConfig.enforce_streaming_quality
-      : (baseCfg.enforce_streaming_quality ?? true);
+  const powerMode = resolveEffectivePowerMode(camConfig, baseCfg, timers.mode);
+  const streamingQuality = resolveEffectiveStreamingQuality(camConfig, baseCfg, timers.mode);
 
-  if ((camConfig.sync_power ?? baseCfg.sync_power ?? true) === false) {
+  if (powerMode === POWER_MODES.KEEP) {
     return Object.freeze({
-      enforceQuality,
+      powerMode,
+      streamingQuality,
       powerWorkingMode: null,
+      recordingClipLength: null,
+      recordingEndClipMotionStops: null,
+      recordingRetriggerInterval: null,
+    });
+  }
+  if (powerMode === POWER_MODES.BATTERY || powerMode === POWER_MODES.SURVEILLANCE) {
+    const powerWorkingMode =
+      powerMode === POWER_MODES.BATTERY ? POWER_WORKING_MODES.BATTERY_SAVER : POWER_WORKING_MODES.SURVEILLANCE;
+    return Object.freeze({
+      powerMode,
+      streamingQuality,
+      powerWorkingMode,
       recordingClipLength: null,
       recordingEndClipMotionStops: null,
       recordingRetriggerInterval: null,
@@ -888,31 +950,20 @@ function resolveHardwareRecordingConfig(camConfig = {}, resolvedTimers = null, b
   const explicitClipLen = camConfig.recording_clip_length ?? baseCfg.recording_clip_length;
   const explicitEndEarly = camConfig.recording_end_early ?? baseCfg.recording_end_early;
   const explicitRetrigger = camConfig.recording_retrigger_interval ?? baseCfg.recording_retrigger_interval;
-  const hasExplicitClipCfg =
-    explicitClipLen !== undefined || explicitEndEarly !== undefined || explicitRetrigger !== undefined;
-
-  const {powerWorkingMode, sendCustomClips} = resolveEffectivePowerWorkingMode(
-    camConfig.power_working_mode ?? baseCfg.power_working_mode,
-    hasExplicitClipCfg,
-    {defaultClipSecs, letEufyDecideEnd: timers.letEufyDecideEnd, scope}
-  );
-  if (!sendCustomClips) {
-    return Object.freeze({
-      enforceQuality,
-      powerWorkingMode,
-      recordingClipLength: null,
-      recordingEndClipMotionStops: null,
-      recordingRetriggerInterval: null,
-    });
-  }
-
+  const effectiveLetEufyDecideEnd =
+    camConfig.end_early !== undefined
+      ? Boolean(camConfig.end_early)
+      : baseCfg.end_early !== undefined
+        ? Boolean(baseCfg.end_early)
+        : timers.letEufyDecideEnd;
   const clipFields = resolveCustomClipRecordingFields(
     {explicitClipLen, explicitEndEarly, explicitRetrigger},
-    {defaultClipSecs, letEufyDecideEnd: timers.letEufyDecideEnd, scope}
+    {defaultClipSecs, letEufyDecideEnd: effectiveLetEufyDecideEnd, scope}
   );
   return Object.freeze({
-    enforceQuality,
-    powerWorkingMode,
+    powerMode,
+    streamingQuality,
+    powerWorkingMode: POWER_WORKING_MODES.CUSTOMIZE_RECORDING,
     ...clipFields,
   });
 }
@@ -934,13 +985,12 @@ const RTSP_DIRECT_IGNORED_CAMERA_KEYS = Object.freeze([
   'critical_battery_threshold',
   'low_battery_hold_secs',
   'low_battery_wake_on_view',
-  'sync_power',
+  'power_mode',
   'track_stuck_spotlight',
-  'power_working_mode',
   'recording_clip_length',
   'recording_end_early',
   'recording_retrigger_interval',
-  'enforce_streaming_quality',
+  'streaming_quality',
   'trigger_events',
   'startup_snapshot',
   'telemetry',
@@ -959,9 +1009,9 @@ const RTSP_DIRECT_IGNORED_TOP_LEVEL_KEYS = Object.freeze([
   'use_rtsp',
   'backfill_enabled',
   'backfill_delay_secs',
-  'sync_power',
+  'power_mode',
   'track_stuck_spotlight',
-  'enforce_streaming_quality',
+  'streaming_quality',
   'low_battery_threshold',
   'critical_battery_threshold',
   'low_battery_hold_secs',
@@ -977,8 +1027,7 @@ const RTSP_DIRECT_IGNORED_TOP_LEVEL_KEYS = Object.freeze([
   'snapshot_capture_delay_secs',
 ]);
 
-const SYNC_POWER_IGNORED_CAMERA_KEYS = Object.freeze([
-  'power_working_mode',
+const CUSTOM_POWER_CLIP_KEYS = Object.freeze([
   'recording_clip_length',
   'recording_end_early',
   'recording_retrigger_interval',
@@ -989,17 +1038,51 @@ const TELEMETRY_SUB_KEYS = Object.freeze(['battery', 'power_source', 'wifi', 'rs
 const MINIMAL_IGNORED_TELEMETRY_KEYS = Object.freeze(['temperature', 'last_seen']);
 
 /**
- * Returns true when a Power Manager camera key is explicitly set and ignored under sync_power=false.
+ * Returns true when a custom Power Manager clip key is explicitly set and ignored because `power_mode !== "custom"`.
  *
  * @param {string} key - Candidate power configuration key.
  * @param {Record<string, *>} rawCam - Raw camera configuration object.
  * @param {string} mode - Resolved camera mode.
  * @returns {boolean}
  */
-function isIgnoredSyncPowerKey(key, rawCam, mode) {
+function isIgnoredCustomPowerKey(key, rawCam, mode) {
   const feedsCustomEndEarly =
     key === 'recording_end_early' && mode === CAMERA_MODES.CUSTOM && rawCam.end_early === undefined;
-  return rawCam[key] !== undefined && !feedsCustomEndEarly;
+  return rawCam[key] !== undefined ? !feedsCustomEndEarly : false;
+}
+
+/**
+ * Logs startup warnings when custom-only `power_mode`, integer `streaming_quality`, or `recording_*` clip keys
+ * are configured on a camera where they do not apply.
+ *
+ * @param {Record<string, *>} rawCam - Original un-normalized camera configuration object.
+ * @param {{ timers: ReturnType<typeof resolveCameraTimers>, scope: string }} ctx - Resolved timers and scope.
+ * @param {Record<string, *>} baseCfg - Global configuration object.
+ */
+function warnIgnoredPowerAndQualityOptions(rawCam, {timers, scope}, baseCfg) {
+  if (rawCam.power_mode === POWER_MODES.CUSTOM && timers.mode !== CAMERA_MODES.CUSTOM) {
+    log.warn(
+      scope,
+      'ignoring power_mode="custom" in mode="' + timers.mode + '" (power_mode="custom" only applies in mode="custom")'
+    );
+  }
+  if (typeof rawCam.streaming_quality === 'number' && timers.mode !== CAMERA_MODES.CUSTOM) {
+    log.warn(
+      scope,
+      'ignoring streaming_quality=' +
+        rawCam.streaming_quality +
+        ' in mode="' +
+        timers.mode +
+        '" (integer streaming_quality only applies in mode="custom")'
+    );
+  }
+  const effectivePowerMode = resolveEffectivePowerMode(rawCam, baseCfg, timers.mode);
+  if (effectivePowerMode !== POWER_MODES.CUSTOM) {
+    const ignoredPower = CUSTOM_POWER_CLIP_KEYS.filter((key) => isIgnoredCustomPowerKey(key, rawCam, timers.mode));
+    if (ignoredPower.length > 0) {
+      log.warn(scope, 'ignoring ' + ignoredPower.join(', ') + ' because power_mode="' + effectivePowerMode + '"');
+    }
+  }
 }
 
 /**
@@ -1037,8 +1120,18 @@ function hasExplicitSnapshotSleepScreen(cam) {
 }
 
 /**
+ * Returns true when a camera entry is a non-direct Eufy camera configured in `mode: "custom"`.
+ *
+ * @param {Record<string, *>|null|undefined} cam - Candidate camera configuration object.
+ * @returns {boolean}
+ */
+function isCustomModeEufyCamera(cam) {
+  return Boolean(cam && !hasDirectRtspUrl(cam) && resolveCameraMode(cam) === CAMERA_MODES.CUSTOM);
+}
+
+/**
  * Logs startup warnings when explicitly specified per-camera mode, transport, timer, or Power Manager
- * options are ignored due to direct rtsp_url, the resolved camera mode, or sync_power=false.
+ * options are ignored due to direct rtsp_url, the resolved camera mode, or `power_mode !== "custom"`.
  *
  * @param {Record<string, *>} rawCam - Original un-normalized camera configuration object.
  * @param {{ timers: ReturnType<typeof resolveCameraTimers>, scope: string }} ctx - Resolved timers and scope.
@@ -1083,14 +1176,7 @@ function warnIgnoredCameraModeOptions(rawCam, {timers, scope}, baseCfg = activeR
         ' in backfill-only mode (motion events replay clips instead of starting live streams)'
     );
   }
-  if ((rawCam.sync_power ?? baseCfg.sync_power ?? true) === false) {
-    const ignoredPower = SYNC_POWER_IGNORED_CAMERA_KEYS.filter((key) =>
-      isIgnoredSyncPowerKey(key, rawCam, timers.mode)
-    );
-    if (ignoredPower.length > 0) {
-      log.warn(scope, 'ignoring ' + ignoredPower.join(', ') + ' because sync_power=false');
-    }
-  }
+  warnIgnoredPowerAndQualityOptions(rawCam, {timers, scope}, baseCfg);
 }
 
 /**
@@ -1177,6 +1263,11 @@ function warnIgnoredTopLevelOptions(rawCfg, hwMode, env = process.env) {
     if (ignoredDirect.length > 0) {
       log.warn('bridge', 'ignoring ' + ignoredDirect.join(', ') + ' because all cameras specify rtsp_url');
     }
+  } else if (rawCfg.power_mode === POWER_MODES.CUSTOM && cams.length > 0 && !cams.some(isCustomModeEufyCamera)) {
+    log.warn(
+      'bridge',
+      'ignoring power_mode="custom" because no camera uses mode="custom" (falling back to power_mode="keep")'
+    );
   }
   if (rawCfg.card_theme !== undefined && normalizeCardTheme(rawCfg.card_theme) === CARD_THEMES.NONE) {
     const anyVisibleCamCard = cams.some(hasExplicitVisibleCardTheme);
@@ -1239,6 +1330,7 @@ function resolveCameraConfig(camConfig = {}, baseCfg = activeRawCfg) {
     baseCfg.triggers instanceof Set ? baseCfg.triggers : activeTriggers || buildTriggerSet(undefined);
   const timers = resolveCameraTimers(normalizedCam, baseCfg);
   const triggers = resolveCameraTriggers(normalizedCam, fallbackTriggers);
+  const {hasExplicitTriggers, rawTriggers} = resolveExplicitTriggerMetadata(normalizedCam, baseCfg);
   const cardConfig = resolveCardConfig(normalizedCam, baseCfg);
   const telemetryConfig = resolveTelemetryConfig(normalizedCam, baseCfg);
   const hwRecordingConfig = resolveHardwareRecordingConfig(normalizedCam, timers, baseCfg);
@@ -1259,6 +1351,8 @@ function resolveCameraConfig(camConfig = {}, baseCfg = activeRawCfg) {
       startupSnapshot: timers.rtspDirect ? false : (normalizedCam.startup_snapshot ?? baseCfg.startup_snapshot ?? true),
       timers,
       triggers,
+      hasExplicitTriggers,
+      rawTriggers,
       cardConfig,
       telemetryConfig,
       hwRecordingConfig,

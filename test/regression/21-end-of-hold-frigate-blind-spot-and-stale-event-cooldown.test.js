@@ -31,6 +31,7 @@ describe('Regression 21. End-of-Hold Frigate Blind Spot, Stale Event Cooldown & 
         serial: 'T8161T0000000091',
         name: 'storage_room',
         mode: 'rtsp',
+        hold_secs: 60,
       });
 
       // 1. Session 1 files a Frigate event (evUntil = t0 + 62000), then ends after video.
@@ -117,6 +118,7 @@ describe('Regression 21. End-of-Hold Frigate Blind Spot, Stale Event Cooldown & 
         serial: 'T8161T0000000092',
         name: 'garage_cam',
         mode: 'backfill',
+        hold_secs: 30,
       });
       backfillCam.setMotionUntil(t0 + 60000);
       backfillCam.setLastMotionAt(t0);
@@ -157,12 +159,14 @@ describe('Regression 21. End-of-Hold Frigate Blind Spot, Stale Event Cooldown & 
         serial: 'T8161T0000000093',
         name: 'storage_room',
         mode: 'rtsp',
+        hold_secs: 60,
         startup_snapshot: false,
       });
       const garageCam = new Camera({
         serial: 'T8161T0000000094',
         name: 'garage_cam',
         mode: 'backfill',
+        hold_secs: 30,
         startup_snapshot: false,
       });
       storageCam.updateDiscoveredRtspConfig('T8030P0000000000', 'rtsp://127.0.0.1:8554/storage');

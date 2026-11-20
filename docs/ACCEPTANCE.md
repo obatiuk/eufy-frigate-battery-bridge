@@ -46,9 +46,9 @@ must strictly enforce the following behavior across all event and wake sources:
 | [AT-07](acceptance/AT-07.md) | Offline Detection, Deep-Standby Protection & Battery-Swap Recovery                                                 |
 | [AT-08](acceptance/AT-08.md) | Post-Sleep `3s` Guard, Idle Wedged `P2P` Radio Recovery & Service Disruption Resilience                            |
 | [AT-09](acceptance/AT-09.md) | Post-Viewer Linger Clean Termination & Trigger-Bypassed Viewer Cooldown                                            |
-| [AT-10](acceptance/AT-10.md) | Hardware Power Manager Sync & Stuck Spotlight (`light`) Conservation                                               |
+| [AT-10](acceptance/AT-10.md) | Non-Invasive `power_mode` & `streaming_quality` Profiles, Metadata Sync & Stuck Spotlight (`light`)                |
 | [AT-11](acceptance/AT-11.md) | Mid-Stream Hold Extensions Across All Modes & Signal Sources                                                       |
-| [AT-12](acceptance/AT-12.md) | `end_early: false` Mid-Session Re-Wake, `end_early: true` Clean End, Hard Duration Caps & `idle_timeout_secs`      |
+| [AT-12](acceptance/AT-12.md) | Default `end_early: true` Clean End, `RTSP` Clip Continuation, `end_early: false` Re-Wake & Session Caps           |
 | [AT-13](acceptance/AT-13.md) | Per-Station `P2P` Priority Preemption, Preempted Event Backfill & Instant Back-to-Back Switching                   |
 | [AT-14](acceptance/AT-14.md) | Human Frigate Live View - Dashboard Grid Ignore, Same-Station Switching & Blocks                                   |
 | [AT-15](acceptance/AT-15.md) | Proportional `20%` Safety-Net Backfill Cutoff & Bounded `120s` Recording Wait                                      |
@@ -107,7 +107,7 @@ The matrix in section 1 always applies. `AT-NN` links are in the index above.
 | `src/overlay/*`                                | AT-17, AT-18                                                                              |
 | `src/config/index.js`                          | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-10, AT-12, AT-13, AT-17, AT-18, AT-19 |
 | `src/config/constants.js`                      | AT-01, AT-02, AT-03, AT-04, AT-05, AT-06, AT-07, AT-10, AT-12, AT-13, AT-17, AT-18, AT-19 |
-| `src/config/camera-config.js`                  | AT-05, AT-19                                                                              |
+| `src/config/camera-config.js`                  | AT-05, AT-10, AT-19                                                                       |
 | `src/config/env.js`                            | AT-08, AT-19                                                                              |
 | `src/config/validation.js`                     | AT-05, AT-19                                                                              |
 | `src/config/resolvers.js`                      | AT-01, AT-02, AT-03, AT-04, AT-05, AT-07, AT-10, AT-12, AT-13, AT-18, AT-19               |

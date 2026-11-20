@@ -337,7 +337,7 @@ describe('Camera State Enums & Debug HUD Modules (src/domain/camera/)', () => {
     const now = 1000000;
     const idleRows = [
       'ST:IDLE -> IDLE        +000s | DEC:DETACH | BF:IDLE    | FPS:15/15 | WS:OK HB:OK FRG:OK RTC:OK | DROP:0 RST:0 ',
-      'LIGHT:OFF     | BAT:---% BAT | WIFI:-/4 ----dBm IDLE:0 | TMP:--C   | HW:M2/060s/EE:N/Q-/RTSP:N | SEEN:----    ',
+      'LIGHT:OFF     | BAT:---% BAT | WIFI:-/4 ----dBm IDLE:0 | TMP:--C   | HW:M-/---s/EE:-/Q-/RTSP:N | SEEN:----    ',
       'SES:NONE R:00 | HOLD:---     | IDLE:---   | VID:---    | VW:0/0    | TRIG:CLEAR  ---   Q:00/00 | STOP:N       ',
       'EV:IDLE   --- /------        | BFQ:---  TRY:0/10 Q:0   | CONT:N    | CLIP:0000/0000f           | INIT:none    ',
     ];
@@ -353,5 +353,71 @@ describe('Camera State Enums & Debug HUD Modules (src/domain/camera/)', () => {
     assert.ok(busyRows[1].includes('/RTSP:Y |'));
     assert.ok(busyRows[2].startsWith('SES:NONE R:03 |'));
     assert.deepEqual([...buildDebugHudLines(snapshot, now)], idleRows, 'formatting must not mutate the snapshot');
+
+    // Verify M0/M1/M3+ effective clip/end-early display and QU formatting for Ultra (10) without column shift
+    hudCam.applyTelemetryProperties(
+      {
+        state: 1,
+        battery: 91,
+        powerWorkingMode: 0,
+        recordingClipLength: 60,
+        recordingEndClipMotionStops: false,
+        videoStreamingQuality: 10,
+      },
+      false
+    );
+    const m0Lines = hudCam.buildDebugHudLines(now);
+    assert.ok(
+      m0Lines[1].includes('HW:M0/020s/EE:Y/QU/RTSP:N |'),
+      'M0 must display effective 020s/EE:Y instead of leftover M2 060s/EE:N, and quality 10 must render as QU'
+    );
+    assert.equal(m0Lines[1].length, idleRows[1].length);
+    assert.equal(m0Lines[1].indexOf('| SEEN:'), idleRows[1].indexOf('| SEEN:'));
+    assert.deepEqual(hudCam.toStatusSummary(now).telemetry.hardware_settings, {
+      power_working_mode: 0,
+      recording_clip_length: 20,
+      recording_end_early: true,
+      streaming_quality: 10,
+    });
+
+    hudCam.applyTelemetryProperties(
+      {
+        powerWorkingMode: 1,
+        recordingClipLength: 20,
+        recordingEndClipMotionStops: false,
+        videoStreamingQuality: 9,
+      },
+      false
+    );
+    assert.ok(
+      hudCam.buildDebugHudLines(now)[1].includes('HW:M1/060s/EE:Y/Q9/RTSP:N |'),
+      'M1 must display effective 060s/EE:Y and Q9'
+    );
+    assert.deepEqual(hudCam.toStatusSummary(now).telemetry.hardware_settings, {
+      power_working_mode: 1,
+      recording_clip_length: 60,
+      recording_end_early: true,
+      streaming_quality: 9,
+    });
+
+    hudCam.applyTelemetryProperties(
+      {
+        powerWorkingMode: 3,
+        recordingClipLength: 60,
+        recordingEndClipMotionStops: false,
+        videoStreamingQuality: 0,
+      },
+      false
+    );
+    assert.ok(
+      hudCam.buildDebugHudLines(now)[1].includes('HW:M3/---s/EE:-/Q0/RTSP:N |'),
+      'Schedule mode (M3) must not display leftover M2 clip length or end-early flags'
+    );
+    assert.deepEqual(hudCam.toStatusSummary(now).telemetry.hardware_settings, {
+      power_working_mode: 3,
+      recording_clip_length: null,
+      recording_end_early: null,
+      streaming_quality: 0,
+    });
   });
 });

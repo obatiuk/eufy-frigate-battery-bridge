@@ -135,9 +135,11 @@ hardware property, and backfill clip directly inside Frigate Live View or record
    - `WIFI:<bars>/4 <rssi>dBm IDLE:<n>`: Wi-Fi bars, RSSI in dBm, and `IDLE:<n>` (`idleRssiChangeCount` counter so you
      can immediately see if a sleeping camera is spamming `wifiRssi` updates).
    - `TMP:<c>C`: Camera battery temperature.
-   - `HW:M<mode>/<clipLen>s/EE:<Y|N>/Q<quality>/RTSP:<Y|N>`: Eufy hardware settings (`powerWorkingMode`,
-     `recordingClipLength`, `recordingEndClipMotionStops`, `videoStreamingQuality`, and `RTSP` capability/URL status
-     `useRtsp && (rtspUrl || rtspSupported)`, seeded from `hwRecordingCfg` until camera properties arrive).
+   - `HW:M<mode>/<clipLen>s/EE:<Y|N>/Q<quality>/RTSP:<Y|N>`: Effective Eufy hardware settings (`powerWorkingMode`,
+     effective clip length and early-end flag where `M0` shows `020s/EE:Y`, `M1` shows `060s/EE:Y`, `M2` shows
+     `recordingClipLength`/`recordingEndClipMotionStops`, and `M3+` schedule modes show `---s/EE:-`,
+     `videoStreamingQuality` as `Q0`-`Q9` or `QU` for `Ultra` `10`, and `RTSP` capability/URL status
+     `useRtsp && (rtspUrl || rtspSupported)`).
    - `SEEN:<HH:MM>`: Local wall-clock `HH:MM` timestamp of the last decoded video frame or cached snapshot (`----` when
      none).
 3. **Row 3 - Active Session, Hold/Cooldown Timers, Viewers, Eufy Trigger State & Frame Queues:**

@@ -24,19 +24,20 @@ omitted) and resolves its operating mode via `resolveCameraMode(camConfig)`:
 
 - `"auto"` (default): Uses HomeBase native `RTSP` (`rtspStreamUrl`) when supported by the camera (unless `use_rtsp:
 false` is set), resolves to `"rtsp"` when explicit `rtsp_url` is configured, or uses live `P2P` otherwise, with
-  automatic HomeBase clip backfill when busy or interrupted (`hold_secs: 60`, `end_early: false`).
-- `"rtsp"`: Uses HomeBase native `RTSP` (`useRtsp: true`, `alwaysBackfill: false`, default `hold_secs: 60`,
-  `end_early: false`) auto-discovered via `eufy-security-ws` `rtspStreamUrl` when `rtsp_url` is omitted. When explicit
+  automatic HomeBase clip backfill when busy or interrupted (default `hold_secs: 30`, `end_early: true`, or mirrored
+  from Eufy hardware telemetry under `power_mode: "keep"`).
+- `"rtsp"`: Uses HomeBase native `RTSP` (`useRtsp: true`, `alwaysBackfill: false`, default `hold_secs: 30`,
+  `end_early: true`) auto-discovered via `eufy-security-ws` `rtspStreamUrl` when `rtsp_url` is omitted. When explicit
   `rtsp_url` (`rtsp://` or `rtsps://`) is configured on an `"rtsp"` or `"auto"` camera (for Eufy Baby cameras such as
   Baby Monitor E20 `T8352` / E21 `T8354` or standalone `RTSP` cameras), the bridge pulls directly from `rtsp_url` and
-  never queries `eufy-security-ws` (`backfillDownloads: false`, `sync_power: false`, `telemetry` disabled with
-  `enabled: false`, `serial` optional when `name` is set, active streams flowing continuously with all
+  never queries `eufy-security-ws` (`backfillDownloads: false`, `powerMode: null`, `streamingQuality: null`, `telemetry`
+  disabled with `enabled: false`, `serial` optional when `name` is set, active streams flowing continuously with all
   session/hold/idle/viewer timeouts bypassed, and `validateConfig()` rejecting `rtsp_url` combined with `"p2p"`,
   `"backfill"`, or `"custom"`).
-- `"p2p"`: Uses live `P2P` on events (`useRtsp: false`, `alwaysBackfill: false`, default `hold_secs: 60`,
-  `end_early: false`).
+- `"p2p"`: Uses live `P2P` on events (`useRtsp: false`, `alwaysBackfill: false`, default `hold_secs: 30`,
+  `end_early: true`).
 - `"backfill"`: Battery-saver clip replay mode for battery doorbells and high-traffic cameras (`useRtsp: true` by
-  default when supported, `alwaysBackfill: true`, default `hold_secs: 30`, `end_early: true`). **Never** wakes a live
+  default when supported, `alwaysBackfill: true`, default `hold_secs: 20`, `end_early: true`). **Never** wakes a live
   `RTSP` or `P2P` stream on Eufy motion/person/ring events or hardware `'rtsp livestream started'` / trigger-paired
   `'livestream started'` notifications regardless of camera type (`RTSP`-capable or `P2P`-only); instead, it queues a
   `BackfillJob` (displaying a **Yellow** `Waiting` / `card.busy` status indicator across all card themes and the Debug
@@ -53,14 +54,15 @@ false` is set), resolves to `"rtsp"` when explicit `rtsp_url` is configured, or 
   post-sleep guard with no active trigger/backfill (Eufy mobile app Live View, which the bridge piggybacks on as `P2P`
   without sending `device.start_livestream` and stops immediately on `'livestream stopped'`). If the camera is already
   streaming live, `/api/wake` or motion triggers extend the active hold (`status: 'extended'`).
-- `"custom"`: Advanced per-camera tuning mode enabling `backfill_only` (`alwaysBackfill: true`, inheriting `30s` hold,
-  `end_early: true`, and `backfillDownloads = true` when `backfill_only: true`) and falling back to
-  `recording_end_early` for bridge `end_early` when `end_early` is omitted, alongside per-camera overrides (`use_rtsp`,
-  `backfill_enabled`, `trigger_events`, `low_battery_threshold`, `critical_battery_threshold`,
-  `low_battery_hold_secs`, `low_battery_wake_on_view`,
-  `frigate_event_secs`, `sync_power`, `track_stuck_spotlight`, `power_working_mode`, `recording_clip_length`,
-  `recording_end_early`, `recording_retrigger_interval`, `enforce_streaming_quality`). Defensive non-contradiction rules
-  run across all modes:
+- `"custom"`: Advanced per-camera tuning mode enabling `backfill_only` (`alwaysBackfill: true`, inheriting `20s` hold,
+  `end_early: true`, and `backfillDownloads = true` when `backfill_only: true`), `power_mode: "custom"` (custom hardware
+  clip controls `recording_clip_length`, `recording_end_early`, and `recording_retrigger_interval`), and raw integer
+  `streaming_quality` (`0..10`), while falling back to `recording_end_early` for bridge `end_early` when `end_early` is
+  omitted, alongside per-camera overrides (`use_rtsp`, `backfill_enabled`, `trigger_events`, `low_battery_threshold`,
+  `critical_battery_threshold`, `low_battery_hold_secs`, `low_battery_wake_on_view`, `frigate_event_secs`, `power_mode`,
+  `track_stuck_spotlight`, `streaming_quality`). Removed legacy keys (`sync_power`, `power_working_mode`,
+  `enforce_streaming_quality`) are rejected as unknown by `validateConfig()`. Defensive non-contradiction rules run
+  across all modes:
   1. `IDLE_FPS <= LIVE_FPS`: If `idle_fps > live_fps`, logs a warning and clamps `IDLE_FPS = LIVE_FPS`.
   2. `backfill_only` & `backfill_enabled`: If `backfill_enabled: false` is set when `alwaysBackfill` is active
      (`"backfill"` or `"custom"` + `backfill_only: true`), logs a warning and keeps `backfillDownloads = true`.
@@ -70,44 +72,57 @@ false` is set), resolves to `"rtsp"` when explicit `rtsp_url` is configured, or 
      `0 < critical_battery_threshold < low_battery_threshold <= 99`: Clamps `maxMs >= holdMs`, `viewMaxMs >= lingerMs`,
      `lowBatHoldMs <= holdMs`, `lowBatThreshold` to `2..99` (default `30`), and `criticalBatThreshold` to
      `1..min(98, lowBatThreshold - 1)` (default `5`) with startup warnings.
-  4. `recording_clip_length >= hold_secs` when `!recordingEndClipMotionStops`: Raises explicit `recordingClipLength` to
-     `hold_secs` (`5..120s`) so the Eufy camera hardware does not cut off the stream before `hold_secs` expires.
-  5. `power_working_mode < 2` with custom clip overrides or conflicting `hold_secs`: Automatically promotes
-     `powerWorkingMode` to `2` (`Customize Recording`) when custom clip properties (`recording_clip_length`,
-     `recording_end_early`, `recording_retrigger_interval`) are specified or when `power_working_mode: 0`
-     (`Optimal Battery Life`, which hardcodes `20s` early-ending clips) conflicts with `hold_secs > 20` or
-     `end_early: false`; preserves `1` (`Optimal Surveillance`) or compatible `0` (`hold_secs <= 20` +
-     `end_early: true`) without sending conflicting clip properties.
+  4. `recording_clip_length >= hold_secs` when `mode: "custom"`, `power_mode: "custom"`, and
+     `!recordingEndClipMotionStops`: Raises explicit `recordingClipLength` to `hold_secs` (`5..120s`) so the Eufy camera
+     hardware does not cut off the stream before `hold_secs` expires.
+  5. Native grouped presets (`power_mode: "battery"` -> `powerWorkingMode: 0`, `power_mode: "surveillance"` ->
+     `powerWorkingMode: 1`) are never silently promoted to `2` (`Customize Recording`), even when `hold_secs` or
+     `end_early` is customized on the bridge.
   6. Ignored-option startup warnings & `null`-filtered `/api/config` (`warnIgnoredCameraModeOptions`,
      `warnIgnoredCameraCardOptions`, `warnIgnoredTopLevelOptions`, `buildConfigPayload`, `Camera.toConfigSummary`):
      Logs a `[WARN ]` message whenever any explicitly specified top-level or per-camera option is ignored (such as
-     session timeout, Eufy WS, telemetry, backfill, or Power Manager options when `rtsp_url` is set or when all cameras
-     specify `rtsp_url`, `backfill_only` outside `"custom"` mode, `use_rtsp` when overridden by `"rtsp"`/`"p2p"` mode,
-     `idle_timeout_secs` in backfill-only mode, Power Manager clip/mode options when `sync_power: false`,
-     card/telemetry options when `card_theme: "none"`, `card_position: "center"`, `card_theme: "minimal"`, or
-     `telemetry.enabled: false`, `startup_snapshot` when `sleep_screen` is `"slate"` or `"black"`, and
-     `BRIDGE_HWACCEL_DEVICE` when `BRIDGE_HWACCEL` does not use a device node), and sets those inapplicable fields to
-     `null` in `GET /api/config`.
+     session timeout, Eufy WS, telemetry, backfill, `power_mode`, or `streaming_quality` options when `rtsp_url` is set
+     or when all cameras specify `rtsp_url`, `backfill_only`, `power_mode: "custom"`, or integer `streaming_quality`
+     outside `"custom"` mode, `recording_*` clip options when `power_mode !== "custom"`, `use_rtsp` when overridden by
+     `"rtsp"`/`"p2p"` mode, `idle_timeout_secs` in backfill-only mode, card/telemetry options when `card_theme: "none"`,
+     `card_position: "center"`, `card_theme: "minimal"`, or `telemetry.enabled: false`, `startup_snapshot` when
+     `sleep_screen` is `"slate"` or `"black"`, and `BRIDGE_HWACCEL_DEVICE` when `BRIDGE_HWACCEL` does not use a device
+     node), and sets those inapplicable fields to `null` in `GET /api/config`.
 
-## Unified `hold_secs` & `end_early` Auto-Sync (`resolveCameraTimers` & `resolveHardwareRecordingConfig`)
+## Non-Invasive `power_mode`, `streaming_quality` & Telemetry Auto-Mirroring
 
-- `hold_secs` (default `60` for `auto`/`rtsp`/`p2p`/`custom`, or `30` when `alwaysBackfill` is active): Sets the bridge
-  live hold duration (`holdMs`), the Frigate event duration (`eventSecs`, clamped to `1..3600s`, unless
-  `frigate_event_secs` is explicitly set), and the Eufy hardware `recordingClipLength` (`5..120s`). While active,
-  subsequent events, mid-stream camera re-triggers, or active Eufy hardware triggers / Frigate object detections within
-  `12s` of timeout (`evaluateActiveHoldExtension`) extend the hold by `hold_secs / 2` (or a full `hold_secs` when a new
-  trigger arrives in the second half of the hold window) up to `stream_max_secs` (`900s`).
-- `end_early` (default `false` for `auto`/`rtsp`/`p2p`/`custom`, or `true` when `alwaysBackfill` is active): Sets both
-  the bridge's `letEufyDecideEnd` behavior and Eufy's hardware `recordingEndClipMotionStops` property.
-- Unless `sync_power: false` is set, the bridge automatically syncs `powerWorkingMode: 2` (`Customize Recording`),
-  `recordingClipLength`, `recordingEndClipMotionStops`, and `recordingRetriggerInterval: 5` to each camera via
-  `device.set_property` on initial telemetry load whenever the hardware value differs. Independently, unless
-  `enforce_streaming_quality: false` is set, non-doorbell `P2P` `videoStreamingQuality` (`0` `Auto` or `> 7`
-  `High`/`4K`) is clamped to `7` (`Medium`, or an explicit `1..10` integer override; `1..6` are left untouched).
+- `power_mode` (global and per-camera: `"keep"` default, `"battery"`, `"surveillance"`, or `"custom"` in
+  `mode: "custom"`):
+  - `"keep"` (default): Sends **zero** Power Manager `device.set_property` writes so Eufy app schedules and battery
+    modes stay untouched. When `hold_secs` / `end_early` (or `frigate_event_secs`) are omitted in `config.yaml`,
+    `Camera` mirrors the camera's reported telemetry (`powerWorkingMode === 0 -> 20s, end_early: true`;
+    `1 -> 60s, end_early: true`; `2 -> recordingClipLength` clamped `5..120s` and `recordingEndClipMotionStops`, falling
+    back to `30s` live / `20s` backfill and `end_early: true` before telemetry arrives or on schedule/geofence modes
+    `>= 3`). Explicit `hold_secs` or `end_early` in `config.yaml` always wins.
+  - `"battery"` (`powerWorkingMode: 0`, default `hold_secs: 20`, `end_early: true`) and `"surveillance"`
+    (`powerWorkingMode: 1`, default `hold_secs: 60`, `end_early: true`): Sync only `powerWorkingMode` without touching
+    custom clip properties.
+  - `"custom"` (only in `mode: "custom"`): Syncs `powerWorkingMode: 2` (`Customize Recording`), `recordingClipLength`
+    (defaulting to clamped `hold_secs`), `recordingEndClipMotionStops` (defaulting to `end_early`), and
+    `recordingRetriggerInterval` (default `5`).
+- `streaming_quality` (global and per-camera: `"keep"` default, `"auto"`, `"low"`, `"medium"`, `"high"`, `"ultra"`, or
+  integer `0..10` in `mode: "custom"`): `"keep"` sends **zero** `videoStreamingQuality` writes. Opted-in named tiers
+  query `device.get_properties_metadata` once per camera (`videoStreamingQuality.states`) to map both Eufy hardware
+  scales (`0..3` on doorbells/2K cameras vs `0/5/7/10` on 4K S3 cameras, with `"ultra"`/`"high"` falling back to the
+  highest available state when no exact label exists).
+- `hold_secs` (default `30` in live modes, `20` when `alwaysBackfill` or `power_mode: "battery"` is active, `60` under
+  `power_mode: "surveillance"`) and `end_early` (default `true` across all modes): Govern live hold windows (`holdMs`),
+  Frigate event durations (`eventSecs`, unless `frigate_event_secs` is set), and clean post-motion termination while
+  allowing active Eufy triggers, Frigate object detections, and connected waking viewers to re-wake `RTSP` across clip
+  boundaries (`AT-11`, `AT-12`).
 - `track_stuck_spotlight` (experimental, default `false` globally and per-camera): Controls whether the `500ms`
   housekeeping watchdog and idle `wifiRssi` recovery turn off a camera spotlight (`light: false`) left on past `130s`
   while `IDLE` with no active triggers or pending `BackfillJob`. Disabled by default while the detection heuristic is
   refined.
+- `trigger_events` (global and per-camera): Filters incoming Eufy trigger events locally without writing any camera
+  `motionDetection*` properties; `Telemetry` inspects reported Eufy Motion Detection toggles read-only and logs a
+  deduplicated `WARN` when `motionDetection` is `false` or active `trigger_events` categories are disabled in the Eufy
+  app (`AT-10`).
 
 ## Session Timers, Low-Battery Saver, Frame Rates & Snapshot Options
 

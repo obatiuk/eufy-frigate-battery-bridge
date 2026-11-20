@@ -9,7 +9,15 @@
  */
 'use strict';
 
-const {LIVE_FPS, IDLE_FPS, STREAM_MODES} = require('../../config');
+const {
+  LIVE_FPS,
+  IDLE_FPS,
+  STREAM_MODES,
+  POWER_WORKING_MODES,
+  OPTIMAL_BATTERY_MAX_CLIP_SECS,
+  SURVEILLANCE_HOLD_SECS,
+  MAX_STREAMING_QUALITY,
+} = require('../../config');
 const {WIFI_SIGNAL_LEVELS} = require('../telemetry');
 const {BACKFILL_STATES, BACKFILL_MAX_QUERY_ATTEMPTS} = require('../backfill-job');
 const {SESSION_STATES, FRIGATE_EVENT_STATES, DECODER_STATES} = require('./states');
@@ -84,6 +92,9 @@ const HUD_SERVICE_DOWN_LABEL = 'DN';
 const HUD_EMPTY_DURATION_4 = '--- ';
 const HUD_EMPTY_SEEN_4 = '----';
 const HUD_EMPTY_EVENT_ID_6 = '------';
+const HUD_UNKNOWN_CHAR = '-';
+const HUD_UNKNOWN_CLIP_SECS = '---s';
+const HUD_QUALITY_ULTRA_LABEL = 'U';
 
 /**
  * Pads or truncates a value to an exact fixed character width so diagnostic HUD columns never shift.
@@ -307,17 +318,64 @@ function formatTemperature(temp) {
 }
 
 /**
+ * Returns true when a snapshot hardware value is neither null nor undefined.
+ *
+ * @param {*} value - Candidate hardware reading.
+ * @returns {boolean}
+ */
+function isKnownHwValue(value) {
+  return value !== null ? value !== undefined : false;
+}
+
+/**
+ * Formats the single-character quality slot (`0`..`9`, `U` for Ultra `10+`, or `-` when unknown).
+ *
+ * @param {*} hwQuality - Reported Eufy `videoStreamingQuality` value.
+ * @returns {string}
+ */
+function formatHudQuality(hwQuality) {
+  if (!isKnownHwValue(hwQuality)) {
+    return HUD_UNKNOWN_CHAR;
+  }
+  return Math.round(Number(hwQuality)) >= MAX_STREAMING_QUALITY
+    ? HUD_QUALITY_ULTRA_LABEL
+    : formatZeroPaddedInt(Number(hwQuality), HUD_SINGLE_DIGIT_WIDTH);
+}
+
+/**
+ * Resolves effective clip-length and early-end tokens for the HUD `HW:` column so preset modes
+ * (`M0` -> `020s/EE:Y`, `M1` -> `060s/EE:Y`, `M3+` -> `---s/EE:-`) never display leftover `M2` values.
+ *
+ * @param {Readonly<DebugHudSnapshot>} snap - HUD snapshot.
+ * @returns {{ clipLength: string, endEarly: string }}
+ */
+function resolveHudClipAndEndEarly(snap) {
+  if (snap.hwPowerMode === POWER_WORKING_MODES.BATTERY_SAVER) {
+    return {clipLength: formatHudDuration(OPTIMAL_BATTERY_MAX_CLIP_SECS), endEarly: HUD_FLAG_YES};
+  }
+  if (snap.hwPowerMode === POWER_WORKING_MODES.SURVEILLANCE) {
+    return {clipLength: formatHudDuration(SURVEILLANCE_HOLD_SECS), endEarly: HUD_FLAG_YES};
+  }
+  if (isKnownHwValue(snap.hwPowerMode) && Number(snap.hwPowerMode) > POWER_WORKING_MODES.CUSTOMIZE_RECORDING) {
+    return {clipLength: HUD_UNKNOWN_CLIP_SECS, endEarly: HUD_UNKNOWN_CHAR};
+  }
+  const clipLength = isKnownHwValue(snap.hwClipLength) ? formatHudDuration(snap.hwClipLength) : HUD_UNKNOWN_CLIP_SECS;
+  const endEarly = !isKnownHwValue(snap.hwEndEarly) ? HUD_UNKNOWN_CHAR : snap.hwEndEarly ? HUD_FLAG_YES : HUD_FLAG_NO;
+  return {clipLength, endEarly};
+}
+
+/**
  * Formats the hardware recording settings summary (power mode, clip length, end-early, quality, RTSP flag).
  *
  * @param {Readonly<DebugHudSnapshot>} snap - HUD snapshot.
  * @returns {string}
  */
 function formatHardwareSummary(snap) {
-  const isKnown = (value) => value !== null && value !== undefined;
-  const powerMode = isKnown(snap.hwPowerMode) ? String(snap.hwPowerMode).slice(0, HUD_SINGLE_DIGIT_WIDTH) : '-';
-  const clipLength = isKnown(snap.hwClipLength) ? formatHudDuration(snap.hwClipLength) : '---s';
-  const endEarly = !isKnown(snap.hwEndEarly) ? '-' : snap.hwEndEarly ? HUD_FLAG_YES : HUD_FLAG_NO;
-  const quality = isKnown(snap.hwQuality) ? formatZeroPaddedInt(snap.hwQuality, HUD_SINGLE_DIGIT_WIDTH) : '-';
+  const powerMode = isKnownHwValue(snap.hwPowerMode)
+    ? String(snap.hwPowerMode).slice(0, HUD_SINGLE_DIGIT_WIDTH)
+    : HUD_UNKNOWN_CHAR;
+  const {clipLength, endEarly} = resolveHudClipAndEndEarly(snap);
+  const quality = formatHudQuality(snap.hwQuality);
   const rtspFlag = snap.rtspEnabled ? HUD_FLAG_YES : HUD_FLAG_NO;
   return 'M' + powerMode + '/' + clipLength + '/EE:' + endEarly + '/Q' + quality + '/RTSP:' + rtspFlag;
 }

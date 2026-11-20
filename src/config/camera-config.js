@@ -128,6 +128,10 @@ class CameraConfig {
     this.startupSnapshot = props.startupSnapshot ?? true;
     this.timers = props.timers || null;
     this.triggers = props.triggers || null;
+    /** @type {boolean} */
+    this.hasExplicitTriggers = Boolean(props.hasExplicitTriggers);
+    /** @type {ReadonlySet<string>|null} */
+    this.rawTriggers = props.rawTriggers instanceof Set ? props.rawTriggers : null;
     this.cardConfig = props.cardConfig || null;
     this.telemetryConfig = props.telemetryConfig || null;
     this.hwRecordingConfig = props.hwRecordingConfig || null;

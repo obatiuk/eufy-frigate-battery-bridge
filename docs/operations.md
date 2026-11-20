@@ -129,7 +129,7 @@ podman exec eufy-frigate-battery-bridge node -e '
       const p = m.result.properties;
       console.log(
         unwrap(p.name) + " (" + unwrap(p.serialNumber) + "): " +
-          "powerMode=" + unwrap(p.powerWorkingMode) + " (0=Battery, 1=Surveillance, 2=Custom)" +
+          "powerMode=" + unwrap(p.powerWorkingMode) + " (0=Battery, 1=Surveillance, 2=Custom, 3=Schedule)" +
           ", clipLen=" + unwrap(p.recordingClipLength) + "s" +
           ", endEarly=" + unwrap(p.recordingEndClipMotionStops) +
           ", retrigger=" + unwrap(p.recordingRetriggerInterval) + "s" +

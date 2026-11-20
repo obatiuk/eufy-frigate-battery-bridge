@@ -81,11 +81,16 @@ describe('Regression 13. Two-Pipe Backfill Audio/Video EOF Deadlock & `RTSP` Re-
       );
       const termP2p = garageCam.terminateSession(tView + 16000, 'viewer closed', false, 'eufy/camera');
       assert.equal(termP2p.hadUnexpectedRtsp, false);
+      const mediumCam = new Camera({
+        serial: 'T8161T5555555555',
+        name: 'garage_medium',
+        mode: 'p2p',
+        streaming_quality: 'medium',
+      });
       assert.deepEqual(
-        garageCam.evaluateQualityChange({videoStreamingQuality: {value: 10}}),
+        mediumCam.evaluateQualityChange({videoStreamingQuality: {value: 10}}),
         {shouldUpdate: true, currentQuality: 10, targetQuality: 7},
-        'evaluateQualityChange must clamp High/Ultra/4K (>7) streaming quality down to Medium (7) ' +
-          'to prevent 4K bandwidth stalls over weak Wi-Fi'
+        'evaluateQualityChange resolves streaming_quality="medium" to 7 to prevent 4K bandwidth stalls over weak Wi-Fi'
       );
 
       // 11. Back-to-back backfill during DRAINING_BACKFILL_TAIL: needsLatestInfoBackfillQuery
@@ -240,7 +245,15 @@ describe('Regression 13. Two-Pipe Backfill Audio/Video EOF Deadlock & `RTSP` Re-
         }
         origSend(raw, cb);
       };
-      const modeSwitchCam = new Camera({serial: 'T8161T3333333333', name: 'garage', mode: 'backfill'});
+      const modeSwitchCam = new Camera({
+        serial: 'T8161T3333333333',
+        name: 'garage',
+        mode: 'custom',
+        backfill_only: true,
+        power_mode: 'custom',
+        hold_secs: 30,
+        recording_end_early: true,
+      });
       applyDeviceProperties(
         modeSwitchCam,
         {

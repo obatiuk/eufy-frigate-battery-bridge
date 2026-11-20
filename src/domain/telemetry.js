@@ -10,7 +10,21 @@
  */
 'use strict';
 
-const {CARD_THEMES, resolveCameraTimers, resolveTelemetryConfig, resolveHardwareRecordingConfig} = require('../config');
+const {
+  CARD_THEMES,
+  POWER_WORKING_MODES,
+  POWER_MODES,
+  STREAMING_QUALITIES,
+  OPTIMAL_BATTERY_MAX_CLIP_SECS,
+  SURVEILLANCE_HOLD_SECS,
+  MIN_RECORDING_CLIP_SECS,
+  MAX_RECORDING_CLIP_SECS,
+  clampNum,
+  resolveCameraTimers,
+  resolveCameraTriggers,
+  resolveTelemetryConfig,
+  resolveHardwareRecordingConfig,
+} = require('../config');
 const {
   STATUS_KINDS,
   POWER_LABELS,
@@ -42,11 +56,122 @@ const EUFY_DEVICE_STATES = Object.freeze({
 });
 
 const BATTERY_SWAP_DELTA_PCT = 10;
-const AUTO_STREAMING_QUALITY = 0;
-const MEDIUM_STREAMING_QUALITY = 7;
+const FALLBACK_QUALITY_AUTO = 0;
+const FALLBACK_QUALITY_LOW = 5;
+const FALLBACK_QUALITY_MEDIUM = 7;
+const FALLBACK_QUALITY_HIGH = 9;
+const FALLBACK_QUALITY_ULTRA = 10;
 const LOW_BAT_VIEWER_REFRESH_COOLDOWN_MS = 300000;
 const OFFLINE_STANDBY_MIN_BATTERY_PCT = 5;
 const OFFLINE_DEAD_LINK_RSSI_DBM = -95;
+const SCHEDULED_POWER_WORKING_MODE = 3;
+const POWER_WORKING_MODE_PROP = 'powerWorkingMode';
+const RECORDING_CLIP_LENGTH_PROP = 'recordingClipLength';
+const RECORDING_END_EARLY_PROP = 'recordingEndClipMotionStops';
+const VIDEO_STREAMING_QUALITY_PROP = 'videoStreamingQuality';
+const PROP_KV_SEPARATOR = '=';
+const SUMMARY_ITEM_SEPARATOR = ', ';
+const LABEL_PREFIX = ' ("';
+const LABEL_SUFFIX = '")';
+const PAREN_FALSE_PREFIX = ' (';
+const PAREN_FALSE_SUFFIX = '=false)';
+const QUOTE_CHAR = '"';
+const WARN_SIG_SEP = '|';
+
+const MOTION_DETECTION_PROPS = Object.freeze({
+  ENABLED: 'motionDetection',
+  HUMAN: 'motionDetectionTypeHuman',
+  FACE: 'motionDetectionTypeHumanRecognition',
+  VEHICLE: 'motionDetectionTypeVehicle',
+  PET: 'motionDetectionTypePet',
+  DOG: 'motionDetectionTypeDog',
+  PET_STANDALONE: 'petDetection',
+  ALL_OTHER: 'motionDetectionTypeAllOtherMotions',
+  OTHER_LEGACY: 'motionDetectionTypeOtherMotions',
+  LOITERING: 'loiteringDetection',
+  SOUND: 'soundDetection',
+  CRYING: 'cryingDetection',
+});
+
+const DETECTION_CATEGORIES = Object.freeze({
+  MOTION: 'motion',
+  PERSON: 'person',
+  HUMAN: 'human',
+  FACE: 'face',
+  IDENTITY_PERSON: 'identity person',
+  LOITERING: 'loitering',
+  VEHICLE: 'vehicle',
+  PET: 'pet',
+  DOG: 'dog',
+  SOUND: 'sound',
+  CRYING: 'crying',
+  NONE: 'none',
+});
+
+const DETECTION_WARN_KINDS = Object.freeze({
+  MASTER_OFF: 'master_off',
+  DISABLED_TYPES: 'disabled_types',
+});
+
+const TRIGGER_NAMES = Object.freeze({
+  MOTION: 'motion detected',
+  RADAR: 'radar motion detected',
+  PERSON: 'person detected',
+  STRANGER: 'stranger person detected',
+  IDENTITY_PERSON: 'identity person detected',
+  IDENTITY_SHORT: 'identity person',
+  LOITERING: 'someone loitering',
+  LOITERING_SHORT: 'loitering',
+  VEHICLE: 'vehicle detected',
+  PET: 'pet detected',
+  DOG: 'dog detected',
+  DOG_LICK: 'dog lick detected',
+  DOG_POOP: 'dog poop detected',
+  SOUND: 'sound detected',
+  CRYING: 'crying detected',
+});
+
+const NON_MOTION_ONLY_TRIGGERS = new Set([
+  'ring',
+  'rings',
+  'ringing',
+  TRIGGER_NAMES.SOUND,
+  DETECTION_CATEGORIES.SOUND,
+  TRIGGER_NAMES.CRYING,
+  DETECTION_CATEGORIES.CRYING,
+]);
+
+const WARN_SIG_PREFIXES = Object.freeze({
+  MASTER: 'master:',
+  EXPLICIT: 'explicit:',
+  DEFAULT: 'default:',
+});
+
+/** @type {Readonly<Record<number, string>>} */
+const POWER_WORKING_MODE_LABELS = Object.freeze({
+  [POWER_WORKING_MODES.BATTERY_SAVER]: 'Optimal Battery Life',
+  [POWER_WORKING_MODES.SURVEILLANCE]: 'Optimal Surveillance',
+  [POWER_WORKING_MODES.CUSTOMIZE_RECORDING]: 'Customize Recording',
+  [SCHEDULED_POWER_WORKING_MODE]: 'Schedule',
+});
+
+/** @type {Readonly<Record<string, number>>} */
+const DEFAULT_QUALITY_TIER_CODES = Object.freeze({
+  [STREAMING_QUALITIES.AUTO]: FALLBACK_QUALITY_AUTO,
+  [STREAMING_QUALITIES.LOW]: FALLBACK_QUALITY_LOW,
+  [STREAMING_QUALITIES.MEDIUM]: FALLBACK_QUALITY_MEDIUM,
+  [STREAMING_QUALITIES.HIGH]: FALLBACK_QUALITY_HIGH,
+  [STREAMING_QUALITIES.ULTRA]: FALLBACK_QUALITY_ULTRA,
+});
+
+/** @type {Readonly<Record<string, RegExp>>} */
+const QUALITY_TIER_PATTERNS = Object.freeze({
+  [STREAMING_QUALITIES.AUTO]: /\bauto\b/i,
+  [STREAMING_QUALITIES.LOW]: /\b(?:low|sd|standard|basic)\b/i,
+  [STREAMING_QUALITIES.MEDIUM]: /\b(?:medium|med|720p?)\b/i,
+  [STREAMING_QUALITIES.HIGH]: /\b(?:high|1080p?|2k|full\s*hd|fhd)\b/i,
+  [STREAMING_QUALITIES.ULTRA]: /\b(?:ultra|4k|max|uhd)\b/i,
+});
 
 /** @type {ReadonlyArray<{ name: string, coerce: (v: *) => number|boolean }>} */
 const RECORDING_MODE_PROPERTIES = Object.freeze([
@@ -56,7 +181,89 @@ const RECORDING_MODE_PROPERTIES = Object.freeze([
   {name: 'recordingRetriggerInterval', coerce: Number},
 ]);
 
-const DOORBELL_T8214_SERIAL_REGEX = /^T8214/i;
+/**
+ * Returns true when `name` is present on `props` with a defined unwrapped value.
+ *
+ * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+ * @param {string} name - Property name.
+ * @returns {boolean}
+ */
+function hasPresentProperty(props, name) {
+  return name in props ? unwrapProperty(props[name]) !== undefined : false;
+}
+
+/**
+ * Formats a Eufy Power Manager `name=value` pair, appending the human mode label on `powerWorkingMode`.
+ *
+ * @param {string} name - Eufy property name.
+ * @param {*} value - Unwrapped property value.
+ * @returns {string}
+ */
+function formatRecordingPropertyPair(name, value) {
+  const base = name + PROP_KV_SEPARATOR + value;
+  if (name !== POWER_WORKING_MODE_PROP) {
+    return base;
+  }
+  const label = POWER_WORKING_MODE_LABELS[Number(value)];
+  return label ? base + LABEL_PREFIX + label + LABEL_SUFFIX : base;
+}
+
+/**
+ * Formats a `videoStreamingQuality=<code>` pair, appending the device metadata state label when known.
+ *
+ * @param {number|null} code - Numeric Eufy streaming quality code.
+ * @param {Readonly<Record<string, *>>|null} states - Loaded metadata `states` dictionary, if any.
+ * @returns {string}
+ */
+function formatStreamingQualityPair(code, states) {
+  const base = VIDEO_STREAMING_QUALITY_PROP + PROP_KV_SEPARATOR + code;
+  const rawLabel = states && typeof states === 'object' ? states[String(code)] : null;
+  const label = typeof rawLabel === 'string' ? rawLabel.trim() : '';
+  return label ? base + LABEL_PREFIX + label + LABEL_SUFFIX : base;
+}
+
+/**
+ * Resolves a named `streaming_quality` tier against Eufy's `videoStreamingQuality.states` map,
+ * falling back to the highest numeric state when `"ultra"` or `"high"` has no exact label match on
+ * lower-resolution hardware, or `DEFAULT_QUALITY_TIER_CODES` when no states map is loaded.
+ *
+ * @param {string} tier - Named streaming_quality tier ('auto', 'low', 'medium', 'high', 'ultra').
+ * @param {Readonly<Record<string, *>>|null} states - Metadata states map from eufy-security-ws, if loaded.
+ * @returns {number|null}
+ */
+function resolveQualityCodeFromStates(tier, states) {
+  const fallback = tier in DEFAULT_QUALITY_TIER_CODES ? DEFAULT_QUALITY_TIER_CODES[tier] : null;
+  if (!states || typeof states !== 'object') {
+    return fallback;
+  }
+  const entries = [];
+  for (const [rawCode, rawLabel] of Object.entries(states)) {
+    const code = Number(rawCode);
+    if (Number.isInteger(code) && typeof rawLabel === 'string') {
+      entries.push({code, label: rawLabel.trim()});
+    }
+  }
+  if (entries.length === 0) {
+    return fallback;
+  }
+  const pattern = QUALITY_TIER_PATTERNS[tier];
+  if (pattern) {
+    const matched = entries.find((entry) => pattern.test(entry.label));
+    if (matched) {
+      return matched.code;
+    }
+  }
+  if (tier === STREAMING_QUALITIES.ULTRA || tier === STREAMING_QUALITIES.HIGH) {
+    let maxCode = entries[0].code;
+    for (const entry of entries) {
+      if (entry.code > maxCode) {
+        maxCode = entry.code;
+      }
+    }
+    return maxCode;
+  }
+  return fallback;
+}
 
 /**
  * Unwraps a property value returned by eufy-security-ws, handling both direct values
@@ -118,6 +325,64 @@ function parseTrimmedString(raw) {
 }
 
 /**
+ * Returns a boolean when `raw` is strictly boolean, or `null` when absent/non-boolean.
+ *
+ * @param {*} raw - Unwrapped Eufy property value.
+ * @returns {boolean|null}
+ */
+function parseOptionalBoolean(raw) {
+  return typeof raw === 'boolean' ? raw : null;
+}
+
+/**
+ * Formats `<category> (<propName>=false)` for Eufy Motion Detection mismatch warnings.
+ *
+ * @param {string} category - Bridge trigger category label.
+ * @param {string} propName - Eufy property name that reported `false`.
+ * @returns {string}
+ */
+function formatDisabledDetectionEntry(category, propName) {
+  return category + PAREN_FALSE_PREFIX + propName + PAREN_FALSE_SUFFIX;
+}
+
+/**
+ * Parses read-only Eufy Motion Detection configuration booleans from a raw property dictionary.
+ *
+ * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+ * @returns {Readonly<{
+ *   enabled: boolean|null,
+ *   human: boolean|null,
+ *   face: boolean|null,
+ *   vehicle: boolean|null,
+ *   pet: boolean|null,
+ *   dog: boolean|null,
+ *   petStandalone: boolean|null,
+ *   allOther: boolean|null,
+ *   loitering: boolean|null,
+ *   sound: boolean|null,
+ *   crying: boolean|null
+ * }>}
+ */
+function parseMotionDetectionConfig(props) {
+  const allOther = unwrapProperty(
+    props[MOTION_DETECTION_PROPS.ALL_OTHER] ?? props[MOTION_DETECTION_PROPS.OTHER_LEGACY]
+  );
+  return Object.freeze({
+    enabled: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.ENABLED])),
+    human: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.HUMAN])),
+    face: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.FACE])),
+    vehicle: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.VEHICLE])),
+    pet: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.PET])),
+    dog: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.DOG])),
+    petStandalone: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.PET_STANDALONE])),
+    allOther: parseOptionalBoolean(allOther),
+    loitering: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.LOITERING])),
+    sound: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.SOUND])),
+    crying: parseOptionalBoolean(unwrapProperty(props[MOTION_DETECTION_PROPS.CRYING])),
+  });
+}
+
+/**
  * Normalizes a raw Eufy device property bag into a frozen structure of unwrapped sensor,
  * hardware-setting, and identity values.
  *
@@ -142,7 +407,8 @@ function parseTrimmedString(raw) {
  *   hwPowerMode: number|null,
  *   hwClipLength: number|null,
  *   hwEndEarly: boolean|null,
- *   hwQuality: number|null
+ *   hwQuality: number|null,
+ *   hwDetection: ReturnType<typeof parseMotionDetectionConfig>
  * }>}
  */
 function parseTelemetryProperties(props = {}) {
@@ -179,6 +445,7 @@ function parseTelemetryProperties(props = {}) {
     hwClipLength: parseValidNumber(unwrapProperty(props.recordingClipLength)),
     hwEndEarly: typeof hwEndEarly === 'boolean' ? hwEndEarly : null,
     hwQuality: parseValidNumber(hwQual),
+    hwDetection: parseMotionDetectionConfig(props),
   });
 }
 
@@ -297,6 +564,9 @@ class Telemetry {
     this.lastSeen = initialLastSeen;
     this.lastLowBatRefreshAt = 0;
     this.qualityChecked = false;
+    /** @type {Readonly<Record<string, *>>|null} */
+    this.qualityStates = null;
+    this.qualityStatesLoaded = false;
     this.recordingModeChecked = false;
     this.lightOn = false;
     this.lightOnAt = 0;
@@ -310,6 +580,43 @@ class Telemetry {
     this.hwEndEarly = this.hwRecordingCfg.recordingEndClipMotionStops;
     /** @type {number|null} */
     this.hwQuality = null;
+    /** @type {Set<string>} */
+    this.triggers =
+      rawCamCfg && rawCamCfg.triggers instanceof Set ? rawCamCfg.triggers : resolveCameraTriggers(rawCamCfg);
+    this.hasExplicitTriggers = Boolean(
+      (rawCamCfg && rawCamCfg.hasExplicitTriggers) ||
+      (rawCamCfg && Array.isArray(rawCamCfg.trigger_events) && rawCamCfg.trigger_events.length > 0)
+    );
+    /** @type {ReadonlySet<string>} */
+    this.rawTriggers =
+      rawCamCfg && rawCamCfg.rawTriggers instanceof Set
+        ? rawCamCfg.rawTriggers
+        : Array.isArray(rawCamCfg.trigger_events)
+          ? new Set(rawCamCfg.trigger_events.map((t) => String(t).toLowerCase().trim()))
+          : new Set();
+    /** @type {boolean|null} */
+    this.hwMotionEnabled = null;
+    /** @type {boolean|null} */
+    this.hwMotionHuman = null;
+    /** @type {boolean|null} */
+    this.hwMotionFace = null;
+    /** @type {boolean|null} */
+    this.hwMotionVehicle = null;
+    /** @type {boolean|null} */
+    this.hwMotionPet = null;
+    /** @type {boolean|null} */
+    this.hwMotionDog = null;
+    /** @type {boolean|null} */
+    this.hwPetStandalone = null;
+    /** @type {boolean|null} */
+    this.hwMotionAllOther = null;
+    /** @type {boolean|null} */
+    this.hwLoitering = null;
+    /** @type {boolean|null} */
+    this.hwSound = null;
+    /** @type {boolean|null} */
+    this.hwCrying = null;
+    this.lastDetectionWarnSignature = '';
   }
 
   /**
@@ -357,6 +664,31 @@ class Telemetry {
    */
   markRecordingModeChecked() {
     this.recordingModeChecked = true;
+  }
+
+  /**
+   * Updates the cached `hwQuality` reading immediately after a `videoStreamingQuality` `set_property` succeeds.
+   *
+   * @param {number} quality - Confirmed numeric streaming quality code.
+   */
+  applyConfirmedStreamingQuality(quality) {
+    this.hwQuality = Number(quality);
+  }
+
+  /**
+   * Updates the cached Power Manager reading immediately after a `device.set_property` write succeeds.
+   *
+   * @param {string} name - Confirmed Eufy property name.
+   * @param {*} value - Confirmed target value.
+   */
+  applyConfirmedRecordingProperty(name, value) {
+    if (name === POWER_WORKING_MODE_PROP) {
+      this.hwPowerMode = Number(value);
+    } else if (name === RECORDING_CLIP_LENGTH_PROP) {
+      this.hwClipLength = Number(value);
+    } else if (name === RECORDING_END_EARLY_PROP) {
+      this.hwEndEarly = Boolean(value);
+    }
   }
 
   /**
@@ -453,6 +785,44 @@ class Telemetry {
   }
 
   /**
+   * Resolves the effective hardware clip length in seconds for `GET /api/status` so preset modes
+   * (`0 -> 20s`, `1 -> 60s`, `>= 3 -> null`) do not report leftover `Customize Recording` (`2`) values.
+   *
+   * @returns {number|null}
+   */
+  _resolveEffectiveStatusClipLength() {
+    if (this.hwPowerMode === POWER_WORKING_MODES.BATTERY_SAVER) {
+      return OPTIMAL_BATTERY_MAX_CLIP_SECS;
+    }
+    if (this.hwPowerMode === POWER_WORKING_MODES.SURVEILLANCE) {
+      return SURVEILLANCE_HOLD_SECS;
+    }
+    if (this.hwPowerMode !== null && this.hwPowerMode > POWER_WORKING_MODES.CUSTOMIZE_RECORDING) {
+      return null;
+    }
+    return this.hwClipLength;
+  }
+
+  /**
+   * Resolves the effective hardware early-end flag for `GET /api/status` so preset modes
+   * (`0 -> true`, `1 -> true`, `>= 3 -> null`) do not report leftover `Customize Recording` (`2`) values.
+   *
+   * @returns {boolean|null}
+   */
+  _resolveEffectiveStatusEndEarly() {
+    if (
+      this.hwPowerMode === POWER_WORKING_MODES.BATTERY_SAVER ||
+      this.hwPowerMode === POWER_WORKING_MODES.SURVEILLANCE
+    ) {
+      return true;
+    }
+    if (this.hwPowerMode !== null && this.hwPowerMode > POWER_WORKING_MODES.CUSTOMIZE_RECORDING) {
+      return null;
+    }
+    return this.hwEndEarly;
+  }
+
+  /**
    * Returns an immutable live sensor and hardware-settings summary for GET /api/status,
    * or null on direct rtsp_url cameras where Eufy hardware telemetry does not apply.
    *
@@ -478,10 +848,11 @@ class Telemetry {
       last_seen: this.lastSeen || null,
       hardware_settings: Object.freeze({
         power_working_mode: this.hwPowerMode,
-        recording_clip_length: this.hwClipLength,
-        recording_end_early: this.hwEndEarly,
+        recording_clip_length: this._resolveEffectiveStatusClipLength(),
+        recording_end_early: this._resolveEffectiveStatusEndEarly(),
         streaming_quality: this.hwQuality,
       }),
+      motion_detection: this._buildMotionDetectionStatusSummary(),
     });
   }
 
@@ -540,6 +911,21 @@ class Telemetry {
   }
 
   /**
+   * Returns true if `deviceState` reports an intentional user-disabled or unpaired state
+   * (`2` MANUALLY_DISABLED, `4` REMOVE_AND_READD, or `5` RESET_AND_READD) where background
+   * `driver.poll_refresh` cannot recover the camera and would only wake sibling battery cameras.
+   *
+   * @returns {boolean}
+   */
+  isManuallyDisabledOrRemovedState() {
+    return (
+      this.deviceState === EUFY_DEVICE_STATES.MANUALLY_DISABLED ||
+      this.deviceState === EUFY_DEVICE_STATES.REMOVE_AND_READD ||
+      this.deviceState === EUFY_DEVICE_STATES.RESET_AND_READD
+    );
+  }
+
+  /**
    * Returns true if the camera is currently offline/dead (reported offline by Eufy state,
    * depleted to 0% battery while unplugged, or unreachable after a wake timeout).
    *
@@ -547,6 +933,17 @@ class Telemetry {
    */
   isDeviceOffline() {
     return Boolean(this.isReportedOfflineByState() || this.isBatteryDepleted() || this.wakeTimedOutOffline);
+  }
+
+  /**
+   * Returns true if this camera is offline due to a recoverable power, link, or timeout condition
+   * (excluding `MANUALLY_DISABLED` / `REMOVE_AND_READD` / `RESET_AND_READD`) and warrants a
+   * rate-limited background `driver.poll_refresh`.
+   *
+   * @returns {boolean}
+   */
+  shouldPollRefreshWhileOffline() {
+    return this.isDeviceOffline() ? !this.isManuallyDisabledOrRemovedState() : false;
   }
 
   /**
@@ -671,41 +1068,129 @@ class Telemetry {
   }
 
   /**
-   * Evaluates whether the camera's videoStreamingQuality property needs to be updated
-   * to prevent 4K P2P stream stalls, committing qualityChecked immediately when no write
-   * is needed (or when commit !== false).
+   * Returns true when a named `streaming_quality` profile (other than `"keep"`) is configured
+   * and `videoStreamingQuality.states` metadata has not yet been queried for this camera.
+   *
+   * @returns {boolean}
+   */
+  needsQualityMetadataLookup() {
+    const q = this.hwRecordingCfg.streamingQuality;
+    return !this.qualityChecked && !this.qualityStatesLoaded && typeof q === 'string'
+      ? q !== STREAMING_QUALITIES.KEEP
+      : false;
+  }
+
+  /**
+   * Stores the camera's `videoStreamingQuality.states` metadata dictionary from `eufy-security-ws`
+   * so named quality tiers resolve against the hardware's native enum scale.
+   *
+   * @param {Record<string, *>|null|undefined} states - `states` object from `device.get_properties_metadata`.
+   */
+  setQualityMetadataStates(states) {
+    this.qualityStates = states && typeof states === 'object' ? Object.freeze({...states}) : null;
+    this.qualityStatesLoaded = true;
+  }
+
+  /**
+   * Resolves the target numeric `videoStreamingQuality` code for the configured `streaming_quality`,
+   * or returns `null` when `streaming_quality` is `"keep"` or inapplicable.
+   *
+   * @returns {number|null}
+   */
+  resolveTargetStreamingQuality() {
+    const q = this.hwRecordingCfg.streamingQuality;
+    if (q === null || q === undefined || q === STREAMING_QUALITIES.KEEP) {
+      return null;
+    }
+    if (typeof q === 'number') {
+      return q;
+    }
+    return resolveQualityCodeFromStates(q, this.qualityStates);
+  }
+
+  /**
+   * Resolves the hardware-mirrored hold duration in seconds when `power_mode === "keep"`,
+   * mapping `powerWorkingMode` `0 -> 20s`, `1 -> 60s`, and `2 -> recordingClipLength` (`5..120s`),
+   * or returning `null` before telemetry arrives, on schedule/geofence modes (`>= 3`), or when `power_mode !== "keep"`.
+   *
+   * @returns {number|null}
+   */
+  resolveMirroredHoldSecs() {
+    if (this.hwRecordingCfg.powerMode !== POWER_MODES.KEEP || this.hwPowerMode === null) {
+      return null;
+    }
+    if (this.hwPowerMode === POWER_WORKING_MODES.BATTERY_SAVER) {
+      return OPTIMAL_BATTERY_MAX_CLIP_SECS;
+    }
+    if (this.hwPowerMode === POWER_WORKING_MODES.SURVEILLANCE) {
+      return SURVEILLANCE_HOLD_SECS;
+    }
+    if (this.hwPowerMode === POWER_WORKING_MODES.CUSTOMIZE_RECORDING && this.hwClipLength !== null) {
+      return clampNum(
+        this.hwClipLength,
+        MIN_RECORDING_CLIP_SECS,
+        MAX_RECORDING_CLIP_SECS,
+        OPTIMAL_BATTERY_MAX_CLIP_SECS
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Resolves the hardware-mirrored `end_early` boolean when `power_mode === "keep"`,
+   * mapping `powerWorkingMode` `0 -> true`, `1 -> true`, and `2 -> hwEndEarly` (if boolean),
+   * or returning `null` otherwise.
+   *
+   * @returns {boolean|null}
+   */
+  resolveMirroredEndEarly() {
+    if (this.hwRecordingCfg.powerMode !== POWER_MODES.KEEP || this.hwPowerMode === null) {
+      return null;
+    }
+    if (
+      this.hwPowerMode === POWER_WORKING_MODES.BATTERY_SAVER ||
+      this.hwPowerMode === POWER_WORKING_MODES.SURVEILLANCE
+    ) {
+      return true;
+    }
+    if (this.hwPowerMode === POWER_WORKING_MODES.CUSTOMIZE_RECORDING && typeof this.hwEndEarly === 'boolean') {
+      return this.hwEndEarly;
+    }
+    return null;
+  }
+
+  /**
+   * Returns true when `hwRecordingCfg` specifies a non-null target value for `name`.
+   *
+   * @param {string} name - Recording property key.
+   * @returns {boolean}
+   */
+  _hasConfiguredRecordingTarget(name) {
+    const val = this.hwRecordingCfg[name];
+    return val !== null ? val !== undefined : false;
+  }
+
+  /**
+   * Evaluates whether the camera's `videoStreamingQuality` property needs to be updated when an
+   * explicit `streaming_quality` profile or integer is configured (`"keep"` never writes), committing
+   * `qualityChecked` immediately when no write is needed (or when `commit !== false`).
    *
    * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
-   * @param {string|{serial?: string, commit?: boolean}} [serialOrOpts=this.serial] - Serial or evaluation options.
-   * @returns {{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }}
+   * @param {string|{serial?: string, commit?: boolean}} [serialOrOpts={}] - Serial or evaluation options.
+   * @returns {Readonly<{ shouldUpdate: boolean, currentQuality: number, targetQuality: number|null }>}
    */
-  evaluateQualityChange(props, serialOrOpts = this.serial) {
+  evaluateQualityChange(props, serialOrOpts = {}) {
     const isOpts = serialOrOpts !== null && typeof serialOrOpts === 'object';
-    const serial =
-      isOpts && typeof serialOrOpts.serial === 'string'
-        ? serialOrOpts.serial
-        : typeof serialOrOpts === 'string'
-          ? serialOrOpts
-          : this.serial;
     const commit = !isOpts || serialOrOpts.commit !== false;
-    const enforceQuality = this.hwRecordingCfg.enforceQuality;
-    if (!enforceQuality || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
-      return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY});
+    const targetQuality = this.resolveTargetStreamingQuality();
+    if (targetQuality === null || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
+      return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality});
     }
     const currentQuality = Number(unwrapProperty(props.videoStreamingQuality));
     if (Number.isNaN(currentQuality)) {
-      return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY});
+      return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality});
     }
-    const isDoorbellT8214 = DOORBELL_T8214_SERIAL_REGEX.test(serial || '');
-    if (enforceQuality === true && isDoorbellT8214) {
-      this.qualityChecked = true;
-      return Object.freeze({shouldUpdate: false, currentQuality, targetQuality: MEDIUM_STREAMING_QUALITY});
-    }
-    const targetQuality = typeof enforceQuality === 'number' ? enforceQuality : MEDIUM_STREAMING_QUALITY;
-    const shouldUpdate =
-      typeof enforceQuality === 'number'
-        ? currentQuality !== targetQuality
-        : currentQuality === AUTO_STREAMING_QUALITY || currentQuality > MEDIUM_STREAMING_QUALITY;
+    const shouldUpdate = currentQuality !== targetQuality;
     if (!shouldUpdate || commit) {
       this.qualityChecked = true;
     }
@@ -713,9 +1198,9 @@ class Telemetry {
   }
 
   /**
-   * Evaluates whether any configured Eufy hardware Power Manager properties (powerWorkingMode,
-   * recordingClipLength, recordingEndClipMotionStops, recordingRetriggerInterval) need to be
-   * synced to the camera via device.set_property once all 4 recording keys are present.
+   * Evaluates whether any opted-in Eufy hardware Power Manager properties (`powerWorkingMode` for
+   * `"battery"`/`"surveillance"`, or all 4 recording keys for `"custom"`) need to be synced to the camera
+   * via `device.set_property` once every required target key is present in `props`.
    *
    * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
    * @param {{commit?: boolean}} [opts={}] - Evaluation options.
@@ -725,27 +1210,74 @@ class Telemetry {
     if (this.recordingModeChecked || !props || typeof props !== 'object') {
       return Object.freeze([]);
     }
-    const hasFullRecordingSet = RECORDING_MODE_PROPERTIES.every(
-      (spec) => spec.name in props && unwrapProperty(props[spec.name]) !== undefined
-    );
-    if (!hasFullRecordingSet) {
+    const activeSpecs = RECORDING_MODE_PROPERTIES.filter((spec) => this._hasConfiguredRecordingTarget(spec.name));
+    if (activeSpecs.length === 0) {
+      return Object.freeze([]);
+    }
+    const hasRequiredKeys = activeSpecs.every((spec) => hasPresentProperty(props, spec.name));
+    if (!hasRequiredKeys) {
       return Object.freeze([]);
     }
     const commit = !opts || opts.commit !== false;
     const updates = [];
-    for (const {name, coerce} of RECORDING_MODE_PROPERTIES) {
+    for (const {name, coerce} of activeSpecs) {
       const targetValue = this.hwRecordingCfg[name];
-      if (targetValue !== null && targetValue !== undefined) {
-        const cur = unwrapProperty(props[name]);
-        if (coerce(cur) !== targetValue) {
-          updates.push(Object.freeze({name, currentValue: cur, targetValue}));
-        }
+      const cur = unwrapProperty(props[name]);
+      if (coerce(cur) !== targetValue) {
+        updates.push(Object.freeze({name, currentValue: cur, targetValue}));
       }
     }
     if (updates.length === 0 || commit) {
       this.recordingModeChecked = true;
     }
     return Object.freeze(updates);
+  }
+
+  /**
+   * Builds a structured summary of existing Eufy Power Manager settings vs target overrides for `WARN` logging.
+   *
+   * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+   * @param {ReadonlyArray<{ name: string, currentValue: *, targetValue: * }>} updates - Pending property updates.
+   * @returns {Readonly<{ powerMode: string, existingSummary: string, targetSummary: string }>}
+   */
+  describeRecordingOverride(props, updates) {
+    const existingItems = [];
+    if (props && typeof props === 'object') {
+      for (const {name} of RECORDING_MODE_PROPERTIES) {
+        if (hasPresentProperty(props, name)) {
+          existingItems.push(formatRecordingPropertyPair(name, unwrapProperty(props[name])));
+        }
+      }
+    }
+    if (existingItems.length === 0) {
+      for (const upd of updates) {
+        existingItems.push(formatRecordingPropertyPair(upd.name, upd.currentValue));
+      }
+    }
+    const targetItems = updates.map((upd) => formatRecordingPropertyPair(upd.name, upd.targetValue));
+    return Object.freeze({
+      powerMode: String(this.hwRecordingCfg.powerMode || ''),
+      existingSummary: existingItems.join(SUMMARY_ITEM_SEPARATOR),
+      targetSummary: targetItems.join(SUMMARY_ITEM_SEPARATOR),
+    });
+  }
+
+  /**
+   * Builds a structured summary of existing Eufy `videoStreamingQuality` vs target override for `WARN` logging.
+   *
+   * @param {number} currentQuality - Reported numeric `videoStreamingQuality` value on the camera.
+   * @param {number} targetQuality - Target numeric `videoStreamingQuality` value to apply.
+   * @returns {Readonly<{ configuredQuality: string, existingSummary: string, targetSummary: string }>}
+   */
+  describeQualityOverride(currentQuality, targetQuality) {
+    const rawCfgQuality = this.hwRecordingCfg.streamingQuality;
+    const configuredQuality =
+      typeof rawCfgQuality === 'string' ? QUOTE_CHAR + rawCfgQuality + QUOTE_CHAR : String(rawCfgQuality);
+    return Object.freeze({
+      configuredQuality,
+      existingSummary: formatStreamingQualityPair(currentQuality, this.qualityStates),
+      targetSummary: formatStreamingQualityPair(targetQuality, this.qualityStates),
+    });
   }
 
   /**
@@ -826,6 +1358,230 @@ class Telemetry {
     if (parsed.firmware !== null) {
       this.firmware = parsed.firmware;
     }
+    this._applyMotionDetectionReadings(parsed.hwDetection);
+  }
+
+  /**
+   * Merges reported read-only Eufy Motion Detection configuration booleans into cached Telemetry fields.
+   *
+   * @param {ReturnType<typeof parseMotionDetectionConfig>} det - Parsed detection flags.
+   */
+  _applyMotionDetectionReadings(det) {
+    if (!det) {
+      return;
+    }
+    if (det.enabled !== null) this.hwMotionEnabled = det.enabled;
+    if (det.human !== null) this.hwMotionHuman = det.human;
+    if (det.face !== null) this.hwMotionFace = det.face;
+    if (det.vehicle !== null) this.hwMotionVehicle = det.vehicle;
+    if (det.pet !== null) this.hwMotionPet = det.pet;
+    if (det.dog !== null) this.hwMotionDog = det.dog;
+    if (det.petStandalone !== null) this.hwPetStandalone = det.petStandalone;
+    if (det.allOther !== null) this.hwMotionAllOther = det.allOther;
+    if (det.loitering !== null) this.hwLoitering = det.loitering;
+    if (det.sound !== null) this.hwSound = det.sound;
+    if (det.crying !== null) this.hwCrying = det.crying;
+  }
+
+  /**
+   * Resolves the effective pet/dog detection boolean across Eufy camera schemas (`null` when unreported).
+   *
+   * @returns {boolean|null}
+   */
+  _resolveEffectivePetDetection() {
+    if (this.hwMotionPet === true || this.hwPetStandalone === true || this.hwMotionDog === true) {
+      return true;
+    }
+    if (this.hwMotionPet === false || this.hwPetStandalone === false || this.hwMotionDog === false) {
+      return false;
+    }
+    return null;
+  }
+
+  /**
+   * Returns true if at least one Eufy Motion Detection configuration flag has been reported for this camera.
+   *
+   * @returns {boolean}
+   */
+  _hasAnyMotionDetectionProperty() {
+    return (
+      this.hwMotionEnabled !== null ||
+      this.hwMotionHuman !== null ||
+      this.hwMotionFace !== null ||
+      this.hwMotionVehicle !== null ||
+      this._resolveEffectivePetDetection() !== null ||
+      this.hwMotionAllOther !== null ||
+      this.hwLoitering !== null ||
+      this.hwSound !== null ||
+      this.hwCrying !== null
+    );
+  }
+
+  /**
+   * Builds the read-only Eufy Motion Detection summary for `GET /api/status` (`null` until reported).
+   *
+   * @returns {Readonly<Record<string, boolean|null>>|null}
+   */
+  _buildMotionDetectionStatusSummary() {
+    if (!this._hasAnyMotionDetectionProperty()) {
+      return null;
+    }
+    return Object.freeze({
+      enabled: this.hwMotionEnabled,
+      human: this.hwMotionHuman,
+      face: this.hwMotionFace,
+      vehicle: this.hwMotionVehicle,
+      pet: this._resolveEffectivePetDetection(),
+      all_other_motions: this.hwMotionAllOther,
+      loitering: this.hwLoitering,
+      sound: this.hwSound ?? this.hwCrying,
+    });
+  }
+
+  /**
+   * Collects human-readable names of Eufy detection categories currently enabled on the camera.
+   *
+   * @returns {string}
+   */
+  _formatEnabledDetectionCategories() {
+    const enabled = [];
+    if (this.hwMotionHuman === true) enabled.push(DETECTION_CATEGORIES.HUMAN);
+    if (this.hwMotionFace === true) enabled.push(DETECTION_CATEGORIES.FACE);
+    if (this.hwLoitering === true) enabled.push(DETECTION_CATEGORIES.LOITERING);
+    if (this.hwMotionVehicle === true) enabled.push(DETECTION_CATEGORIES.VEHICLE);
+    if (this._resolveEffectivePetDetection() === true) enabled.push(DETECTION_CATEGORIES.PET);
+    if (this.hwMotionAllOther === true) enabled.push(DETECTION_CATEGORIES.MOTION);
+    if (this.hwSound === true) enabled.push(DETECTION_CATEGORIES.SOUND);
+    if (this.hwCrying === true && this.hwSound !== true) enabled.push(DETECTION_CATEGORIES.CRYING);
+    return enabled.length > 0 ? enabled.join(SUMMARY_ITEM_SEPARATOR) : DETECTION_CATEGORIES.NONE;
+  }
+
+  /**
+   * Collects disabled Eufy Motion Detection entries that conflict with this camera's active `triggers` set.
+   *
+   * @returns {string[]}
+   */
+  _collectDisabledTriggerEntries() {
+    const disabled = [];
+    if (
+      (this.triggers.has(TRIGGER_NAMES.MOTION) || this.triggers.has(TRIGGER_NAMES.RADAR)) &&
+      this.hwMotionAllOther === false
+    ) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.MOTION, MOTION_DETECTION_PROPS.ALL_OTHER));
+    }
+    if (
+      (this.triggers.has(TRIGGER_NAMES.PERSON) || this.triggers.has(TRIGGER_NAMES.STRANGER)) &&
+      this.hwMotionHuman === false
+    ) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.PERSON, MOTION_DETECTION_PROPS.HUMAN));
+    }
+    const wantsExplicitIdentity =
+      this.hasExplicitTriggers &&
+      (this.rawTriggers.has(TRIGGER_NAMES.IDENTITY_SHORT) || this.rawTriggers.has(TRIGGER_NAMES.IDENTITY_PERSON));
+    if (wantsExplicitIdentity && this.hwMotionFace === false) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.IDENTITY_PERSON, MOTION_DETECTION_PROPS.FACE));
+    }
+    const wantsExplicitLoitering =
+      this.hasExplicitTriggers &&
+      (this.rawTriggers.has(TRIGGER_NAMES.LOITERING_SHORT) || this.rawTriggers.has(TRIGGER_NAMES.LOITERING));
+    if (wantsExplicitLoitering && this.hwLoitering === false) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.LOITERING, MOTION_DETECTION_PROPS.LOITERING));
+    }
+    if (this.triggers.has(TRIGGER_NAMES.VEHICLE) && this.hwMotionVehicle === false) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.VEHICLE, MOTION_DETECTION_PROPS.VEHICLE));
+    }
+    this._appendPetAndSoundDisabledEntries(disabled);
+    return disabled;
+  }
+
+  /**
+   * Appends disabled pet/dog and sound/crying entries to `disabled` when active in `this.triggers`.
+   *
+   * @param {string[]} disabled - Mutable collector of formatted disabled entries.
+   */
+  _appendPetAndSoundDisabledEntries(disabled) {
+    const wantsPet =
+      this.triggers.has(TRIGGER_NAMES.PET) ||
+      this.triggers.has(TRIGGER_NAMES.DOG) ||
+      this.triggers.has(TRIGGER_NAMES.DOG_LICK) ||
+      this.triggers.has(TRIGGER_NAMES.DOG_POOP);
+    if (wantsPet && this._resolveEffectivePetDetection() === false) {
+      const prop =
+        this.hwMotionPet === false
+          ? MOTION_DETECTION_PROPS.PET
+          : this.hwPetStandalone === false
+            ? MOTION_DETECTION_PROPS.PET_STANDALONE
+            : MOTION_DETECTION_PROPS.DOG;
+      const cat =
+        this.hwMotionPet === false || this.hwPetStandalone === false
+          ? DETECTION_CATEGORIES.PET
+          : DETECTION_CATEGORIES.DOG;
+      disabled.push(formatDisabledDetectionEntry(cat, prop));
+    }
+    if (this.triggers.has(TRIGGER_NAMES.SOUND) && this.hwSound === false) {
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.SOUND, MOTION_DETECTION_PROPS.SOUND));
+    } else if (
+      this.triggers.has(TRIGGER_NAMES.CRYING) &&
+      (this.hwCrying === false || (this.hwCrying === null && this.hwSound === false))
+    ) {
+      const soundProp = this.hwCrying === false ? MOTION_DETECTION_PROPS.CRYING : MOTION_DETECTION_PROPS.SOUND;
+      disabled.push(formatDisabledDetectionEntry(DETECTION_CATEGORIES.CRYING, soundProp));
+    }
+  }
+
+  /**
+   * Evaluates whether reported Eufy Motion Detection settings disable categories active in `trigger_events`,
+   * deduplicating repeated polls until the mismatch signature changes or clears.
+   *
+   * @returns {Readonly<{
+   *   kind: 'master_off'|'disabled_types',
+   *   explicitTriggers: boolean,
+   *   disabledSummary: string,
+   *   enabledSummary: string
+   * }>|null}
+   */
+  consumeTriggerDetectionWarning() {
+    if (this.isRtspDirect || !this._hasAnyMotionDetectionProperty()) {
+      return null;
+    }
+    if (this.hwMotionEnabled === false) {
+      const needsMotion = Array.from(this.triggers).some((t) => !NON_MOTION_ONLY_TRIGGERS.has(t));
+      if (!needsMotion) {
+        this.lastDetectionWarnSignature = '';
+        return null;
+      }
+      const disabledSummary = MOTION_DETECTION_PROPS.ENABLED + PROP_KV_SEPARATOR + false;
+      const sig = WARN_SIG_PREFIXES.MASTER + disabledSummary;
+      if (sig === this.lastDetectionWarnSignature) {
+        return null;
+      }
+      this.lastDetectionWarnSignature = sig;
+      return Object.freeze({
+        kind: DETECTION_WARN_KINDS.MASTER_OFF,
+        explicitTriggers: this.hasExplicitTriggers,
+        disabledSummary,
+        enabledSummary: DETECTION_CATEGORIES.NONE,
+      });
+    }
+    const disabled = this._collectDisabledTriggerEntries();
+    if (disabled.length === 0) {
+      this.lastDetectionWarnSignature = '';
+      return null;
+    }
+    const disabledSummary = disabled.join(SUMMARY_ITEM_SEPARATOR);
+    const enabledSummary = this._formatEnabledDetectionCategories();
+    const prefix = this.hasExplicitTriggers ? WARN_SIG_PREFIXES.EXPLICIT : WARN_SIG_PREFIXES.DEFAULT;
+    const sig = prefix + disabledSummary + WARN_SIG_SEP + enabledSummary;
+    if (sig === this.lastDetectionWarnSignature) {
+      return null;
+    }
+    this.lastDetectionWarnSignature = sig;
+    return Object.freeze({
+      kind: DETECTION_WARN_KINDS.DISABLED_TYPES,
+      explicitTriggers: this.hasExplicitTriggers,
+      disabledSummary,
+      enabledSummary,
+    });
   }
 
   /**

@@ -44,14 +44,26 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
     while `DETECTION_PROPERTY_EVENT_MAP` maps boolean `'property changed'` updates (`motionDetected`, `personDetected`,
     `ringing`, etc.) to canonical trigger names.
   - `setCameraProperty()` chains `device.set_property` calls per camera serial (`propertySyncChains`) so `HomeBase`
-    never drops concurrent `P2P` `CMD_SET_PAYLOAD` writes when syncing `powerWorkingMode`, `recordingClipLength`,
-    `recordingEndClipMotionStops`, `recordingRetriggerInterval`, `videoStreamingQuality`, and `rtspStream` (`AT-10`).
+    never drops concurrent `P2P` `CMD_SET_PAYLOAD` writes when syncing opted-in `power_mode` (`powerWorkingMode` or
+    `recording*`), `streaming_quality` (`videoStreamingQuality` resolved via `device.get_properties_metadata` `states`),
+    and `rtspStream` (`AT-10`). Default `power_mode: "keep"` and `streaming_quality: "keep"` send zero writes; whenever
+    an opted-in `power_mode` or `streaming_quality` differs from the camera's reported settings, the bridge logs `WARN`
+    with the camera's existing settings and target overrides before writing. Permanent device rejections
+    (`device_invalid_property`, `device_invalid_property_value`, `device_not_supported`,
+    `device_property_not_supported`, `read_only_property`) log once at `WARN` and latch the per-camera check flag so
+    unsupported properties never retry on subsequent polls, while transient `no_reply` / `ws_closed` failures retry.
     Enabling `rtspStream: true` when `rtspStreamUrl` is empty immediately follows up with `device.get_properties`.
+  - `applyDeviceProperties()` inspects reported Eufy Motion Detection properties (`motionDetection`,
+    `motionDetectionType*`, `petDetection`, `loiteringDetection`, `soundDetection`, `cryingDetection`) strictly
+    read-only (never calling `device.set_property` on them), exposes them under `telemetry.motion_detection` in
+    `GET /api/status`, and logs a deduplicated `WARN` when `motionDetection` is `false` or active `trigger_events`
+    categories are disabled in the Eufy app (`AT-10`).
 - **Telemetry Refresh & `HomeBase` Station Self-Healing (`telemetry-sync.js`, `station-recovery.js`):**
   - `fetchAllCameraTelemetry()` coalesces concurrent callers onto one active pass (queuing one forced follow-up if
     `forceRefresh=true` arrives mid-flight) and issues `driver.poll_refresh` (`2s` `POLL_REFRESH_SETTLE_MS`) when
-    forced or at most once per `5` minutes (`OFFLINE_POLL_REFRESH_COOLDOWN_MS`) while any Eufy camera is offline before
-    querying `device.get_properties` per camera.
+    forced or at most once per `60` minutes (`OFFLINE_POLL_REFRESH_COOLDOWN_MS`) while any Eufy camera is offline due to
+    a recoverable power/link/timeout condition (`shouldPollRefreshWhileOffline()`, skipping `state: 2/4/5` manually
+    disabled or unpaired cameras) before querying `device.get_properties` per camera.
   - `ensureInitialDriverAndStationConnected()` checks `driver.is_connected` and `station.is_connected` after
     `start_listening` and dispatches `driver.connect` / `station.connect` when disconnected.
   - If `driver.poll_refresh` fails, `station.is_connected` times out (`no_reply`), a `P2P` wake stalls to retry `>= 2`

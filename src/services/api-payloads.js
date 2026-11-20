@@ -27,6 +27,8 @@ const {
   TELEMETRY_POLL_MS,
   LOW_BAT_THRESHOLD,
   CRITICAL_BAT_THRESHOLD,
+  CAMERA_MODES,
+  POWER_MODES,
   FORWARD_FACE_NAMES,
   GLOBAL_AUTO_FRIGATE_MASK,
   GLOBAL_CARD_SHOW_ON_LIVE,
@@ -50,6 +52,10 @@ const startedAtMs = Date.now();
  */
 function buildConfigPayload(cams) {
   const hasEufyCameras = cams.length === 0 || cams.some((c) => !c.isRtspDirect());
+  const hasCustomEufyCamera =
+    cams.length === 0 || cams.some((c) => !c.isRtspDirect() && c.getConfiguredMode() === CAMERA_MODES.CUSTOM);
+  const effectiveTopPowerMode =
+    cfg.power_mode === POWER_MODES.CUSTOM && !hasCustomEufyCamera ? POWER_MODES.KEEP : cfg.power_mode;
   const hasLiveCardTarget = cams.length === 0 || cams.some((c) => c.supportsLiveCardOverlay());
   return Object.freeze({
     version: BRIDGE_VERSION,
@@ -71,6 +77,8 @@ function buildConfigPayload(cams) {
     telemetry_poll_secs: hasEufyCameras ? Math.round(TELEMETRY_POLL_MS / MS_PER_SECOND) : null,
     low_battery_threshold: hasEufyCameras ? LOW_BAT_THRESHOLD : null,
     critical_battery_threshold: hasEufyCameras ? CRITICAL_BAT_THRESHOLD : null,
+    power_mode: hasEufyCameras ? effectiveTopPowerMode : null,
+    streaming_quality: hasEufyCameras ? cfg.streaming_quality : null,
     track_stuck_spotlight: hasEufyCameras ? Boolean(cfg.track_stuck_spotlight) : null,
     forward_face_names: hasEufyCameras ? FORWARD_FACE_NAMES : null,
     auto_frigate_mask: GLOBAL_AUTO_FRIGATE_MASK,

@@ -34,8 +34,8 @@ installDefaultFetchStub();
 
 describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
   it(
-    'AT-19: Enforces YAML config validation, env endpoints, direct rtsp_url resolution, defensive clamping, ' +
-      'ignored-option warnings, and null-filtered /api/config',
+    'AT-19: Enforces YAML config validation (rejecting legacy power/quality keys), env endpoints, direct rtsp_url ' +
+      'resolution, defensive clamping, ignored-option warnings, and null-filtered /api/config',
     () => {
       // Verify 1: YAML config validation (no legacy/env-only keys), single-pass error reporting, and env endpoints
       const minimalCfg = {
@@ -50,16 +50,32 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
             frigate_url: 'http://frigate:5000',
             eufy_ws: 'ws://eufy:3000',
             hwaccel: 'vaapi',
+            sync_power: true,
+            enforce_streaming_quality: true,
+            power_mode: 'invalid_profile',
+            streaming_quality: 'super_ultra',
             bogus_top: true,
-            cameras: [{serial: 'T8161T0000000035', rtsp_url: 'http://bad-scheme/live', bogus_cam: 1}],
+            cameras: [
+              {
+                serial: 'T8161T0000000035',
+                rtsp_url: 'http://bad-scheme/live',
+                power_working_mode: 2,
+                bogus_cam: 1,
+              },
+            ],
           }),
         (err) =>
           err instanceof Error &&
           err.message.includes('unknown key "frigate_url"') &&
           err.message.includes('unknown key "eufy_ws"') &&
           err.message.includes('unknown key "hwaccel"') &&
+          err.message.includes('unknown key "sync_power"') &&
+          err.message.includes('unknown key "enforce_streaming_quality"') &&
+          err.message.includes('"power_mode"') &&
+          err.message.includes('"streaming_quality"') &&
           err.message.includes('unknown key "bogus_top"') &&
           err.message.includes('cameras[0] "rtsp_url" must start with rtsp:// or rtsps://') &&
+          err.message.includes('unknown camera key "cameras[0].power_working_mode"') &&
           err.message.includes('unknown camera key "cameras[0].bogus_cam"')
       );
 
@@ -95,20 +111,20 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
       assert.equal(defaultEndpoints.ha_webhook_url, '');
 
       const customEndpoints = resolveServiceEndpoints({
-        EUFY_WS_HOST: 'eufy.internal',
+        EUFY_WS_HOST: 'eufy.example.com',
         EUFY_WS_PORT: '3100',
         FRIGATE_URL: 'https://nvr.example.com:8971/api/',
-        GO2RTC_HOST: 'rtc.internal',
+        GO2RTC_HOST: 'rtc.example.com',
         GO2RTC_API_PORT: '1985',
         GO2RTC_RTSP_PORT: '8555',
         GO2RTC_RTSP_USER: 'pub',
         GO2RTC_RTSP_PASSWORD: 's@cret',
         HA_WEBHOOK_URL: 'http://ha:8123/api/webhook/hook1',
       });
-      assert.equal(customEndpoints.eufy_security_ws_url, 'ws://eufy.internal:3100');
+      assert.equal(customEndpoints.eufy_security_ws_url, 'ws://eufy.example.com:3100');
       assert.equal(customEndpoints.frigate_url, 'https://nvr.example.com:8971');
-      assert.equal(customEndpoints.go2rtc_url, 'http://rtc.internal:1985');
-      assert.equal(customEndpoints.rtsp_publish_url, 'rtsp://pub:s%40cret@rtc.internal:8555/{name}');
+      assert.equal(customEndpoints.go2rtc_url, 'http://rtc.example.com:1985');
+      assert.equal(customEndpoints.rtsp_publish_url, 'rtsp://pub:s%40cret@rtc.example.com:8555/{name}');
       assert.equal(customEndpoints.ha_webhook_url, 'http://ha:8123/api/webhook/hook1');
 
       // Verify 2: 5 camera modes, identity/title defaults, and direct rtsp_url isolation
@@ -157,7 +173,8 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
       assert.equal(directMinimalCam.getTelemetryConfig().rssi, false);
       assert.deepEqual(directMinimalCam.getCardBounds(), {boxX: 24, boxY: 684, boxW: 26, boxH: 12});
 
-      // Verify 3: Defensive clamping (FPS, timers, backfill_enabled in "backfill" mode, and Power Manager promotion)
+      // Verify 3: Defensive clamping (FPS, timers, backfill_enabled in "backfill", and custom clip length >= hold_secs
+      // without silently promoting power_mode="battery" to 2)
       const rates = resolveFrameRates({live_fps: 10, idle_fps: 20});
       assert.equal(rates.idleFps, 10);
       const clampedTimers = resolveCameraTimers({
@@ -180,20 +197,27 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
         {
           serial: 'T8161T0000000034',
           mode: 'custom',
+          power_mode: 'custom',
           hold_secs: 60,
           end_early: false,
-          power_working_mode: 0,
           recording_clip_length: 20,
         },
         clampedTimers
       );
       assert.equal(clampedHw.powerWorkingMode, 2);
       assert.equal(clampedHw.recordingClipLength, 60);
+      const unpromotedBatHw = resolveHardwareRecordingConfig({
+        serial: 'T8161T0000000038',
+        mode: 'rtsp',
+        power_mode: 'battery',
+        hold_secs: 60,
+      });
+      assert.equal(unpromotedBatHw.powerWorkingMode, 0, 'power_mode="battery" must never silently promote to 2');
+
       const forcedBackfillCam = new Camera({
         serial: 'T8214T0000000037',
         mode: 'backfill',
         backfill_enabled: false,
-        sync_power: false,
         card_theme: 'none',
         sleep_screen: 'slate',
       });
@@ -202,19 +226,27 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
       // Verify 4: Ignored-option startup warnings and null-filtered GET /api/config with credential masking
       const directCfgPayload = buildConfigPayload([directMinimalCam]);
       assert.equal(directCfgPayload.use_rtsp, null);
+      assert.equal(directCfgPayload.power_mode, null);
+      assert.equal(directCfgPayload.streaming_quality, null);
       assert.equal(directCfgPayload.telemetry_poll_secs, null);
       assert.equal(directCfgPayload.cameras[0].serial, null);
       assert.equal(directCfgPayload.cameras[0].mode, 'rtsp');
       assert.equal(directCfgPayload.cameras[0].rtsp_url, 'rtsp://***@127.0.0.1:8554/nursery');
       assert.equal(directCfgPayload.cameras[0].hold_secs, null);
-      assert.equal(directCfgPayload.cameras[0].sync_power, null);
+      assert.equal(directCfgPayload.cameras[0].power_mode, null);
+      assert.equal(directCfgPayload.cameras[0].streaming_quality, null);
       assert.equal(directCfgPayload.cameras[0].telemetry, null);
 
       const mixedCfgPayload = buildConfigPayload([forcedBackfillCam]);
       assert.equal(mixedCfgPayload.use_rtsp, true);
+      assert.equal(mixedCfgPayload.power_mode, 'keep');
+      assert.equal(mixedCfgPayload.streaming_quality, 'keep');
       assert.equal(mixedCfgPayload.card_show_on_live, null);
+      assert.equal(mixedCfgPayload.cameras[0].hold_secs, 20);
+      assert.equal(mixedCfgPayload.cameras[0].end_early, true);
+      assert.equal(mixedCfgPayload.cameras[0].power_mode, 'keep');
+      assert.equal(mixedCfgPayload.cameras[0].streaming_quality, 'keep');
       assert.equal(mixedCfgPayload.cameras[0].idle_timeout_secs, null);
-      assert.equal(mixedCfgPayload.cameras[0].power_working_mode, null);
       assert.equal(mixedCfgPayload.cameras[0].recording_clip_length, null);
       assert.equal(mixedCfgPayload.cameras[0].card_position, null);
       assert.equal(mixedCfgPayload.cameras[0].card_show_on_live, null);
@@ -237,13 +269,26 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
                 rtsp_url: 'rtsp://127.0.0.1:8554/nursery',
                 hold_secs: 60,
                 stream_max_secs: 300,
-                sync_power: true,
+                power_mode: 'battery',
+                streaming_quality: 'medium',
                 telemetry: {battery: true},
               },
             ],
           },
           {BRIDGE_HWACCEL: 'nvenc', BRIDGE_HWACCEL_DEVICE: '/dev/dri/renderD128'}
         ).build();
+        new BridgeConfigBuilder({
+          cameras: [
+            {
+              serial: 'T8161T0000000039',
+              name: 'non_custom_cam',
+              mode: 'rtsp',
+              power_mode: 'custom',
+              streaming_quality: 7,
+              recording_clip_length: 30,
+            },
+          ],
+        }).build();
       } finally {
         log.warn = origWarn;
       }
@@ -263,11 +308,20 @@ describe('Locked Acceptance Criterion AT-19 (docs/acceptance/AT-19.md)', () => {
             w.scope === 'nursery_cam' &&
             w.msg.includes('hold_secs') &&
             w.msg.includes('stream_max_secs') &&
-            w.msg.includes('sync_power') &&
+            w.msg.includes('power_mode') &&
+            w.msg.includes('streaming_quality') &&
             w.msg.includes('telemetry')
         ),
         true,
         'AT-19: Must warn when per-camera timeout/Eufy/telemetry options are ignored on a direct rtsp_url camera'
+      );
+      assert.equal(
+        capturedWarnings.some(
+          (w) =>
+            w.scope === 'non_custom_cam' && w.msg.includes('power_mode="custom"') && w.msg.includes('mode="custom"')
+        ),
+        true,
+        'AT-19: Must warn when power_mode="custom" is specified outside camera mode="custom"'
       );
     }
   );

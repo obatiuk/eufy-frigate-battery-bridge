@@ -272,28 +272,28 @@ describe('Regression 52: Serialized Telemetry Polling & 5-Minute Unforced Offlin
       assert.equal(sock.sent.filter((m) => m.command === 'device.get_properties').length, 1);
       assert.equal(offlineCam.isDeviceOffline(), true);
 
-      // 2. Unforced polls within the 5-minute (300_000ms) cooldown skip driver.poll_refresh
-      t.mock.timers.tick(60_000);
+      // 2. Unforced polls within the 60-minute (3_600_000ms) cooldown skip driver.poll_refresh
+      t.mock.timers.tick(300_000);
       await runPoll(false);
-      t.mock.timers.tick(180_000);
+      t.mock.timers.tick(1_800_000);
       await runPoll(false);
       assert.equal(sock.sent.filter((m) => m.command === 'driver.poll_refresh').length, 1);
       assert.equal(sock.sent.filter((m) => m.command === 'device.get_properties').length, 3);
 
-      // 3. Explicit forced refresh (viewer / /api/wake) bypasses cooldown and resets the 5-minute window
+      // 3. Explicit forced refresh (viewer / /api/wake) bypasses cooldown and resets the 60-minute window
       const forcedStart = Date.now();
       await runPoll(true);
       assert.equal(sock.sent.filter((m) => m.command === 'driver.poll_refresh').length, 2);
 
-      // Advance to 290_000ms after forcedStart (< 300_000ms): unforced poll still skips driver.poll_refresh
-      t.mock.timers.tick(290_000 - (Date.now() - forcedStart));
+      // Advance to 3_590_000ms after forcedStart (< 3_600_000ms): unforced poll still skips driver.poll_refresh
+      t.mock.timers.tick(3_590_000 - (Date.now() - forcedStart));
       await runPoll(false);
       assert.equal(sock.sent.filter((m) => m.command === 'driver.poll_refresh').length, 2);
 
-      // 4. Once >= 300_000ms elapses since forcedStart, unforced poll runs driver.poll_refresh and detects battery swap
+      // 4. Once >= 3_600_000ms elapses since forcedStart, unforced poll runs driver.poll_refresh and detects swap
       reportedBattery = 100;
       reportedRssi = -70;
-      t.mock.timers.tick(300_000 - (Date.now() - forcedStart));
+      t.mock.timers.tick(3_600_000 - (Date.now() - forcedStart));
       await runPoll(false);
       assert.equal(sock.sent.filter((m) => m.command === 'driver.poll_refresh').length, 3);
       assert.equal(offlineCam.isDeviceOffline(), false);

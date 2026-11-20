@@ -22,6 +22,8 @@ describe('Regression 20. Stuck Spotlight Watchdog Switched Off a Light That a Re
       serial: 'T8161T0000000000',
       name: 'driveway',
       mode: 'rtsp',
+      hold_secs: 60,
+      end_early: false,
       station_serial: 'T8030P0000000000',
     });
     rtspCam.updateDiscoveredRtspConfig('T8030P0000000000', 'rtsp://127.0.0.1:8554/driveway');
@@ -110,10 +112,10 @@ describe('Regression 20. Stuck Spotlight Watchdog Switched Off a Light That a Re
       'Real Frigate detector object (data.type === "object") must extend hold even if sub_label matches evPerson'
     );
     assert.equal(p2pCam.isNonSyntheticFrigateEvent({sub_label: null}), true);
-    assert.equal(p2pCam.resolveApiWakeDurationSecs(undefined, 5), 60);
+    assert.equal(p2pCam.resolveApiWakeDurationSecs(undefined, 5), 30);
     assert.equal(p2pCam.resolveApiWakeDurationSecs(2, 5), 5);
     assert.equal(p2pCam.shouldClearQueueForSigUsr1Test(), true);
-    assert.equal(p2pCam.formatStartupSummary(), 'doorbell(p2p:60s)');
+    assert.equal(p2pCam.formatStartupSummary(), 'doorbell(p2p:30s)');
 
     // 5. Fast continuation across timeout boundary when hardware triggers remain active or split clips are queued
     rtspCam.beginSession('rtsp', t0, true);

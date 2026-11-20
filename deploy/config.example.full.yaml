@@ -19,10 +19,10 @@ instant_event_snapshot: true
 snapshot_capture_delay_secs: 3
 
 # Recording timers and Live View arbitration defaults
-hold_secs: 60
+hold_secs: 30
 stream_max_secs: 900
-frigate_event_secs: 60
-end_early: false
+frigate_event_secs: 30
+end_early: true
 idle_timeout_secs: 0
 view_linger_secs: 20
 view_max_secs: 300
@@ -33,9 +33,9 @@ view_has_priority: true
 use_rtsp: true
 backfill_enabled: true
 backfill_delay_secs: 2
-sync_power: true
+power_mode: keep
 track_stuck_spotlight: false
-enforce_streaming_quality: true
+streaming_quality: keep
 low_battery_threshold: 30
 critical_battery_threshold: 5
 low_battery_hold_secs: 20
@@ -93,8 +93,8 @@ cameras:
     title: Front Doorbell
     serial: SN0000000002
     mode: backfill
-    hold_secs: 30
-    frigate_event_secs: 30
+    hold_secs: 20
+    frigate_event_secs: 20
     end_early: true
     trigger_events:
       - person
@@ -121,13 +121,12 @@ cameras:
     critical_battery_threshold: 5
     low_battery_hold_secs: 20
     low_battery_wake_on_view: false
-    sync_power: true
+    power_mode: custom
     track_stuck_spotlight: false
-    power_working_mode: 2
     recording_clip_length: 60
     recording_end_early: false
     recording_retrigger_interval: 5
-    enforce_streaming_quality: true
+    streaming_quality: medium
     trigger_events:
       - motion
       - person

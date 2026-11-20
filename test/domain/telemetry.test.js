@@ -539,9 +539,8 @@ describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
       const tel = new Telemetry({
         mode: 'custom',
         low_battery_threshold: 20,
-        enforce_streaming_quality: 3,
-        sync_power: true,
-        power_working_mode: 2,
+        streaming_quality: 3,
+        power_mode: 'custom',
         recording_clip_length: 60,
         recording_end_early: false,
         recording_retrigger_interval: 5,
@@ -580,7 +579,7 @@ describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
       });
       assert.deepEqual(
         tel.evaluateQualityChange({videoStreamingQuality: {value: 3}}, 'T8161T0000000000'),
-        {shouldUpdate: false, currentQuality: 0, targetQuality: 7},
+        {shouldUpdate: false, currentQuality: 0, targetQuality: 3},
         'Only checks streaming quality once per session'
       );
 
@@ -737,7 +736,7 @@ describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
 
   it('requires all 4 Power Manager recording keys before evaluating or latching recordingModeChecked', () => {
     // Verify partial 1..3-key recording bags do not latch recordingModeChecked or emit n/a writes.
-    const cam = new Camera({serial: 'T8161T0000000054', name: 'yard', mode: 'backfill'});
+    const cam = new Camera({serial: 'T8161T0000000054', name: 'yard', mode: 'custom', power_mode: 'custom'});
 
     assert.deepEqual(cam.evaluateRecordingModeChanges({powerWorkingMode: {value: 2}}), []);
     assert.equal(cam.hasRecordingModeChecked(), false);
@@ -763,5 +762,139 @@ describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
       {name: 'recordingEndClipMotionStops', currentValue: false, targetValue: true},
     ]);
     assert.equal(cam.hasRecordingModeChecked(), true);
+
+    const recOverride = cam.describeRecordingOverride(
+      {
+        powerWorkingMode: {value: 2},
+        recordingClipLength: {value: 60},
+        recordingEndClipMotionStops: {value: false},
+        recordingRetriggerInterval: {value: 5},
+      },
+      fullUpdates
+    );
+    assert.deepEqual(recOverride, {
+      powerMode: 'custom',
+      existingSummary:
+        'powerWorkingMode=2 ("Customize Recording"), recordingClipLength=60, ' +
+        'recordingEndClipMotionStops=false, recordingRetriggerInterval=5',
+      targetSummary: 'recordingClipLength=30, recordingEndClipMotionStops=true',
+    });
+
+    const qualCam = new Camera({
+      serial: 'T8161T0000000055',
+      name: 'porch',
+      mode: 'rtsp',
+      streaming_quality: 'high',
+    });
+    qualCam.setQualityMetadataStates({0: 'Auto', 5: 'Low', 7: 'Medium', 10: 'Ultra'});
+    assert.deepEqual(qualCam.describeQualityOverride(0, 10), {
+      configuredQuality: '"high"',
+      existingSummary: 'videoStreamingQuality=0 ("Auto")',
+      targetSummary: 'videoStreamingQuality=10 ("Ultra")',
+    });
   });
+
+  it(
+    'evaluates read-only Eufy Motion Detection mismatches across default triggers, explicit aliases, ' +
+      'and master motionDetection=false without false positives',
+    () => {
+      // Verify default trigger_events warns once when camera has non-human types disabled, explicit [person] does not
+      // false-warn on face/loitering aliases, explicit [identity person, loitering] warns, and motionDetection=false
+      // warns.
+      const defaultTriggerCam = new Camera({serial: 'T8161T0000000056', name: 'storage'});
+      defaultTriggerCam.applyTelemetryProperties(
+        {
+          battery: 88,
+          motionDetection: true,
+          motionDetectionTypeHuman: true,
+          motionDetectionTypeHumanRecognition: true,
+          motionDetectionTypeVehicle: false,
+          motionDetectionTypePet: false,
+          motionDetectionTypeAllOtherMotions: false,
+        },
+        false
+      );
+      const defaultWarn = defaultTriggerCam.consumeTriggerDetectionWarning();
+      assert.deepEqual(defaultWarn, {
+        kind: 'disabled_types',
+        explicitTriggers: false,
+        disabledSummary:
+          'motion (motionDetectionTypeAllOtherMotions=false), vehicle (motionDetectionTypeVehicle=false), ' +
+          'pet (motionDetectionTypePet=false)',
+        enabledSummary: 'human, face',
+      });
+      assert.equal(defaultTriggerCam.consumeTriggerDetectionWarning(), null, 'Deduplicates unchanged mismatch');
+      assert.deepEqual(defaultTriggerCam.toStatusSummary(1000).telemetry.motion_detection, {
+        enabled: true,
+        human: true,
+        face: true,
+        vehicle: false,
+        pet: false,
+        all_other_motions: false,
+        loitering: null,
+        sound: null,
+      });
+
+      const personOnlyCam = new Camera({
+        serial: 'T8214T0000000057',
+        name: 'front_door',
+        trigger_events: ['person', 'ring'],
+      });
+      personOnlyCam.applyTelemetryProperties(
+        {
+          battery: 90,
+          motionDetection: true,
+          motionDetectionTypeHuman: true,
+          motionDetectionTypeHumanRecognition: false,
+          motionDetectionTypeVehicle: false,
+          motionDetectionTypePet: false,
+          motionDetectionTypeAllOtherMotions: false,
+          loiteringDetection: false,
+        },
+        false
+      );
+      assert.equal(personOnlyCam.consumeTriggerDetectionWarning(), null);
+
+      const faceLoiterCam = new Camera({
+        serial: 'T8161T0000000058',
+        name: 'gate',
+        trigger_events: ['identity person', 'loitering', 'sound'],
+      });
+      faceLoiterCam.applyTelemetryProperties(
+        {
+          battery: 80,
+          motionDetection: true,
+          motionDetectionTypeHuman: true,
+          motionDetectionTypeHumanRecognition: false,
+          loiteringDetection: false,
+          soundDetection: false,
+        },
+        false
+      );
+      assert.deepEqual(faceLoiterCam.consumeTriggerDetectionWarning(), {
+        kind: 'disabled_types',
+        explicitTriggers: true,
+        disabledSummary:
+          'identity person (motionDetectionTypeHumanRecognition=false), loitering (loiteringDetection=false), ' +
+          'sound (soundDetection=false)',
+        enabledSummary: 'human',
+      });
+
+      const masterOffCam = new Camera({serial: 'T8161T0000000059', name: 'shed', trigger_events: ['person']});
+      masterOffCam.applyTelemetryProperties(
+        {battery: 75, motionDetection: false, motionDetectionTypeHuman: true},
+        false
+      );
+      assert.deepEqual(masterOffCam.consumeTriggerDetectionWarning(), {
+        kind: 'master_off',
+        explicitTriggers: true,
+        disabledSummary: 'motionDetection=false',
+        enabledSummary: 'none',
+      });
+
+      const ringOnlyCam = new Camera({serial: 'T8214T0000000060', name: 'bell_only', trigger_events: ['ring']});
+      ringOnlyCam.applyTelemetryProperties({battery: 75, motionDetection: false}, false);
+      assert.equal(ringOnlyCam.consumeTriggerDetectionWarning(), null);
+    }
+  );
 });

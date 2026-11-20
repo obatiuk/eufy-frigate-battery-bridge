@@ -69,7 +69,7 @@ describe('HTTP Wake Target Resolution & Server Endpoints (src/services/http-serv
     assert.equal(cfgPayload.cameras[0].track_stuck_spotlight, false);
     assert.equal('homebase_rtsp_url' in cfgPayload.cameras[0], false);
     assert.equal(cfgPayload.cameras[0].rtsp_url, 'rtsp://***@192.168.1.50/live0');
-    assert.equal(cfgPayload.cameras[0].hold_secs, 60);
+    assert.equal(cfgPayload.cameras[0].hold_secs, 30);
     assert.equal(cfgPayload.cameras[1].name, 'doorbell');
     assert.equal(cfgPayload.cameras[1].rtsp_url, null);
 

@@ -22,7 +22,8 @@ const {
   CARD_POSITIONS,
   SLEEP_SCREENS,
   CAMERA_MODES,
-  POWER_WORKING_MODES,
+  POWER_MODES,
+  STREAMING_QUALITIES,
   BridgeConfigBuilder,
   validateConfig,
   resolveConfigFilePath,
@@ -228,8 +229,10 @@ describe('Source & Example File Integrity', () => {
       cameras: [{serial: 'T8161T0000000000'}],
     }).build();
     const cam = built.cameras[0];
+    const customCam = new BridgeConfigBuilder({
+      cameras: [{serial: 'T8161T0000000001', mode: 'custom', power_mode: 'custom'}],
+    }).build().cameras[0];
     const MS = 1000;
-    const syncPowerEnabled = cam.hwRecordingConfig.powerWorkingMode !== null;
     // Schema key -> value resolved when the key is omitted from config.yaml.
     const topDefaults = {
       width: built.width,
@@ -258,9 +261,9 @@ describe('Source & Example File Integrity', () => {
       use_rtsp: built.use_rtsp,
       backfill_enabled: built.backfill_enabled,
       backfill_delay_secs: built.backfillDelayMs / MS,
-      sync_power: syncPowerEnabled,
+      power_mode: built.power_mode,
       track_stuck_spotlight: built.track_stuck_spotlight,
-      enforce_streaming_quality: built.enforce_streaming_quality,
+      streaming_quality: built.streaming_quality,
       low_battery_threshold: built.low_battery_threshold,
       critical_battery_threshold: built.critical_battery_threshold,
       low_battery_hold_secs: built.lowBatHoldMs / MS,
@@ -287,11 +290,10 @@ describe('Source & Example File Integrity', () => {
       critical_battery_threshold: cam.timers.criticalBatThreshold,
       low_battery_hold_secs: cam.timers.lowBatHoldMs / MS,
       low_battery_wake_on_view: cam.timers.lowBatWakeOnView,
-      sync_power: syncPowerEnabled,
+      power_mode: cam.hwRecordingConfig.powerMode,
       track_stuck_spotlight: cam.trackStuckSpotlight,
-      power_working_mode: cam.hwRecordingConfig.powerWorkingMode,
-      recording_retrigger_interval: cam.hwRecordingConfig.recordingRetriggerInterval,
-      enforce_streaming_quality: cam.hwRecordingConfig.enforceQuality,
+      recording_retrigger_interval: customCam.hwRecordingConfig.recordingRetriggerInterval,
+      streaming_quality: cam.hwRecordingConfig.streamingQuality,
       card_theme: cam.cardConfig.theme,
       card_position: cam.cardConfig.position,
       sleep_screen: cam.cardConfig.sleepScreen,
@@ -391,9 +393,11 @@ describe('Source & Example File Integrity', () => {
           buildCam({low_battery_threshold: 99, critical_battery_threshold: v}).timers.criticalBatThreshold,
         low_battery_hold_secs: (v) => buildCam({hold_secs: 3600, low_battery_hold_secs: v}).timers.lowBatHoldMs / MS,
         recording_clip_length: (v) =>
-          buildCam({mode: 'custom', end_early: true, recording_clip_length: v}).hwRecordingConfig.recordingClipLength,
+          buildCam({mode: 'custom', power_mode: 'custom', end_early: true, recording_clip_length: v}).hwRecordingConfig
+            .recordingClipLength,
         recording_retrigger_interval: (v) =>
-          buildCam({mode: 'custom', recording_retrigger_interval: v}).hwRecordingConfig.recordingRetriggerInterval,
+          buildCam({mode: 'custom', power_mode: 'custom', recording_retrigger_interval: v}).hwRecordingConfig
+            .recordingRetriggerInterval,
       };
 
       const assertBoundParity = (scopeLabel, properties, resolvers) => {
@@ -430,10 +434,8 @@ describe('Source & Example File Integrity', () => {
       assert.deepEqual(new Set(deref(schema.properties.card_position).enum), new Set(Object.values(CARD_POSITIONS)));
       assert.deepEqual(deref(schema.properties.sleep_screen).enum, Object.values(SLEEP_SCREENS));
       assert.deepEqual(new Set(schema.definitions.camera.properties.mode.enum), new Set(Object.values(CAMERA_MODES)));
-      assert.deepEqual(
-        schema.definitions.camera.properties.power_working_mode.enum,
-        Object.values(POWER_WORKING_MODES)
-      );
+      assert.deepEqual(deref(schema.properties.power_mode).enum, Object.values(POWER_MODES));
+      assert.deepEqual(deref(schema.properties.streaming_quality).enum, Object.values(STREAMING_QUALITIES));
       assert.equal(schema.definitions.camera.properties.station_serial.minLength, 1);
 
       // Every top-level schema key is accepted by validateConfig and illustrated in deploy/config.example.full.yaml
@@ -441,7 +443,7 @@ describe('Source & Example File Integrity', () => {
         assert.ok(key in full, 'deploy/config.example.full.yaml missing top-level schema key: ' + key);
       }
       const frontDoorbell = full.cameras.find((c) => c.name === 'front_doorbell');
-      assert.ok(frontDoorbell && frontDoorbell.frigate_event_secs === 30);
+      assert.ok(frontDoorbell && frontDoorbell.frigate_event_secs === 20);
     }
   );
 });

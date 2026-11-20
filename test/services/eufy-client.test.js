@@ -66,7 +66,13 @@ describe('Eufy WebSocket Client, Telemetry Sync & Station Recovery (src/services
     () => {
       // Verify: synchronizes initial device properties (RTSP URL discovery, Power Manager, streaming quality, and
       // Eufy device name).
-      const autoCam = new Camera({serial: 'T8161T0000000000', name: 'garage', mode: 'auto'});
+      const autoCam = new Camera({
+        serial: 'T8161T0000000000',
+        name: 'garage',
+        mode: 'auto',
+        power_mode: 'surveillance',
+        streaming_quality: 'medium',
+      });
       const doorbellCam = new Camera({serial: 'T8214T2222222222', mode: 'backfill'});
 
       applyDeviceProperties(

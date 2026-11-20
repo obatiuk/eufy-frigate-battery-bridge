@@ -43,7 +43,10 @@ describe('Regression 22. Wedged HomeBase Station P2P Session & Missing `rtspStre
       const rtspBfCam = new Camera({
         serial: 'T8161T0000000081',
         name: 'patio',
-        mode: 'backfill',
+        mode: 'custom',
+        backfill_only: true,
+        power_mode: 'custom',
+        hold_secs: 30,
         station_serial: 'T8030P0000000080',
       });
       const doorbellP2p = new Camera({

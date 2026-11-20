@@ -12,6 +12,7 @@ const {describe, it} = require('node:test');
 const assert = require('node:assert/strict');
 
 require('../helpers/test-env');
+const {flushAsync} = require('../helpers/async');
 const {setupAcceptanceHarness} = require('../helpers/acceptance-harness');
 const {Camera} = require('../../src/domain/camera');
 const {fetchAllCameraTelemetry} = require('../../src/services/eufy-client');
@@ -19,12 +20,15 @@ const {fetchAllCameraTelemetry} = require('../../src/services/eufy-client');
 describe('Locked Acceptance Criterion AT-07 (docs/acceptance/AT-07.md)', () => {
   it(
     'AT-07: Deep-standby battery cameras (state=0) are never marked offline when healthy, genuinely offline ' +
-      'cameras pause their encoder,Low-Battery Economy Mode skips poll_refresh, and battery swaps auto-recover',
-    async () => {
+      'cameras pause their encoder, Low-Battery Economy Mode and manually disabled cameras (state=2/4/5) skip ' +
+      'poll_refresh, unforced offline polls enforce a 60m cooldown, and battery swaps auto-recover',
+    async (t) => {
+      t.mock.timers.enable({apis: ['Date', 'setTimeout'], now: 1_000_000});
       const cam = new Camera({
         serial: 'T8214T0000000009',
         name: 'doorbell',
         mode: 'backfill',
+        hold_secs: 30,
         station_serial: 'T8030P0000000001',
       });
 
@@ -48,7 +52,20 @@ describe('Locked Acceptance Criterion AT-07 (docs/acceptance/AT-07.md)', () => {
         'AT-07: Online camera in Low-Battery Economy Mode must not invoke driver.poll_refresh on background poll'
       );
 
-      // 3. Explicit OFFLINE_LOWBAT (state=3) marks camera offline and pauses encoder
+      // 2b. Manually disabled / unpaired states (state=2/4/5) mark camera offline but never trigger driver.poll_refresh
+      for (const disabledState of [2, 4, 5]) {
+        sentCommands.length = 0;
+        cam.applyTelemetryProperties({state: disabledState, battery: 80, chargingStatus: 2, wifiRssi: -68}, false);
+        assert.equal(cam.isDeviceOffline(), true);
+        await fetchAllCameraTelemetry(false);
+        assert.equal(
+          sentCommands.includes('driver.poll_refresh'),
+          false,
+          'AT-07: Camera in state=' + disabledState + ' must never trigger background driver.poll_refresh'
+        );
+      }
+
+      // 3. Explicit OFFLINE_LOWBAT (state=3) marks camera offline, pauses encoder, and enforces 60m poll cooldown
       let encoderKilled = false;
       cam.attachEncoder({
         kill() {
@@ -59,6 +76,31 @@ describe('Locked Acceptance Criterion AT-07 (docs/acceptance/AT-07.md)', () => {
       assert.equal(cam.isDeviceOffline(), true);
       assert.equal(cam.pauseEncoderForOffline(), true);
       assert.equal(encoderKilled, true);
+
+      sentCommands.length = 0;
+      const firstOfflinePoll = fetchAllCameraTelemetry(false);
+      await flushAsync(3);
+      t.mock.timers.tick(2000);
+      await flushAsync(4);
+      await firstOfflinePoll;
+      assert.equal(sentCommands.filter((c) => c === 'driver.poll_refresh').length, 1);
+
+      sentCommands.length = 0;
+      t.mock.timers.tick(1_800_000); // 30 minutes (< 60m cooldown)
+      await fetchAllCameraTelemetry(false);
+      assert.equal(
+        sentCommands.includes('driver.poll_refresh'),
+        false,
+        'AT-07: Unforced offline background poll must skip driver.poll_refresh inside the 60-minute cooldown'
+      );
+
+      t.mock.timers.tick(1_800_000); // 60 minutes total (>= 3600s cooldown)
+      const secondOfflinePoll = fetchAllCameraTelemetry(false);
+      await flushAsync(3);
+      t.mock.timers.tick(2000);
+      await flushAsync(4);
+      await secondOfflinePoll;
+      assert.equal(sentCommands.filter((c) => c === 'driver.poll_refresh').length, 1);
 
       // 4. Battery swap to 100% clears offline state even if stale state=3 is still reported
       const swapped = cam.applyTelemetryProperties({state: 3, battery: 100, chargingStatus: 2, wifiRssi: -72}, false);

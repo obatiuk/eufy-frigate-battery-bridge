@@ -140,7 +140,10 @@ describe('Regression 54: Sync Eufy Hardware Properties Only from Full Property S
       const cam = new Camera({
         serial: 'T8161T0000000054',
         name: 'driveway',
-        mode: 'backfill',
+        mode: 'custom',
+        backfill_only: true,
+        power_mode: 'custom',
+        streaming_quality: 'medium',
         station_serial: 'T8030P0000000054',
       });
 
@@ -188,7 +191,10 @@ describe('Regression 54: Sync Eufy Hardware Properties Only from Full Property S
       const cam = new Camera({
         serial: 'T8161T0000000055',
         name: 'backyard',
-        mode: 'backfill',
+        mode: 'custom',
+        backfill_only: true,
+        power_mode: 'custom',
+        streaming_quality: 'medium',
         track_stuck_spotlight: true,
         station_serial: 'T8030P0000000054',
       });
@@ -261,10 +267,10 @@ describe('Regression 54: Sync Eufy Hardware Properties Only from Full Property S
         .filter((m) => m.command === 'device.set_property')
         .map((m) => m.name + '=' + m.value);
       assert.deepEqual(firstPassWrites, [
-        'videoStreamingQuality=7',
-        'recordingClipLength=30',
+        'recordingClipLength=20',
         'recordingEndClipMotionStops=true',
         'rtspStream=true',
+        'videoStreamingQuality=7',
       ]);
       assert.equal(cam.hasQualityChecked(), false, 'Failed videoStreamingQuality write must stay uncommitted');
       assert.equal(cam.hasRecordingModeChecked(), false, 'Failed Power Manager writes must stay uncommitted');
@@ -286,10 +292,10 @@ describe('Regression 54: Sync Eufy Hardware Properties Only from Full Property S
         .filter((m) => m.command === 'device.set_property')
         .map((m) => m.name + '=' + m.value);
       assert.deepEqual(retryWrites, [
-        'videoStreamingQuality=7',
-        'recordingClipLength=30',
+        'recordingClipLength=20',
         'recordingEndClipMotionStops=true',
         'rtspStream=true',
+        'videoStreamingQuality=7',
       ]);
       assert.equal(cam.hasQualityChecked(), true);
       assert.equal(cam.hasRecordingModeChecked(), true);

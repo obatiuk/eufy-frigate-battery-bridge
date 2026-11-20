@@ -49,9 +49,9 @@ const {
 const {log} = require('../../src/logger');
 const {Camera} = require('../../src/domain/camera');
 
-describe('Camera Mode Presets & Unified hold_secs / end_early Auto-Sync', () => {
-  it('resolves "auto" mode when mode is omitted (60s hold, end_early=false, RTSP enabled when supported)', () => {
-    // Verify: resolves "auto" mode when mode is omitted (60s hold, end_early=false, RTSP enabled when supported).
+describe('Camera Mode Presets & Non-Invasive power_mode / streaming_quality Resolution', () => {
+  it('resolves "auto" mode when mode is omitted (30s hold, end_early=true, non-invasive keep defaults)', () => {
+    // Verify: resolves "auto" mode when mode is omitted (30s hold, end_early=true, non-invasive keep defaults).
     const rawCam = {serial: 'T8161T0000000000'};
     const mode = resolveCameraMode(rawCam);
     const timers = resolveCameraTimers(rawCam);
@@ -60,103 +60,125 @@ describe('Camera Mode Presets & Unified hold_secs / end_early Auto-Sync', () => 
     assert.equal(timers.mode, 'auto');
     assert.equal(timers.useRtsp, true);
     assert.equal(timers.alwaysBackfill, false);
-    assert.equal(timers.holdMs, 60000);
-    assert.equal(timers.eventSecs, 60);
-    assert.equal(timers.letEufyDecideEnd, false);
-    assert.equal(hw.powerWorkingMode, 2);
-    assert.equal(hw.recordingClipLength, 60);
-    assert.equal(hw.recordingEndClipMotionStops, false);
-    assert.equal(hw.recordingRetriggerInterval, 5);
+    assert.equal(timers.holdMs, 30000);
+    assert.equal(timers.eventSecs, 30);
+    assert.equal(timers.letEufyDecideEnd, true);
+    assert.equal(hw.powerMode, 'keep');
+    assert.equal(hw.streamingQuality, 'keep');
+    assert.equal(hw.powerWorkingMode, null);
+    assert.equal(hw.recordingClipLength, null);
+    assert.equal(hw.recordingEndClipMotionStops, null);
+    assert.equal(hw.recordingRetriggerInterval, null);
   });
 
-  it('resolves "rtsp" mode with 60s hold, end_early=false, and Power Manager 60s full-clip sync', () => {
-    // Verify: resolves "rtsp" mode with 60s hold, end_early=false, and Power Manager 60s full-clip sync.
+  it('resolves "rtsp" mode with 30s hold, end_early=true, and non-invasive power_mode="keep"', () => {
+    // Verify: resolves "rtsp" mode with 30s hold, end_early=true, and non-invasive power_mode="keep".
     const rawCam = {serial: 'T8161T0000000000', mode: 'rtsp'};
     const timers = resolveCameraTimers(rawCam);
     const hw = resolveHardwareRecordingConfig(rawCam, timers);
     assert.equal(timers.mode, 'rtsp');
     assert.equal(timers.useRtsp, true);
     assert.equal(timers.alwaysBackfill, false);
-    assert.equal(timers.holdMs, 60000);
-    assert.equal(timers.eventSecs, 60);
-    assert.equal(timers.letEufyDecideEnd, false);
-    assert.equal(hw.powerWorkingMode, 2);
-    assert.equal(hw.recordingClipLength, 60);
-    assert.equal(hw.recordingEndClipMotionStops, false);
+    assert.equal(timers.holdMs, 30000);
+    assert.equal(timers.eventSecs, 30);
+    assert.equal(timers.letEufyDecideEnd, true);
+    assert.equal(hw.powerMode, 'keep');
+    assert.equal(hw.powerWorkingMode, null);
+    assert.equal(hw.recordingClipLength, null);
+    assert.equal(hw.recordingEndClipMotionStops, null);
   });
 
   it(
-    'resolves "backfill" mode with 30s hold, end_early=true, useRtsp=true (so RTSP cameras keep RTSP ' +
-      'Live View while backfilling events), and Power Manager 30s early-end sync',
+    'resolves "backfill" mode with 20s hold, end_early=true, useRtsp=true (so RTSP cameras keep RTSP ' +
+      'Live View while backfilling events), and non-invasive power_mode="keep"',
     () => {
-      // Verify: resolves "backfill" mode with 30s hold, end_early=true, useRtsp=true (so RTSP cameras keep RTSP Live
-      // View while backfilling events), and Power Manager 30s early-end sync.
+      // Verify: resolves "backfill" mode with 20s hold, end_early=true, useRtsp=true, and power_mode="keep".
       const rawCam = {serial: 'T8214T2222222222', mode: 'backfill'};
       const timers = resolveCameraTimers(rawCam);
       const hw = resolveHardwareRecordingConfig(rawCam, timers);
       assert.equal(timers.mode, 'backfill');
       assert.equal(timers.useRtsp, true);
       assert.equal(timers.alwaysBackfill, true);
-      assert.equal(timers.holdMs, 30000);
-      assert.equal(timers.eventSecs, 30);
+      assert.equal(timers.holdMs, 20000);
+      assert.equal(timers.eventSecs, 20);
       assert.equal(timers.letEufyDecideEnd, true);
-      assert.equal(hw.powerWorkingMode, 2);
-      assert.equal(hw.recordingClipLength, 30);
-      assert.equal(hw.recordingEndClipMotionStops, true);
+      assert.equal(hw.powerMode, 'keep');
+      assert.equal(hw.powerWorkingMode, null);
+      assert.equal(hw.recordingClipLength, null);
+      assert.equal(hw.recordingEndClipMotionStops, null);
     }
   );
 
-  it('resolves "p2p" mode with 60s hold, end_early=false, useRtsp=false, and alwaysBackfill=false', () => {
-    // Verify: resolves "p2p" mode with 60s hold, end_early=false, useRtsp=false, and alwaysBackfill=false.
+  it('resolves "p2p" mode with 30s hold, end_early=true, useRtsp=false, and alwaysBackfill=false', () => {
+    // Verify: resolves "p2p" mode with 30s hold, end_early=true, useRtsp=false, and alwaysBackfill=false.
     const rawCam = {serial: 'T8140T0000000000', mode: 'p2p'};
     const timers = resolveCameraTimers(rawCam);
     const hw = resolveHardwareRecordingConfig(rawCam, timers);
     assert.equal(timers.mode, 'p2p');
     assert.equal(timers.useRtsp, false);
     assert.equal(timers.alwaysBackfill, false);
-    assert.equal(timers.holdMs, 60000);
-    assert.equal(timers.eventSecs, 60);
-    assert.equal(timers.letEufyDecideEnd, false);
-    assert.equal(hw.recordingClipLength, 60);
-    assert.equal(hw.recordingEndClipMotionStops, false);
+    assert.equal(timers.holdMs, 30000);
+    assert.equal(timers.eventSecs, 30);
+    assert.equal(timers.letEufyDecideEnd, true);
+    assert.equal(hw.powerMode, 'keep');
+    assert.equal(hw.recordingClipLength, null);
+    assert.equal(hw.recordingEndClipMotionStops, null);
   });
 
   it(
-    'automatically syncs per-camera hold_secs and end_early across bridge timers, Frigate event duration, ' +
-      'and Eufy Power Manager while allowing independent frigate_event_secs in "custom" mode',
+    'resolves grouped power_mode ("battery", "surveillance", "custom") and custom streaming_quality ' +
+      'while allowing independent frigate_event_secs in "custom" mode',
     () => {
-      // Verify: automatically syncs per-camera hold_secs and end_early across bridge timers, Frigate event duration,
-      // and Eufy Power Manager while allowing independent frigate_event_secs in "custom" mode.
-      const tunedRtsp = {
+      // Verify: resolves grouped power_mode ("battery", "surveillance", "custom") and custom streaming_quality
+      // while allowing independent frigate_event_secs in "custom" mode.
+      const batRtsp = {
         serial: 'T8161T0000000000',
         mode: 'rtsp',
-        hold_secs: 45,
-        end_early: true,
+        power_mode: 'battery',
+        streaming_quality: 'medium',
       };
-      const tunedTimers = resolveCameraTimers(tunedRtsp);
-      const tunedHw = resolveHardwareRecordingConfig(tunedRtsp, tunedTimers);
-      assert.equal(tunedTimers.holdMs, 45000);
-      assert.equal(tunedTimers.eventSecs, 45);
-      assert.equal(tunedTimers.letEufyDecideEnd, true);
-      assert.equal(tunedHw.recordingClipLength, 45);
-      assert.equal(tunedHw.recordingEndClipMotionStops, true);
+      const batTimers = resolveCameraTimers(batRtsp);
+      const batHw = resolveHardwareRecordingConfig(batRtsp, batTimers);
+      assert.equal(batTimers.holdMs, 20000);
+      assert.equal(batTimers.eventSecs, 20);
+      assert.equal(batTimers.letEufyDecideEnd, true);
+      assert.equal(batHw.powerMode, 'battery');
+      assert.equal(batHw.powerWorkingMode, 0);
+      assert.equal(batHw.recordingClipLength, null);
+      assert.equal(batHw.streamingQuality, 'medium');
+
+      const survRtsp = {
+        serial: 'T8161T0000000002',
+        mode: 'rtsp',
+        power_mode: 'surveillance',
+      };
+      const survTimers = resolveCameraTimers(survRtsp);
+      const survHw = resolveHardwareRecordingConfig(survRtsp, survTimers);
+      assert.equal(survTimers.holdMs, 60000);
+      assert.equal(survTimers.eventSecs, 60);
+      assert.equal(survHw.powerMode, 'surveillance');
+      assert.equal(survHw.powerWorkingMode, 1);
 
       const customCam = {
         serial: 'T8161T1111111111',
         mode: 'custom',
+        power_mode: 'custom',
         hold_secs: 60,
         frigate_event_secs: 45,
         end_early: false,
         recording_retrigger_interval: 10,
-        enforce_streaming_quality: 7,
+        streaming_quality: 7,
       };
       const customTimers = resolveCameraTimers(customCam);
       const customHw = resolveHardwareRecordingConfig(customCam, customTimers);
       assert.equal(customTimers.holdMs, 60000);
       assert.equal(customTimers.eventSecs, 45);
+      assert.equal(customHw.powerMode, 'custom');
+      assert.equal(customHw.powerWorkingMode, 2);
       assert.equal(customHw.recordingClipLength, 60);
+      assert.equal(customHw.recordingEndClipMotionStops, false);
       assert.equal(customHw.recordingRetriggerInterval, 10);
-      assert.equal(customHw.enforceQuality, 7);
+      assert.equal(customHw.streamingQuality, 7);
     }
   );
 
@@ -183,11 +205,12 @@ describe('Camera Mode Presets & Unified hold_secs / end_early Auto-Sync', () => 
       assert.equal(timers.alwaysBackfill, false);
       assert.equal(timers.backfillDownloads, false);
       assert.equal(timers.letEufyDecideEnd, false);
+      assert.equal(hw.powerMode, null);
+      assert.equal(hw.streamingQuality, null);
       assert.equal(hw.powerWorkingMode, null);
       assert.equal(hw.recordingClipLength, null);
       assert.equal(hw.recordingEndClipMotionStops, null);
       assert.equal(hw.recordingRetriggerInterval, null);
-      assert.equal(hw.enforceQuality, null);
       assert.deepEqual(tel, {
         enabled: false,
         battery: false,
@@ -328,85 +351,65 @@ describe('Defensive Non-Contradiction Validation ("custom" mode & frame rates)',
     }
   );
 
-  it('disables hardware Power Manager sync when sync_power=false', () => {
-    // Verify: disables hardware Power Manager sync when sync_power=false.
+  it('disables hardware Power Manager sync when power_mode="keep"', () => {
+    // Verify: disables hardware Power Manager sync when power_mode="keep".
     const hw = resolveHardwareRecordingConfig({
       serial: 'T8161CUSTOM0003',
       mode: 'rtsp',
-      sync_power: false,
+      power_mode: 'keep',
     });
+    assert.equal(hw.powerMode, 'keep');
     assert.equal(hw.powerWorkingMode, null);
     assert.equal(hw.recordingClipLength, null);
     assert.equal(hw.recordingEndClipMotionStops, null);
     assert.equal(hw.recordingRetriggerInterval, null);
   });
 
-  it(
-    'promotes power_working_mode < 2 to 2 when custom clip settings are specified, and raises ' +
-      'recording_clip_length >= hold_secs when end_early=false',
-    () => {
-      // Verify: promotes power_working_mode < 2 to 2 when custom clip settings are specified, and raises
-      // recording_clip_length >= hold_secs when end_early=false.
-      const rawCam = {
-        serial: 'T8161CUSTOM0001',
-        mode: 'custom',
-        hold_secs: 60,
-        end_early: false,
-        power_working_mode: 0,
-        recording_clip_length: 20,
-      };
-      const timers = resolveCameraTimers(rawCam);
-      const hw = resolveHardwareRecordingConfig(rawCam, timers);
-      assert.equal(hw.powerWorkingMode, 2);
-      assert.equal(hw.recordingClipLength, 60);
-      assert.equal(hw.recordingEndClipMotionStops, false);
-      assert.equal(hw.recordingRetriggerInterval, 5);
-    }
-  );
+  it('raises recording_clip_length >= hold_secs when end_early=false under mode="custom" + power_mode="custom"', () => {
+    // Verify: raises recording_clip_length >= hold_secs when end_early=false under mode="custom" + power_mode="custom".
+    const rawCam = {
+      serial: 'T8161CUSTOM0001',
+      mode: 'custom',
+      power_mode: 'custom',
+      hold_secs: 60,
+      end_early: false,
+      recording_clip_length: 20,
+    };
+    const timers = resolveCameraTimers(rawCam);
+    const hw = resolveHardwareRecordingConfig(rawCam, timers);
+    assert.equal(hw.powerMode, 'custom');
+    assert.equal(hw.powerWorkingMode, 2);
+    assert.equal(hw.recordingClipLength, 60);
+    assert.equal(hw.recordingEndClipMotionStops, false);
+    assert.equal(hw.recordingRetriggerInterval, 5);
+  });
 
-  it(
-    'promotes power_working_mode=0 to 2 when hold_secs > 20 or end_early=false, and preserves compatible ' +
-      'presets (mode 1 or mode 0 with 20s + end_early=true)',
-    () => {
-      // Verify: promotes power_working_mode=0 to 2 when hold_secs > 20 or end_early=false, and preserves compatible
-      // presets (mode 1 or mode 0 with 20s + end_early=true).
-      const conflictingMode0 = {
-        serial: 'T8161CUSTOM0002',
-        mode: 'custom',
-        hold_secs: 60,
-        end_early: false,
-        power_working_mode: 0,
-      };
-      const conflictingTimers = resolveCameraTimers(conflictingMode0);
-      const conflictingHw = resolveHardwareRecordingConfig(conflictingMode0, conflictingTimers);
-      assert.equal(conflictingHw.powerWorkingMode, 2);
-      assert.equal(conflictingHw.recordingClipLength, 60);
-      assert.equal(conflictingHw.recordingEndClipMotionStops, false);
+  it('keeps native Eufy presets (power_mode="battery" -> 0, "surveillance" -> 1) without promoting to 2', () => {
+    // Verify: keeps native Eufy presets (power_mode="battery" -> 0, "surveillance" -> 1) without promoting to 2.
+    const batWithLongHold = {
+      serial: 'T8161CUSTOM0002',
+      mode: 'rtsp',
+      hold_secs: 60,
+      end_early: false,
+      power_mode: 'battery',
+    };
+    const batTimers = resolveCameraTimers(batWithLongHold);
+    const batHw = resolveHardwareRecordingConfig(batWithLongHold, batTimers);
+    assert.equal(batHw.powerWorkingMode, 0);
+    assert.equal(batHw.recordingClipLength, null);
+    assert.equal(batHw.recordingEndClipMotionStops, null);
+    assert.equal(batHw.recordingRetriggerInterval, null);
 
-      const compatibleMode0 = {
-        serial: 'T8161CUSTOM0003',
-        mode: 'custom',
-        hold_secs: 20,
-        end_early: true,
-        power_working_mode: 0,
-      };
-      const compatibleMode0Hw = resolveHardwareRecordingConfig(compatibleMode0, resolveCameraTimers(compatibleMode0));
-      assert.equal(compatibleMode0Hw.powerWorkingMode, 0);
-      assert.equal(compatibleMode0Hw.recordingClipLength, null);
-      assert.equal(compatibleMode0Hw.recordingEndClipMotionStops, null);
-      assert.equal(compatibleMode0Hw.recordingRetriggerInterval, null);
-
-      const surveillanceMode1 = {
-        serial: 'T8161CUSTOM0004',
-        mode: 'custom',
-        power_working_mode: 1,
-      };
-      const surveillanceHw = resolveHardwareRecordingConfig(surveillanceMode1, resolveCameraTimers(surveillanceMode1));
-      assert.equal(surveillanceHw.powerWorkingMode, 1);
-      assert.equal(surveillanceHw.recordingClipLength, null);
-      assert.equal(surveillanceHw.recordingEndClipMotionStops, null);
-    }
-  );
+    const surveillanceMode1 = {
+      serial: 'T8161CUSTOM0004',
+      mode: 'rtsp',
+      power_mode: 'surveillance',
+    };
+    const surveillanceHw = resolveHardwareRecordingConfig(surveillanceMode1, resolveCameraTimers(surveillanceMode1));
+    assert.equal(surveillanceHw.powerWorkingMode, 1);
+    assert.equal(surveillanceHw.recordingClipLength, null);
+    assert.equal(surveillanceHw.recordingEndClipMotionStops, null);
+  });
 
   it(
     'supports per-camera backfill_enabled, trigger_events, low_battery_threshold, ' +
@@ -809,7 +812,7 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
     assert.equal(globalEnabledBuilt.cameras[1].trackStuckSpotlight, false);
 
     const camOverrideBuilt = new BridgeConfigBuilder({
-      sync_power: false,
+      power_mode: 'keep',
       cameras: [{serial: 'T8161T0000000003', track_stuck_spotlight: true}],
     }).build();
     assert.equal(camOverrideBuilt.track_stuck_spotlight, false);
@@ -868,13 +871,12 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
           low_battery_threshold: 25,
           low_battery_hold_secs: 20,
           low_battery_wake_on_view: false,
-          sync_power: false,
+          power_mode: 'battery',
           track_stuck_spotlight: true,
-          power_working_mode: 2,
           recording_clip_length: 60,
           recording_end_early: false,
           recording_retrigger_interval: 5,
-          enforce_streaming_quality: true,
+          streaming_quality: 'medium',
           trigger_events: ['motion'],
           startup_snapshot: true,
           telemetry: {battery: true},
@@ -923,17 +925,25 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
         true
       );
 
-      // 4. Power Manager options ignored when sync_power=false
+      // 4. Custom recording/quality options ignored outside mode="custom" or when power_mode !== "custom"
       const powerWarnings = captureWarnings(() => {
         resolveCameraConfig({
           serial: 'T8161T0000000013',
           name: 'shed',
           mode: 'rtsp',
-          sync_power: false,
-          power_working_mode: 2,
+          power_mode: 'custom',
+          streaming_quality: 7,
           recording_clip_length: 60,
           recording_end_early: false,
           recording_retrigger_interval: 5,
+        });
+        resolveCameraConfig({
+          serial: 'T8161T0000000019',
+          name: 'shed_keep',
+          mode: 'custom',
+          power_mode: 'battery',
+          recording_clip_length: 45,
+          recording_retrigger_interval: 10,
         });
       });
       assert.equal(
@@ -941,9 +951,20 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
           (w) =>
             w.scope === 'shed' &&
             w.msg.includes(
-              'ignoring power_working_mode, recording_clip_length, recording_end_early, ' +
-                'recording_retrigger_interval because sync_power=false'
+              'ignoring power_mode="custom" in mode="rtsp" (power_mode="custom" only applies in mode="custom")'
             )
+        ),
+        true
+      );
+      assert.equal(
+        powerWarnings.some((w) => w.scope === 'shed' && w.msg.includes('ignoring streaming_quality=7 in mode="rtsp"')),
+        true
+      );
+      assert.equal(
+        powerWarnings.some(
+          (w) =>
+            w.scope === 'shed_keep' &&
+            w.msg.includes('ignoring recording_clip_length, recording_retrigger_interval because power_mode="battery"')
         ),
         true
       );
@@ -1018,6 +1039,7 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
       const topWarnings = captureWarnings(() => {
         new BridgeConfigBuilder(
           {
+            power_mode: 'custom',
             card_theme: 'none',
             card_position: 'top-left',
             sleep_screen: 'slate',
@@ -1025,8 +1047,19 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
             cameras: [{serial: 'T8161T0000000017', name: 'front', mode: 'rtsp'}],
           },
           {BRIDGE_HWACCEL: 'false', BRIDGE_HWACCEL_DEVICE: '/dev/dri/renderD128'}
-        ).build();
+        )
+          .withVideoAndAudio()
+          .withEventsAndOverlays()
+          .withCameras()
+          .build();
       });
+      assert.equal(
+        topWarnings.some(
+          (w) =>
+            w.scope === 'bridge' && w.msg.includes('ignoring power_mode="custom" because no camera uses mode="custom"')
+        ),
+        true
+      );
       assert.equal(
         topWarnings.some(
           (w) => w.scope === 'bridge' && w.msg.includes('ignoring BRIDGE_HWACCEL_DEVICE="/dev/dri/renderD128"')

@@ -73,6 +73,7 @@ class StreamSession {
    *     earlySleepMs?: number,
    *     letEufyDecideEnd?: boolean,
    *   },
+   *   shouldLetEufyDecideEnd?: () => boolean,
    *   onDecoderTransition?: (prev: string, next: string, reason: string) => void,
    *   onDecoderRefused?: (prev: string, next: string, reason: string) => void,
    * }} opts - Static camera session options and decoder transition logger callbacks.
@@ -80,6 +81,10 @@ class StreamSession {
   constructor(opts) {
     this.directRtsp = Boolean(opts.directRtsp);
     this.timers = opts.timers;
+    this.shouldLetEufyDecideEnd =
+      typeof opts.shouldLetEufyDecideEnd === 'function'
+        ? opts.shouldLetEufyDecideEnd
+        : () => Boolean(this.timers.letEufyDecideEnd);
     this.onDecoderTransition = typeof opts.onDecoderTransition === 'function' ? opts.onDecoderTransition : () => {};
     this.onDecoderRefused = typeof opts.onDecoderRefused === 'function' ? opts.onDecoderRefused : () => {};
 
@@ -720,7 +725,7 @@ class StreamSession {
    */
   shortenHoldOnMotionClear(now, settleMs = DEFAULT_MOTION_CLEAR_SETTLE_MS, minVideoMs = DEFAULT_MIN_EVENT_VIDEO_MS) {
     this.motionClearedAt = now;
-    if (this.timers.letEufyDecideEnd && this.active && this.isInMotion(now) && this.gotVideo) {
+    if (this.shouldLetEufyDecideEnd() && this.active && this.isInMotion(now) && this.gotVideo) {
       const minEnd = Math.max(now + settleMs, (this.firstVideoAt || now) + minVideoMs);
       if (this.motionUntil > minEnd) {
         this.motionUntil = minEnd;

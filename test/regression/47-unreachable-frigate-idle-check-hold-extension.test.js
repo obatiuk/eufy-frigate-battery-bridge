@@ -123,7 +123,10 @@ describe('Regression 47. Unreachable Frigate Treated as Active Object During Hol
         }
 
         // Early sleep (idle_timeout_secs) must skip confirmation when Frigate is unknown rather than sleeping early.
-        const earlyCam = buildActiveRtspCam('SN0000000472', 'early_unknown_cam', {idle_timeout_secs: 15});
+        const earlyCam = buildActiveRtspCam('SN0000000472', 'early_unknown_cam', {
+          idle_timeout_secs: 15,
+          end_early: false,
+        });
         earlyCam.recordMotionCleared(t0 + 5_000, 5_000, 10_000, 'motion detected');
         initOrchestrator([earlyCam], new Map([[earlyCam.getSerial(), earlyCam]]), () => false);
         global.fetch = async () => ({

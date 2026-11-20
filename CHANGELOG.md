@@ -4,6 +4,14 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- **BREAKING:** Replace automatic Eufy power-mode and streaming-quality overrides with non-invasive keep-by-default
+  profiles (rejecting the removed legacy power and quality configuration keys at startup and logging a warning with the
+  camera's existing settings whenever an opted-in profile overrides them), inspect Eufy app motion detection toggles
+  read-only to warn when active event triggers are disabled on the camera and report them in runtime status, mirror
+  reported camera recording settings when timers are omitted, shorten default live and backfill hold windows to 30 and
+  20 seconds with early motion-clear termination across all modes while continuing active streams across clip
+  boundaries, latch unsupported device property writes, and skip or back off background station refreshes to 60 minutes
+  when cameras are manually disabled or offline
 - Rename cached camera snapshot files to include the camera name and local capture timestamp, automatically migrate
   legacy snapshot files and prune superseded ones, and log restored snapshot timestamps and relative ages at startup
 - Synchronize Eufy hardware settings only from complete property snapshots with confirmed write retries, prevent

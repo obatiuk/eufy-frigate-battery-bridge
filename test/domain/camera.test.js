@@ -22,8 +22,9 @@ afterEach(() => {
 });
 
 describe('Camera & Telemetry Domain Models', () => {
-  it('derives Eufy Power Manager property sync changes for "rtsp" and "backfill" modes', () => {
-    // Verify: derives Eufy Power Manager property sync changes for "rtsp" and "backfill" modes.
+  it('keeps non-invasive defaults on "rtsp" and "backfill" while syncing opted-in power_mode profiles', () => {
+    // Verify: "rtsp" and "backfill" emit zero recording changes under default power_mode="keep" and mirror telemetry,
+    // while opted-in "surveillance" and "custom" profiles derive expected Power Manager property updates.
     const rtspCam = new Camera({
       serial: 'T8161T0000000000',
       title: 'Storage Room Camera',
@@ -36,32 +37,53 @@ describe('Camera & Telemetry Domain Models', () => {
       mode: 'backfill',
       priority: 100,
     });
+    const survCam = new Camera({
+      serial: 'T8161T0000000002',
+      mode: 'rtsp',
+      power_mode: 'surveillance',
+    });
+    const customCam = new Camera({
+      serial: 'T8161T0000000003',
+      mode: 'custom',
+      power_mode: 'custom',
+    });
 
     assert.equal(rtspCam.getName(), 'T8161T0000000000');
     assert.equal(backfillCam.getName(), 'T8214T2222222222');
+    assert.deepEqual(
+      rtspCam.evaluateRecordingModeChanges({
+        powerWorkingMode: {value: 0},
+        recordingClipLength: {value: 20},
+        recordingEndClipMotionStops: {value: true},
+        recordingRetriggerInterval: {value: 5},
+      }),
+      []
+    );
+    assert.deepEqual(
+      backfillCam.evaluateRecordingModeChanges({
+        powerWorkingMode: {value: 2},
+        recordingClipLength: {value: 60},
+        recordingEndClipMotionStops: {value: false},
+        recordingRetriggerInterval: {value: 5},
+      }),
+      []
+    );
 
-    const rtspChanges = rtspCam.evaluateRecordingModeChanges({
-      powerWorkingMode: {value: 0},
-      recordingClipLength: {value: 20},
-      recordingEndClipMotionStops: {value: true},
-      recordingRetriggerInterval: {value: 5},
-    });
-    assert.deepEqual(rtspChanges, [
-      {name: 'powerWorkingMode', currentValue: 0, targetValue: 2},
-      {name: 'recordingClipLength', currentValue: 20, targetValue: 60},
-      {name: 'recordingEndClipMotionStops', currentValue: true, targetValue: false},
+    assert.deepEqual(survCam.evaluateRecordingModeChanges({powerWorkingMode: {value: 0}}), [
+      {name: 'powerWorkingMode', currentValue: 0, targetValue: 1},
     ]);
-
-    const backfillChanges = backfillCam.evaluateRecordingModeChanges({
-      powerWorkingMode: {value: 2},
-      recordingClipLength: {value: 60},
-      recordingEndClipMotionStops: {value: false},
-      recordingRetriggerInterval: {value: 5},
-    });
-    assert.deepEqual(backfillChanges, [
-      {name: 'recordingClipLength', currentValue: 60, targetValue: 30},
-      {name: 'recordingEndClipMotionStops', currentValue: false, targetValue: true},
-    ]);
+    assert.deepEqual(
+      customCam.evaluateRecordingModeChanges({
+        powerWorkingMode: {value: 2},
+        recordingClipLength: {value: 60},
+        recordingEndClipMotionStops: {value: false},
+        recordingRetriggerInterval: {value: 5},
+      }),
+      [
+        {name: 'recordingClipLength', currentValue: 60, targetValue: 30},
+        {name: 'recordingEndClipMotionStops', currentValue: false, targetValue: true},
+      ]
+    );
   });
 
   it('isolates station idle checks so active RTSP cameras never block P2P backfill downloads', () => {
@@ -255,6 +277,7 @@ describe('Camera & Telemetry Domain Models', () => {
       );
 
       cam1.setMotionUntil(t0 + 60000);
+      cam1.addActiveTriggerEvent('motion detected');
       assert.equal(
         cam1.shouldRewakeRtspOnDrop(t0 + 15000),
         true,
@@ -262,6 +285,7 @@ describe('Camera & Telemetry Domain Models', () => {
       );
 
       cam1.setMotionUntil(0);
+      cam1.clearActiveTriggerEvents();
       doorbell.beginSession('p2p', t0, false);
       doorbell.setViewUntil(t0 + 20000);
       const p2pCam3 = new Camera({
@@ -335,7 +359,13 @@ describe('Camera Arbitration, Hold Extension, Early Sleep & Watchdog Health', ()
     () => {
       // Verify: evaluates active hold extensions near expiry, early sleep on motion cleared, and Eufy clean-end
       // detection.
-      const cam = new Camera({serial: 'T8161T0000000000', mode: 'p2p', hold_secs: 60, stream_max_secs: 120});
+      const cam = new Camera({
+        serial: 'T8161T0000000000',
+        mode: 'p2p',
+        hold_secs: 60,
+        stream_max_secs: 120,
+        end_early: false,
+      });
       const t0 = 100000;
       cam.beginSession('p2p', t0, false);
       cam.setGotVideo(true);
@@ -728,7 +758,7 @@ describe('Camera Offline Detection, Battery-Swap Recovery & Direct RTSP Lifecycl
       babyCam.markRtspFrameReceived(t0 + 600000);
       assert.equal(babyCam.hasReachedMaxDuration(t0 + 600000), false);
       assert.equal(babyCam.hasReachedViewMaxDuration(t0 + 600000), false);
-      assert.ok(babyCam.wantUntil() >= t0 + 660000);
+      assert.ok(babyCam.wantUntil() >= t0 + 630000);
       const liveTermOut = babyCam.terminateSession(t0 + 601000, 'direct RTSP stream ended', false, 'eufy/rtsp-end');
       assert.equal(
         liveTermOut.shouldPersistSnapshot,
@@ -800,8 +830,8 @@ describe('Camera Offline Detection, Battery-Swap Recovery & Direct RTSP Lifecycl
       assert.equal(babySummary.view_max_secs, null);
       assert.equal(babySummary.backfill_only, null);
       assert.equal(babySummary.backfill_enabled, null);
-      assert.equal(babySummary.sync_power, null);
-      assert.equal(babySummary.power_working_mode, null);
+      assert.equal(babySummary.power_mode, null);
+      assert.equal(babySummary.streaming_quality, null);
       assert.equal(babySummary.startup_snapshot, null);
       assert.equal(babySummary.telemetry, null);
       assert.equal(timedDirectCam.toConfigSummary().serial, 'T8352P0000000002');
@@ -810,14 +840,15 @@ describe('Camera Offline Detection, Battery-Swap Recovery & Direct RTSP Lifecycl
         serial: 'T8214T0000000099',
         name: 'doorbell_none',
         mode: 'p2p',
-        sync_power: false,
         card_theme: 'none',
       }).toConfigSummary();
       assert.equal(p2pNoCardSummary.rtsp_url, null);
       assert.equal(p2pNoCardSummary.card_position, null);
       assert.equal(p2pNoCardSummary.card_show_on_live, null);
       assert.equal(p2pNoCardSummary.telemetry, null);
-      assert.equal(p2pNoCardSummary.power_working_mode, null);
+      assert.equal(p2pNoCardSummary.power_mode, 'keep');
+      assert.equal(p2pNoCardSummary.streaming_quality, 'keep');
+      assert.equal(p2pNoCardSummary.recording_clip_length, null);
       assert.equal(p2pNoCardSummary.auto_frigate_mask, true);
 
       const backfillMinimalSummary = new Camera({

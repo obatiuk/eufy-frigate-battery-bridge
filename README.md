@@ -48,9 +48,10 @@ what is on that stream as your cameras sleep, detect activity, or get opened for
   dashboard grids are ignored so sleeping cameras stay asleep, and if a camera is already open in the Eufy mobile app,
   the bridge shares that stream instead of waking it twice.
 - **Behind the scenes - automatic setup & safeguards:** On startup and after Frigate restarts, the bridge masks its
-  corner status card in Frigate so status updates never trigger false motion alerts, and configures each camera's Eufy
-  Power Manager settings to match its mode. Day to day, it shortens recordings when a battery runs low, recovers stalled
-  streams and `HomeBase` connections after Wi-Fi drops, and supports optional GPU video encoding.
+  corner status card in Frigate so status updates never trigger false motion alerts, and reads each camera's Eufy Power
+  Manager settings without overwriting your Eufy app configuration unless you opt in (`power_mode` /
+  `streaming_quality`). Day to day, it shortens recordings when a battery runs low, recovers stalled streams and
+  `HomeBase` connections after Wi-Fi drops, and supports optional GPU video encoding.
 
 How the bridge brings video into Frigate when an event happens - waking a live network stream, opening a direct station
 stream, or replaying a recorded clip from `HomeBase 3` - depends on the `mode` you choose for each camera.
@@ -70,14 +71,14 @@ Eufy cameras can send video to Frigate in three ways:
 Based on those three paths, each camera in your `config.yaml` can be set to one of five modes (plus optional
 `rtsp_url` for standalone `RTSP` cameras):
 
-| Mode                            | Best For                                                             | How It Works                                                                                                                                                    | Default Recording Length                      |
-| :------------------------------ | :------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------- |
-| `"auto"` (default when omitted) | Most setups (automatic detection)                                    | Picks `"rtsp"` on cameras that support `HomeBase` `RTSP` (or when `rtsp_url` is set), and `"p2p"` with `HomeBase` clip-replay fallback on all others.           | Matches selected mode                         |
-| `"rtsp"`                        | Battery cameras with NAS / `RTSP` Stream (e.g. eufyCam S300 `T8161`) | Wakes a live `HomeBase` `RTSP` stream via `eufy-security-ws` on motion or Live View, and puts the camera back to sleep when finished.                           | `60` seconds                                  |
-| `"rtsp"` (with `rtsp_url` set)  | Standalone `RTSP` cameras (e.g. Baby Monitor `E20` / `E21`)          | Pulls `rtsp_url` directly from the camera without using `eufy-security-ws`, showing the cached snapshot and status card in Frigate whenever the camera is off.  | Continuous while camera is on                 |
-| `"backfill"`                    | Battery doorbells (`T8214`) & high-traffic cameras (`T8161`)         | Best battery life & zero missed walk-bys. Records each motion/ring clip to `HomeBase 3`, sleeps, then replays the clip into Frigate. Streams live on Live View. | `30` seconds (stops early once motion clears) |
-| `"p2p"`                         | Battery cameras without `RTSP` when you prefer live motion streams   | Wakes a live `P2P` stream on motion, and automatically falls back to replaying the `HomeBase` clip if another `P2P` camera is already streaming.                | `60` seconds                                  |
-| `"custom"`                      | Advanced per-camera tuning                                           | Lets you mix and override individual stream, timer, and Eufy Power Manager settings while automatically fixing any conflicting values.                          | `60` seconds (unless overridden)              |
+| Mode                            | Best For                                                             | How It Works                                                                                                                                                    | Default Recording Length                 |
+| :------------------------------ | :------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------- |
+| `"auto"` (default when omitted) | Most setups (automatic detection)                                    | Picks `"rtsp"` on cameras that support `HomeBase` `RTSP` (or when `rtsp_url` is set), and `"p2p"` with `HomeBase` clip-replay fallback on all others.           | Mirrors Eufy app (`30` seconds fallback) |
+| `"rtsp"`                        | Battery cameras with NAS / `RTSP` Stream (e.g. eufyCam S300 `T8161`) | Wakes a live `HomeBase` `RTSP` stream via `eufy-security-ws` on motion or Live View, and puts the camera back to sleep once motion clears.                      | Mirrors Eufy app (`30` seconds fallback) |
+| `"rtsp"` (with `rtsp_url` set)  | Standalone `RTSP` cameras (e.g. Baby Monitor `E20` / `E21`)          | Pulls `rtsp_url` directly from the camera without using `eufy-security-ws`, showing the cached snapshot and status card in Frigate whenever the camera is off.  | Continuous while camera is on            |
+| `"backfill"`                    | Battery doorbells (`T8214`) & high-traffic cameras (`T8161`)         | Best battery life & zero missed walk-bys. Records each motion/ring clip to `HomeBase 3`, sleeps, then replays the clip into Frigate. Streams live on Live View. | Mirrors Eufy app (`20` seconds fallback) |
+| `"p2p"`                         | Battery cameras without `RTSP` when you prefer live motion streams   | Wakes a live `P2P` stream on motion, and automatically falls back to replaying the `HomeBase` clip if another `P2P` camera is already streaming.                | Mirrors Eufy app (`30` seconds fallback) |
+| `"custom"`                      | Advanced per-camera tuning                                           | Lets you mix and override individual stream, timer, quality, and Eufy Power Manager settings while automatically fixing any conflicting values.                 | `30` seconds (unless overridden)         |
 
 Once you know which mode fits each camera, you can get the bridge running in three steps.
 
@@ -284,16 +285,16 @@ Bridge configuration is split into two places so container networking stays sepa
 
 ### Per-Camera Settings (`cameras[]`)
 
-| Key         | Required |            Default             | Meaning                                                                                                                                                                                    |
-| :---------- | :------: | :----------------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `serial`    | **Yes**  |               -                | Camera serial number from the Eufy app (e.g. `SN0000000001`; optional when `rtsp_url` and `name` are set)                                                                                  |
-| `name`      |    No    |            `serial`            | Camera name in Frigate (defaults to `serial` when omitted)                                                                                                                                 |
-| `title`     |    No    |           Eufy name            | Friendly display name for logs and notifications                                                                                                                                           |
-| `mode`      |    No    |            `"auto"`            | `"rtsp"`, `"backfill"`, `"p2p"`, `"custom"`, or `"auto"`                                                                                                                                   |
-| `rtsp_url`  |    No    |               -                | Direct camera `RTSP` URL (`rtsp://...` or `rtsps://...`, supported with `"rtsp"` or `"auto"` mode) for standalone `RTSP` cameras; streams continuously without querying `eufy-security-ws` |
-| `hold_secs` |    No    |   `60` (`30` in `backfill`)    | Recording & event duration in seconds (`5 - 86400`, global or per-camera; syncs to the Eufy camera, the bridge, and Frigate)                                                               |
-| `end_early` |    No    | `false` (`true` in `backfill`) | Stop recording early as soon as motion clears (`true` or `false`, global or per-camera)                                                                                                    |
-| `priority`  |    No    |              `0`               | Priority when two `P2P` cameras trigger at the same time (`-10000 - 10000`, higher number wins)                                                                                            |
+| Key         | Required |          Default          | Meaning                                                                                                                                                                                    |
+| :---------- | :------: | :-----------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serial`    | **Yes**  |             -             | Camera serial number from the Eufy app (e.g. `SN0000000001`; optional when `rtsp_url` and `name` are set)                                                                                  |
+| `name`      |    No    |         `serial`          | Camera name in Frigate (defaults to `serial` when omitted)                                                                                                                                 |
+| `title`     |    No    |         Eufy name         | Friendly display name for logs and notifications                                                                                                                                           |
+| `mode`      |    No    |         `"auto"`          | `"rtsp"`, `"backfill"`, `"p2p"`, `"custom"`, or `"auto"`                                                                                                                                   |
+| `rtsp_url`  |    No    |             -             | Direct camera `RTSP` URL (`rtsp://...` or `rtsps://...`, supported with `"rtsp"` or `"auto"` mode) for standalone `RTSP` cameras; streams continuously without querying `eufy-security-ws` |
+| `hold_secs` |    No    | `30` (`20` in `backfill`) | Recording & event duration in seconds (`5 - 86400`, global or per-camera; mirrors Eufy app Power Manager when omitted under `power_mode: "keep"`)                                          |
+| `end_early` |    No    |          `true`           | Stop recording early as soon as motion clears (`true` or `false`, global or per-camera)                                                                                                    |
+| `priority`  |    No    |            `0`            | Priority when two `P2P` cameras trigger at the same time (`-10000 - 10000`, higher number wins)                                                                                            |
 
 You can also override `card_theme`, `card_position`, `sleep_screen`, `telemetry`, `trigger_events`, `backfill_enabled`,
 `low_battery_threshold`, `critical_battery_threshold`, or `low_battery_wake_on_view` on individual cameras - see
@@ -394,8 +395,9 @@ validates your configuration and recovers from common Eufy and Wi-Fi hiccups:
     line if any explicitly configured option does not apply to the chosen mode or theme.
   - **Checks service versions:** Verifies in the background that `Frigate`, `go2rtc`, and `eufy-security-ws` meet the
     minimum supported versions and logs a `[WARN ]` message without interrupting startup if an older version is found.
-  - **Syncs Eufy Power Manager:** Reads each camera's battery, signal, and recording settings, then configures Eufy
-    Power Manager mode, clip length, retrigger delay, streaming quality, and `RTSP` toggles to match your chosen `mode`.
+  - **Reads camera telemetry & optional profiles:** Reads each camera's battery, signal, and Power Manager settings to
+    align bridge timers automatically (`power_mode: "keep"`, `streaming_quality: "keep"`), and applies `RTSP` toggles or
+    any opted-in `power_mode` / `streaming_quality` profile.
   - **Verifies cloud & `HomeBase` links:** Confirms that `eufy-security-ws` is connected to Eufy's cloud and every
     `HomeBase` station, reconnecting automatically if an earlier Wi-Fi drop left a station wedged.
   - **Restores snapshots & Frigate masks:** Loads saved snapshots from `/config/cache` (or briefly wakes a newly added
@@ -423,9 +425,10 @@ you want to customize individual cameras, triggers, timers, or Power Manager set
   set `idle_timeout_secs: 15` so the stream still closes early once Frigate confirms nobody is left in view.
 - **Indoor or nursery cameras:** Wake only on `"crying"` or `"sound"`, hide temperature or Wi-Fi icons on the status
   card (`telemetry`), and allow longer Live View sessions (`view_max_secs: 900`).
-- **Managing camera schedules yourself in the Eufy app or using `HomeBase 2`:** Set `sync_power: false` so the bridge
-  leaves your Eufy Power Manager settings untouched, or set `backfill_enabled: false` on older `HomeBase 2` stations
-  that do not support clip downloads.
+- **Managing camera schedules in the Eufy app or using `HomeBase 2`:** By default (`power_mode: "keep"` and
+  `streaming_quality: "keep"`), the bridge leaves your Eufy app Power Manager and streaming quality untouched; set
+  `power_mode: battery` or `surveillance` (or `custom` in `mode: custom`) when you want the bridge to manage them, or
+  set `backfill_enabled: false` on older `HomeBase 2` stations that do not support clip downloads.
 
 In the tables below, settings marked **`Global & Camera`** can be placed at the top of `config.yaml` (for all cameras)
 or inside a single camera in `cameras[]`. Settings marked **`Camera ("custom")`** apply to individual cameras when
@@ -462,6 +465,9 @@ or inside a single camera in `cameras[]`. Settings marked **`Camera ("custom")`*
 
 - **Filtering triggers (`trigger_events`):** Choose which Eufy alerts (`motion`, `radar`, `person`, `identity person`,
   `stranger`, `loitering`, `package`, `pet`, `dog`, `vehicle`, `sound`, `crying`, `ring`) wake or backfill each camera.
+  The bridge filters incoming alerts locally and never modifies your camera's Motion Detection toggles; if Motion
+  Detection or any active `trigger_events` categories are disabled in the Eufy app, the bridge logs a `WARN` notice at
+  startup showing which categories are off on the camera and which ones are enabled.
 - **Priority switching (`priority` & `event_priorities`):** Because a `HomeBase` can only run one `P2P` stream or clip
   download at a time, the bridge combines each camera's `priority` with the event's urgency (`ring` beats `person`,
   which beats general `motion`). If a more urgent `P2P` alert arrives while another `P2P` camera is streaming, the
@@ -521,42 +527,42 @@ or inside a single camera in `cameras[]`. Settings marked **`Camera ("custom")`*
 | `live_fps` | Global |  `15`   |         `5 - 60`         | Output frame rate while a camera is streaming or replaying a clip         |
 | `idle_fps` | Global |   `5`   | `1 - 30` (`<= live_fps`) | Output frame rate while a camera is asleep (match Frigate's `detect.fps`) |
 
-### 5. Custom Mode (`mode: custom`), Clip Backfill & Eufy Power Manager Overrides
+### 5. Custom Mode (`mode: custom`), Clip Backfill, Power Mode & Streaming Quality
 
 Use `mode: custom` on a camera when you want to combine settings that the preset modes normally manage for you - for
 example, enabling `backfill_only: true` while keeping `use_rtsp: true` so motion events replay recorded `HomeBase 3`
-clips while manual Live View opens a fast `RTSP` stream, or setting custom Eufy Power Manager values
-(`power_working_mode`, `recording_clip_length`, `recording_end_early`, `recording_retrigger_interval`).
+clips while manual Live View opens a fast `RTSP` stream, or opting into `power_mode: custom` with custom Eufy clip
+settings (`recording_clip_length`, `recording_end_early`, `recording_retrigger_interval`) and raw `streaming_quality`
+codes (`0 - 10`).
 
-Even in `mode: custom`, the bridge checks for conflicting values at startup and adjusts them safely:
+At startup, the bridge checks for conflicting values and adjusts them safely:
 
 - **`idle_fps > live_fps`:** Lowers `idle_fps` to match `live_fps` so a sleeping stream never runs faster than live
   video.
 - **`stream_max_secs < hold_secs` or `low_battery_hold_secs > hold_secs`:** Raises `stream_max_secs` to at least
   `hold_secs` and caps `low_battery_hold_secs` at `hold_secs`.
-- **`recording_clip_length < hold_secs` when `end_early: false`:** Raises `recording_clip_length` to match `hold_secs`
-  (up to `120s`) so the camera hardware does not cut off before `hold_secs` finishes.
-- **`power_working_mode: 0` or `1` with custom hold/clip settings:** Switches `power_working_mode` to `2` (`Customize
-Recording`) whenever custom clip settings are used or when mode `0` (`Optimal Battery Life`, fixed at `20s`) conflicts
-  with `hold_secs > 20` or `end_early: false`.
+- **`recording_clip_length < hold_secs` when `power_mode: custom` and `end_early: false`:** Raises
+  `recording_clip_length` to match `hold_secs` (up to `120s`) so the camera hardware does not cut off before `hold_secs`
+  finishes.
+- **Grouped `power_mode` presets (`"battery"` or `"surveillance"`):** Sync only Eufy's native preset (`0` or `1`) and
+  never silently switch your camera into `Customize Recording` (`2`).
 - **`backfill_enabled: false` in `"backfill"` mode:** Keeps `backfill_enabled: true` on any `mode: backfill` camera so
   clip-replay events are never dropped.
 
-| Key                            |       Scope       |             Default             |     Valid Range / Values     | Meaning                                                                                                                     |
-| :----------------------------- | :---------------: | :-----------------------------: | :--------------------------: | :-------------------------------------------------------------------------------------------------------------------------- |
-| `use_rtsp`                     |  Global & Camera  |             `true`              |      `true` or `false`       | Use `HomeBase` native `RTSP` (`true`, auto-discovered from `eufy-security-ws`) or `P2P` (`false`)                           |
-| `station_serial`               |      Camera       |         Auto-discovered         |        `SN0000000000`        | Explicit `HomeBase` station serial number for multi-station `P2P` setups                                                    |
-| `backfill_only`                | Camera (`custom`) |             `false`             |      `true` or `false`       | Use clip-replay backfill mode on events when a camera uses `mode: custom`                                                   |
-| `backfill_enabled`             |  Global & Camera  |             `true`              |      `true` or `false`       | Replay recorded clips from `HomeBase 3` when a `P2P` stream is busy or in `"backfill"` mode (`false` on `HB2`)              |
-| `backfill_delay_secs`          |      Global       |               `2`               |          `2 - 120`           | Wait time after a `HomeBase` `P2P` stream finishes before downloading a recorded clip                                       |
-| `frigate_event_secs`           |  Global & Camera  | `hold_secs` (`60` / `30` in BF) |          `1 - 3600`          | Frigate event duration in seconds (defaults to matching `hold_secs`)                                                        |
-| `sync_power`                   |  Global & Camera  |             `true`              |      `true` or `false`       | Automatically sync Eufy Power Manager mode and clip settings on startup (`false` leaves Power Manager settings untouched)   |
-| `track_stuck_spotlight`        |  Global & Camera  |             `false`             |      `true` or `false`       | **Experimental:** Turn off a camera spotlight left stuck on (`>130s` idle); disabled by default while refined               |
-| `power_working_mode`           |      Camera       |        `2` (`Customize`)        |       `0`, `1`, or `2`       | Eufy Power Manager mode (`0` Optimal Battery, `1` Optimal Surveillance, `2` Customize Recording; honored when `sync_power`) |
-| `recording_clip_length`        |      Camera       |           `hold_secs`           |          `5 - 120`           | Camera hardware clip length in seconds (honored when `sync_power: true`)                                                    |
-| `recording_end_early`          |      Camera       |           `end_early`           |      `true` or `false`       | Camera hardware setting to stop recording early when motion stops (also falls back to `end_early` in `"custom"` mode)       |
-| `recording_retrigger_interval` |      Camera       |               `5`               |           `0 - 60`           | Minimum pause in seconds between camera hardware motion triggers (honored when `sync_power: true`)                          |
-| `enforce_streaming_quality`    |  Global & Camera  |             `true`              | `true`, `false`, or `1 - 10` | Clamp non-doorbell `P2P` quality (`0` Auto or `> 7` High/4K) to `7` (`1280x720`), or set an explicit `1 - 10` value         |
+| Key                            |       Scope       |             Default             |                         Valid Range / Values                         | Meaning                                                                                                                               |
+| :----------------------------- | :---------------: | :-----------------------------: | :------------------------------------------------------------------: | :------------------------------------------------------------------------------------------------------------------------------------ |
+| `use_rtsp`                     |  Global & Camera  |             `true`              |                          `true` or `false`                           | Use `HomeBase` native `RTSP` (`true`, auto-discovered from `eufy-security-ws`) or `P2P` (`false`)                                     |
+| `station_serial`               |      Camera       |         Auto-discovered         |                            `SN0000000000`                            | Explicit `HomeBase` station serial number for multi-station `P2P` setups                                                              |
+| `backfill_only`                | Camera (`custom`) |             `false`             |                          `true` or `false`                           | Use clip-replay backfill mode on events when a camera uses `mode: custom`                                                             |
+| `backfill_enabled`             |  Global & Camera  |             `true`              |                          `true` or `false`                           | Replay recorded clips from `HomeBase 3` when a `P2P` stream is busy or in `"backfill"` mode (`false` on `HB2`)                        |
+| `backfill_delay_secs`          |      Global       |               `2`               |                              `2 - 120`                               | Wait time after a `HomeBase` `P2P` stream finishes before downloading a recorded clip                                                 |
+| `frigate_event_secs`           |  Global & Camera  | `hold_secs` (`30` / `20` in BF) |                              `1 - 3600`                              | Frigate event duration in seconds (defaults to matching `hold_secs`)                                                                  |
+| `power_mode`                   |  Global & Camera  |            `"keep"`             |        `"keep"`, `"battery"`, `"surveillance"`, or `"custom"`        | Eufy Power Manager profile (`"keep"` leaves camera untouched and mirrors telemetry; `"custom"` requires `mode: custom`)               |
+| `track_stuck_spotlight`        |  Global & Camera  |             `false`             |                          `true` or `false`                           | **Experimental:** Turn off a camera spotlight left stuck on (`>130s` idle); disabled by default while refined                         |
+| `recording_clip_length`        | Camera (`custom`) |           `hold_secs`           |                              `5 - 120`                               | Camera hardware clip length in seconds (honored when `mode: custom` and `power_mode: custom`)                                         |
+| `recording_end_early`          | Camera (`custom`) |           `end_early`           |                          `true` or `false`                           | Camera hardware setting to stop recording early when motion stops (honored when `mode: custom` and `power_mode: custom`)              |
+| `recording_retrigger_interval` | Camera (`custom`) |               `5`               |                               `0 - 60`                               | Minimum pause in seconds between camera hardware motion triggers (honored when `mode: custom` and `power_mode: custom`)               |
+| `streaming_quality`            |  Global & Camera  |            `"keep"`             | `"keep"`, `"auto"`, `"low"`, `"medium"`, `"high"`, `"ultra"`, `0-10` | Live `P2P` streaming quality (`"keep"` leaves camera untouched; named tiers map each camera's Eufy quality scale; `0-10` in `custom`) |
 
 If something does not behave the way you expect after configuring your cameras, check the common questions below.
 
@@ -565,9 +571,11 @@ If something does not behave the way you expect after configuring your cameras, 
 ### Events & Motion Detection
 
 - **Nothing happens when I walk in front of a camera:**
-  Make sure **push notifications are turned ON** for that camera in the Eufy app on the account used by
-  `eufy-security-ws`. Eufy only sends motion alerts when push notifications are enabled (you can mute the Eufy app in
-  your phone's OS settings instead).
+  Make sure **Motion Detection** (plus matching detection types such as `Human`, `Vehicle`, `Pet`, or
+  `All Other Motions`) and **push notifications** are turned **ON** for that camera in the Eufy app on the account used
+  by `eufy-security-ws` (the bridge logs a `WARN` at startup if Motion Detection or any active `trigger_events`
+  categories are disabled on the camera). Eufy only sends motion alerts when push notifications are enabled (you can
+  mute the Eufy app in your phone's OS settings instead).
 - **My battery doorbell (or walkway camera) misses fast walk-bys, or wakes up after the person has already left:**
   Waking a sleeping battery camera over `P2P` takes `3-6` seconds. Set `mode: backfill` on that camera in `config.yaml`.
   Instead of opening a live stream on motion, the camera records its native clip (including the pre-roll right before
@@ -604,9 +612,9 @@ If something does not behave the way you expect after configuring your cameras, 
   In the Eufy app, open **Camera Settings -> Storage -> NAS (`RTSP`)** once to enable the `RTSP` toggle. After that, the
   bridge wakes and manages the `RTSP` stream automatically.
 - **My `P2P` live stream is slow to start, stutters, or times out:**
-  When Eufy's `P2P` streaming quality is set to `Auto`, `High`, or `4K`, the camera sends a heavy stream that often
-  stalls over `HomeBase` `P2P`. Keep `enforce_streaming_quality: true` (on by default) so the bridge clamps non-doorbell
-  `P2P` streaming quality to `Medium` (`1280x720`), which starts much faster.
+  When Eufy's `P2P` streaming quality is set to `Auto`, `High`, or `4K`, the camera sends a heavy stream that can stall
+  over `HomeBase` `P2P`. Set `streaming_quality: medium` (globally or on that camera in `config.yaml`, or lower the
+  streaming quality in the Eufy app) so `P2P` streams start faster.
 
 ### Battery, Offline Cameras & Hardware
 
@@ -626,10 +634,11 @@ If something does not behave the way you expect after configuring your cameras, 
   wake fails to respond, the bridge stops that camera's stream so Frigate marks it offline. As soon as you recharge the
   battery or the camera comes back online, the bridge restarts its stream automatically.
 - **I swapped or recharged a dead battery, why does the camera still show as offline in Frigate?**
-  Eufy cameras do not push an instant notification when you physically swap a battery while the camera is asleep. Wait
-  up to `5` minutes (`telemetry_poll_secs`), open the camera in Frigate Live View, call `/api/wake/<camera>` (returns
-  `503 CAMERA_OFFLINE` while offline and triggers an immediate refresh), or walk in front of the camera - the bridge
-  will refresh the battery reading and restart the stream automatically.
+  Eufy cameras do not push an instant notification when you physically swap a battery while the camera is asleep, and
+  background `HomeBase` refreshes while a camera is offline are spaced `60` minutes apart so one flat battery does not
+  wake healthy sibling cameras every `5` minutes. Open the camera in Frigate Live View, call `/api/wake/<camera>`
+  (returns `503 CAMERA_OFFLINE` while offline and triggers an immediate refresh), or walk in front of the camera - the
+  bridge will refresh the battery reading and restart the stream right away.
 - **GPU encoding (`BRIDGE_HWACCEL=vaapi`, `qsv`, or `nvenc`) fails at startup:**
   If the container cannot access your GPU, the bridge **automatically falls back to CPU encoding** so your streams keep
   working. To use GPU encoding, make sure `/dev/dri:/dev/dri` is passed through in your `docker-compose.yml` and the
@@ -648,7 +657,8 @@ If something does not behave the way you expect after configuring your cameras, 
     connectivity (`eufy-security-ws`, `Frigate`, `go2rtc`), `HomeBase` station `P2P` health and active slot state,
     summary camera counts, and every configured camera's live session/decoder state, encoder codec (`hwaccel` fallback
     status), connected viewers, `Frigate` event/mask state, backfill queue, hardware triggers, and live sensor telemetry
-    (battery, power source, Wi-Fi/RSSI, temperature, spotlight, model, firmware, and `last_seen`).
+    (battery, power source, Wi-Fi/RSSI, temperature, spotlight, hardware and motion-detection settings, model, firmware,
+    and `last_seen`).
   - Run `curl http://127.0.0.1:8080/api/config` - returns the running bridge version, Git commit, and active settings.
 - **How do I visually see what the bridge and camera are doing inside Frigate?**
   Set `card_theme: hud` (globally or on a single camera in `config.yaml`). This displays a diagnostic bar (at your

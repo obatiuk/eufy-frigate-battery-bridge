@@ -121,14 +121,14 @@
       "default": 2,
       "description": "Wait time in seconds after a HomeBase P2P stream finishes before downloading a recorded clip."
     },
-    "sync_power": {
-      "$ref": "#/definitions/syncPower"
+    "power_mode": {
+      "$ref": "#/definitions/powerMode"
     },
     "track_stuck_spotlight": {
       "$ref": "#/definitions/trackStuckSpotlight"
     },
-    "enforce_streaming_quality": {
-      "$ref": "#/definitions/enforceStreamingQuality"
+    "streaming_quality": {
+      "$ref": "#/definitions/streamingQuality"
     },
     "low_battery_threshold": {
       "$ref": "#/definitions/lowBatteryThreshold"
@@ -233,8 +233,8 @@
       "type": "number",
       "minimum": 5,
       "maximum": 86400,
-      "default": 60,
-      "description": "Recording and event duration in seconds (default 60s, or 30s in \"backfill\" mode; automatically syncs to the Eufy camera, the bridge, and Frigate)."
+      "default": 30,
+      "description": "Recording and event duration in seconds (default 30s in live modes, 20s in \"backfill\" or power_mode: \"battery\", 60s in power_mode: \"surveillance\", or mirrored from camera telemetry under power_mode: \"keep\")."
     },
     "streamMaxSecs": {
       "type": "number",
@@ -247,13 +247,13 @@
       "type": "number",
       "minimum": 1,
       "maximum": 3600,
-      "default": 60,
-      "description": "Frigate event duration in seconds (defaults to matching hold_secs: 60s, or 30s in \"backfill\" mode)."
+      "default": 30,
+      "description": "Frigate event duration in seconds (defaults to matching hold_secs: 30s, or 20s in \"backfill\" mode)."
     },
     "endEarly": {
       "type": "boolean",
-      "default": false,
-      "description": "Stop recording early as soon as motion clears (default false, or true in \"backfill\" mode)."
+      "default": true,
+      "description": "Stop recording early as soon as motion clears (default true across all modes)."
     },
     "idleTimeoutSecs": {
       "type": "number",
@@ -291,29 +291,36 @@
       "default": false,
       "description": "Use clip-replay backfill mode on events without waking a live stream (requires mode: \"custom\")."
     },
-    "syncPower": {
-      "type": "boolean",
-      "default": true,
-      "description": "Automatically sync Eufy Power Manager settings on startup (false leaves camera settings untouched)."
+    "powerMode": {
+      "type": "string",
+      "enum": ["keep", "battery", "surveillance", "custom"],
+      "default": "keep",
+      "description": "Eufy Power Manager profile (\"keep\" leaves camera settings untouched and mirrors telemetry, \"battery\" sets Optimal Battery Life, \"surveillance\" sets Optimal Surveillance, and \"custom\" applies recording_* settings in mode: \"custom\")."
     },
     "trackStuckSpotlight": {
       "type": "boolean",
       "default": false,
       "description": "Experimental: monitor idle cameras for a spotlight left stuck on (>130s after activity) and turn it off (light=false). Disabled by default while detection is refined."
     },
-    "enforceStreamingQuality": {
+    "streamingQuality": {
+      "type": "string",
+      "enum": ["keep", "auto", "low", "medium", "high", "ultra"],
+      "default": "keep",
+      "description": "Live P2P streaming quality profile (\"keep\" leaves camera quality untouched; named tiers resolve against the camera's reported Eufy quality states)."
+    },
+    "cameraStreamingQuality": {
       "oneOf": [
         {
-          "type": "boolean"
+          "$ref": "#/definitions/streamingQuality"
         },
         {
           "type": "integer",
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 10
         }
       ],
-      "default": true,
-      "description": "Set P2P streaming quality to 7 (1280x720) so P2P streams start quickly and do not stall at 4K (or specify an integer 1..10)."
+      "default": "keep",
+      "description": "Live P2P streaming quality profile (\"keep\", \"auto\", \"low\", \"medium\", \"high\", \"ultra\", or raw integer 0..10 in mode: \"custom\")."
     },
     "lowBatteryThreshold": {
       "type": "integer",
@@ -535,37 +542,31 @@
         "low_battery_wake_on_view": {
           "$ref": "#/definitions/lowBatteryWakeOnView"
         },
-        "sync_power": {
-          "$ref": "#/definitions/syncPower"
+        "power_mode": {
+          "$ref": "#/definitions/powerMode"
         },
         "track_stuck_spotlight": {
           "$ref": "#/definitions/trackStuckSpotlight"
-        },
-        "power_working_mode": {
-          "type": "integer",
-          "enum": [0, 1, 2],
-          "default": 2,
-          "description": "Eufy Power Manager mode (0 = Optimal Battery Life, 1 = Optimal Surveillance, 2 = Customize Recording)."
         },
         "recording_clip_length": {
           "type": "integer",
           "minimum": 5,
           "maximum": 120,
-          "description": "Camera hardware clip length in seconds (defaults to matching hold_secs)."
+          "description": "Camera hardware clip length in seconds (honored when mode: \"custom\" and power_mode: \"custom\"; defaults to matching hold_secs)."
         },
         "recording_end_early": {
           "type": "boolean",
-          "description": "Camera hardware setting to stop recording early when motion stops (defaults to matching end_early)."
+          "description": "Camera hardware setting to stop recording early when motion stops (honored when mode: \"custom\" and power_mode: \"custom\"; defaults to matching end_early)."
         },
         "recording_retrigger_interval": {
           "type": "integer",
           "minimum": 0,
           "maximum": 60,
           "default": 5,
-          "description": "Minimum pause in seconds between camera hardware motion triggers."
+          "description": "Minimum pause in seconds between camera hardware motion triggers (honored when mode: \"custom\" and power_mode: \"custom\")."
         },
-        "enforce_streaming_quality": {
-          "$ref": "#/definitions/enforceStreamingQuality"
+        "streaming_quality": {
+          "$ref": "#/definitions/cameraStreamingQuality"
         },
         "trigger_events": {
           "$ref": "#/definitions/triggerEvents"

@@ -17,7 +17,7 @@ const DEFAULT_CONTAINER_CONFIG_PATH = '/config/config.yaml';
 const DEFAULT_LOCAL_CONFIG_PATH = 'config.yaml';
 const READY_MARKER_FILENAME = 'eufy-bridge-ready.pid';
 const MS_PER_SECOND = 1000;
-const MIN_STREAMING_QUALITY = 1;
+const MIN_STREAMING_QUALITY = 0;
 const MAX_STREAMING_QUALITY = 10;
 
 const DEFAULT_EUFY_WS_HOST = 'eufy-security-ws';
@@ -65,9 +65,9 @@ const ALLOWED_TOP_KEYS = new Set([
   'use_rtsp',
   'backfill_enabled',
   'backfill_delay_secs',
-  'sync_power',
+  'power_mode',
   'track_stuck_spotlight',
-  'enforce_streaming_quality',
+  'streaming_quality',
   'low_battery_threshold',
   'critical_battery_threshold',
   'low_battery_hold_secs',
@@ -102,13 +102,12 @@ const ALLOWED_CAMERA_KEYS = new Set([
   'critical_battery_threshold',
   'low_battery_hold_secs',
   'low_battery_wake_on_view',
-  'sync_power',
+  'power_mode',
   'track_stuck_spotlight',
-  'power_working_mode',
   'recording_clip_length',
   'recording_end_early',
   'recording_retrigger_interval',
-  'enforce_streaming_quality',
+  'streaming_quality',
   'trigger_events',
   'card_theme',
   'card_position',
@@ -260,6 +259,34 @@ const POWER_WORKING_MODES = Object.freeze({
   CUSTOMIZE_RECORDING: 2,
 });
 
+/**
+ * Grouped opt-in Eufy Power Manager profiles in config.yaml (`power_mode`).
+ *
+ * @readonly
+ * @enum {string}
+ */
+const POWER_MODES = Object.freeze({
+  KEEP: 'keep',
+  BATTERY: 'battery',
+  SURVEILLANCE: 'surveillance',
+  CUSTOM: 'custom',
+});
+
+/**
+ * Grouped opt-in Eufy live P2P streaming quality profiles in config.yaml (`streaming_quality`).
+ *
+ * @readonly
+ * @enum {string}
+ */
+const STREAMING_QUALITIES = Object.freeze({
+  KEEP: 'keep',
+  AUTO: 'auto',
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  ULTRA: 'ultra',
+});
+
 /** @type {Set<string>} */
 const SUPPORTED_HWACCEL_MODES = new Set([
   HWACCEL_MODES.VAAPI,
@@ -284,7 +311,6 @@ const BOOLEAN_CONFIG_KEYS = new Set([
   'use_rtsp',
   'backfill_enabled',
   'backfill_only',
-  'sync_power',
   'track_stuck_spotlight',
   'low_battery_wake_on_view',
   'forward_face_names',
@@ -300,7 +326,6 @@ const INTEGER_CONFIG_KEYS = new Set([
   'critical_battery_threshold',
   'telemetry_poll_secs',
   'priority',
-  'power_working_mode',
   'recording_clip_length',
   'recording_retrigger_interval',
 ]);
@@ -461,8 +486,10 @@ const MAX_LOW_BAT_THRESHOLD_PCT = 99;
 const DEFAULT_LOW_BAT_THRESHOLD_PCT = 30;
 const MIN_HOLD_SECS = 5;
 const MAX_HOLD_SECS = 86400;
-const DEFAULT_HOLD_SECS = 60;
-const DEFAULT_BACKFILL_HOLD_SECS = 30;
+const DEFAULT_HOLD_SECS = 30;
+const DEFAULT_BACKFILL_HOLD_SECS = 20;
+const SURVEILLANCE_HOLD_SECS = 60;
+const DEFAULT_END_EARLY = true;
 const MIN_SESSION_MAX_SECS = 10;
 const MAX_SESSION_MAX_SECS = 86400;
 const DEFAULT_MAX_SECS = 900;
@@ -476,8 +503,6 @@ const DEFAULT_EARLY_SLEEP_SECS = 0;
 const MIN_LOW_BAT_HOLD_SECS = 5;
 const MAX_LOW_BAT_HOLD_SECS = 3600;
 const DEFAULT_LOW_BAT_HOLD_SECS = 20;
-const MIN_POWER_WORKING_MODE = POWER_WORKING_MODES.BATTERY_SAVER;
-const MAX_POWER_WORKING_MODE = POWER_WORKING_MODES.CUSTOMIZE_RECORDING;
 const OPTIMAL_BATTERY_MAX_CLIP_SECS = 20;
 const MIN_RECORDING_CLIP_SECS = 5;
 const MAX_RECORDING_CLIP_SECS = 120;
@@ -547,6 +572,8 @@ module.exports = {
   HWACCEL_MODES,
   FRAME_STAGE_MARKERS,
   POWER_WORKING_MODES,
+  POWER_MODES,
+  STREAMING_QUALITIES,
   SUPPORTED_HWACCEL_MODES,
   DISABLED_HWACCEL_TOKENS,
   SUPPORTED_LOG_LEVELS,
@@ -607,6 +634,8 @@ module.exports = {
   MAX_HOLD_SECS,
   DEFAULT_HOLD_SECS,
   DEFAULT_BACKFILL_HOLD_SECS,
+  SURVEILLANCE_HOLD_SECS,
+  DEFAULT_END_EARLY,
   MIN_SESSION_MAX_SECS,
   MAX_SESSION_MAX_SECS,
   DEFAULT_MAX_SECS,
@@ -620,8 +649,6 @@ module.exports = {
   MIN_LOW_BAT_HOLD_SECS,
   MAX_LOW_BAT_HOLD_SECS,
   DEFAULT_LOW_BAT_HOLD_SECS,
-  MIN_POWER_WORKING_MODE,
-  MAX_POWER_WORKING_MODE,
   OPTIMAL_BATTERY_MAX_CLIP_SECS,
   MIN_RECORDING_CLIP_SECS,
   MAX_RECORDING_CLIP_SECS,

@@ -36,6 +36,8 @@ const {
   DEFAULT_LOW_BAT_HOLD_SECS,
   MAX_RECORDING_CLIP_SECS,
   MAX_RETRIGGER_INTERVAL_SECS,
+  POWER_MODES,
+  STREAMING_QUALITIES,
   clampNum,
 } = require('./constants');
 const {hasDirectRtspUrl} = require('./camera-config');
@@ -173,7 +175,8 @@ class BridgeConfigBuilder {
       ) * MS_PER_SECOND;
     this._built.low_battery_wake_on_view = Boolean(this._raw.low_battery_wake_on_view ?? false);
     this._built.track_stuck_spotlight = Boolean(this._raw.track_stuck_spotlight ?? DEFAULT_TRACK_STUCK_SPOTLIGHT);
-    this._built.enforce_streaming_quality = this._raw.enforce_streaming_quality ?? true;
+    this._built.power_mode = this._raw.power_mode ?? POWER_MODES.KEEP;
+    this._built.streaming_quality = this._raw.streaming_quality ?? STREAMING_QUALITIES.KEEP;
     this._built.telemetryPollMs =
       clampNum(this._raw.telemetry_poll_secs, 0, MAX_HOLD_SECS, DEFAULT_VIEW_MAX_SECS) * MS_PER_SECOND;
     this._built.startup_snapshot = this._raw.startup_snapshot !== undefined ? this._raw.startup_snapshot : true;
@@ -208,6 +211,9 @@ class BridgeConfigBuilder {
    * @returns {this}
    */
   withCameras() {
+    if (!this._hasTimers) {
+      this.withTimersAndArbitration();
+    }
     if (!this._hasEventsAndOverlays) {
       this.withEventsAndOverlays();
     }
