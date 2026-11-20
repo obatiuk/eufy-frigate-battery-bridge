@@ -11,7 +11,16 @@ const assert = require('node:assert/strict');
 
 require('./helpers/test-env');
 const {installDefaultFetchStub} = require('./helpers/service-mocks');
-const {formatLocalTimestamp, formatLocalHm, normalizeLevelName, formatLogLine, initLogger} = require('../src/logger');
+const {
+  formatLocalTimestamp,
+  formatLocalHm,
+  formatFileTimestamp,
+  parseFileTimestampMs,
+  formatRelativeAge,
+  normalizeLevelName,
+  formatLogLine,
+  initLogger,
+} = require('../src/logger');
 
 installDefaultFetchStub();
 
@@ -105,5 +114,25 @@ describe('Structured Alloy/Loki Logger & Root-Cause Error Diagnostics (src/logge
     }
     assert.equal(formatLogLine('info', {cameraName: 'porch'}, ['hello'], fixedDate), stamp + '[bridge] hello');
     assert.equal(formatLogLine('info', {getName: () => 'porch'}, ['hello'], fixedDate), stamp + '[bridge] hello');
+  });
+
+  it('formats and parses filesystem-safe timestamps and formats human-friendly relative ages', () => {
+    // Verify: snapshot filenames round-trip local timestamps without colons and format friendly relative ages.
+    const fixedDate = new Date(2026, 10, 19, 18, 16, 4);
+    const stamp = formatFileTimestamp(fixedDate);
+    assert.equal(stamp, '2026-11-19_18-16-04');
+    assert.equal(parseFileTimestampMs(stamp), fixedDate.getTime());
+    assert.equal(parseFileTimestampMs('2026-02-31_12-00-00'), 0);
+    assert.equal(parseFileTimestampMs('not-a-timestamp'), 0);
+    assert.equal(parseFileTimestampMs(''), 0);
+
+    assert.equal(formatRelativeAge(0), 'just now');
+    assert.equal(formatRelativeAge(4_000), 'just now');
+    assert.equal(formatRelativeAge(45_000), '45s ago');
+    assert.equal(formatRelativeAge(12 * 60_000 + 19_000), '12m ago');
+    assert.equal(formatRelativeAge(2 * 3_600_000), '2h ago');
+    assert.equal(formatRelativeAge(2 * 3_600_000 + 35 * 60_000), '2h 35m ago');
+    assert.equal(formatRelativeAge(3 * 86_400_000), '3d ago');
+    assert.equal(formatRelativeAge(3 * 86_400_000 + 4 * 3_600_000), '3d 4h ago');
   });
 });

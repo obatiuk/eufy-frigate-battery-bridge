@@ -9,7 +9,53 @@
  */
 'use strict';
 
+const {formatFileTimestamp} = require('../logger');
+
 const URL_SCHEME_DELIM = '://';
+const CACHE_SNAPSHOT_INFIX = '_snapshot_';
+const CACHE_JPEG_EXT = '.jpg';
+const LEGACY_CACHE_PREFIX = 'last_';
+const NAME_SERIAL_SEP = '_';
+
+/**
+ * Normalizes a Date, epoch millisecond timestamp, or pre-formatted timestamp string into 'YYYY-MM-DD_HH-MM-SS'.
+ *
+ * @param {Date|number|string} [at=Date.now()] - Capture timestamp or Date.
+ * @returns {string}
+ */
+function resolveSnapshotTimestamp(at = Date.now()) {
+  if (typeof at === 'string' && at.trim()) {
+    return at.trim();
+  }
+  if (at instanceof Date) {
+    return formatFileTimestamp(at);
+  }
+  const ms = typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : Date.now();
+  return formatFileTimestamp(new Date(ms));
+}
+
+/**
+ * Extracts normalized { name, serial } from either a Camera domain object (with getName/getSerial)
+ * or a raw/CameraConfig configuration object.
+ *
+ * @param {unknown} rawCam - Camera configuration or domain instance.
+ * @returns {{ name: string, serial: string }}
+ */
+function extractNameAndSerial(rawCam) {
+  const hasGetters =
+    rawCam &&
+    typeof rawCam === 'object' &&
+    typeof (/** @type {{ getName?: unknown }} */ (rawCam).getName) === 'function' &&
+    typeof (/** @type {{ getSerial?: unknown }} */ (rawCam).getSerial) === 'function';
+  if (hasGetters) {
+    return {
+      name: /** @type {{ getName: () => string }} */ (rawCam).getName(),
+      serial: /** @type {{ getSerial: () => string }} */ (rawCam).getSerial(),
+    };
+  }
+  const {name, serial} = CameraConfig.normalizeIdentity(rawCam);
+  return {name, serial};
+}
 
 /**
  * Strips any RFC 3986 URI `#fragment` suffix (such as go2rtc's `#backchannel=0`) after the
@@ -116,13 +162,14 @@ class CameraConfig {
   }
 
   /**
-   * Returns the unique snapshot cache filename (`last_<name>.jpg` when `serial === name`,
-   * or `last_<name>_<serial>.jpg` when they differ) for this camera.
+   * Returns the unique timestamped snapshot cache filename (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when
+   * `serial === name`, or `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when they differ) for this camera.
    *
+   * @param {Date|number|string} [at] - Optional explicit capture timestamp or Date.
    * @returns {string}
    */
-  getCacheFileName() {
-    return CameraConfig.formatCacheFileName(this.name, this.serial);
+  getCacheFileName(at = undefined) {
+    return CameraConfig.formatCacheFileName(this.name, this.serial, at);
   }
 
   /**
@@ -210,57 +257,81 @@ class CameraConfig {
   }
 
   /**
-   * Formats the deterministic JPEG cache filename (`last_<name>.jpg` when `serial === name`,
-   * or `last_<name>_<serial>.jpg` when both differ).
+   * Formats the deterministic camera snapshot filename prefix (`<name>_snapshot_` when `serial === name`,
+   * or `<name>_<serial>_snapshot_` when both differ).
    *
    * @param {string} name - Camera stream name.
    * @param {string} serial - Camera serial number.
    * @returns {string}
    */
-  static formatCacheFileName(name, serial) {
-    const suffix = serial && serial !== name ? name + '_' + serial : name || serial;
-    return 'last_' + suffix + '.jpg';
+  static formatCacheFilePrefix(name, serial) {
+    const stem = serial && serial !== name ? name + NAME_SERIAL_SEP + serial : name || serial;
+    return stem + CACHE_SNAPSHOT_INFIX;
   }
 
   /**
-   * Resolves the deterministic JPEG cache filename (`last_<name>.jpg` when `serial === name`,
-   * or `last_<name>_<serial>.jpg` when they differ) for any camera configuration or domain instance.
+   * Resolves the camera snapshot filename prefix (`<name>[_<serial>]_snapshot_`) for any camera or config object.
    *
    * @param {unknown} rawCam - Camera configuration or domain instance.
    * @returns {string}
    */
-  static resolveCacheFileName(rawCam) {
+  static resolveCacheFilePrefix(rawCam) {
+    const {name, serial} = extractNameAndSerial(rawCam);
+    return CameraConfig.formatCacheFilePrefix(name, serial);
+  }
+
+  /**
+   * Formats the timestamped JPEG cache filename (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when `serial === name`,
+   * or `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when both differ).
+   *
+   * @param {string} name - Camera stream name.
+   * @param {string} serial - Camera serial number.
+   * @param {Date|number|string} [at=Date.now()] - Capture timestamp or Date.
+   * @returns {string}
+   */
+  static formatCacheFileName(name, serial, at = Date.now()) {
+    return CameraConfig.formatCacheFilePrefix(name, serial) + resolveSnapshotTimestamp(at) + CACHE_JPEG_EXT;
+  }
+
+  /**
+   * Resolves the timestamped JPEG cache filename (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when `serial === name`,
+   * or `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when they differ) for any camera configuration or domain
+   * instance.
+   *
+   * @param {unknown} rawCam - Camera configuration or domain instance.
+   * @param {Date|number|string} [at] - Optional explicit capture timestamp or Date.
+   * @returns {string}
+   */
+  static resolveCacheFileName(rawCam, at = undefined) {
     if (
       rawCam &&
       typeof rawCam === 'object' &&
       typeof (/** @type {{ getCacheFileName?: unknown }} */ (rawCam).getCacheFileName) === 'function'
     ) {
-      return /** @type {{ getCacheFileName: () => string }} */ (rawCam).getCacheFileName();
+      return /** @type {{ getCacheFileName: (ts?: Date|number|string) => string }} */ (rawCam).getCacheFileName(at);
     }
     const {serial, name} = CameraConfig.normalizeIdentity(rawCam);
-    return CameraConfig.formatCacheFileName(name, serial);
+    return CameraConfig.formatCacheFileName(name, serial, at);
   }
 
   /**
-   * Returns the legacy duplicated cache filename (`last_<name>_<name>.jpg`) when a camera's
-   * normalized serial equals its name, or an empty string when no legacy duplicate existed.
+   * Returns the ordered list of legacy `last_*.jpg` filenames (`last_<name>_<serial>.jpg`, `last_<name>.jpg`,
+   * and `last_<name>_<name>.jpg` when `serial === name`) that earlier bridge versions created for this camera.
    *
    * @param {unknown} rawCam - Camera configuration or domain instance.
-   * @returns {string}
+   * @returns {readonly string[]}
    */
-  static resolveLegacyDuplicateCacheFileName(rawCam) {
-    const hasGetters =
-      rawCam &&
-      typeof rawCam === 'object' &&
-      typeof (/** @type {{ getName?: unknown }} */ (rawCam).getName) === 'function' &&
-      typeof (/** @type {{ getSerial?: unknown }} */ (rawCam).getSerial) === 'function';
-    const name = hasGetters
-      ? /** @type {{ getName: () => string }} */ (rawCam).getName()
-      : CameraConfig.normalizeIdentity(rawCam).name;
-    const serial = hasGetters
-      ? /** @type {{ getSerial: () => string }} */ (rawCam).getSerial()
-      : CameraConfig.normalizeIdentity(rawCam).serial;
-    return name && serial && serial === name ? 'last_' + name + '_' + serial + '.jpg' : '';
+  static resolveLegacyCacheFileNames(rawCam) {
+    const {name, serial} = extractNameAndSerial(rawCam);
+    const stem = serial && serial !== name ? name + NAME_SERIAL_SEP + serial : name || serial;
+    if (!stem) {
+      return Object.freeze([]);
+    }
+    const primaryLegacy = LEGACY_CACHE_PREFIX + stem + CACHE_JPEG_EXT;
+    if (name && serial && serial === name) {
+      return Object.freeze([primaryLegacy, LEGACY_CACHE_PREFIX + name + NAME_SERIAL_SEP + serial + CACHE_JPEG_EXT]);
+    }
+    return Object.freeze([primaryLegacy]);
   }
 }
 

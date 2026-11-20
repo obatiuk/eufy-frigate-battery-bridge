@@ -24,7 +24,7 @@ const {
 } = require('./config');
 const {log, formatErrorMessage} = require('./logger');
 const {Camera} = require('./domain/camera');
-const {loadCachedFrame, waitForPendingSnapshotSaves} = require('./overlay/snapshot-cache');
+const {loadCachedFrame, formatLoadedSnapshotLog, waitForPendingSnapshotSaves} = require('./overlay/snapshot-cache');
 const {renderCameraCards} = require('./overlay/card-renderer');
 const {configureEncoderHooks, startEncoder, startMediaTickers, stopMediaTickers} = require('./media/encoder');
 const {setDecoderStopHandler} = require('./media/decoder');
@@ -97,14 +97,18 @@ function clearBridgeReady() {
  * off the event loop, so the already-bound HTTP listener keeps answering health probes meanwhile.
  *
  * @param {Camera[]} cams - Active camera collection populated in place during bootstrap.
- * @returns {Promise<Map<string, Camera>>} Lookup map by hardware serial number.
+ * @returns {Promise<{
+ *   bySerial: Map<string, Camera>,
+ *   snapshots: ReadonlyArray<import('./overlay/snapshot-cache').LoadedSnapshotResult>,
+ * }>}
  */
 async function initCameras(cams) {
   const snapshots = await Promise.all(cfg.cameras.map((rawCam) => loadCachedFrame(rawCam)));
   cfg.cameras.forEach((rawCam, index) => {
     cams.push(new Camera(rawCam, snapshots[index], renderCameraCards));
   });
-  return new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
+  const bySerial = new Map(cams.filter((cam) => !cam.isRtspDirect()).map((cam) => [cam.getSerial(), cam]));
+  return {bySerial, snapshots};
 }
 
 /**
@@ -332,12 +336,33 @@ function logStartupBanner(cams) {
 }
 
 /**
+ * Logs each camera's restored snapshot filename, local capture timestamp, and relative age at INFO level.
+ *
+ * @param {Camera[]} cams - Active camera collection.
+ * @param {ReadonlyArray<{ fileName?: string, takenAtMs?: number }|null|undefined>} snapshots - Loaded snapshots.
+ * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
+ */
+function logStartupSnapshots(cams, snapshots, now = Date.now()) {
+  if (!Array.isArray(snapshots)) {
+    return;
+  }
+  cams.forEach((cam, index) => {
+    const msg = formatLoadedSnapshotLog(snapshots[index], now);
+    if (msg) {
+      log.info(cam, msg);
+    }
+  });
+}
+
+/**
  * Starts all background loops, per-camera FFmpeg encoders, and the Eufy WebSocket client.
  *
  * @param {Camera[]} cams - Active camera collection.
+ * @param {ReadonlyArray<{ fileName?: string, takenAtMs?: number }|null|undefined>} [snapshots=[]] - Loaded snapshots.
  */
-function startServices(cams) {
+function startServices(cams, snapshots = []) {
   logStartupBanner(cams);
+  logStartupSnapshots(cams, snapshots);
   startMediaTickers(cams);
   ensureCameraEncodersStarted({wsConnected: false});
 
@@ -378,9 +403,9 @@ async function main() {
     isShuttingDown: () => bridgeShuttingDown,
   });
   markBridgeReady();
-  const bySerial = await initCameras(cams);
+  const {bySerial, snapshots} = await initCameras(cams);
   wireServices(cams, bySerial);
-  startServices(cams);
+  startServices(cams, snapshots);
 }
 
 if (require.main === module) {
@@ -392,6 +417,7 @@ if (require.main === module) {
 
 module.exports = {
   handleSigUsr2SyntheticEventTest,
+  logStartupSnapshots,
   shutdownBridge,
   handleUncaughtException,
   resetBridgeShutdownForTests,

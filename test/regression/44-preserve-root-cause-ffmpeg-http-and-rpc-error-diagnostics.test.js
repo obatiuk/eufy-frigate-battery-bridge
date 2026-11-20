@@ -439,7 +439,7 @@ describe('Regression 44. Preserve Root-Cause FFmpeg, HTTP, WebSocket, and RPC Er
 
       // 3. Snapshot cache decode & save failures preserve real FFmpeg / OS error instead of "Conversion failed!"
       const snapCam = new Camera({serial: 'T8161T0000009991', name: 'snap_diag_cam'});
-      const snapFile = getCacheFilePath(snapCam);
+      const snapFile = getCacheFilePath(snapCam, new Date(2026, 10, 19, 9, 30, 0));
       fs.writeFileSync(snapFile, Buffer.from('corrupt-jpeg'));
       const capturedWarns = [];
       const origWarn = log.warn;
@@ -453,7 +453,7 @@ describe('Regression 44. Preserve Root-Cause FFmpeg, HTTP, WebSocket, and RPC Er
           ? '[mjpeg @ 0x7f22] No JPEG data found in image\n' +
             '[in#0 @ 0x7f20] Error decodingframes\n' +
             'Conversion failed!\n'
-          : "[image2 @ 0x7f33] Could not open file '/config/cache/last_snap_diag_cam.jpg': Read-only file system\n" +
+          : "[image2 @ 0x7f33] Could not open file '/config/cache/snap_diag_cam.jpg': Read-only file system\n" +
             '[vost#0:0/mjpeg @ 0x7f34] Error submitting a packet to the muxer: Read-only file system\n' +
             '[out#0/image2 @ 0x7f35] Error muxing a packet\n' +
             '[out#0/image2 @ 0x7f35] video:24KiB audio:0KiB subtitle:0KiB other streams:0KiB ' +

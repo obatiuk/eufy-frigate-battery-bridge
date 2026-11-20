@@ -30,9 +30,16 @@ describe("Regression 2. Cross-Camera Residual Frame Contamination (Doorbell Show
       // re-wakes flashed "Waking Up..." when frame temporarily cleared after gotVideo became true.
       const doorbell = new Camera({serial: 'T8214T0000000001', name: 'doorbell', mode: 'p2p'});
       const driveway = new Camera({serial: 'T8161T0000000002', name: 'driveway', mode: 'rtsp'});
+      const snapAt = new Date(2026, 10, 19, 12, 0, 0);
 
-      assert.equal(getCacheFilePath(doorbell), path.join(CACHE_DIR, 'last_doorbell_T8214T0000000001.jpg'));
-      assert.equal(getCacheFilePath(driveway), path.join(CACHE_DIR, 'last_driveway_T8161T0000000002.jpg'));
+      assert.equal(
+        getCacheFilePath(doorbell, snapAt),
+        path.join(CACHE_DIR, 'doorbell_T8214T0000000001_snapshot_2026-11-19_12-00-00.jpg')
+      );
+      assert.equal(
+        getCacheFilePath(driveway, snapAt),
+        path.join(CACHE_DIR, 'driveway_T8161T0000000002_snapshot_2026-11-19_12-00-00.jpg')
+      );
       assert.equal(doorbell.getLastFrameBuffer(), null);
 
       applyDeviceProperties(

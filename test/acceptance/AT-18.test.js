@@ -184,16 +184,17 @@ describe('Locked Acceptance Criterion AT-18 (docs/acceptance/AT-18.md)', () => {
       cam.setFrameNew(true);
       assert.equal(shouldWriteEncoderFrame(cam, true, false, false, t0 + 66), true);
 
-      // 5. Per-camera snapshot cache filename isolation (deduplicated when serial === name) and startup probe
-      assert.equal(cam.getCacheFileName(), 'last_doorbell_T8214T0000000032.jpg');
+      // 5. Per-camera timestamped snapshot cache filename isolation (deduplicated when serial === name) and probe
+      const snapAt = new Date(2026, 10, 19, 18, 16, 4);
+      assert.equal(cam.getCacheFileName(snapAt), 'doorbell_T8214T0000000032_snapshot_2026-11-19_18-16-04.jpg');
       const probeCam = new Camera(
         {serial: 'T8161T0000000033', sleep_screen: 'snapshot', startup_snapshot: true},
         {frame: null, lastSeen: ''}
       );
-      assert.equal(probeCam.getCacheFileName(), 'last_T8161T0000000033.jpg');
+      assert.equal(probeCam.getCacheFileName(snapAt), 'T8161T0000000033_snapshot_2026-11-19_18-16-04.jpg');
       assert.equal(probeCam.requiresStartupSnapshot(), true);
       const directSnapCam = new Camera({name: 'nursery', rtsp_url: 'rtsp://192.0.2.10/live0'});
-      assert.equal(directSnapCam.getCacheFileName(), 'last_nursery.jpg');
+      assert.equal(directSnapCam.getCacheFileName(snapAt), 'nursery_snapshot_2026-11-19_18-16-04.jpg');
     }
   );
 });

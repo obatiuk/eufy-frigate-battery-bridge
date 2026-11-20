@@ -52,7 +52,12 @@ describe('src/config split modules', () => {
 
     const cfgObj = new CameraConfig({serial: 'SN0000000401', unexpectedDynamicProp: 42});
     assert.equal('unexpectedDynamicProp' in cfgObj, false, 'CameraConfig constructor must assign fixed fields only');
-    assert.equal(CameraConfig.formatCacheFileName('porch', 'SN0000000401'), 'last_porch_SN0000000401.jpg');
+    const snapAt = new Date(2026, 10, 19, 18, 16, 4);
+    assert.equal(CameraConfig.formatCacheFilePrefix('porch', 'SN0000000401'), 'porch_SN0000000401_snapshot_');
+    assert.equal(
+      CameraConfig.formatCacheFileName('porch', 'SN0000000401', snapAt),
+      'porch_SN0000000401_snapshot_2026-11-19_18-16-04.jpg'
+    );
   });
 
   it('resolves build metadata, service endpoints, and env placeholders in env.js', () => {

@@ -117,7 +117,9 @@ h264_qsv -bf 0 -global_quality 19 -maxrate 3500k -bufsize 3500k`
   during backfill downloads), slices exact `AUDIO_CHUNK` subarrays from the head chunk without `Buffer.concat`, and
   copies into a single reusable `outBuf` only when a `100ms` tick straddles two chunks (returning `SILENCE` while muted
   before backfill Frame `0` or when underflowed).
-- **Async Snapshot Cache (`src/overlay/snapshot-cache.js`):** Decodes cached `JPEG` files (`last_<name>.jpg`, or
-  `last_<name>_<serial>.jpg` when `name !== serial`, migrating legacy `last_<name>_<name>.jpg` files) in parallel
-  background `ffmpeg` processes at startup with kill timeouts, and persists clean un-overlayed `JPEG` snapshots on
-  session stop via atomic temp-file renames (`TMPDIR` fallback if `BRIDGE_CACHE_DIR` is unwritable).
+- **Async Snapshot Cache (`src/overlay/snapshot-cache.js`):** Decodes the newest timestamped `JPEG` file per camera
+  (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg`, or `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when
+  `name !== serial`, migrating legacy `last_*.jpg` files and pruning superseded snapshots) in parallel background
+  `ffmpeg` processes at startup with kill timeouts, logs the restored snapshot timestamp and relative age at `INFO`,
+  and persists clean un-overlayed `JPEG` snapshots on session stop via atomic temp-file renames (`TMPDIR` fallback if
+  `BRIDGE_CACHE_DIR` is unwritable).

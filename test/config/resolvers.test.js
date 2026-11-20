@@ -628,16 +628,17 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
       // (no duplicated cam && !cam.name && cam.serial checks)
       assert.equal(typeof CameraConfig, 'function');
       assert.equal(camSlice instanceof CameraConfig, true);
+      const snapAt = new Date(2026, 10, 19, 18, 16, 4);
       assert.equal(camSlice.getName(), 'driveway');
       assert.equal(camSlice.getSerial(), 'T8161T0000000000');
       assert.equal(camSlice.getScopeName(), 'driveway');
-      assert.equal(camSlice.getCacheFileName(), 'last_driveway_T8161T0000000000.jpg');
+      assert.equal(camSlice.getCacheFileName(snapAt), 'driveway_T8161T0000000000_snapshot_2026-11-19_18-16-04.jpg');
       assert.equal(camSlice.hasValidIdentity(), true);
 
       assert.equal(cam.getName(), 'driveway');
       assert.equal(cam.getSerial(), 'T8161T0000000000');
       assert.equal(cam.getScopeName(), 'driveway');
-      assert.equal(cam.getCacheFileName(), 'last_driveway_T8161T0000000000.jpg');
+      assert.equal(cam.getCacheFileName(snapAt), 'driveway_T8161T0000000000_snapshot_2026-11-19_18-16-04.jpg');
       assert.equal(cam.hasValidIdentity(), true);
       assert.equal(cam.hasPendingViewerWake(), false);
 
@@ -646,14 +647,29 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
       assert.equal(unnamedRaw.name, undefined);
       assert.equal(CameraConfig.resolveScopeName(unnamedRaw), 'T8214T2222222222');
       assert.equal(CameraConfig.resolveScopeName({}), 'bridge');
-      assert.equal(CameraConfig.resolveCacheFileName(camSlice), 'last_driveway_T8161T0000000000.jpg');
-      assert.equal(CameraConfig.resolveCacheFileName(cam), 'last_driveway_T8161T0000000000.jpg');
-      assert.equal(CameraConfig.resolveCacheFileName(unnamedRaw), 'last_T8214T2222222222.jpg');
+      assert.equal(
+        CameraConfig.resolveCacheFileName(camSlice, snapAt),
+        'driveway_T8161T0000000000_snapshot_2026-11-19_18-16-04.jpg'
+      );
+      assert.equal(
+        CameraConfig.resolveCacheFileName(cam, snapAt),
+        'driveway_T8161T0000000000_snapshot_2026-11-19_18-16-04.jpg'
+      );
+      assert.equal(
+        CameraConfig.resolveCacheFileName(unnamedRaw, snapAt),
+        'T8214T2222222222_snapshot_2026-11-19_18-16-04.jpg'
+      );
       const directUnnamedSerialCfg = new BridgeConfigBuilder({
         cameras: [{name: 'nursery_cam', mode: 'rtsp', rtsp_url: 'rtsp://192.0.2.10/live0'}],
       }).build();
-      assert.equal(directUnnamedSerialCfg.cameras[0].getCacheFileName(), 'last_nursery_cam.jpg');
-      assert.equal(CameraConfig.resolveCacheFileName(directUnnamedSerialCfg.cameras[0]), 'last_nursery_cam.jpg');
+      assert.equal(
+        directUnnamedSerialCfg.cameras[0].getCacheFileName(snapAt),
+        'nursery_cam_snapshot_2026-11-19_18-16-04.jpg'
+      );
+      assert.equal(
+        CameraConfig.resolveCacheFileName(directUnnamedSerialCfg.cameras[0], snapAt),
+        'nursery_cam_snapshot_2026-11-19_18-16-04.jpg'
+      );
       assert.equal(CameraConfig.hasValidIdentity({}), false);
       assert.equal(CameraConfig.hasValidIdentity(null), false);
     }

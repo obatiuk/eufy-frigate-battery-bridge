@@ -4,6 +4,8 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Rename cached camera snapshot files to include the camera name and local capture timestamp, automatically migrate
+  legacy snapshot files and prune superseded ones, and log restored snapshot timestamps and relative ages at startup
 - Synchronize Eufy hardware settings only from complete property snapshots with confirmed write retries, prevent
   transient `RTSP` or `TCP` output errors from downgrading hardware encoders (and isolate fallback tests on GPU-less
   builders), disable Intel Quick Sync B-frames while pacing multi-camera grid keyframe bursts, remove the legacy flat

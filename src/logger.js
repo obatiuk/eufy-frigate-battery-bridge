@@ -18,6 +18,19 @@ const LOG_LEVELS = Object.freeze({
 
 const LOG_LEVEL_NAME_WIDTH = 5;
 const MAX_ERROR_CAUSE_DEPTH = 4;
+const MS_PER_SECOND = 1000;
+const JUST_NOW_THRESHOLD_SECS = 5;
+const SECS_PER_MINUTE = 60;
+const SECS_PER_HOUR = 3600;
+const SECS_PER_DAY = 86400;
+const FILE_TIMESTAMP_REGEX = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})$/;
+const AGE_JUST_NOW = 'just now';
+const AGE_SECONDS_SUFFIX = 's ago';
+const AGE_MINUTES_SUFFIX = 'm ago';
+const AGE_HOURS_INFIX = 'h ';
+const AGE_HOURS_SUFFIX = 'h ago';
+const AGE_DAYS_INFIX = 'd ';
+const AGE_DAYS_SUFFIX = 'd ago';
 const GENERIC_OBJECT_TO_STRING = '[object Object]';
 const BARE_AGGREGATE_ERROR_LABEL = 'AggregateError';
 const URL_CREDENTIALS_REGEX = /([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi;
@@ -77,6 +90,83 @@ function formatLocalTimestamp(date = new Date()) {
  */
 function formatLocalHm(date = new Date()) {
   return padTwoDigits(date.getHours()) + ':' + padTwoDigits(date.getMinutes());
+}
+
+/**
+ * Formats a Date object as 'YYYY-MM-DD_HH-MM-SS' in local time for filesystem-safe snapshot filenames.
+ *
+ * @param {Date} [date=new Date()] - Date instance to format.
+ * @returns {string}
+ */
+function formatFileTimestamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = padTwoDigits(date.getMonth() + 1);
+  const day = padTwoDigits(date.getDate());
+  const hours = padTwoDigits(date.getHours());
+  const minutes = padTwoDigits(date.getMinutes());
+  const seconds = padTwoDigits(date.getSeconds());
+
+  return year + '-' + month + '-' + day + '_' + hours + '-' + minutes + '-' + seconds;
+}
+
+/**
+ * Parses a 'YYYY-MM-DD_HH-MM-SS' local timestamp string into epoch milliseconds, or returns 0 when malformed.
+ *
+ * @param {string} rawStamp - Candidate filename timestamp segment.
+ * @returns {number}
+ */
+function parseFileTimestampMs(rawStamp) {
+  const match = FILE_TIMESTAMP_REGEX.exec(String(rawStamp || '').trim());
+  if (!match) {
+    return 0;
+  }
+  const [, rawYear, rawMonth, rawDay, rawHour, rawMin, rawSec] = match;
+  const year = Number(rawYear);
+  const monthIdx = Number(rawMonth) - 1;
+  const day = Number(rawDay);
+  const hour = Number(rawHour);
+  const minute = Number(rawMin);
+  const second = Number(rawSec);
+  const parsed = new Date(year, monthIdx, day, hour, minute, second, 0);
+  const matchesCalendar =
+    parsed.getFullYear() === year &&
+    parsed.getMonth() === monthIdx &&
+    parsed.getDate() === day &&
+    parsed.getHours() === hour &&
+    parsed.getMinutes() === minute &&
+    parsed.getSeconds() === second;
+  return matchesCalendar ? parsed.getTime() : 0;
+}
+
+/**
+ * Formats an elapsed millisecond duration into a concise human-friendly relative age ('just now', '45s ago',
+ * '12m ago', '2h 35m ago', '3d 4h ago').
+ *
+ * @param {number} elapsedMs - Elapsed duration in milliseconds (clamped at 0).
+ * @returns {string}
+ */
+function formatRelativeAge(elapsedMs) {
+  if (!Number.isFinite(elapsedMs)) {
+    return '';
+  }
+  const totalSecs = Math.max(0, Math.floor(elapsedMs / MS_PER_SECOND));
+  if (totalSecs < JUST_NOW_THRESHOLD_SECS) {
+    return AGE_JUST_NOW;
+  }
+  if (totalSecs < SECS_PER_MINUTE) {
+    return totalSecs + AGE_SECONDS_SUFFIX;
+  }
+  if (totalSecs < SECS_PER_HOUR) {
+    return Math.floor(totalSecs / SECS_PER_MINUTE) + AGE_MINUTES_SUFFIX;
+  }
+  if (totalSecs < SECS_PER_DAY) {
+    const hours = Math.floor(totalSecs / SECS_PER_HOUR);
+    const mins = Math.floor((totalSecs % SECS_PER_HOUR) / SECS_PER_MINUTE);
+    return mins > 0 ? hours + AGE_HOURS_INFIX + mins + AGE_MINUTES_SUFFIX : hours + AGE_HOURS_SUFFIX;
+  }
+  const days = Math.floor(totalSecs / SECS_PER_DAY);
+  const remHours = Math.floor((totalSecs % SECS_PER_DAY) / SECS_PER_HOUR);
+  return remHours > 0 ? days + AGE_DAYS_INFIX + remHours + AGE_HOURS_SUFFIX : days + AGE_DAYS_SUFFIX;
 }
 
 /**
@@ -368,6 +458,9 @@ function initLogger(rawLevel) {
 module.exports = {
   formatLocalTimestamp,
   formatLocalHm,
+  formatFileTimestamp,
+  parseFileTimestampMs,
+  formatRelativeAge,
   normalizeLevelName,
   maskSecrets,
   formatErrorMessage,

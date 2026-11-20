@@ -23,9 +23,15 @@ describe('Regression 46. Event-Loop-Blocking Snapshot FFmpeg Calls & Serial go2r
     // Regression: a failed or killed JPEG encode must never leave a truncated snapshot or a stray temp file.
     const childProcess = require('node:child_process');
     const cam = new Camera({serial: 'T8161T0000009994', name: 'snap_fail_cam'});
-    cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x33), Buffer.alloc(FRAME, 0x33), 20000, '10:00');
+    const prevFile = getCacheFilePath(cam, new Date(2026, 10, 19, 9, 55, 0));
+    fs.writeFileSync(prevFile, 'previous-good-snapshot');
+    cam.recordDecodedFrame(
+      Buffer.alloc(FRAME, 0x33),
+      Buffer.alloc(FRAME, 0x33),
+      new Date(2026, 10, 19, 10, 0, 0).getTime(),
+      '10:00'
+    );
     const finalFile = getCacheFilePath(cam);
-    fs.writeFileSync(finalFile, 'previous-good-snapshot');
     const spawned = [];
     t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {
       const proc = createFakeFfmpegProcess();
@@ -39,9 +45,11 @@ describe('Regression 46. Event-Loop-Blocking Snapshot FFmpeg Calls & Serial go2r
       fs.writeFileSync(tempFile, 'partial');
       finishFakeFfmpegProcess(spawned[0].proc, {status: 1, stderr: Buffer.from('Error muxing a packet\n')});
       await saving;
-      assert.equal(fs.readFileSync(finalFile, 'utf8'), 'previous-good-snapshot');
+      assert.equal(fs.readFileSync(prevFile, 'utf8'), 'previous-good-snapshot');
+      assert.equal(fs.existsSync(finalFile), false);
       assert.equal(fs.existsSync(tempFile), false);
     } finally {
+      fs.rmSync(prevFile, {force: true});
       fs.rmSync(finalFile, {force: true});
     }
   });

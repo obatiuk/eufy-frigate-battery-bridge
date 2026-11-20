@@ -101,8 +101,9 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
 - **Immediate Snapshot Persistence (`lastFrame`, `/config/cache`):** `cam.lastFrame` and `cam.telemetry.lastSeen` update
   in RAM on the first decoded frame of every live/backfill session (`lastFrame` also updates after `2s` on first-boot
   `startup_snapshot` probes). Clean un-overlayed `JPEG` frames are persisted to
-  `/config/cache/last_<name>.jpg` when `serial === name` (or `last_<name>_<serial>.jpg` when they differ, automatically
-  migrating legacy `last_<name>_<name>.jpg` files) when a session that decoded video (or is not a passive
+  `/config/cache/<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when `serial === name` (or
+  `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when they differ, automatically migrating legacy `last_*.jpg`
+  files and removing superseded snapshots) when a session that decoded video (or is not a passive
   `rtsp-direct-probe` without video) stops (`stop()`, falling back to `os.tmpdir()` / `TMPDIR` if `BRIDGE_CACHE_DIR` is
   unwritable)
   so container restarts never need to wake cameras that already have a cached snapshot. While

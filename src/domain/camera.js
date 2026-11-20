@@ -348,13 +348,16 @@ class Camera {
   }
 
   /**
-   * Returns the unique snapshot cache filename (`last_<name>.jpg` when `serial === name`,
-   * or `last_<name>_<serial>.jpg` when they differ) for this camera.
+   * Returns the unique timestamped snapshot cache filename (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when
+   * `serial === name`, or `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when they differ) for this camera,
+   * defaulting the timestamp to the latest decoded frame capture time (`frameAt`) when omitted.
    *
+   * @param {Date|number|string} [at] - Optional explicit capture timestamp or Date.
    * @returns {string}
    */
-  getCacheFileName() {
-    return CameraConfig.formatCacheFileName(this.name, this.serial);
+  getCacheFileName(at = undefined) {
+    const effectiveAt = at !== undefined ? at : this.frameAt > 0 ? this.frameAt : Date.now();
+    return CameraConfig.formatCacheFileName(this.name, this.serial, effectiveAt);
   }
 
   /**

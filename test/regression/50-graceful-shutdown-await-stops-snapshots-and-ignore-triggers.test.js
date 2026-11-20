@@ -41,7 +41,6 @@ describe('Regression 50. Graceful Shutdown Drain for Station Stops, Snapshot Sav
         mode: 'p2p',
         station_serial: 'T8030P0000000050',
       });
-      const finalFile = getCacheFilePath(cam);
 
       let shuttingDown = false;
       const {sentCommands, wsInstance} = await setupAcceptanceHarness([cam, idleCam]);
@@ -71,6 +70,7 @@ describe('Regression 50. Graceful Shutdown Drain for Station Stops, Snapshot Sav
       cam.beginSession('p2p', t0 - 10_000, false);
       cam.setViewUntil(t0 + 25_000);
       cam.recordDecodedFrame(Buffer.alloc(FRAME, 0x66), Buffer.alloc(FRAME, 0x66), t0 - 1_000, '13:00');
+      const finalFile = getCacheFilePath(cam);
 
       const spawned = [];
       t.mock.method(childProcess, 'spawn', (cmd, args, opts) => {

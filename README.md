@@ -433,12 +433,14 @@ or inside a single camera in `cameras[]`. Settings marked **`Camera ("custom")`*
 
 ### 1. Status Card, Display & Snapshots
 
-- **Saved snapshots (`/config/cache`):** Whenever a camera streams live video or replays a clip, the bridge saves a
-  clean `JPEG` picture (without the corner status card) to `/config/cache` and uses it as the sleeping backdrop when
-  `sleep_screen: "snapshot"` is set.
+- **Saved snapshots (`/config/cache`):** Whenever a camera finishes streaming live video or replaying a clip, the bridge
+  saves a clean timestamped `JPEG` picture (`<name>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg`, or
+  `<name>_<serial>_snapshot_<YYYY-MM-DD_HH-MM-SS>.jpg` when `name` and `serial` differ, replacing the previous file) to
+  `/config/cache` without the corner status card and uses it as the sleeping backdrop when `sleep_screen: "snapshot"` is
+  set.
 - **First-boot snapshot (`startup_snapshot: true`):** The bridge only wakes a camera on startup if there is **no saved
-  snapshot on disk yet** (for example, the first time you add a new camera). On all later restarts, it loads the saved
-  file from `/config/cache` without waking the camera.
+  snapshot on disk yet** (for example, the first time you add a new camera). On all later restarts, it loads the latest
+  saved file from `/config/cache`, logs when it was taken, and skips waking the camera.
 - **Clean Frigate event thumbnails (`instant_event_snapshot: true`):** On motion or doorbell events, the bridge waits
   for `1` second of real video (`0.8s` on backfill clip replays) before creating the Frigate event so the thumbnail
   shows live action. If a wake ever times out without video, the bridge briefly hides the `"Waking Up..."` card so
