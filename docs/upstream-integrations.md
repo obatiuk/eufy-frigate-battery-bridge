@@ -1,4 +1,4 @@
-# Upstream integrations: eufy-security-ws, Frigate, go2rtc, and Home Assistant
+# Upstream integrations: `eufy-security-ws`, Frigate, `go2rtc`, and Home Assistant
 
 Read when: changing `src/services/eufy/*`, `src/services/frigate-client.js`, `src/services/frigate-masks.js`,
 `src/services/go2rtc-viewers.js`, `src/services/ha-notifier.js`, `src/services/service-versions.js`, or
@@ -90,7 +90,7 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
   `GET /api/events?cameras=<cam>&limit=10` (`2.5s` `FRIGATE_FAST_QUERY_TIMEOUT_MS`) and returns `'idle'`, `'active'`, or
   `'unknown'` (on timeout, non-`2xx`, or malformed JSON) so outages neither extend holds to `stream_max_secs` nor
   confirm early battery-saver sleep (`AT-11`, `AT-12`).
-- **Auto-Mask Sync & `0.14` - `0.18+` Compatibility (`syncFrigateMotionMasks`):**
+- **Named Auto-Mask Sync (`syncFrigateMotionMasks`):**
   - Runs on initial telemetry load, every `60s` (`MASK_SYNC_INTERVAL_MS`), and `6s` after encoder drop recovery.
   - Fetches `GET /api/config` (`5s` timeout) to track `frigateConnected` service health (`AT-08`, `AT-18`) and inspect
     each camera's `motion.mask` and `objects.mask`.

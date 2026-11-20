@@ -12,8 +12,10 @@ line across all 4 severity levels for a stateful `Camera`, `BackfillJob`, decode
 its current uppercase `[STATE]` badge; omitted only on raw `CameraConfig` startup cache logs before `Camera`
 construction):
 
-    YYYY-MM-DD HH:MM:SS - [INFO ] - [bridge] message
-    YYYY-MM-DD HH:MM:SS - [DEBUG] - [camera] [STATE] message
+```text
+YYYY-MM-DD HH:MM:SS - [INFO ] - [bridge] message
+YYYY-MM-DD HH:MM:SS - [DEBUG] - [camera] [STATE] message
+```
 
 - **Timestamps:** Formatted via `formatLocalTimestamp()` (`YYYY-MM-DD HH:MM:SS`) using local `Date` getters (respecting
   `TZ`) with zero ICU locale dependencies so Grafana Alloy's ISO-8601 regex always matches.

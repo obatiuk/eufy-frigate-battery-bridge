@@ -49,11 +49,11 @@ Read when: you need a build, test, publish, health check, or signal-driven diagn
   `curl -s -X POST http://127.0.0.1:8080/api/wake/all -d '{"reason":"test","duration":30}'` (also accepts `GET` query
   parameters `duration`, `reason`, `create_event` on `/api/wake` or `/api/wake/:cameras`; skips direct `rtsp_url`
   cameras with `status: "unsupported"` in `all`/mixed targets and returns `422` when targeted directly, failing
-  atomically on unknown camera tokens, malformed payloads, or disconnected/offline targets)
+  atomically on unknown camera tokens, malformed/`> 16 KB`/`> 5s` stalled bodies, or disconnected/offline targets)
 - **Trigger Test Frigate Event:** `podman kill -s USR2 eufy-frigate-battery-bridge` (files a `"test"` event on the first
-  camera without waking it, and sends an `HA_WEBHOOK_URL` notification if configured)
-- **Trigger Test Backfill Download:** `podman kill -s USR1 eufy-frigate-battery-bridge` (picks the first non-`RTSP`
-  camera, or last camera, queries `HomeBase 3`, and replays its latest `.zxvideo` clip at `live_fps` into Frigate)
+  non-direct Eufy camera without waking it, and sends an `HA_WEBHOOK_URL` notification if configured)
+- **Trigger Test Backfill Download:** `podman kill -s USR1 eufy-frigate-battery-bridge` (picks the first non-`RTSP` Eufy
+  camera, or last Eufy camera, queries `HomeBase 3`, and replays its latest `.zxvideo` clip at `live_fps` into Frigate)
 
 <details>
 <summary><strong>Diagnostic Script 1: Inspect Hardware Models, Serials & Firmware</strong></summary>
@@ -112,8 +112,9 @@ podman exec eufy-frigate-battery-bridge node -e '
   const wsUrl = process.env.EUFY_WS_URL ||
     ("ws://" + (process.env.EUFY_WS_HOST || "eufy-security-ws") + ":" + (process.env.EUFY_WS_PORT || "3000"));
   const ws = new WS(wsUrl);
+  const eufyCams = (cfg.cameras || []).filter((c) => !c.rtsp_url && c.serial);
   let id = 0;
-  let remaining = cfg.cameras.length;
+  let remaining = eufyCams.length;
   const send = (cmd) => ws.send(JSON.stringify({ messageId: String(++id), ...cmd }));
   const unwrap = (v) => (v && typeof v === "object" && "value" in v ? v.value : v);
 
@@ -123,7 +124,8 @@ podman exec eufy-frigate-battery-bridge node -e '
       send({ command: "set_api_schema", schemaVersion: Math.min(m.maxSchemaVersion, 21) });
       send({ command: "start_listening" });
     } else if (m.messageId === "2") {
-      for (const c of cfg.cameras) send({ command: "device.get_properties", serialNumber: c.serial });
+      if (!remaining) process.exit(0);
+      for (const c of eufyCams) send({ command: "device.get_properties", serialNumber: c.serial });
       setTimeout(() => process.exit(0), 3000);
     } else if (m.type === "result" && m.result?.properties) {
       const p = m.result.properties;
@@ -134,6 +136,7 @@ podman exec eufy-frigate-battery-bridge node -e '
           ", endEarly=" + unwrap(p.recordingEndClipMotionStops) +
           ", retrigger=" + unwrap(p.recordingRetriggerInterval) + "s" +
           ", quality=" + unwrap(p.videoStreamingQuality ?? p.streamingQuality) +
+          ", motionDet=" + unwrap(p.motionDetection) +
           ", rtsp=" + unwrap(p.rtspStream) + " (" + (unwrap(p.rtspStreamUrl) || "n/a") + ")" +
           ", light=" + unwrap(p.light) +
           ", state=" + unwrap(p.state) +

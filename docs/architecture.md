@@ -102,7 +102,7 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [media-pipeline.md](media-p
     │   ├── eufy/                           # modules.test.js for ws-transport, telemetry-sync & station-recovery (mirrors src/services/eufy/*)
     │   └── orchestrator/                   # modules.test.js for context, wake, arbitration, backfill-queue, event-router & housekeeping
     ├── acceptance/                         # AT-01..AT-19.test.js: locked 1:1 acceptance suite mirroring docs/acceptance/AT-NN.md
-    └── regression/                         # NN-slug.test.js (01..46): 1:1 per-case regression suite mirroring docs/regression/NN-slug.md
+    └── regression/                         # NN-slug.test.js: 1:1 per-case regression suite mirroring docs/regression/NN-slug.md
 ```
 
 ### Modular Dependency Flow

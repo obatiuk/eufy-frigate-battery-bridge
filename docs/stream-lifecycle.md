@@ -117,9 +117,10 @@ Related: [ACCEPTANCE.md](ACCEPTANCE.md) section 3.1 concern map (`AT-01`..`AT-04
   `POST/GET /api/wake` and `/api/wake/:cameras` (resolving `name`, `serial`, slugified `title`, comma-separated lists,
   and `all`, failing atomically with `404 CAMERA_NOT_FOUND` on any unknown token, rejecting direct `rtsp_url` cameras
   with `422 UNSUPPORTED_OPERATION` when targeted exclusively or skipping them as `status: "unsupported"` in mixed/`all`
-  lists, validating URL encoding, JSON bodies `<= 16 KB`, `duration`/`create_event`/`reason`, HTTP methods `405`, and
-  shutdown/WS/all-offline `503` states, with `RTSP`-first ordering, `2500ms` per-station pacing, burst coalescing, and
-  `create_event: true` by default), `GET/HEAD /api/config` (`buildConfigPayload` exposing build `version`, Git `commit`,
+  lists, validating URL encoding, JSON bodies `<= 16 KB` (`413`) within `5s` (`408`), `duration`/`create_event`/
+  `reason`, HTTP methods `405`, and shutdown/WS/all-offline `503` states, with `RTSP`-first ordering, `2500ms`
+  per-station pacing, burst coalescing, and `create_event: true` by default), `GET/HEAD /api/config`
+  (`buildConfigPayload` exposing build `version`, Git `commit`,
   and sanitized effective runtime config with `null` for inapplicable fields), `GET/HEAD /api/status`
   (`buildStatusPayload` exposing upstream service connectivity, `HomeBase` station `P2P` slot health, aggregate camera
   counts, and every configured camera's live session, encoder, viewer, event, backfill, trigger, and sensor telemetry

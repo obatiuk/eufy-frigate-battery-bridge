@@ -4,6 +4,9 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Rewrite the user setup guide with a table of contents, plain-language explanations of camera, power, and
+  streaming-quality modes near the top, progressive step-by-step setup examples from default to custom, spaced reference
+  tables, and synced diagnostic and `HTTP` wake documentation
 - **BREAKING:** Replace automatic Eufy power-mode and streaming-quality overrides with non-invasive keep-by-default
   profiles (rejecting the removed legacy power and quality configuration keys at startup and logging a warning with the
   camera's existing settings whenever an opted-in profile overrides them), inspect Eufy app motion detection toggles
