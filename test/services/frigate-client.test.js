@@ -705,4 +705,70 @@ describe('Frigate and go2rtc Client Modules (src/services/)', () => {
       global.fetch = origFetch;
     }
   });
+
+  it('skips legacy query-string PUT fallback on mask errors and warns once per missing Frigate camera', async () => {
+    // Verify syncSingleFrigateMaskSection never issues ?cameras.<name>... PUT and syncFrigateMotionMasks warns once
+    // when a configured camera is absent from Frigate /api/config.
+    const cam = new Camera({
+      serial: 'T8161T0000000057',
+      name: 'shed_cam',
+      card_theme: 'glance',
+      card_position: 'bottom-left',
+      auto_frigate_mask: true,
+    });
+    const putUrls = [];
+    const warnings = [];
+    const origWarn = log.warn;
+    const origFetch = global.fetch;
+    log.warn = (scope, ...args) => {
+      warnings.push((typeof scope === 'object' && scope ? scope.getName() : String(scope)) + ': ' + args.join(' '));
+    };
+
+    try {
+      global.fetch = async (url) => {
+        putUrls.push(String(url));
+        return {
+          ok: false,
+          status: 422,
+          async text() {
+            return 'validation failed';
+          },
+        };
+      };
+      const status = await syncSingleFrigateMaskSection(
+        cam,
+        {motion: {mask: {}}},
+        {section: 'motion', poly: cam.computeMaskPolygon(), frigateUrl: 'http://127.0.0.1:5000'}
+      );
+      assert.equal(status, 'failed');
+      assert.deepEqual(putUrls, ['http://127.0.0.1:5000/api/config/set']);
+      assert.equal(
+        warnings.some((w) => w.includes('HTTP 422') && w.includes('validation failed')),
+        true
+      );
+
+      warnings.length = 0;
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return {cameras: {other_cam: {motion: {mask: {}}, objects: {mask: {}}}}};
+        },
+      });
+      await syncFrigateMotionMasks([cam], {
+        forceResync: false,
+        shuttingDown: false,
+        frigateUrl: 'http://127.0.0.1:5000',
+      });
+      await syncFrigateMotionMasks([cam], {
+        forceResync: false,
+        shuttingDown: false,
+        frigateUrl: 'http://127.0.0.1:5000',
+      });
+      assert.equal(warnings.filter((w) => w.includes('shed_cam')).length, 1);
+    } finally {
+      log.warn = origWarn;
+      global.fetch = origFetch;
+    }
+  });
 });

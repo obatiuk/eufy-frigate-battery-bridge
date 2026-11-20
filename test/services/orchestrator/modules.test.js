@@ -10,8 +10,10 @@
 
 const {describe, it, afterEach} = require('node:test');
 const assert = require('node:assert/strict');
+const {EventEmitter} = require('node:events');
 
 require('../../helpers/test-env');
+const {flushAsync} = require('../../helpers/async');
 
 const {
   configureOrchestratorContext,
@@ -33,8 +35,15 @@ const {
   resetHousekeepingErrorState,
 } = require('../../../src/services/orchestrator/housekeeping');
 const orchestrator = require('../../../src/services/stream-orchestrator');
+const {
+  registerEufySubsystems,
+  configureEufyClientHooks,
+  connectWs,
+  stopWsClient,
+} = require('../../../src/services/eufy/ws-transport');
 const {Camera} = require('../../../src/domain/camera');
 const {stations} = require('../../../src/domain/station');
+const {log} = require('../../../src/logger');
 
 describe('src/services/orchestrator split modules', () => {
   afterEach(() => {
@@ -120,5 +129,132 @@ describe('src/services/orchestrator split modules', () => {
     assert.equal(orchestrator.startHousekeepingLoop, startHousekeepingLoop);
     assert.equal(typeof orchestrator.waitForStationTransitions, 'function');
     assert.equal(typeof resetHousekeepingErrorState, 'function');
+  });
+
+  it('catches floating background RPC rejections in wake.js offline refresh and post-stop get_properties', async () => {
+    // Verify offline api-wake refresh and post-stop device.get_properties never leak unhandled rejections.
+    /** @type {unknown[]} */
+    const unhandled = [];
+    const onUnhandled = (err) => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+
+    const warnings = [];
+    const debugs = [];
+    const origWarn = log.warn;
+    const origDebug = log.debug;
+    log.warn = (_scope, ...args) => warnings.push(args.join(' '));
+    log.debug = (_scope, ...args) => debugs.push(args.join(' '));
+
+    let throwOnResume = false;
+    class GuardWs extends EventEmitter {
+      constructor() {
+        super();
+        this.readyState = 1;
+        GuardWs.last = this;
+      }
+      send(raw, cb) {
+        const msg = JSON.parse(raw);
+        if (cb) cb(null);
+        setImmediate(() => {
+          if (msg.command === 'set_api_schema') {
+            this.emit('message', JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+          } else if (msg.command === 'start_listening') {
+            this.emit(
+              'message',
+              JSON.stringify({
+                type: 'result',
+                messageId: msg.messageId,
+                success: true,
+                result: {state: {driver: {connected: true}, stations: [], devices: []}},
+              })
+            );
+          } else if (msg.command === 'driver.poll_refresh') {
+            this.emit(
+              'message',
+              JSON.stringify({type: 'result', messageId: msg.messageId, success: false, errorCode: 'poll_failed'})
+            );
+          } else if (msg.command === 'device.get_properties') {
+            this.emit(
+              'message',
+              JSON.stringify({
+                type: 'result',
+                messageId: msg.messageId,
+                success: true,
+                result: {properties: {state: {value: 1}, battery: {value: 92}}},
+              })
+            );
+          } else {
+            this.emit('message', JSON.stringify({type: 'result', messageId: msg.messageId, success: true, result: {}}));
+          }
+        });
+      }
+      close() {
+        this.readyState = 3;
+      }
+    }
+    /** @type {GuardWs|null} */
+    GuardWs.last = null;
+
+    const offlineCam = new Camera({serial: 'SN0000000310', name: 'offline_cam', mode: 'p2p'});
+    const liveCam = new Camera({serial: 'SN0000000311', name: 'live_cam', mode: 'p2p'});
+    const cams = [offlineCam, liveCam];
+    const bySerial = new Map(cams.map((c) => [c.getSerial(), c]));
+
+    try {
+      orchestrator.initOrchestrator(cams, bySerial, () => false);
+      configureEufyClientHooks({
+        cams,
+        bySerial,
+        WebSocket: /** @type {*} */ (GuardWs),
+        isShuttingDown: () => false,
+        onDeviceOnlineResume: () => {
+          if (throwOnResume) {
+            throw new Error('simulated post-stop resume failure');
+          }
+        },
+      });
+      connectWs();
+      assert.ok(GuardWs.last);
+      GuardWs.last.emit('message', JSON.stringify({type: 'version', serverVersion: '1.9.9', maxSchemaVersion: 21}));
+      await flushAsync(6);
+
+      offlineCam.applyTelemetryProperties({state: 3, battery: 1, chargingStatus: 2, wifiRssi: -100}, false);
+      registerEufySubsystems({
+        onRecoverDriverAndStations: async () => {
+          throw new Error('simulated offline recovery failure');
+        },
+      });
+
+      const wakeRes = wakeCameraExternal(offlineCam, {
+        durationMs: 30_000,
+        reason: 'unit-offline-wake',
+        createEvent: false,
+      });
+      assert.equal(wakeRes.status, 'offline');
+      await flushAsync(6);
+
+      liveCam.applyTelemetryProperties({state: 1, battery: 92, chargingStatus: 2, wifiRssi: -60}, false);
+      liveCam.beginSession('p2p', Date.now(), false);
+      liveCam.setGotVideo(true);
+      throwOnResume = true;
+      stop(liveCam, 'idle timeout', {initiator: 'bridge'});
+      await flushAsync(6);
+
+      assert.deepEqual(unhandled, []);
+      assert.equal(
+        warnings.some((line) => line.includes('simulated offline recovery failure')),
+        true
+      );
+      assert.equal(
+        debugs.some((line) => line.includes('simulated post-stop resume failure')),
+        true
+      );
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      log.warn = origWarn;
+      log.debug = origDebug;
+      registerEufySubsystems({onRecoverDriverAndStations: async () => {}});
+      stopWsClient();
+    }
   });
 });

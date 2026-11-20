@@ -21,12 +21,44 @@ const ENCODER_RECONNECT_MASK_SYNC_DELAY_MS = 6000;
 const MASK_SYNC_INTERVAL_MS = 60000;
 const FRIGATE_BRIDGE_MASK_KEY = 'eufy_bridge_card';
 const FRIGATE_BRIDGE_MASK_FRIENDLY_NAME = 'Eufy Bridge Status Card';
+const MAX_WARNED_MISSING_CAMERAS = 128;
 
 let isSyncingMasks = false;
 let frigateApiDown = false;
 let lastMaskCheckAt = Date.now();
+/** @type {Set<string>} */
+const warnedMissingMaskCameras = new Set();
 
 const isFrigateConnected = () => !frigateApiDown;
+
+/**
+ * Resets cached missing-camera warning and API-outage flags for deterministic tests.
+ */
+function resetFrigateMaskSyncState() {
+  warnedMissingMaskCameras.clear();
+  frigateApiDown = false;
+  isSyncingMasks = false;
+}
+
+/**
+ * Logs one warning per episode when a configured camera is absent from Frigate's cameras config.
+ *
+ * @param {Camera} cam - Camera missing from Frigate /api/config.
+ */
+function warnMissingFrigateCameraOnce(cam) {
+  const camName = cam.getName();
+  if (warnedMissingMaskCameras.has(camName)) {
+    return;
+  }
+  if (warnedMissingMaskCameras.size >= MAX_WARNED_MISSING_CAMERAS) {
+    const oldest = warnedMissingMaskCameras.values().next().value;
+    if (oldest !== undefined) {
+      warnedMissingMaskCameras.delete(oldest);
+    }
+  }
+  warnedMissingMaskCameras.add(camName);
+  log.warn(cam, 'camera "' + camName + '" not found in Frigate /api/config cameras; skipping auto_frigate_mask sync');
+}
 
 /**
  * Builds the Frigate PUT /api/config/set JSON envelope for updating or deleting eufy_bridge_card.
@@ -174,31 +206,6 @@ async function syncSingleFrigateMaskSection(cam, camCfg, spec) {
       return 'applied';
     }
     const errText = await readHttpErrorSnippet(putRes);
-
-    const legacyUrl =
-      frigateUrl +
-      '/api/config/set?cameras.' +
-      encodeURIComponent(camName) +
-      '.' +
-      section +
-      '.mask=' +
-      encodeURIComponent(poly);
-    let legacyFailureSuffix = '';
-    try {
-      const legRes = await fetch(legacyUrl, {
-        method: 'PUT',
-        signal: AbortSignal.timeout(FRIGATE_CONFIG_PUT_TIMEOUT_MS),
-      });
-      if (legRes.ok) {
-        return 'applied';
-      }
-      if (legRes.status !== putRes.status) {
-        legacyFailureSuffix = '; legacy fallback HTTP ' + legRes.status;
-      }
-    } catch (legErr) {
-      legacyFailureSuffix = '; legacy fallback failed: ' + formatErrorMessage(legErr);
-    }
-
     log.warn(
       cam,
       'could not auto-apply Frigate ' +
@@ -207,7 +214,6 @@ async function syncSingleFrigateMaskSection(cam, camCfg, spec) {
         putRes.status +
         '): ' +
         errText +
-        legacyFailureSuffix +
         ' (calculated mask=' +
         poly +
         ')'
@@ -232,10 +238,13 @@ async function syncCameraFrigateMasks(cam, frigateCfg, frigateUrl) {
     return false;
   }
   const poly = cam.computeMaskPolygon();
-  const camCfg = frigateCfg && frigateCfg.cameras ? frigateCfg.cameras[cam.getName()] : null;
+  const camName = cam.getName();
+  const camCfg = frigateCfg && frigateCfg.cameras ? frigateCfg.cameras[camName] : null;
   if (!camCfg) {
+    warnMissingFrigateCameraOnce(cam);
     return false;
   }
+  warnedMissingMaskCameras.delete(camName);
 
   const motMask = camCfg.motion && camCfg.motion.mask ? camCfg.motion.mask[FRIGATE_BRIDGE_MASK_KEY] : null;
   const objMask = camCfg.objects && camCfg.objects.mask ? camCfg.objects.mask[FRIGATE_BRIDGE_MASK_KEY] : null;
@@ -320,6 +329,7 @@ async function syncFrigateMotionMasks(cams, opts = {}) {
     const hadPriorMaskSync = cams.some((c) => c.hasSyncedMaskPolygon());
     let anyMaskReapplied = false;
     if (forceResync) {
+      warnedMissingMaskCameras.clear();
       for (const c of cams) {
         c.resetMaskSync();
       }
@@ -400,6 +410,7 @@ function checkPeriodicMaskSync(cams, now, shuttingDown) {
 
 module.exports = {
   isFrigateConnected,
+  resetFrigateMaskSyncState,
   buildFrigateMaskPayload,
   buildFrigateMaskDeletePayload,
   isFrigateMaskIntact,

@@ -48,16 +48,19 @@ reason=encoder_stdin_backpressure`) and kills the wedged encoder (`killWedgedEnc
   - `vaapi`: `-init_hw_device vaapi=va:<device> -filter_hw_device va -vf format=nv12,hwupload -c:v h264_vaapi
 -async_depth 1 -bf 0 -qp 18`
   - `qsv`: `-init_hw_device qsv=hw:<device> -filter_hw_device hw -vf format=nv12,hwupload=extra_hw_frames=8 -c:v
-h264_qsv -global_quality 19 -maxrate 3500k -bufsize 3500k`
+h264_qsv -bf 0 -global_quality 19 -maxrate 3500k -bufsize 3500k`
   - `nvenc`: `-c:v h264_nvenc -preset p3 -tune ull -pix_fmt yuv420p -cq 19 -maxrate 3500k -bufsize 3500k`
   - `v4l2m2m`: `-c:v h264_v4l2m2m -pix_fmt yuv420p -b:v 3000k`
   - Software default (`""` / `disabled`): `-c:v libx264 -threads 2 -preset veryfast -tune zerolatency -pix_fmt yuv420p
 -crf 19 -maxrate 3500k -bufsize 3500k`
 - **Automatic `libx264` Fallback (`AT-18`):** If an `hwaccel` encoder exits within `5s` of spawn
   (`HWACCEL_FAIL_WINDOW_MS`) and its rolling `stderr` tail (`attachStderrTailCollector`) matches
-  `HWACCEL_FAILURE_STDERR_REGEX` (`vaapi`, `qsv`, `nvenc`, `v4l2`, `hwupload`, `device`, `driver`, `Invalid argument`,
+  `HWACCEL_FAILURE_STDERR_REGEX` (`vaapi`, `qsv`, `nvenc`, `v4l2m2m`, `hwupload`, `init_hw_device`, `/dev/dri`,
+  `libva`, `cuda`, `mfx`, `AVHWDeviceContext`, `AVHWFramesContext`, `Device creation failed`,
   `Function not implemented`), `cam.disableHwaccel()` disables hardware encoding for that camera, logs a `[WARN ]`
-  with the `ffmpeg` root cause, and restarts on software `libx264` after `1s` (`HWACCEL_FALLBACK_RESTART_MS`).
+  with the `ffmpeg` root cause, and restarts on software `libx264` after `1s` (`HWACCEL_FALLBACK_RESTART_MS`). On
+  bridge shutdown, `stopEncoderProcess()` sends `SIGTERM` followed by a `2s` `SIGKILL` escalation timer if `ffmpeg`
+  does not exit promptly.
 
 ## Per-Session `P2P` & `RTSP` Decoders (`src/media/decoder.js`)
 

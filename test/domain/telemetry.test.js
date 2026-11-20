@@ -734,4 +734,34 @@ describe('Telemetry Semantic Colors, Segments & Property Parsing', () => {
       assert.equal(tempLoadedOutcome.shouldRebuildCard, true);
     }
   );
+
+  it('requires all 4 Power Manager recording keys before evaluating or latching recordingModeChecked', () => {
+    // Verify partial 1..3-key recording bags do not latch recordingModeChecked or emit n/a writes.
+    const cam = new Camera({serial: 'T8161T0000000054', name: 'yard', mode: 'backfill'});
+
+    assert.deepEqual(cam.evaluateRecordingModeChanges({powerWorkingMode: {value: 2}}), []);
+    assert.equal(cam.hasRecordingModeChecked(), false);
+
+    assert.deepEqual(
+      cam.evaluateRecordingModeChanges({
+        powerWorkingMode: {value: 2},
+        recordingClipLength: {value: 60},
+        recordingEndClipMotionStops: {value: false},
+      }),
+      []
+    );
+    assert.equal(cam.hasRecordingModeChecked(), false);
+
+    const fullUpdates = cam.evaluateRecordingModeChanges({
+      powerWorkingMode: {value: 2},
+      recordingClipLength: {value: 60},
+      recordingEndClipMotionStops: {value: false},
+      recordingRetriggerInterval: {value: 5},
+    });
+    assert.deepEqual(fullUpdates, [
+      {name: 'recordingClipLength', currentValue: 60, targetValue: 30},
+      {name: 'recordingEndClipMotionStops', currentValue: false, targetValue: true},
+    ]);
+    assert.equal(cam.hasRecordingModeChecked(), true);
+  });
 });

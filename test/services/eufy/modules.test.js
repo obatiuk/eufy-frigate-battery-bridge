@@ -360,4 +360,86 @@ describe('src/services/eufy split modules', () => {
     await Promise.all([fetchAllCameraTelemetry(false), fetchAllCameraTelemetry(false), fetchAllCameraTelemetry(false)]);
     assert.equal(FakeWebSocket.lastInstance.sent.filter((m) => m.command === 'device.get_properties').length, 1);
   });
+
+  it(
+    'resolves call() cleanly when ws.send throws synchronously and aborts ' + 'handshake when set_api_schema fails',
+    async (t) => {
+      // Verify call() catches synchronous ws.send throws and set_api_schema failure skips start_listening.
+      t.mock.timers.enable({apis: ['setTimeout']});
+      const errors = [];
+      const origError = log.error;
+      log.error = (_scope, ...args) => errors.push(args.join(' '));
+
+      let socketsCreated = 0;
+      class SchemaFailWs extends FakeWebSocket {
+        constructor(url) {
+          super(url);
+          socketsCreated += 1;
+        }
+      }
+
+      FakeWebSocket.onSend = (sock, msg) => {
+        if (msg.command === 'set_api_schema') {
+          sock.emit(
+            'message',
+            JSON.stringify({type: 'result', messageId: msg.messageId, success: false, errorCode: 'schema_incompatible'})
+          );
+        } else if (msg.command === 'start_listening') {
+          sock.emit(
+            'message',
+            JSON.stringify({
+              type: 'result',
+              messageId: msg.messageId,
+              success: true,
+              result: {state: {driver: {connected: true}, stations: [], devices: []}},
+            })
+          );
+        }
+      };
+
+      try {
+        const cam = new Camera({serial: 'T8161T0000000098', name: 'side_yard', station_serial: 'T8030P0000000010'});
+        configureEufyClientHooks({
+          cams: [cam],
+          bySerial: new Map([[cam.getSerial(), cam]]),
+          WebSocket: SchemaFailWs,
+          isShuttingDown: () => false,
+          onDeviceOnlineResume: () => {},
+        });
+        connectWs();
+        assert.equal(socketsCreated, 1);
+        const firstSock = FakeWebSocket.lastInstance;
+        assert.ok(firstSock);
+
+        firstSock.emit('message', JSON.stringify({type: 'version', serverVersion: '1.9.9', maxSchemaVersion: 21}));
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.deepEqual(
+          firstSock.sent.map((m) => m.command),
+          ['set_api_schema']
+        );
+        assert.equal(isWsReady(), false);
+        assert.equal(
+          errors.some((line) => line.includes('set_api_schema failed') && line.includes('schema_incompatible')),
+          true
+        );
+
+        // Synchronous throw from ws.send inside call() must resolve {success: false} without rejecting
+        firstSock.send = () => {
+          throw new Error('WebSocket is not open: readyState 2 (CLOSING)');
+        };
+        const sendThrowRes = await call({command: 'driver.is_connected'});
+        assert.equal(sendThrowRes.success, false);
+        assert.equal(sendThrowRes.errorCode, 'WebSocket is not open: readyState 2 (CLOSING)');
+
+        // Scheduled reconnect timer from failed set_api_schema reconnects after ~10s
+        t.mock.timers.tick(11_000);
+        assert.equal(socketsCreated, 2);
+      } finally {
+        log.error = origError;
+        stopWsClient();
+      }
+    }
+  );
 });

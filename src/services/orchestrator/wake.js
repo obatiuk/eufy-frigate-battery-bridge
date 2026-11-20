@@ -129,16 +129,20 @@ function refreshOfflineCameraOnApiWake(cam, spec) {
       (cam.getOfflineReason() || 'offline') +
       '), polling HomeBase for battery swap/recovery'
   );
-  void Promise.resolve(fetchAllCameraTelemetry(true)).then(() => {
-    if (!cam.isDeviceOffline() && !isShuttingDown()) {
-      const refreshedNow = Date.now();
-      if (cam.shouldBackfillOnlyOnApiWake(refreshedNow)) {
-        queueApiWakeBackfill(cam, reason, refreshedNow);
-      } else {
-        applyExternalWakeTrigger(cam, {reason, durationMs, createEvent});
+  void Promise.resolve(fetchAllCameraTelemetry(true))
+    .then(() => {
+      if (!cam.isDeviceOffline() && !isShuttingDown()) {
+        const refreshedNow = Date.now();
+        if (cam.shouldBackfillOnlyOnApiWake(refreshedNow)) {
+          queueApiWakeBackfill(cam, reason, refreshedNow);
+        } else {
+          applyExternalWakeTrigger(cam, {reason, durationMs, createEvent});
+        }
       }
-    }
-  });
+    })
+    .catch((err) => {
+      log.warn(cam, 'offline api-wake telemetry refresh failed: ' + formatErrorMessage(err));
+    });
 }
 
 /**
@@ -644,11 +648,15 @@ function stop(cam, why, opts = {}) {
   }
 
   if (!isShuttingDown() && closedMode !== STREAM_MODES.DOWNLOAD && !cam.isDeviceOffline() && !cam.isRtspDirect()) {
-    call({command: 'device.get_properties', serialNumber: serial}).then((res) => {
-      if (res.success && res.result && res.result.properties) {
-        applyDeviceProperties(cam, res.result.properties, false);
-      }
-    });
+    void Promise.resolve(call({command: 'device.get_properties', serialNumber: serial}))
+      .then((res) => {
+        if (res && res.success && res.result && res.result.properties) {
+          applyDeviceProperties(cam, res.result.properties, false);
+        }
+      })
+      .catch((err) => {
+        log.debug(cam, 'post-stop get_properties failed: ' + formatErrorMessage(err));
+      });
   } else if (closedMode === STREAM_MODES.DOWNLOAD && cam.wantsWake()) {
     invokeArbitrate();
   }

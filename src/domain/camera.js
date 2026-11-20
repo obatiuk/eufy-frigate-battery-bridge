@@ -81,6 +81,7 @@ const DOORBELL_SERIAL_PREFIX = 'T8214';
 const DEFAULT_MIN_WAKE_SECS = 5;
 const DEFAULT_MIN_CLEAN_VIDEO_MS = 3000;
 const DEFAULT_ENCODER_WEDGED_TIMEOUT_MS = 10000;
+const ENCODER_SIGKILL_DELAY_MS = 2000;
 const DEFAULT_FRESH_FRAME_MAX_AGE_MS = 2000;
 const DEFAULT_DOWNLOAD_PACE_LEAD_MS = 4;
 const DEFAULT_LIVE_HEARTBEAT_WRITE_MS = 500;
@@ -204,6 +205,7 @@ class Camera {
       this.directRtsp || (!this.isDoorbell() && (this.mode === CAMERA_MODES.RTSP || resolvedCfg.use_rtsp === true))
     );
     this.rtspEnabledChecked = false;
+    this.propertySyncEpoch = 0;
     this.unexpectedRtspActive = false;
     this.preserveAspect = resolvedCfg.preserveAspect;
     this.trackStuckSpotlight = Boolean(resolvedCfg.trackStuckSpotlight);
@@ -274,6 +276,8 @@ class Camera {
 
     // 6. FFmpeg Process & Zero-Allocation Media Buffers
     this.enc = null;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this.encKillTimer = null;
     this.offline = new OfflineState();
     this.encoderConsumerConnected = false;
     this.stoppingP2p = false;
@@ -1050,20 +1054,45 @@ class Camera {
    * Evaluates whether the camera's videoStreamingQuality property needs to be updated.
    *
    * @param {Record<string, *>} props - Raw properties dictionary from eufy-security-ws.
+   * @param {{commit?: boolean}} [opts={}] - Evaluation options.
    * @returns {Readonly<{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }>}
    */
-  evaluateQualityChange(props) {
-    return this.telemetry.evaluateQualityChange(props);
+  evaluateQualityChange(props, opts = {}) {
+    return this.telemetry.evaluateQualityChange(props, opts);
   }
 
   /**
    * Evaluates whether any Eufy Power Manager recording properties need to be synced to the camera.
    *
    * @param {Record<string, *>} props - Raw properties dictionary from eufy-security-ws.
+   * @param {{commit?: boolean}} [opts={}] - Evaluation options.
    * @returns {ReadonlyArray<Readonly<{ name: string, currentValue: *, targetValue: * }>>}
    */
-  evaluateRecordingModeChanges(props) {
-    return this.telemetry.evaluateRecordingModeChanges(props);
+  evaluateRecordingModeChanges(props, opts = {}) {
+    return this.telemetry.evaluateRecordingModeChanges(props, opts);
+  }
+
+  /**
+   * Marks the camera's videoStreamingQuality check as completed after RPC confirmation.
+   */
+  markQualityChecked() {
+    this.telemetry.markQualityChecked();
+  }
+
+  /**
+   * Marks the camera's Power Manager recording mode sync check as completed after RPC confirmation.
+   */
+  markRecordingModeChecked() {
+    this.telemetry.markRecordingModeChecked();
+  }
+
+  /**
+   * Returns the monotonic station property-sync epoch used to ignore pre-reconnect RPC completions.
+   *
+   * @returns {number}
+   */
+  getPropertySyncEpoch() {
+    return this.propertySyncEpoch;
   }
 
   /**
@@ -1769,6 +1798,7 @@ class Camera {
    * values are re-synchronized on the post-connect telemetry refresh.
    */
   resetStationSyncFlags() {
+    this.propertySyncEpoch += 1;
     this.telemetry.qualityChecked = false;
     this.telemetry.recordingModeChecked = false;
     this.rtspEnabledChecked = false;
@@ -1888,6 +1918,7 @@ class Camera {
    * @returns {boolean} True if an active encoder process was stopped or newly marked stopped for offline.
    */
   pauseEncoderForOffline() {
+    this.clearEncoderKillTimer();
     this.encoderConsumerConnected = false;
     const wasAlreadyPaused = this.offline.pause(Boolean(this.enc));
     if (!this.enc) {
@@ -3033,9 +3064,10 @@ class Camera {
    * enabled on the HomeBase via eufy-security-ws.
    *
    * @param {*} rtspStreamProp - Current rtspStream property value from eufy-security-ws.
+   * @param {{commit?: boolean}} [opts={}] - Evaluation options.
    * @returns {boolean}
    */
-  shouldEnableRtspProperty(rtspStreamProp) {
+  shouldEnableRtspProperty(rtspStreamProp, opts = {}) {
     if (this.isDoorbell()) {
       this.rtspSupported = false;
       return false;
@@ -3044,7 +3076,9 @@ class Camera {
       this.rtspSupported = true;
     }
     if (this.useRtsp && (this.rtspUrl || this.rtspSupported) && !this.rtspEnabledChecked && rtspStreamProp === false) {
-      this.rtspEnabledChecked = true;
+      if (!opts || opts.commit !== false) {
+        this.rtspEnabledChecked = true;
+      }
       return true;
     }
     return false;
@@ -3055,16 +3089,19 @@ class Camera {
    * non-RTSP doorbell while rtspStream is still enabled on the Eufy camera hardware and power sync is enabled.
    *
    * @param {*} rtspStreamProp - Current rtspStream property value from eufy-security-ws.
+   * @param {{commit?: boolean}} [opts={}] - Evaluation options.
    * @returns {boolean}
    */
-  shouldDisableRtspProperty(rtspStreamProp) {
+  shouldDisableRtspProperty(rtspStreamProp, opts = {}) {
     if (
       (!this.useRtsp || this.isDoorbell()) &&
       this.telemetry.hwRecordingCfg.powerWorkingMode !== null &&
       !this.rtspEnabledChecked &&
       rtspStreamProp === true
     ) {
-      this.rtspEnabledChecked = true;
+      if (!opts || opts.commit !== false) {
+        this.rtspEnabledChecked = true;
+      }
       if (this.isDoorbell()) {
         this.rtspSupported = false;
       }
@@ -3140,6 +3177,15 @@ class Camera {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Restores the cached spotlight state if a stuck-spotlight light=false RPC failed while idle.
+   */
+  restoreSpotlightOnFailedTurnOff() {
+    if (!this.isSessionActive()) {
+      this.telemetry.restoreLightOn();
+    }
   }
 
   /**
@@ -4892,6 +4938,7 @@ class Camera {
    * @param {number} [now=Date.now()] - Current epoch timestamp in milliseconds.
    */
   attachEncoder(enc, now = Date.now()) {
+    this.clearEncoderKillTimer();
     this.enc = enc;
     this.offline.markEncoderStarted();
     this.encoderConsumerConnected = false;
@@ -4918,18 +4965,75 @@ class Camera {
   }
 
   /**
-   * Terminates the persistent FFmpeg encoder process on bridge shutdown.
+   * Returns true if proc has already reported an exit code or terminating signal.
+   *
+   * @param {*} proc - Candidate ChildProcess or test double.
+   * @returns {boolean}
+   */
+  static hasProcessExited(proc) {
+    return Boolean(
+      proc &&
+      ((proc.exitCode !== null && proc.exitCode !== undefined) ||
+        (proc.signalCode !== null && proc.signalCode !== undefined))
+    );
+  }
+
+  /**
+   * Clears any pending encoder SIGKILL escalation timer.
+   */
+  clearEncoderKillTimer() {
+    if (this.encKillTimer) {
+      clearTimeout(this.encKillTimer);
+      this.encKillTimer = null;
+    }
+  }
+
+  /**
+   * Terminates the persistent FFmpeg encoder process on bridge shutdown, escalating to SIGKILL
+   * after ENCODER_SIGKILL_DELAY_MS if SIGTERM does not exit promptly.
    */
   stopEncoderProcess() {
     this.clearOfflineSeedTimer();
-    if (!Camera.canSignalProcess(this.enc)) {
+    this.clearEncoderKillTimer();
+    const targetEnc = this.enc;
+    if (!Camera.canSignalProcess(targetEnc)) {
       return;
     }
+    let exited = Camera.hasProcessExited(targetEnc);
+    const onExit = () => {
+      exited = true;
+      this.clearEncoderKillTimer();
+    };
+    if (typeof targetEnc.once === 'function') {
+      targetEnc.once('exit', onExit);
+    }
     try {
-      this.enc.kill(PROCESS_SIGNALS.SIGTERM);
+      targetEnc.kill(PROCESS_SIGNALS.SIGTERM);
     } catch (err) {
       // Ignore errors when stopping encoder on shutdown.
     }
+    if (exited || Camera.hasProcessExited(targetEnc)) {
+      this.clearEncoderKillTimer();
+      return;
+    }
+    const killTimer = setTimeout(() => {
+      this.encKillTimer = null;
+      if (typeof targetEnc.removeListener === 'function') {
+        targetEnc.removeListener('exit', onExit);
+      }
+      if (exited || !Camera.canSignalProcess(targetEnc) || Camera.hasProcessExited(targetEnc)) {
+        return;
+      }
+      try {
+        targetEnc.kill(PROCESS_SIGNALS.SIGKILL);
+      } catch (err) {
+        // Ignore errors if encoder already exited before SIGKILL.
+      }
+    }, ENCODER_SIGKILL_DELAY_MS);
+    if (killTimer && typeof killTimer.unref === 'function') {
+      killTimer.unref();
+    }
+    this.encKillTimer = killTimer;
   }
 
   /**
@@ -5050,10 +5154,12 @@ class Camera {
   ) {
     const elapsedMs = now - this.lastWrite;
     const livePaceMs = Math.floor(MS_PER_SECOND / liveFps) - downloadPaceLeadMs;
-    const liveIntervalMs = this.isBackfillPlayback() || inBurst ? livePaceMs : liveHeartbeatWriteMs;
+    const liveBurstMs = Math.ceil(MS_PER_SECOND / liveFps);
+    const liveIntervalMs = this.isBackfillPlayback() ? livePaceMs : inBurst ? liveBurstMs : liveHeartbeatWriteMs;
+    const idleIntervalMs = inBurst ? livePaceMs : MS_PER_SECOND / idleFps;
     return isLive
       ? Boolean(this.frameNew || stateChanged || elapsedMs >= liveIntervalMs)
-      : Boolean(stateChanged || inBurst || elapsedMs >= MS_PER_SECOND / idleFps);
+      : Boolean(stateChanged || elapsedMs >= idleIntervalMs);
   }
 
   /**
@@ -5126,6 +5232,7 @@ class Camera {
    */
   detachEncoderIfMatch(enc) {
     if (this.enc === enc) {
+      this.clearEncoderKillTimer();
       this.enc = null;
       this.encoderConsumerConnected = false;
       return true;

@@ -31,9 +31,10 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
   - Skips connection completely when all configured cameras specify direct `rtsp_url` (`isRtspDirect()`).
   - Connects with a `10s` `handshakeTimeout` plus a `10s` post-open `'version'` frame watchdog, and runs a `30s`
     WebSocket `ping` keepalive loop (`10s` `pong`/inbound-message timeout) that terminates half-open dead sockets.
-  - On `'version'`, calls `validateEufyWsVersion(m)`, negotiates `set_api_schema` (`Math.min(m.maxSchemaVersion, 21)`),
-    and sends `start_listening`. Each `call()` assigns `messageId: "b<seq>"` with a `20s` `.unref()` timeout
-    (`WS_RPC_TIMEOUT_MS`, resolving `{success: false, errorCode: "no_reply"}` or `"ws_closed"` without rejecting).
+  - On `'version'`, calls `validateEufyWsVersion(m)`, negotiates `set_api_schema` (`Math.min(m.maxSchemaVersion, 21)`,
+    scheduling a reconnect without calling `start_listening` if rejected), and sends `start_listening`. Each `call()`
+    assigns `messageId: "b<seq>"` with a `20s` `.unref()` timeout (`WS_RPC_TIMEOUT_MS`, catching synchronous `ws.send`
+    throws and resolving `{success: false, errorCode}` without rejecting).
   - On `close`, marks `wsReady = false`, fails pending RPCs, stops active Eufy streams (`error/ws-disconnect`), updates
     camera `wsConnected` health (`Grey` `Disconnected` card), and retries with jittered exponential backoff (`10s`
     initial up to `60s` max, edge-logging the initial outage at `WARN`/`ERROR` and subsequent retries at `DEBUG` while
@@ -81,9 +82,9 @@ Related: [stream-lifecycle.md](stream-lifecycle.md), [status-card-and-hud.md](st
   - Runs on initial telemetry load, every `60s` (`MASK_SYNC_INTERVAL_MS`), and `6s` after encoder drop recovery.
   - Fetches `GET /api/config` (`5s` timeout) to track `frigateConnected` service health (`AT-08`, `AT-18`) and inspect
     each camera's `motion.mask` and `objects.mask`.
-  - Applies normalized card polygons (`6px` chroma safety margin) via `PUT /api/config/set` (`8s` timeout,
-    `requires_restart: 0`) using named `eufy_bridge_card` mask entries (`friendly_name: "Eufy Bridge Status Card"`) on
-    `Frigate 0.18+`, falling back to `PUT /api/config/set?cameras.<cam>.<section>.mask=<poly>` on `Frigate 0.14-0.17`.
+  - Applies normalized card polygons (`6px` chroma safety margin) via JSON `PUT /api/config/set` (`8s` timeout,
+    `requires_restart: 0`) using named `eufy_bridge_card` mask entries (`friendly_name: "Eufy Bridge Status Card"`),
+    and warns once per episode when a configured camera name is absent from `Frigate`'s `cameras` dictionary.
   - When `card_theme: "none"` or `card_position: "center"`, deletes only `eufy_bridge_card` (`maskEntry: ""`), leaving
     user-defined masks untouched (`AT-17`). When `Frigate` recovers from an outage, re-verifies masks and calls
     `seedOfflineCameraSnapshots()`.

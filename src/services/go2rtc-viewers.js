@@ -167,7 +167,6 @@ function applyStreamConsumers(cam, streamInfo, newConnections) {
 
     const clientInfo = (consumer.format_name || consumer.protocol || '') + ' ' + (consumer.remote_addr || '');
     cam.registerNewViewer(consumer.id, pollTimestamp);
-    pushFrameToEncoder(cam, pollTimestamp);
     newConnections.push({cam, id: consumer.id, clientInfo: clientInfo.trim(), now: pollTimestamp});
   }
 
@@ -284,6 +283,23 @@ function evaluateNewViewerConnections(cams, newConnections, isDashboardGrid) {
 }
 
 /**
+ * Pushes one immediate frame for single-camera viewer attaches while letting multi-camera
+ * dashboard grid attaches drain smoothly via the paced media ticker.
+ *
+ * @param {Set<Camera>} distinctNewCams - Cameras that gained new viewer consumers on this poll.
+ * @param {boolean} isDashboardGrid - True when viewers opened across multiple cameras simultaneously.
+ */
+function flushNewViewerKeyframes(distinctNewCams, isDashboardGrid) {
+  if (distinctNewCams.size === 0 || isDashboardGrid) {
+    return;
+  }
+  const now = Date.now();
+  for (const cam of distinctNewCams) {
+    pushFrameToEncoder(cam, now);
+  }
+}
+
+/**
  * Polls go2rtc once every 750ms (bulk `/api/streams`) for the active stream consumers of every camera.
  *
  * @param {Camera[]} cams - Array of Camera instances.
@@ -316,6 +332,7 @@ async function pollViewers(cams, hooks) {
     const activeViewerCams = cams.filter((c) => c.hasConnectedViewers());
     const distinctNewCams = new Set(newConnections.map((x) => x.cam));
     const isDashboardGrid = distinctNewCams.size > 1 && activeViewerCams.length > 1;
+    flushNewViewerKeyframes(distinctNewCams, isDashboardGrid);
 
     if (newConnections.length > 0 && !isDashboardGrid) {
       const pollNow = Date.now();

@@ -10,7 +10,7 @@
 'use strict';
 
 const {FORWARD_FACE_NAMES, TELEMETRY_POLL_MS, sleep} = require('../../config');
-const {log} = require('../../logger');
+const {log, formatErrorMessage} = require('../../logger');
 const {unwrapProperty} = require('../../domain/telemetry');
 const {stations} = require('../../domain/station');
 const {renderCameraCards} = require('../../overlay/card-renderer');
@@ -87,8 +87,14 @@ const DETECTION_PROPERTY_EVENT_MAP = Object.freeze({
   ringing: 'rings',
 });
 
-/** @type {Map<string, Promise<void>>} */
+/** @type {Map<string, Promise<boolean>>} */
 const propertySyncChains = new Map();
+/** @type {Map<string, object>} */
+const qualitySyncInFlight = new Map();
+/** @type {Map<string, object>} */
+const recordingSyncInFlight = new Map();
+/** @type {Map<string, object>} */
+const rtspSyncInFlight = new Map();
 /** @type {Promise<void>|null} */
 let telemetryFetchInFlight = null;
 let activeFetchForced = false;
@@ -101,6 +107,9 @@ let lastPollRefreshAt = null;
  */
 function resetPropertySyncChains() {
   propertySyncChains.clear();
+  qualitySyncInFlight.clear();
+  recordingSyncInFlight.clear();
+  rtspSyncInFlight.clear();
   lastPollRefreshAt = null;
   pendingForcedFetch = false;
 }
@@ -133,21 +142,23 @@ function resolvePropertyTriggerEvent(propName) {
  * @param {Camera} cam - Camera state object.
  * @param {string} name - Eufy property name.
  * @param {*} value - Target property value.
+ * @returns {Promise<boolean>} True only when device.set_property resolves with success === true.
  */
 function setCameraProperty(cam, name, value) {
   const targetWs = getOpenWsSocket();
   if (!targetWs) {
-    return;
+    return Promise.resolve(false);
   }
   const serial = cam.getSerial();
-  const prev = propertySyncChains.get(serial) || Promise.resolve();
+  const prev = propertySyncChains.get(serial) || Promise.resolve(false);
   const next = prev
     .catch(() => {
       // Keep the per-camera property serialization chain alive after any prior failure.
+      return false;
     })
     .then(async () => {
       if (getOpenWsSocket() !== targetWs) {
-        return;
+        return false;
       }
       const res = await call({
         command: 'device.set_property',
@@ -161,7 +172,7 @@ function setCameraProperty(cam, name, value) {
             ? log.debug
             : log.warn;
         logFn(cam, 'could not set ' + name + ': ' + formatRpcError(res));
-        return;
+        return false;
       }
       if (name === 'rtspStream' && value === true && !cam.getRtspUrl()) {
         const propsRes = await call({command: 'device.get_properties', serialNumber: serial});
@@ -174,8 +185,14 @@ function setCameraProperty(cam, name, value) {
           });
         }
       }
+      return true;
+    })
+    .catch((err) => {
+      log.warn(cam, 'could not set ' + name + ': ' + formatErrorMessage(err));
+      return false;
     });
   propertySyncChains.set(serial, next);
+  return next;
 }
 
 /**
@@ -187,8 +204,15 @@ function setCameraProperty(cam, name, value) {
  * @param {Record<string, *>} props - Properties dictionary from device.get_properties.
  */
 function checkStreamingQuality(cam, props) {
-  const {shouldUpdate, currentQuality, targetQuality} = cam.evaluateQualityChange(props);
+  const serial = cam.getSerial();
+  if (qualitySyncInFlight.has(serial)) {
+    return;
+  }
+  const {shouldUpdate, currentQuality, targetQuality} = cam.evaluateQualityChange(props, {commit: false});
   if (shouldUpdate) {
+    const token = {};
+    const epoch = cam.getPropertySyncEpoch();
+    qualitySyncInFlight.set(serial, token);
     log.info(
       cam,
       'videoStreamingQuality is ' +
@@ -199,27 +223,77 @@ function checkStreamingQuality(cam, props) {
         targetQuality +
         ' (Medium 720p) to prevent P2P stalls'
     );
-    setCameraProperty(cam, 'videoStreamingQuality', targetQuality);
+    void setCameraProperty(cam, 'videoStreamingQuality', targetQuality).then((ok) => {
+      if (qualitySyncInFlight.get(serial) === token) {
+        qualitySyncInFlight.delete(serial);
+        if (ok && cam.getPropertySyncEpoch() === epoch) {
+          cam.markQualityChecked();
+        }
+      }
+    });
   }
 }
 
 /**
  * Checks the camera's Eufy Power Manager recording properties and applies any configured
  * per-camera overrides (powerWorkingMode, recordingClipLength, recordingEndClipMotionStops,
- * recordingRetriggerInterval) via eufy-security-ws on initial property sync.
+ * recordingRetriggerInterval) via eufy-security-ws on full property sync.
  *
  * @param {Camera} cam - Camera state object.
  * @param {Record<string, *>} props - Properties dictionary from device.get_properties.
  */
 function checkHardwareRecordingSettings(cam, props) {
-  const updates = cam.evaluateRecordingModeChanges(props);
-  for (const upd of updates) {
+  const serial = cam.getSerial();
+  if (recordingSyncInFlight.has(serial)) {
+    return;
+  }
+  const updates = cam.evaluateRecordingModeChanges(props, {commit: false});
+  if (updates.length === 0) {
+    return;
+  }
+  const token = {};
+  const epoch = cam.getPropertySyncEpoch();
+  recordingSyncInFlight.set(serial, token);
+  const writes = updates.map((upd) => {
     log.info(
       cam,
       'syncing Eufy hardware property ' + upd.name + ' (' + (upd.currentValue ?? 'n/a') + ' -> ' + upd.targetValue + ')'
     );
-    setCameraProperty(cam, upd.name, upd.targetValue);
-  }
+    return setCameraProperty(cam, upd.name, upd.targetValue);
+  });
+  void Promise.all(writes).then((results) => {
+    if (recordingSyncInFlight.get(serial) === token) {
+      recordingSyncInFlight.delete(serial);
+      if (results.every(Boolean) && cam.getPropertySyncEpoch() === epoch) {
+        cam.markRecordingModeChecked();
+      }
+    }
+  });
+}
+
+/**
+ * Enqueues a serialized rtspStream property write and marks rtspEnabledChecked only on confirmation.
+ *
+ * @param {Camera} cam - Camera state object.
+ * @param {boolean} targetEnabled - Target rtspStream boolean value.
+ */
+function enqueueRtspStreamPropertySync(cam, targetEnabled) {
+  const serial = cam.getSerial();
+  const token = {};
+  const epoch = cam.getPropertySyncEpoch();
+  rtspSyncInFlight.set(serial, token);
+  const verb = targetEnabled
+    ? 'enabling HomeBase RTSP stream (rtspStream=true)'
+    : 'disabling HomeBase RTSP stream (rtspStream=false)';
+  log.info(cam, verb + ' via eufy-security-ws');
+  void setCameraProperty(cam, 'rtspStream', targetEnabled).then((ok) => {
+    if (rtspSyncInFlight.get(serial) === token) {
+      rtspSyncInFlight.delete(serial);
+      if (ok && cam.getPropertySyncEpoch() === epoch) {
+        cam.setRtspPropertyChecked(true);
+      }
+    }
+  });
 }
 
 /**
@@ -237,34 +311,62 @@ function syncCameraRtspProperties(cam, rtspProps) {
       startRtspDecoder(cam);
     }
   }
-  if (cam.shouldEnableRtspProperty(rtspStreamProp)) {
-    log.info(cam, 'enabling HomeBase RTSP stream (rtspStream=true) via eufy-security-ws');
-    setCameraProperty(cam, 'rtspStream', true);
-  } else if (cam.shouldDisableRtspProperty(rtspStreamProp)) {
-    log.info(cam, 'disabling HomeBase RTSP stream (rtspStream=false) via eufy-security-ws');
-    setCameraProperty(cam, 'rtspStream', false);
+  if (rtspSyncInFlight.has(cam.getSerial())) {
+    return;
   }
+  if (cam.shouldEnableRtspProperty(rtspStreamProp, {commit: false})) {
+    enqueueRtspStreamPropertySync(cam, true);
+  } else if (cam.shouldDisableRtspProperty(rtspStreamProp, {commit: false})) {
+    enqueueRtspStreamPropertySync(cam, false);
+  }
+}
+
+/**
+ * Resolves card-rebuild and full-sync flags for applyDeviceProperties while preserving 2-arg and 3-arg callers.
+ *
+ * @param {Camera} cam - Camera domain instance.
+ * @param {boolean|{allowCardRebuild?: boolean, fullSync?: boolean}} [options] - Card-rebuild flag or sync options.
+ * @returns {{allowCardRebuild: boolean, fullSync: boolean}}
+ */
+function resolveApplyDeviceOptions(cam, options) {
+  if (typeof options === 'boolean') {
+    return {allowCardRebuild: options, fullSync: true};
+  }
+  const isObj = options !== null && typeof options === 'object';
+  const fullSync = !isObj || options.fullSync !== false;
+  const allowCardRebuild =
+    isObj && typeof options.allowCardRebuild === 'boolean'
+      ? options.allowCardRebuild
+      : fullSync
+        ? !cam.hasBatteryReading()
+        : false;
+  return {allowCardRebuild, fullSync};
 }
 
 /**
  * Applies device telemetry properties from eufy-security-ws to a camera's Telemetry domain model.
  *
  * @param {Camera} cam - Camera domain instance.
- * @param {Record<string, *>} props - Properties dictionary from device.get_properties or start_listening.
- * @param {boolean} [allowCardRebuild=!cam.hasBatteryReading()] - Whether to re-render the sleeping card immediately.
+ * @param {Record<string, *>} props - Properties dictionary from device.get_properties, start_listening, or event.
+ * @param {boolean|{allowCardRebuild?: boolean, fullSync?: boolean}} [options] - Card-rebuild flag or sync options.
  */
-function applyDeviceProperties(cam, props, allowCardRebuild = !cam.hasBatteryReading()) {
+function applyDeviceProperties(cam, props, options) {
   if (!props || typeof props !== 'object') {
     return;
   }
+  const {allowCardRebuild, fullSync} = resolveApplyDeviceOptions(cam, options);
 
-  checkStreamingQuality(cam, props);
-  checkHardwareRecordingSettings(cam, props);
-  syncCameraRtspProperties(cam, {
-    stationSn: unwrapProperty(props.stationSerialNumber),
-    rtspUrlProp: unwrapProperty(props.rtspStreamUrl),
-    rtspStreamProp: unwrapProperty(props.rtspStream),
-  });
+  if (fullSync) {
+    checkStreamingQuality(cam, props);
+    checkHardwareRecordingSettings(cam, props);
+  }
+  if (fullSync || 'stationSerialNumber' in props || 'rtspStreamUrl' in props || 'rtspStream' in props) {
+    syncCameraRtspProperties(cam, {
+      stationSn: unwrapProperty(props.stationSerialNumber),
+      rtspUrlProp: unwrapProperty(props.rtspStreamUrl),
+      rtspStreamProp: unwrapProperty(props.rtspStream),
+    });
+  }
   const outcome = cam.applyTelemetryProperties(props, allowCardRebuild);
   switch (outcome.logLevel) {
     case 'warn':

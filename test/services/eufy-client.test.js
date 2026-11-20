@@ -98,9 +98,17 @@ describe('Eufy WebSocket Client, Telemetry Sync & Station Recovery (src/services
       assert.equal(autoCam.getBatteryPct(), 88);
       assert.equal(autoCam.isCharging(), true);
       assert.equal(autoCam.getPowerLabel(), 'Solar');
-      assert.equal(autoCam.hasQualityChecked(), true);
-      assert.equal(autoCam.hasRecordingModeChecked(), true);
-      assert.equal(autoCam.hasRtspPropertyChecked(), true);
+      assert.equal(autoCam.hasQualityChecked(), false, 'Unconfirmed writes with closed WS must not latch quality flag');
+      assert.equal(
+        autoCam.hasRecordingModeChecked(),
+        false,
+        'Unconfirmed writes with closed WS must not latch Power Manager flag'
+      );
+      assert.equal(
+        autoCam.hasRtspPropertyChecked(),
+        false,
+        'Unconfirmed writes with closed WS must not latch rtspStream flag'
+      );
 
       applyDeviceProperties(
         doorbellCam,

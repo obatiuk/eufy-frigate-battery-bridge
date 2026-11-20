@@ -335,7 +335,11 @@ function forceStopWedgedP2pRadio(cam) {
   );
   if (cam.shouldTurnOffStuckIdleLight(Date.now())) {
     log.warn(cam, 'turning off stuck spotlight during idle wifiRssi drain (light=false) to restore deep sleep');
-    setCameraProperty(cam, 'light', false);
+    void setCameraProperty(cam, 'light', false).then((ok) => {
+      if (!ok) {
+        cam.restoreSpotlightOnFailedTurnOff();
+      }
+    });
   }
   cam.markP2pStopInFlight();
   setStationTransition(
@@ -551,7 +555,7 @@ function handleRtspLivestreamStarted(cam) {
       cam,
       'received RTSP livestream started while in P2P/idle mode, forcing RTSP stop and disabling rtspStream'
     );
-    setCameraProperty(cam, 'rtspStream', false);
+    void setCameraProperty(cam, 'rtspStream', false);
   } else {
     log.debug(cam, 'ignoring RTSP livestream started event while in P2P/idle mode');
   }
@@ -629,7 +633,7 @@ function handlePropertyChanged(cam, e) {
   cam.markDeviceHeardInSession();
   const prevRssi = cam.getRssi();
   if (isTrackedPropertyEvent(e.name)) {
-    applyDeviceProperties(cam, {[e.name]: e.value}, false);
+    applyDeviceProperties(cam, {[e.name]: e.value}, {allowCardRebuild: false, fullSync: false});
   }
   if (e.name === 'wifiRssi' && cam.getRssi() !== prevRssi && cam.recordIdleRssiChange(Date.now())) {
     forceStopWedgedP2pRadio(cam);

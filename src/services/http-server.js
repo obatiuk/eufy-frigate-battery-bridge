@@ -256,12 +256,20 @@ function stopHttpServer() {
   if (!httpServer) {
     return;
   }
+  const activeServer = httpServer;
+  httpServer = null;
   try {
-    httpServer.close();
+    activeServer.close();
   } catch (err) {
     // Ignore close errors on shutdown.
   }
-  httpServer = null;
+  try {
+    if (typeof activeServer.closeAllConnections === 'function') {
+      activeServer.closeAllConnections();
+    }
+  } catch (err) {
+    // Ignore connection close errors on shutdown.
+  }
 }
 
 module.exports = {

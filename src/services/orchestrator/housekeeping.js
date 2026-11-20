@@ -287,7 +287,11 @@ function inspectCameraOnTick(cam, now, clockNow) {
     }
     if (isWsReady() && cam.shouldTurnOffStuckIdleLight(now)) {
       log.warn(cam, 'turning off stuck spotlight while idle (light=false) to restore deep sleep');
-      setCameraProperty(cam, 'light', false);
+      void setCameraProperty(cam, 'light', false).then((ok) => {
+        if (!ok) {
+          cam.restoreSpotlightOnFailedTurnOff();
+        }
+      });
     }
     return;
   }

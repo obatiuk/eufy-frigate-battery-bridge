@@ -4,6 +4,11 @@ Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
 ## dev
 
+- Synchronize Eufy hardware settings only from complete property snapshots with confirmed write retries, prevent
+  transient `RTSP` or `TCP` output errors from downgrading hardware encoders (and isolate fallback tests on GPU-less
+  builders), disable Intel Quick Sync B-frames while pacing multi-camera grid keyframe bursts, remove the legacy flat
+  `Frigate` mask fallback and warn once on missing cameras, reject oversized or stalled `HTTP` wake bodies early while
+  closing keep-alive sockets on shutdown, and harden `WebSocket` command sends and schema negotiation
 - Tolerate 15-second Wi-Fi TCP stalls on direct `RTSP` cameras without dropping the stream, skip viewer cooldown with a
   1-second reconnect after live drops, report passive background probes as connecting when viewers join, and skip direct
   `RTSP` cameras on synthetic test signals

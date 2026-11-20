@@ -162,6 +162,67 @@ describe('readJsonBody', () => {
     assert.equal(failed.statusCode, 400);
     assert.equal(failed.error, 'Failed to read request body');
   });
+
+  it(
+    'short-circuits oversized Content-Length or streaming chunks before end and ' + 'times out stalled bodies',
+    async (t) => {
+      // Verify readJsonBody resolves 413 immediately and times out stalled uploads after 5000ms.
+      t.mock.timers.enable({apis: ['setTimeout']});
+
+      const headerOversizedReq = Object.assign(new EventEmitter(), {headers: {'content-length': '20000'}});
+      let headerSettled = false;
+      const headerPending = readJsonBody(/** @type {*} */ (headerOversizedReq)).then((res) => {
+        headerSettled = true;
+        return res;
+      });
+      await Promise.resolve();
+      if (!headerSettled) {
+        headerOversizedReq.emit('end');
+      }
+      assert.equal(headerSettled, true, 'Must resolve 413 upfront from Content-Length without waiting for end');
+      const byHeader = await headerPending;
+      assert.equal(byHeader.ok, false);
+      assert.equal(byHeader.statusCode, 413);
+      assert.equal(byHeader.errorCode, 'PAYLOAD_TOO_LARGE');
+
+      const streamOversizedReq = new EventEmitter();
+      let streamSettled = false;
+      const streamPending = readJsonBody(/** @type {*} */ (streamOversizedReq)).then((res) => {
+        streamSettled = true;
+        return res;
+      });
+      streamOversizedReq.emit('data', Buffer.alloc(16385, 0x62));
+      await Promise.resolve();
+      if (!streamSettled) {
+        streamOversizedReq.emit('end');
+      }
+      assert.equal(streamSettled, true, 'Must resolve 413 on oversized chunk without waiting for end');
+      const byChunk = await streamPending;
+      assert.equal(byChunk.statusCode, 413);
+      assert.equal(byChunk.errorCode, 'PAYLOAD_TOO_LARGE');
+
+      const stalledReq = new EventEmitter();
+      let timeoutSettled = false;
+      const stalledPending = readJsonBody(/** @type {*} */ (stalledReq)).then((res) => {
+        timeoutSettled = true;
+        return res;
+      });
+      stalledReq.emit('data', Buffer.from('{"duration":'));
+      t.mock.timers.tick(4999);
+      await Promise.resolve();
+      assert.equal(timeoutSettled, false);
+      t.mock.timers.tick(1);
+      await Promise.resolve();
+      if (!timeoutSettled) {
+        stalledReq.emit('end');
+      }
+      assert.equal(timeoutSettled, true, 'Must resolve 408 after 5000ms body read timeout');
+      const timedOut = await stalledPending;
+      assert.equal(timedOut.ok, false);
+      assert.equal(timedOut.statusCode, 408);
+      assert.equal(timedOut.errorCode, 'REQUEST_TIMEOUT');
+    }
+  );
 });
 
 describe('dispatchWakeTargets and result classification', () => {

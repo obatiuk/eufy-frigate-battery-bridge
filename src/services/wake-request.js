@@ -15,14 +15,17 @@ const {
   HTTP_STATUS_OK,
   HTTP_STATUS_BAD_REQUEST,
   HTTP_STATUS_NOT_FOUND,
+  HTTP_STATUS_REQUEST_TIMEOUT,
   HTTP_STATUS_PAYLOAD_TOO_LARGE,
   HTTP_STATUS_UNPROCESSABLE,
   HTTP_STATUS_SERVICE_UNAVAILABLE,
   ERROR_CODES,
   sendJson,
+  sendJsonClose,
 } = require('./http-responses');
 
 const MAX_JSON_BODY_BYTES = 16384;
+const JSON_BODY_READ_TIMEOUT_MS = 5000;
 const MIN_WAKE_DURATION_SECS = 5;
 const MS_PER_SECOND = 1000;
 const DEFAULT_WAKE_REASON = 'external api wake';
@@ -111,7 +114,75 @@ function resolveTargetCameras(targetSpec, cams) {
 }
 
 /**
- * Reads and strictly validates an optional JSON object request body (up to 16 KB).
+ * Returns true when req declares a numeric Content-Length exceeding MAX_JSON_BODY_BYTES.
+ *
+ * @param {import('node:http').IncomingMessage} req - Incoming HTTP request.
+ * @returns {boolean}
+ */
+function hasOversizedContentLengthHeader(req) {
+  const rawLen = req && req.headers ? req.headers['content-length'] : undefined;
+  if (rawLen === undefined || rawLen === null || String(rawLen).trim() === '') {
+    return false;
+  }
+  const declaredBytes = Number(rawLen);
+  return Number.isFinite(declaredBytes) && declaredBytes > MAX_JSON_BODY_BYTES;
+}
+
+/**
+ * Builds the standard 413 PAYLOAD_TOO_LARGE outcome for readJsonBody.
+ *
+ * @returns {{ ok: false, statusCode: number, errorCode: string, error: string, closeConnection: true }}
+ */
+function buildPayloadTooLargeOutcome() {
+  return {
+    ok: false,
+    statusCode: HTTP_STATUS_PAYLOAD_TOO_LARGE,
+    errorCode: ERROR_CODES.PAYLOAD_TOO_LARGE,
+    error: 'Request body exceeds ' + MAX_JSON_BODY_BYTES + ' bytes',
+    closeConnection: true,
+  };
+}
+
+/**
+ * Parses a buffered UTF-8 body string into a non-array JSON object (treating empty text as {}).
+ *
+ * @param {string} raw - Trimmed UTF-8 request body string.
+ * @returns {{
+ *   ok: boolean,
+ *   body?: Record<string, *>,
+ *   statusCode?: number,
+ *   errorCode?: string,
+ *   error?: string,
+ * }}
+ */
+function parseRawJsonObject(raw) {
+  if (!raw) {
+    return {ok: true, body: {}};
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: HTTP_STATUS_BAD_REQUEST,
+      errorCode: ERROR_CODES.INVALID_REQUEST,
+      error: 'Invalid JSON request body',
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      statusCode: HTTP_STATUS_BAD_REQUEST,
+      errorCode: ERROR_CODES.INVALID_REQUEST,
+      error: 'JSON request body must be an object',
+    };
+  }
+  return {ok: true, body: parsed};
+}
+
+/**
+ * Reads and strictly validates an optional JSON object request body (up to 16 KB within 5s).
  *
  * @param {import('node:http').IncomingMessage} req - Incoming HTTP request.
  * @returns {Promise<{
@@ -120,76 +191,104 @@ function resolveTargetCameras(targetSpec, cams) {
  *   statusCode?: number,
  *   errorCode?: string,
  *   error?: string,
+ *   closeConnection?: boolean,
  * }>}
  */
 function readJsonBody(req) {
+  if (hasOversizedContentLengthHeader(req)) {
+    if (typeof req.pause === 'function') {
+      req.pause();
+    }
+    return Promise.resolve(buildPayloadTooLargeOutcome());
+  }
+
   return new Promise((resolve) => {
     /** @type {Buffer[]} */
     const chunks = [];
     let totalBytes = 0;
-    let tooLarge = false;
     let settled = false;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    let bodyTimer = null;
 
-    const finish = (outcome) => {
-      if (!settled) {
-        settled = true;
-        resolve(outcome);
+    const detachStreamListeners = (abortedEarly) => {
+      if (bodyTimer) {
+        clearTimeout(bodyTimer);
+        bodyTimer = null;
+      }
+      if (typeof req.off === 'function') {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+      }
+      if (abortedEarly) {
+        if (typeof req.pause === 'function') {
+          req.pause();
+        }
+        if (
+          typeof req.once === 'function' &&
+          typeof req.listenerCount === 'function' &&
+          req.listenerCount('error') === 0
+        ) {
+          req.once('error', () => {
+            // Ignore post-abort stream errors after early 413/408 rejection.
+          });
+        }
       }
     };
 
-    req.on('data', (chunk) => {
+    const finish = (outcome, abortedEarly = false) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      detachStreamListeners(abortedEarly);
+      resolve(outcome);
+    };
+
+    const onData = (chunk) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       totalBytes += buf.length;
       if (totalBytes > MAX_JSON_BODY_BYTES) {
-        tooLarge = true;
+        finish(buildPayloadTooLargeOutcome(), true);
         return;
       }
       chunks.push(buf);
-    });
+    };
 
-    req.on('end', () => {
-      if (tooLarge) {
-        return finish({
-          ok: false,
-          statusCode: HTTP_STATUS_PAYLOAD_TOO_LARGE,
-          errorCode: ERROR_CODES.PAYLOAD_TOO_LARGE,
-          error: 'Request body exceeds ' + MAX_JSON_BODY_BYTES + ' bytes',
-        });
-      }
+    const onEnd = () => {
       const raw = Buffer.concat(chunks).toString('utf8').trim();
-      if (!raw) {
-        return finish({ok: true, body: {}});
-      }
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (err) {
-        return finish({
-          ok: false,
-          statusCode: HTTP_STATUS_BAD_REQUEST,
-          errorCode: ERROR_CODES.INVALID_REQUEST,
-          error: 'Invalid JSON request body',
-        });
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return finish({
-          ok: false,
-          statusCode: HTTP_STATUS_BAD_REQUEST,
-          errorCode: ERROR_CODES.INVALID_REQUEST,
-          error: 'JSON request body must be an object',
-        });
-      }
-      finish({ok: true, body: parsed});
-    });
+      finish(parseRawJsonObject(raw));
+    };
 
-    req.on('error', () =>
+    const onError = () => {
       finish({
         ok: false,
         statusCode: HTTP_STATUS_BAD_REQUEST,
         errorCode: ERROR_CODES.INVALID_REQUEST,
         error: 'Failed to read request body',
-      })
-    );
+      });
+    };
+
+    bodyTimer = setTimeout(() => {
+      bodyTimer = null;
+      finish(
+        {
+          ok: false,
+          statusCode: HTTP_STATUS_REQUEST_TIMEOUT,
+          errorCode: ERROR_CODES.REQUEST_TIMEOUT,
+          error: 'Request body read timed out',
+          closeConnection: true,
+        },
+        true
+      );
+    }, JSON_BODY_READ_TIMEOUT_MS);
+    if (bodyTimer && typeof bodyTimer.unref === 'function') {
+      bodyTimer.unref();
+    }
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
@@ -298,6 +397,34 @@ function dispatchWakeTargets(targets, {rawDuration, reason, createEvent, wakeCam
 }
 
 /**
+ * Sends a structured body-read error response, closing the underlying socket on 413/408 aborts.
+ *
+ * @param {import('node:http').IncomingMessage} req - Incoming HTTP request.
+ * @param {import('node:http').ServerResponse} res - Outgoing HTTP response.
+ * @param {Awaited<ReturnType<typeof readJsonBody>>} bodyResult - Failed body read outcome.
+ */
+function respondWakeBodyError(req, res, bodyResult) {
+  const statusCode = bodyResult.statusCode || HTTP_STATUS_BAD_REQUEST;
+  const payload = {
+    ok: false,
+    error_code: bodyResult.errorCode || ERROR_CODES.INVALID_REQUEST,
+    error: bodyResult.error,
+  };
+  if (bodyResult.closeConnection) {
+    if (typeof res.once === 'function') {
+      res.once('finish', () => {
+        if (req.socket && typeof req.socket.destroySoon === 'function') {
+          req.socket.destroySoon();
+        }
+      });
+    }
+    sendJsonClose(res, statusCode, payload);
+    return;
+  }
+  sendJson(res, statusCode, payload);
+}
+
+/**
  * Handles GET/POST /api/wake/:cameras HTTP requests with hybrid rtsp_url support, atomic target
  * validation, and structured JSON errors.
  *
@@ -329,11 +456,7 @@ async function handleWakeHttpRequest(req, res, {urlObj, cams, wakeCameraExternal
 
   const bodyResult = req.method === 'POST' ? await readJsonBody(req) : {ok: true, body: {}};
   if (!bodyResult.ok) {
-    sendJson(res, bodyResult.statusCode || HTTP_STATUS_BAD_REQUEST, {
-      ok: false,
-      error_code: bodyResult.errorCode || ERROR_CODES.INVALID_REQUEST,
-      error: bodyResult.error,
-    });
+    respondWakeBodyError(req, res, bodyResult);
     return;
   }
 

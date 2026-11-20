@@ -300,6 +300,8 @@ class Telemetry {
     this.recordingModeChecked = false;
     this.lightOn = false;
     this.lightOnAt = 0;
+    this.pendingLightRestore = false;
+    this.lastClearedLightOnAt = 0;
     /** @type {number|null} */
     this.hwPowerMode = this.hwRecordingCfg.powerWorkingMode;
     /** @type {number|null} */
@@ -320,11 +322,41 @@ class Telemetry {
   }
 
   /**
-   * Clears the cached spotlight state once a light=false reset command has been queued.
+   * Clears the cached spotlight state once a light=false reset command has been queued,
+   * remembering the prior activation timestamp in case the RPC fails and must retry.
    */
   clearLightOn() {
+    this.pendingLightRestore = this.lightOn;
+    this.lastClearedLightOnAt = this.lightOnAt;
     this.lightOn = false;
     this.lightOnAt = 0;
+  }
+
+  /**
+   * Restores the cached spotlight state when a queued light=false RPC fails before any
+   * newer hardware spotlight reading arrives.
+   */
+  restoreLightOn() {
+    if (this.pendingLightRestore && !this.lightOn) {
+      this.lightOn = true;
+      this.lightOnAt = this.lastClearedLightOnAt;
+    }
+    this.pendingLightRestore = false;
+    this.lastClearedLightOnAt = 0;
+  }
+
+  /**
+   * Marks the streaming quality check as completed after RPC confirmation.
+   */
+  markQualityChecked() {
+    this.qualityChecked = true;
+  }
+
+  /**
+   * Marks the Power Manager recording mode sync check as completed after RPC confirmation.
+   */
+  markRecordingModeChecked() {
+    this.recordingModeChecked = true;
   }
 
   /**
@@ -640,13 +672,22 @@ class Telemetry {
 
   /**
    * Evaluates whether the camera's videoStreamingQuality property needs to be updated
-   * to prevent 4K P2P stream stalls, marking qualityChecked on first inspection.
+   * to prevent 4K P2P stream stalls, committing qualityChecked immediately when no write
+   * is needed (or when commit !== false).
    *
    * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
-   * @param {string} [serial=this.serial] - Camera hardware serial number.
+   * @param {string|{serial?: string, commit?: boolean}} [serialOrOpts=this.serial] - Serial or evaluation options.
    * @returns {{ shouldUpdate: boolean, currentQuality: number, targetQuality: number }}
    */
-  evaluateQualityChange(props, serial = this.serial) {
+  evaluateQualityChange(props, serialOrOpts = this.serial) {
+    const isOpts = serialOrOpts !== null && typeof serialOrOpts === 'object';
+    const serial =
+      isOpts && typeof serialOrOpts.serial === 'string'
+        ? serialOrOpts.serial
+        : typeof serialOrOpts === 'string'
+          ? serialOrOpts
+          : this.serial;
+    const commit = !isOpts || serialOrOpts.commit !== false;
     const enforceQuality = this.hwRecordingCfg.enforceQuality;
     if (!enforceQuality || this.qualityChecked || !props || !('videoStreamingQuality' in props)) {
       return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY});
@@ -655,9 +696,9 @@ class Telemetry {
     if (Number.isNaN(currentQuality)) {
       return Object.freeze({shouldUpdate: false, currentQuality: 0, targetQuality: MEDIUM_STREAMING_QUALITY});
     }
-    this.qualityChecked = true;
     const isDoorbellT8214 = DOORBELL_T8214_SERIAL_REGEX.test(serial || '');
     if (enforceQuality === true && isDoorbellT8214) {
+      this.qualityChecked = true;
       return Object.freeze({shouldUpdate: false, currentQuality, targetQuality: MEDIUM_STREAMING_QUALITY});
     }
     const targetQuality = typeof enforceQuality === 'number' ? enforceQuality : MEDIUM_STREAMING_QUALITY;
@@ -665,35 +706,44 @@ class Telemetry {
       typeof enforceQuality === 'number'
         ? currentQuality !== targetQuality
         : currentQuality === AUTO_STREAMING_QUALITY || currentQuality > MEDIUM_STREAMING_QUALITY;
+    if (!shouldUpdate || commit) {
+      this.qualityChecked = true;
+    }
     return Object.freeze({shouldUpdate, currentQuality, targetQuality});
   }
 
   /**
    * Evaluates whether any configured Eufy hardware Power Manager properties (powerWorkingMode,
    * recordingClipLength, recordingEndClipMotionStops, recordingRetriggerInterval) need to be
-   * synced to the camera via device.set_property on first full property inspection.
+   * synced to the camera via device.set_property once all 4 recording keys are present.
    *
    * @param {Record<string, *>} props - Raw properties object from eufy-security-ws.
+   * @param {{commit?: boolean}} [opts={}] - Evaluation options.
    * @returns {ReadonlyArray<Readonly<{ name: string, currentValue: *, targetValue: * }>>}
    */
-  evaluateRecordingModeChanges(props) {
+  evaluateRecordingModeChanges(props, opts = {}) {
     if (this.recordingModeChecked || !props || typeof props !== 'object') {
       return Object.freeze([]);
     }
-    if (!RECORDING_MODE_PROPERTIES.some((spec) => spec.name in props)) {
+    const hasFullRecordingSet = RECORDING_MODE_PROPERTIES.every(
+      (spec) => spec.name in props && unwrapProperty(props[spec.name]) !== undefined
+    );
+    if (!hasFullRecordingSet) {
       return Object.freeze([]);
     }
-    this.recordingModeChecked = true;
-
+    const commit = !opts || opts.commit !== false;
     const updates = [];
     for (const {name, coerce} of RECORDING_MODE_PROPERTIES) {
       const targetValue = this.hwRecordingCfg[name];
       if (targetValue !== null && targetValue !== undefined) {
         const cur = unwrapProperty(props[name]);
-        if (cur === undefined || coerce(cur) !== targetValue) {
+        if (coerce(cur) !== targetValue) {
           updates.push(Object.freeze({name, currentValue: cur, targetValue}));
         }
       }
+    }
+    if (updates.length === 0 || commit) {
+      this.recordingModeChecked = true;
     }
     return Object.freeze(updates);
   }
@@ -739,6 +789,8 @@ class Telemetry {
     if (light === null) {
       return;
     }
+    this.pendingLightRestore = false;
+    this.lastClearedLightOnAt = 0;
     if (light && !this.lightOn) {
       this.lightOnAt = now;
     } else if (!light) {

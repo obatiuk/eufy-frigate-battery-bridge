@@ -29,6 +29,8 @@ const FIXED_WAIT_REGEX = /new Promise\(\s*\(?\s*\w+\s*\)?\s*=>\s*setTimeout\(\s*
 const SRC_IMPORT_REGEX = /require\(\s*['"]\.\.(?:\/\.\.)*\/src(?:\/|['"])/;
 const TEST_ENV_IMPORT_REGEX = /require\(\s*['"](?:\.\/|(?:\.\.\/)+)helpers\/test-env['"]\s*\)/;
 const SHARED_REFRESH_RESET_REGEX = /lastLowBatRefreshAt\s*=/;
+const PROCESS_HWACCEL_RENDER_REGEX = /process\.env\.BRIDGE_HWACCEL\s*=\s*['"](?:vaapi|qsv|true)['"]/i;
+const PROCESS_HWACCEL_DEVICE_REGEX = /process\.env\.BRIDGE_HWACCEL_DEVICE\s*=/;
 const MULTI_REGRESSION_TAG_REGEX = /\bit\(\s*(?:\r?\n\s*)?['"]Regression \d+(?:, \d+)+:/g;
 const REGRESSION_IT_REGEX = /\bit\(\s*(?:\r?\n\s*)?['"]Regression (\d+):/g;
 const ACCEPTANCE_IT_REGEX = /\bit\(\s*(?:\r?\n\s*)?['"](AT-\d{2}):/g;
@@ -146,6 +148,19 @@ describe('test hygiene', () => {
     assert.equal(sampleEnv.BRIDGE_CONFIG, paths.configPath);
     assert.equal(sampleEnv.BRIDGE_CACHE_DIR, paths.cacheDir);
     assert.equal(fs.existsSync(paths.configPath), true);
+  });
+
+  it('requires explicit BRIDGE_HWACCEL_DEVICE whenever a test enables vaapi or qsv on process.env', () => {
+    // Verify: container builds and headless CI runners have no /dev/dri/renderD128 node, so any test enabling vaapi or
+    // qsv on process.env must point BRIDGE_HWACCEL_DEVICE at a deterministic fixture path instead of host hardware.
+    const offenders = [];
+    for (const rel of listUnlockedTestFiles(TEST_DIR).sort()) {
+      const text = fs.readFileSync(path.join(TEST_DIR, rel), 'utf8');
+      if (PROCESS_HWACCEL_RENDER_REGEX.test(text) && !PROCESS_HWACCEL_DEVICE_REGEX.test(text)) {
+        offenders.push('test/' + rel);
+      }
+    }
+    assert.deepEqual(offenders, []);
   });
 
   it('keeps every unlocked test file at or below 2100 lines', () => {
@@ -472,6 +487,11 @@ describe('test hygiene', () => {
       noTsPreload,
       [
         "'use strict';",
+        "const fs = require('node:fs');",
+        'const origExists = fs.existsSync;',
+        'fs.existsSync = function (p) {',
+        "  return String(p).startsWith('/dev/dri') ? false : origExists.call(this, p);",
+        '};',
         "const Module = require('node:module');",
         'const origLoad = Module._load;',
         'Module._load = function (req, parent, isMain) {',
@@ -495,6 +515,7 @@ describe('test hygiene', () => {
         '--test-reporter=' + path.join(simDir, 'test', 'reporter.js'),
         path.join(simDir, 'test', 'camera-coupling.test.js'),
         path.join(simDir, 'test', 'test-hygiene.test.js'),
+        path.join(simDir, 'test', 'regression', '55-encoder-hwaccel-regex-url-replacer-and-sigkill.test.js'),
         path.join(simDir, 'test', 'scripts', 'check-docs.test.js'),
         path.join(simDir, 'test', 'scripts', 'check-docs-regression.test.js'),
         path.join(simDir, 'test', 'scripts', 'check-commit-msg.test.js'),

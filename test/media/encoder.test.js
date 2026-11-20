@@ -39,6 +39,9 @@ describe('Persistent FFmpeg Encoder Pipeline (src/media/encoder.js)', () => {
 
     const qsvCodec = buildVideoCodecArgs('qsv', '15');
     assert.ok(qsvCodec.includes('h264_qsv'));
+    const qsvBfIdx = qsvCodec.indexOf('-bf');
+    assert.notEqual(qsvBfIdx, -1, 'h264_qsv must set -bf 0 for zero B-frame reordering latency');
+    assert.equal(qsvCodec[qsvBfIdx + 1], '0');
 
     const nvencCodec = buildVideoCodecArgs('nvenc', '15');
     assert.ok(nvencCodec.includes('h264_nvenc'));
@@ -143,6 +146,22 @@ describe('Persistent FFmpeg Encoder Pipeline (src/media/encoder.js)', () => {
         false,
         'Live stream must NOT write duplicate frames during inBurst when frameNew is false'
       );
+      assert.equal(
+        shouldWriteEncoderFrame(cam, true, false, true, t0 + 66),
+        false,
+        'Live inBurst must not preempt steady 66ms 15 fps decodes with a duplicate frame'
+      );
+      assert.equal(
+        shouldWriteEncoderFrame(cam, true, false, true, t0 + 67),
+        true,
+        'Live inBurst still writes at 67ms on VFR/static streams'
+      );
+      assert.equal(
+        shouldWriteEncoderFrame(cam, false, false, true, t0 + 10),
+        false,
+        'Sleeping keyframe burst must pace writes by livePaceMs instead of writing back-to-back'
+      );
+      assert.equal(shouldWriteEncoderFrame(cam, false, false, true, t0 + 62), true);
 
       // Clean event thumbnail fallback (instant_event_snapshot: true): while waking before live video arrives,
       // suppressing the waking status card causes selectEncoderFrame to emit clean cam.lastFrame
@@ -254,5 +273,47 @@ describe('Persistent FFmpeg Encoder Pipeline (src/media/encoder.js)', () => {
     encoderMod.startMediaTickers([]);
     encoderMod.stopMediaTickers();
     encoderMod.stopMediaTickers();
+  });
+
+  it('preserves literal replacement tokens in buildEncoderArgs and escalates stopEncoderProcess to SIGKILL', (t) => {
+    // Verify buildEncoderArgs uses a function replacer for {name} and stopEncoderProcess escalates wedged encoders.
+    t.mock.timers.enable({apis: ['setTimeout']});
+    const fakeCam = /** @type {*} */ ({getName: () => 'patio_$&_$$'});
+    const args = buildEncoderArgs(fakeCam, '');
+    assert.equal(args[args.length - 1].endsWith('/patio_$&_$$'), true);
+
+    const {EventEmitter} = require('node:events');
+    const cam = new Camera({serial: 'T8161T0000000055', name: 'patio'});
+    const wedgedProc = Object.assign(new EventEmitter(), {
+      pid: 4100,
+      exitCode: null,
+      signalCode: null,
+      signals: [],
+      kill(sig) {
+        this.signals.push(sig);
+      },
+    });
+    cam.attachEncoder(wedgedProc, 1000);
+    cam.stopEncoderProcess();
+    assert.deepEqual(wedgedProc.signals, ['SIGTERM']);
+
+    t.mock.timers.tick(2000);
+    assert.deepEqual(wedgedProc.signals, ['SIGTERM', 'SIGKILL']);
+
+    const cleanProc = Object.assign(new EventEmitter(), {
+      pid: 4101,
+      exitCode: null,
+      signalCode: null,
+      signals: [],
+      kill(sig) {
+        this.signals.push(sig);
+      },
+    });
+    cam.attachEncoder(cleanProc, 2000);
+    cam.stopEncoderProcess();
+    cleanProc.exitCode = 0;
+    cleanProc.emit('exit', 0, null);
+    t.mock.timers.tick(2000);
+    assert.deepEqual(cleanProc.signals, ['SIGTERM']);
   });
 });

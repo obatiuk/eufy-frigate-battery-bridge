@@ -311,4 +311,27 @@ describe('HTTP API Payload Builders (src/services/api-payloads.js)', () => {
     assert.deepEqual(emptyStatus.stations, []);
     assert.equal(emptyStatus.summary.total_cameras, 0);
   });
+
+  it('closes all active keep-alive connections in stopHttpServer during shutdown', (t) => {
+    // Verify stopHttpServer invokes both server.close() and server.closeAllConnections().
+    const http = require('node:http');
+    const {startHttpServer, stopHttpServer} = require('../../src/services/http-server');
+    let closedCalled = false;
+    let closedAllCalled = false;
+    t.mock.method(http, 'createServer', () => ({
+      on() {},
+      listen() {},
+      close() {
+        closedCalled = true;
+      },
+      closeAllConnections() {
+        closedAllCalled = true;
+      },
+    }));
+
+    startHttpServer([], {wakeCameraExternal: () => ({}), isShuttingDown: () => false});
+    stopHttpServer();
+    assert.equal(closedCalled, true);
+    assert.equal(closedAllCalled, true);
+  });
 });

@@ -436,13 +436,20 @@ function call(commandPayload) {
       clearTimeout(timeoutTimer);
       resolve(responsePayload);
     });
-    const serializedCommand = JSON.stringify({messageId: requestId, ...commandPayload});
-    ws.send(serializedCommand, (sendErr) => {
-      if (sendErr && pendingRpcMap.delete(requestId)) {
+    try {
+      const serializedCommand = JSON.stringify({messageId: requestId, ...commandPayload});
+      ws.send(serializedCommand, (sendErr) => {
+        if (sendErr && pendingRpcMap.delete(requestId)) {
+          clearTimeout(timeoutTimer);
+          resolve({success: false, errorCode: formatErrorMessage(sendErr)});
+        }
+      });
+    } catch (err) {
+      if (pendingRpcMap.delete(requestId)) {
         clearTimeout(timeoutTimer);
-        resolve({success: false, errorCode: formatErrorMessage(sendErr)});
+        resolve({success: false, errorCode: formatErrorMessage(err)});
       }
-    });
+    }
   });
 }
 
@@ -486,6 +493,31 @@ function needsInitialTelemetryRetry(cam) {
 }
 
 /**
+ * Marks the WebSocket handshake not ready, updates camera wsConnected health, logs the RPC error,
+ * and schedules a reconnect attempt.
+ *
+ * @param {string} commandName - Handshake RPC command name ('set_api_schema' or 'start_listening').
+ * @param {Record<string, *>|null|undefined} rpcRes - Failed RPC response object.
+ */
+function failHandshakeAndScheduleReconnect(commandName, rpcRes) {
+  wsReady = false;
+  wsReadyAt = Date.now();
+  for (const c of camsRef) {
+    if (c.updateServiceHealth({wsConnected: false})) {
+      renderCameraCards(c);
+      pushFrameToEncoder(c);
+    }
+  }
+  wsHasEverDisconnected = true;
+  const retrySecs = scheduleWsReconnect();
+  log.error(
+    'bridge',
+    commandName + ' failed (' + formatRpcError(rpcRes) + '), retrying connection in ' + retrySecs + ' s'
+  );
+  ensureCameraEncodersStarted({wsConnected: false});
+}
+
+/**
  * Handles the initial 'version' message from eufy-security-ws by negotiating schema version
  * and starting event listening.
  *
@@ -498,26 +530,23 @@ async function handleVersionMessage(m) {
   const targetSchema = Number.isFinite(rawMaxSchema)
     ? Math.min(rawMaxSchema, MAX_SUPPORTED_API_SCHEMA)
     : MAX_SUPPORTED_API_SCHEMA;
-  await call({command: 'set_api_schema', schemaVersion: targetSchema});
+  const schemaRes = await call({command: 'set_api_schema', schemaVersion: targetSchema});
+  if (!schemaRes.success) {
+    failHandshakeAndScheduleReconnect('set_api_schema', schemaRes);
+    return;
+  }
   const st = await call({command: 'start_listening'});
-  wsReady = Boolean(st.success);
+  if (!st.success) {
+    failHandshakeAndScheduleReconnect('start_listening', st);
+    return;
+  }
+  wsReady = true;
   wsReadyAt = Date.now();
   for (const c of camsRef) {
-    if (c.updateServiceHealth({wsConnected: wsReady})) {
+    if (c.updateServiceHealth({wsConnected: true})) {
       renderCameraCards(c);
       pushFrameToEncoder(c);
     }
-  }
-
-  if (!wsReady) {
-    wsHasEverDisconnected = true;
-    const retrySecs = scheduleWsReconnect();
-    log.error(
-      'bridge',
-      'start_listening failed (' + formatRpcError(st) + '), retrying connection in ' + retrySecs + ' s'
-    );
-    ensureCameraEncodersStarted({wsConnected: false});
-    return;
   }
 
   wsReconnectAttempts = 0;
@@ -546,7 +575,9 @@ async function handleVersionMessage(m) {
   initialTelemetryRetryTimer = setTimeout(() => {
     initialTelemetryRetryTimer = null;
     if (wsReady && camsRef.some(needsInitialTelemetryRetry)) {
-      void onFetchAllTelemetryFn();
+      void Promise.resolve(onFetchAllTelemetryFn()).catch((err) => {
+        log.debug('bridge', 'initial telemetry retry failed: ' + formatErrorMessage(err));
+      });
     }
   }, INITIAL_TELEMETRY_RETRY_MS);
   if (initialTelemetryRetryTimer && typeof initialTelemetryRetryTimer.unref === 'function') {

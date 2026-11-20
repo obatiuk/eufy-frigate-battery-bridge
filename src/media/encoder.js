@@ -45,8 +45,24 @@ const ENCODER_MAX_RESTART_DELAY_MS = 30000;
 const OFFLINE_SNAPSHOT_SEED_MS = 6000;
 const OFFLINE_SNAPSHOT_MAX_WAIT_MS = 30000;
 const MS_PER_SECOND = 1000;
-const HWACCEL_FAILURE_STDERR_REGEX =
-  /vaapi|qsv|nvenc|v4l2|hwupload|device|driver|Invalid argument|Function not implemented/i;
+const HWACCEL_FAILURE_STDERR_REGEX = new RegExp(
+  [
+    'vaapi',
+    'qsv',
+    'nvenc',
+    'v4l2m2m',
+    'hwupload',
+    'init_hw_device',
+    '/dev/dri',
+    'libva',
+    'cuda',
+    '\\bmfx\\b',
+    'AVHW(?:Device|Frames)Context',
+    'Device creation failed',
+    'Function not implemented',
+  ].join('|'),
+  'i'
+);
 const MIN_GOP_FRAMES = 4;
 const VAAPI_QP = '18';
 const VAAPI_ASYNC_DEPTH = '1';
@@ -275,6 +291,8 @@ function buildVideoCodecArgs(hwMode, gop) {
         'format=nv12,hwupload=extra_hw_frames=' + QSV_EXTRA_HW_FRAMES,
         '-c:v',
         'h264_qsv',
+        '-bf',
+        '0',
         '-global_quality',
         QSV_GLOBAL_QUALITY,
         '-maxrate',
@@ -379,7 +397,7 @@ function buildEncoderArgs(cam, hwMode = '') {
   builder
     .option('-f', 'rtsp')
     .option('-rtsp_transport', 'tcp')
-    .output(cfg.rtsp_publish_url.replace('{name}', cam.getName()));
+    .output(cfg.rtsp_publish_url.replace('{name}', () => cam.getName()));
   return builder.build();
 }
 
