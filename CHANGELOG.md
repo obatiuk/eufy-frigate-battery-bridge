@@ -2,7 +2,7 @@
 
 Finished work, newest first. Open work lives in [docs/TODO.md](docs/TODO.md).
 
-## dev
+## v0.0.3
 
 - Rewrite the user setup guide with a table of contents, plain-language explanations of camera, power, and
   streaming-quality modes near the top, progressive step-by-step setup examples from default to custom, spaced reference

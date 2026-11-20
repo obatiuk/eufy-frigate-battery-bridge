@@ -9,7 +9,7 @@
  */
 'use strict';
 
-const DEFAULT_FALLBACK_VERSION = '0.0.2';
+const DEFAULT_FALLBACK_VERSION = '0.0.3';
 const DEFAULT_FALLBACK_COMMIT = 'dev';
 const DEFAULT_CACHE_DIR = '/config/cache';
 const DEFAULT_HWACCEL_DEVICE = '/dev/dri/renderD128';

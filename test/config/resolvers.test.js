@@ -788,7 +788,7 @@ describe('Status Card Theme, Position, Sleep Screen, Telemetry & Event Priority 
       assert.equal(Object.isFrozen(customBuild), true);
       assert.deepEqual(customBuild, {version: 'v0.0.1', commit: 'a1b2c3d-dirty'});
       const fallbackBuild = resolveBuildInfo({});
-      assert.equal(fallbackBuild.version, '0.0.2');
+      assert.equal(fallbackBuild.version, '0.0.3');
       assert.equal(fallbackBuild.commit, 'dev');
       const trimmedBuild = resolveBuildInfo({BRIDGE_VERSION: '  v1.5.0  ', BRIDGE_COMMIT: '  abc1234  '});
       assert.deepEqual(trimmedBuild, {version: 'v1.5.0', commit: 'abc1234'});
